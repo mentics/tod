@@ -52,7 +52,11 @@ impl GithubError {
     /// a missing pull request, a refused request) will fail the same way
     /// until the user fixes it.
     pub fn is_transient(&self) -> bool {
-        matches!(self, Self::Http(_) | Self::Unavailable(_))
+        match self {
+            Self::Http(_) | Self::Unavailable(_) => true,
+            Self::Api(message) => is_transient_graphql(message),
+            _ => false,
+        }
     }
 }
 
@@ -60,7 +64,38 @@ impl GithubError {
 /// (`tod_core::pr_readiness::PrFeed` reports `String`s), possibly with a
 /// prefix. Pinned to the variants' own messages by a test.
 pub fn is_transient_message(message: &str) -> bool {
-    message.contains("HTTP request failed:") || message.contains("GitHub is unavailable (")
+    message.contains("HTTP request failed:") || message.contains("GitHub is unavailable (") || is_transient_graphql(message)
+}
+
+/// GitHub's GraphQL answers an internal hiccup with HTTP 200 and this text
+/// (what `gh` prints as `GraphQL: Something went wrong while executing your
+/// query`); the same query works moments later.
+fn is_transient_graphql(message: &str) -> bool {
+    message.contains("Something went wrong while executing your query")
+}
+
+/// How long to wait before each retry of a GitHub call that failed
+/// transiently: three retries, so a hiccup of a few seconds never reaches
+/// anyone.
+pub const RETRY_DELAYS_MS: [u64; 3] = [2_000, 6_000, 15_000];
+
+/// Runs `call`, and again after each of `delays_ms` while it fails with an
+/// error `retry` accepts. The last error is returned as it is.
+pub fn with_retries<T>(
+    delays_ms: &[u64],
+    retry: impl Fn(&GithubError) -> bool,
+    mut call: impl FnMut() -> Result<T, GithubError>,
+) -> Result<T, GithubError> {
+    let mut delays = delays_ms.iter();
+    loop {
+        match call() {
+            Err(err) if retry(&err) => match delays.next() {
+                Some(ms) => std::thread::sleep(std::time::Duration::from_millis(*ms)),
+                None => return Err(err),
+            },
+            other => return other,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,6 +208,8 @@ pub struct Github {
     api: String,
     /// Proxy authentication with no proxy to carry it: every call is refused.
     proxy_missing: bool,
+    /// Pauses before each retry of a call that failed transiently.
+    retry_delays_ms: Vec<u64>,
 }
 
 impl Github {
@@ -193,7 +230,19 @@ impl Github {
 
     /// With the agent and API base URL given.
     pub fn with_agent(auth: GithubAuth, agent: ureq::Agent, api: &str) -> Self {
-        Self { auth, agent, api: api.trim_end_matches('/').to_string(), proxy_missing: false }
+        Self {
+            auth,
+            agent,
+            api: api.trim_end_matches('/').to_string(),
+            proxy_missing: false,
+            retry_delays_ms: RETRY_DELAYS_MS.to_vec(),
+        }
+    }
+
+    /// With `delays_ms` as the pauses before each retry (none: never retry).
+    pub fn with_retry_delays(mut self, delays_ms: &[u64]) -> Self {
+        self.retry_delays_ms = delays_ms.to_vec();
+        self
     }
 
     pub fn auth(&self) -> &GithubAuth {
@@ -400,12 +449,18 @@ impl Github {
     }
 
     /// Post a top-level (issue-style) comment on the pull request.
+    ///
+    /// Retried while GitHub says it is unavailable (5xx, 429): nothing was
+    /// posted then. A dropped connection is not retried, since the comment
+    /// may have gone through.
     pub fn post_issue_comment(&self, owner: &str, repo: &str, number: i64, body: &str) -> Result<(), GithubError> {
-        self.post_json::<serde_json::Value>(
-            &format!("/repos/{owner}/{repo}/issues/{number}/comments"),
-            serde_json::json!({ "body": body }),
-        )?;
-        Ok(())
+        with_retries(&self.retry_delays_ms, |e| matches!(e, GithubError::Unavailable(_)), || {
+            self.post_json::<serde_json::Value>(
+                &format!("/repos/{owner}/{repo}/issues/{number}/comments"),
+                serde_json::json!({ "body": body }),
+            )
+            .map(|_| ())
+        })
     }
 
     /// `POST <api>/graphql`; GraphQL reports failures in an `errors` array
@@ -416,13 +471,21 @@ impl Github {
         variables: serde_json::Value,
         repo: Option<(&str, &str)>,
     ) -> Result<T, GithubError> {
-        let reply: GraphqlReply<T> =
-            self.post_json_for("/graphql", serde_json::json!({ "query": query, "variables": variables }), repo)?;
-        if let Some(errors) = reply.errors.filter(|e| !e.is_empty()) {
-            let message = errors.into_iter().map(|e| e.message).collect::<Vec<_>>().join("; ");
-            return Err(GithubError::Api(message));
-        }
-        reply.data.ok_or_else(|| GithubError::Api("GitHub returned no data".into()))
+        // A query that fails transiently is asked again after a pause; a
+        // mutation that failed with GitHub's "something went wrong" did not
+        // apply, so it is safe to ask again too.
+        with_retries(&self.retry_delays_ms, GithubError::is_transient, || {
+            let reply: GraphqlReply<T> = self.post_json_for(
+                "/graphql",
+                serde_json::json!({ "query": query, "variables": variables }),
+                repo,
+            )?;
+            if let Some(errors) = reply.errors.filter(|e| !e.is_empty()) {
+                let message = errors.into_iter().map(|e| e.message).collect::<Vec<_>>().join("; ");
+                return Err(GithubError::Api(message));
+            }
+            reply.data.ok_or_else(|| GithubError::Api("GitHub returned no data".into()))
+        })
     }
 
     /// Every label `owner/repo` defines (the first 100): what a pull request
@@ -1690,6 +1753,72 @@ impl<'a> NodePrRepo<'a> {
 #[cfg(test)]
 mod tests {
 
+    /// Serves one canned `(status line, body)` per request on loopback and
+    /// returns how many requests came in.
+    fn serve_canned(replies: Vec<(&'static str, &'static str)>) -> (String, std::thread::JoinHandle<usize>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            for (status, body) in &replies {
+                let (mut stream, _) = listener.accept().unwrap();
+                // The request is small: one read takes its head and body.
+                let mut buf = [0u8; 8192];
+                let _ = stream.read(&mut buf);
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+            replies.len()
+        });
+        (url, handle)
+    }
+
+    fn client(url: &str, delays: &[u64]) -> Github {
+        let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+        Github::with_agent(GithubAuth::Token("t".into()), agent, url).with_retry_delays(delays)
+    }
+
+    #[test]
+    fn a_graphql_hiccup_is_asked_again_before_it_is_an_error() {
+        let (url, handle) = serve_canned(vec![
+            ("200 OK", r#"{"errors":[{"message":"Something went wrong while executing your query."}]}"#),
+            ("200 OK", r#"{"data":{"ok":true}}"#),
+        ]);
+        let value: serde_json::Value = client(&url, &[1]).graphql("query { x }", serde_json::json!({}), None).unwrap();
+        assert_eq!(value["ok"], true);
+        assert_eq!(handle.join().unwrap(), 2);
+    }
+
+    #[test]
+    fn a_graphql_hiccup_that_does_not_clear_ends_as_the_error_after_every_retry() {
+        let hiccup = ("200 OK", r#"{"errors":[{"message":"Something went wrong while executing your query."}]}"#);
+        let (url, handle) = serve_canned(vec![hiccup, hiccup, hiccup]);
+        let err = client(&url, &[1, 1])
+            .graphql::<serde_json::Value>("query { x }", serde_json::json!({}), None)
+            .unwrap_err();
+        assert!(err.is_transient() && err.to_string().contains("Something went wrong"), "{err}");
+        assert_eq!(handle.join().unwrap(), 3);
+    }
+
+    #[test]
+    fn a_comment_is_posted_again_after_github_says_it_is_unavailable_and_a_real_error_is_not_retried() {
+        let (url, handle) = serve_canned(vec![
+            ("503 Service Unavailable", r#"{"message":"down"}"#),
+            ("201 Created", r#"{"id":1}"#),
+        ]);
+        client(&url, &[1]).post_issue_comment("o", "r", 1, "hi").unwrap();
+        assert_eq!(handle.join().unwrap(), 2);
+
+        let (url, handle) = serve_canned(vec![("422 Unprocessable Entity", r#"{"message":"Validation Failed"}"#)]);
+        let err = client(&url, &[1, 1]).post_issue_comment("o", "r", 1, "hi").unwrap_err();
+        assert!(!err.is_transient(), "{err}");
+        assert_eq!(handle.join().unwrap(), 1, "a refused comment is not posted again");
+    }
+
     /// Serves `count` requests on loopback, returning each one's `Authorization` header.
     fn serve(count: usize) -> (String, std::thread::JoinHandle<Vec<Option<String>>>) {
         use std::io::{BufRead, BufReader, Write};
@@ -1800,6 +1929,9 @@ mod tests {
             GithubError::NotFound,
             GithubError::Api("Validation Failed".into()),
         ];
+        // GitHub's own "try again" in a 200 reply.
+        assert!(GithubError::Api("Something went wrong while executing your query.".into()).is_transient());
+        assert!(is_transient_message("GraphQL: Something went wrong while executing your query"));
         for err in &transient {
             assert!(err.is_transient(), "{err}");
             assert!(is_transient_message(&err.to_string()), "{err}");

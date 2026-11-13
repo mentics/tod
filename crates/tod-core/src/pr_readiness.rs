@@ -107,6 +107,18 @@ pub struct BotReport {
     pub reviewed_at: Option<DateTime<Utc>>,
     /// The head has waited `rerun_after_minutes` for its review.
     pub overdue: bool,
+    /// Comments asking it for a review (the settings' `ask` text) on the
+    /// pull request since the head commit, whoever posted them: tod, or the
+    /// agent by the project's skill.
+    pub asks: u32,
+    /// When the latest of them was posted.
+    pub last_ask_at: Option<DateTime<Utc>>,
+    /// Tod should ask it again now: `ask` is set, the review is overdue,
+    /// fewer than `max_asks` asks were made for this head, and the last was
+    /// at least `ask_every_minutes` ago.
+    pub ask_due: bool,
+    /// When the head commit was made.
+    pub head_at: Option<DateTime<Utc>>,
 }
 
 /// A review thread that still wants an answer.
@@ -190,10 +202,12 @@ pub enum Work {
     /// and the agent has not had a turn since.
     LowScore { bot: String, score: u8, min: u8 },
     /// A bot has not reviewed the current head in `minutes`
-    /// (`rerun_after_minutes`), nor has the agent had a turn in that time:
-    /// it may need asking, which the project's own skill says how to do.
-    /// `low_last_score` is its latest score and the threshold, when that
-    /// score (for an earlier commit) is under it.
+    /// (`rerun_after_minutes`) and its latest score, on an earlier commit,
+    /// is under the threshold (`low_last_score`): its findings are for the
+    /// agent to fix, once (until the bot reviews again). A bot that is only
+    /// slow is not work: it is a [`Wait::BotReview`], and tod asks it
+    /// ([`Assessment::asks_due`]) and, when it stays silent, the user
+    /// ([`Assessment::silent_bots`]).
     BotReviewMissing { bot: String, minutes: u64, low_last_score: Option<(u8, u8)> },
     /// A person asked for changes, nothing has been pushed since, and no
     /// review thread carries the request (those are [`Work::Threads`]).
@@ -219,6 +233,24 @@ impl Work {
             Work::Behind | Work::Conflict => false,
         }
     }
+
+    /// Whether a turn of the agent can change what this asks for. A bot
+    /// that has not reviewed, with no findings of its own to fix, can only
+    /// be waited for (or pinged, which tod does): a turn on it changes
+    /// nothing, so it is never counted toward "two turns changed nothing".
+    pub fn agent_can_fix(&self) -> bool {
+        !matches!(self, Work::BotReviewMissing { low_last_score: None, .. })
+    }
+}
+
+/// A review tod is to ask a bot for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BotAsk {
+    pub bot: String,
+    /// The comment to post (the settings' `ask`).
+    pub text: String,
+    /// Asks already made for this head.
+    pub asks: u32,
 }
 
 /// Something the babysitter can only wait for.
@@ -279,6 +311,7 @@ impl Assessment {
                     now.signed_duration_since(h)
                         >= chrono::Duration::minutes(configured.rerun_after_minutes as i64)
                 });
+                let (asks, last_ask_at) = asks_made(snapshot, bot, configured, head_at);
                 let reviewed_at = snapshot
                     .reviews
                     .iter()
@@ -294,7 +327,24 @@ impl Assessment {
                     )
                     .filter_map(parse_time)
                     .max();
-                bots.push(BotReport { settings: configured.clone(), bot, standing, reviewed_at, overdue });
+                let waiting = !matches!(standing, BotStanding::Current { .. }) && overdue && !snapshot.status.merged;
+                let every = chrono::Duration::minutes(configured.ask_every_minutes as i64);
+                let ask_gap_over = last_ask_at.is_none_or(|at| now - at >= every);
+                let ask_due = waiting
+                    && configured.ask.as_deref().map(str::trim).is_some_and(|a| !a.is_empty())
+                    && asks < configured.max_asks
+                    && ask_gap_over;
+                bots.push(BotReport {
+                    settings: configured.clone(),
+                    bot,
+                    standing,
+                    reviewed_at,
+                    overdue,
+                    asks,
+                    last_ask_at,
+                    ask_due,
+                    head_at,
+                });
             }
         }
         Ok(Self {
@@ -312,6 +362,14 @@ impl Assessment {
                 snapshot,
                 head_at,
                 &settings.bots.iter().filter_map(|b| builtin_bot(&b.name)).collect::<Vec<_>>(),
+                &settings
+                    .bots
+                    .iter()
+                    .filter_map(|b| b.ask.as_deref())
+                    .map(|a| a.trim().to_ascii_lowercase())
+                    .filter(|a| !a.is_empty())
+                    .chain(settings.waived_asks.iter().cloned())
+                    .collect::<Vec<_>>(),
             ),
             read_at: now,
             answered_at: None,
@@ -387,29 +445,68 @@ impl Assessment {
                     }
                 }
                 BotStanding::Current { .. } => {}
-                BotStanding::Stale { .. } | BotStanding::Missing => {
-                    // Told at most once per `minutes`: a bot asked and slow
-                    // is not asked again at once, and one that never comes
-                    // ends in the round limit.
+                BotStanding::Stale { last_score } => {
+                    // Its last score, on an earlier commit, is under the
+                    // threshold: those findings are the agent's to fix, once
+                    // (a turn since the review has seen them). A bot that is
+                    // only slow is a wait, never work.
                     let minutes = report.settings.rerun_after_minutes;
-                    let quiet = chrono::Duration::minutes(minutes as i64);
-                    if report.overdue && self.answered_at.is_none_or(|a| self.read_at - a >= quiet) {
-                        let low_last_score = match report.standing {
-                            BotStanding::Stale { last_score: Some(score) } if score < report.settings.min_score => {
-                                Some((score, report.settings.min_score))
-                            }
-                            _ => None,
-                        };
+                    if let Some(score) = last_score.filter(|s| *s < report.settings.min_score)
+                        && report.overdue
+                        && self.answered_at.is_none_or(|a| report.reviewed_at.is_none_or(|r| r > a))
+                    {
                         work.push(Work::BotReviewMissing {
                             bot: report.settings.name.clone(),
                             minutes,
-                            low_last_score,
+                            low_last_score: Some((score, report.settings.min_score)),
                         });
                     }
                 }
+                BotStanding::Missing => {}
             }
         }
         work
+    }
+
+    /// The reviews tod should ask for now: for each bot with an `ask` text
+    /// that is overdue and under its limits (one ask per head, none sooner
+    /// than `ask_every_minutes` after the last, at most `max_asks`).
+    pub fn asks_due(&self) -> Vec<BotAsk> {
+        if self.merged {
+            return Vec::new();
+        }
+        self.bots
+            .iter()
+            .filter(|r| r.ask_due)
+            .filter_map(|r| Some(BotAsk { bot: r.settings.name.clone(), text: r.settings.ask.clone()?, asks: r.asks }))
+            .collect()
+    }
+
+    /// The bots that stayed silent past the limits: asked as often as
+    /// allowed (`max_asks`, the last at least `ask_every_minutes` ago) and
+    /// still no review of the head. With no `ask` text tod cannot ask, so the
+    /// same patience is measured from the later of the head commit and the
+    /// agent's last turn (which pushed it): `rerun_after_minutes` plus
+    /// `max_asks` intervals. The user decides whether to go on without it.
+    pub fn silent_bots(&self) -> Vec<&BotReport> {
+        if self.merged {
+            return Vec::new();
+        }
+        self.bots.iter().filter(|r| self.is_silent(r)).collect()
+    }
+
+    fn is_silent(&self, r: &BotReport) -> bool {
+        if matches!(r.standing, BotStanding::Current { .. }) || !r.overdue {
+            return false;
+        }
+        let every = chrono::Duration::minutes(r.settings.ask_every_minutes as i64);
+        if r.settings.ask.as_deref().map(str::trim).is_some_and(|a| !a.is_empty()) {
+            return r.asks >= r.settings.max_asks && r.last_ask_at.is_none_or(|at| self.read_at - at >= every);
+        }
+        let patience = chrono::Duration::minutes(r.settings.rerun_after_minutes as i64)
+            + every * r.settings.max_asks as i32;
+        let since = r.head_at.into_iter().chain(self.answered_at).max();
+        since.is_some_and(|since| self.read_at - since >= patience)
     }
 
     /// What is being waited for.
@@ -509,7 +606,16 @@ fn human_review(snapshot: &PrSnapshot, head_at: Option<DateTime<Utc>>) -> HumanR
 /// The reviews people left with text and no verdict since the head commit.
 /// A bot's report (a score, a summary) is read through its own standing, and
 /// a review that approves or asks for changes through [`human_review`].
-fn review_comments(snapshot: &PrSnapshot, head_at: Option<DateTime<Utc>>, bots: &[&ReviewBot]) -> Vec<ReviewComment> {
+///
+/// `asks` are the settings' comments that ask a bot for a review (lowercase):
+/// a comment holding one is tod's own ask, posted as the user after the
+/// agent's turn, and is not feedback.
+fn review_comments(
+    snapshot: &PrSnapshot,
+    head_at: Option<DateTime<Utc>>,
+    bots: &[&ReviewBot],
+    asks: &[String],
+) -> Vec<ReviewComment> {
     let mut found: Vec<ReviewComment> = snapshot
         .reviews
         .iter()
@@ -553,6 +659,10 @@ fn review_comments(snapshot: &PrSnapshot, head_at: Option<DateTime<Utc>>, bots: 
         }
         let Some(author) = c.author.as_deref().filter(|a| is_person(a)) else { continue };
         let Some(at) = parse_time(&c.created_at) else { continue };
+        let lower = body.to_ascii_lowercase();
+        if asks.iter().any(|ask| lower.contains(ask)) {
+            continue;
+        }
         if body.is_empty() || !head_at.is_none_or(|h| at > h) {
             continue;
         }
@@ -754,15 +864,37 @@ pub fn render_work(url: &str, assessment: &Assessment) -> String {
             ),
             Work::BotReviewMissing { bot, minutes, low_last_score } => match low_last_score {
                 Some((score, min)) => format!(
-                    "- {bot} has not reviewed the current head in {minutes} minutes, and its last score, {score}/5 on an earlier commit, is under the {min}/5 needed: fix what it found that this change introduced if you have not, and if it has to be asked for a new review, ask it\n"
+                    "- {bot} has not reviewed the current head in {minutes} minutes, and its last score, {score}/5 on an earlier commit, is under the {min}/5 needed: fix what it found that this change introduced if you have not (tod asks it for the new review, so do not)\n"
                 ),
-                None => format!(
-                    "- {bot} has not reviewed the current head in {minutes} minutes: if it has to be asked for a review, ask it\n"
-                ),
+                None => format!("- {bot} has not reviewed the current head in {minutes} minutes: nothing for you to do, tod waits for it\n"),
             },
         });
     }
     out
+}
+
+/// The comments on the pull request since the head commit that ask `bot`
+/// for a review (they contain the settings' `ask` text, ignoring case),
+/// from anyone but the bot, and when the latest was posted.
+fn asks_made(
+    snapshot: &PrSnapshot,
+    bot: &ReviewBot,
+    configured: &PrReviewBotSettings,
+    head_at: Option<DateTime<Utc>>,
+) -> (u32, Option<DateTime<Utc>>) {
+    let Some(ask) = configured.ask.as_deref().map(str::trim).filter(|a| !a.is_empty()) else {
+        return (0, None);
+    };
+    let ask = ask.to_ascii_lowercase();
+    let times: Vec<DateTime<Utc>> = snapshot
+        .comments
+        .iter()
+        .filter(|c| !c.author.as_deref().is_some_and(|a| bot.is_author(a)))
+        .filter(|c| c.body.to_ascii_lowercase().contains(&ask))
+        .filter_map(|c| parse_time(&c.created_at))
+        .filter(|at| head_at.is_none_or(|h| *at >= h))
+        .collect();
+    (times.len() as u32, times.into_iter().max())
 }
 
 /// Reads a real pull request, for checking the GitHub side by hand:
@@ -803,11 +935,7 @@ mod live {
             assert_eq!(rounds(t), 1);
         }
         let settings = PrReadinessSettings {
-            bots: vec![tod_store::PrReviewBotSettings {
-                name: "greptile".into(),
-                min_score: 4,
-                rerun_after_minutes: 10,
-            }],
+            bots: vec![PrReviewBotSettings::new("greptile", 4, 10)],
             ..Default::default()
         };
         let mut a = Assessment::of(&snap, &settings, Utc::now());
@@ -875,7 +1003,7 @@ Not safe.
 
     fn greptile_settings() -> tod_store::PrReadinessSettings {
         tod_store::PrReadinessSettings {
-            bots: vec![tod_store::PrReviewBotSettings { name: "greptile".into(), min_score: 4, rerun_after_minutes: 10 }],
+            bots: vec![PrReviewBotSettings::new("greptile", 4, 10)],
             ..Default::default()
         }
     }
@@ -953,7 +1081,7 @@ Not safe.
 
     fn settings() -> PrReadinessSettings {
         PrReadinessSettings {
-            bots: vec![PrReviewBotSettings { name: "greptile".into(), min_score: 4, rerun_after_minutes: 10 }],
+            bots: vec![PrReviewBotSettings::new("greptile", 4, 10)],
             ..Default::default()
         }
     }
@@ -1119,15 +1247,17 @@ Not safe.
         );
         let a = Assessment::of(&s, &settings(), now());
         assert_eq!(a.bots[0].standing, BotStanding::Stale { last_score: Some(2) });
-        // Stale: no work from its old score. The head is two hours old (ten
-        // minutes is the limit), so the agent is told, which may ask it.
+        // Stale, and its last score is under the threshold: those findings
+        // are the agent's to fix, once.
         assert_eq!(a.work(), vec![Work::BotReviewMissing { bot: "greptile".into(), minutes: 10, low_last_score: Some((2, 4)) }]);
-        // After a turn in the last ten minutes, it is only waited for.
+        // After a turn since its review, it is only waited for, however
+        // long ago that turn was: a turn that did not fix it is not repeated.
         let answered = a.clone().answered_through(Some(at("2026-01-01T11:55:00Z")));
         assert_eq!(answered.next(), Next::Wait(vec![Wait::BotReview { bot: "greptile".into() }]));
-        // Still missing ten minutes after that turn: told again.
-        let later = a.answered_through(Some(at("2026-01-01T11:50:00Z")));
-        assert_eq!(later.work().len(), 1);
+        let later = a.answered_through(Some(at("2026-01-01T08:30:00Z")));
+        assert_eq!(later.work().len(), 1, "a turn before the review has not seen it");
+        let long_after = Assessment::of(&s, &settings(), now()).answered_through(Some(at("2026-01-01T10:00:00Z")));
+        assert!(long_after.work().is_empty());
     }
 
     #[test]
@@ -1136,6 +1266,108 @@ Not safe.
         st.head_committed_at = Some("2026-01-01T11:55:00Z".into());
         let a = Assessment::of(&snap(st, vec![], vec![]), &settings(), now());
         assert_eq!(a.next(), Next::Wait(vec![Wait::BotReview { bot: "greptile".into() }]));
+    }
+
+    fn asking_settings(ask_every: u64, max_asks: u32) -> PrReadinessSettings {
+        let mut bot = PrReviewBotSettings::new("greptile", 4, 10);
+        bot.ask = Some("@greptileai please review".into());
+        bot.ask_every_minutes = ask_every;
+        bot.max_asks = max_asks;
+        PrReadinessSettings { bots: vec![bot], ..Default::default() }
+    }
+
+    fn ask_comment(who: &str, body: &str, at: &str) -> tod_store::github::IssueComment {
+        let mut c = comment(who, body, at);
+        c.created_at = at.to_string();
+        c
+    }
+
+    /// Seen live: a bot that never came was asked again and again by the
+    /// agent, one turn each. Now it is a wait that tod asks about, bounded.
+    #[test]
+    fn a_slow_bot_is_waited_for_and_asked_once_per_head_and_per_interval() {
+        let st = status("blocked", "success");
+        // The head is two hours old and nobody has asked yet.
+        let none = Assessment::of(&snap(st.clone(), vec![], vec![]), &asking_settings(30, 3), now());
+        assert!(none.work().is_empty(), "never work for the agent");
+        assert_eq!(none.waits(), vec![Wait::BotReview { bot: "greptile".into() }]);
+        let due = none.asks_due();
+        assert_eq!(due.len(), 1);
+        assert_eq!((due[0].bot.as_str(), due[0].text.as_str(), due[0].asks), ("greptile", "@greptileai please review", 0));
+
+        // Asked ten minutes ago, by the agent or tod, in other case: not again yet.
+        let asked = snap(
+            st.clone(),
+            vec![],
+            vec![ask_comment("joel", "@GreptileAI please review", "2026-01-01T11:50:00Z")],
+        );
+        let a = Assessment::of(&asked, &asking_settings(30, 3), now());
+        assert_eq!((a.bots[0].asks, a.asks_due().len()), (1, 0));
+        assert!(a.silent_bots().is_empty());
+
+        // An ask from before the head commit belongs to an earlier head.
+        let mut st_new = st.clone();
+        st_new.head_committed_at = Some("2026-01-01T11:00:00Z".into());
+        let old = snap(st_new, vec![], vec![ask_comment("joel", "@greptileai please review", "2026-01-01T10:00:00Z")]);
+        assert_eq!(Assessment::of(&old, &asking_settings(30, 3), now()).bots[0].asks, 0);
+
+        // Thirty minutes after the last: due again, with the count.
+        let a = Assessment::of(&asked, &asking_settings(10, 3), now());
+        assert_eq!(a.asks_due().iter().map(|d| d.asks).collect::<Vec<_>>(), vec![1]);
+    }
+
+    #[test]
+    fn a_bot_asked_as_often_as_allowed_is_silent_and_never_asked_again() {
+        let st = status("blocked", "success");
+        let comments = vec![
+            ask_comment("joel", "@greptileai please review", "2026-01-01T10:00:00Z"),
+            ask_comment("joel", "@greptileai please review", "2026-01-01T10:30:00Z"),
+            ask_comment("joel", "@greptileai please review", "2026-01-01T11:00:00Z"),
+        ];
+        let a = Assessment::of(&snap(st, vec![], comments), &asking_settings(30, 3), now());
+        assert_eq!(a.bots[0].asks, 3);
+        assert!(a.asks_due().is_empty(), "the limit is a limit");
+        assert_eq!(a.silent_bots().len(), 1);
+        // Still a wait, never work.
+        assert!(a.work().is_empty());
+        assert_eq!(a.bots[0].last_ask_at, Some(at("2026-01-01T11:00:00Z")));
+    }
+
+    #[test]
+    fn with_nothing_to_ask_with_a_bot_is_silent_after_the_time_the_asks_would_take() {
+        let st = status("blocked", "success");
+        // The default tuning: 10 minutes, then 3 asks 30 minutes apart.
+        let patience = |mins: i64| now() - chrono::Duration::minutes(mins);
+        let mut fresh = st.clone();
+        fresh.head_committed_at = Some(patience(99).to_rfc3339());
+        assert!(Assessment::of(&snap(fresh, vec![], vec![]), &settings(), now()).silent_bots().is_empty());
+        let mut stale = st;
+        stale.head_committed_at = Some(patience(101).to_rfc3339());
+        let silent = Assessment::of(&snap(stale, vec![], vec![]), &settings(), now());
+        assert_eq!(silent.silent_bots().len(), 1);
+        // The clock starts at the push, not at the commit: an agent turn ten
+        // minutes ago pushed it.
+        let just_pushed = silent.answered_through(Some(now() - chrono::Duration::minutes(10)));
+        assert!(just_pushed.silent_bots().is_empty());
+    }
+
+    #[test]
+    fn work_the_agent_cannot_fix_is_not_a_turn_that_counts() {
+        let missing = Work::BotReviewMissing { bot: "b".into(), minutes: 10, low_last_score: None };
+        let low = Work::BotReviewMissing { bot: "b".into(), minutes: 10, low_last_score: Some((2, 4)) };
+        assert!(!missing.agent_can_fix());
+        assert!(low.agent_can_fix() && Work::Threads(1).agent_can_fix() && Work::Behind.agent_can_fix());
+    }
+
+    #[test]
+    fn a_bot_the_user_went_on_without_is_not_waited_for_asked_or_required() {
+        let st = status("blocked", "success");
+        let with = Assessment::of(&snap(st.clone(), vec![], vec![]), &asking_settings(30, 3), now());
+        assert!(!with.review_clean());
+        let without_bot = crate::bot_silence::without_waived(&asking_settings(30, 3), &["greptile".to_string()]);
+        let a = Assessment::of(&snap(st, vec![], vec![]), &without_bot, now());
+        assert!(a.bots.is_empty() && a.asks_due().is_empty() && a.silent_bots().is_empty());
+        assert!(a.review_clean(), "only a person is left");
     }
 
     #[test]
@@ -1195,7 +1427,9 @@ Not safe.
         let a = Assessment::of_with(&reviewed_6a3e22b9(), &greptile_settings(), now(), &mut |_, _| Ok::<_, String>(false))
             .unwrap();
         assert_eq!(a.bots[0].standing, BotStanding::Stale { last_score: Some(5) });
-        assert!(a.work().iter().any(|w| matches!(w, Work::BotReviewMissing { .. })));
+        // Not reviewed, and nothing of its own to fix: a wait, not work.
+        assert!(a.work().is_empty());
+        assert_eq!(a.waits(), vec![Wait::BotReview { bot: "greptile".into() }]);
     }
 
     #[test]
@@ -1380,6 +1614,11 @@ pub trait PrFeed: Send + Sync {
     ) -> Result<bool, String> {
         Err("this feed does not compare commits".to_string())
     }
+    /// Post a top-level comment on the pull request (the ask for a bot's
+    /// review, `PrReviewBotSettings::ask`).
+    fn post_comment(&self, _pr: &tod_store::github::NodePr, _body: &str) -> Result<(), String> {
+        Err("this feed does not post comments".to_string())
+    }
     /// Post tod's own code review of `post.commit_id` (`crate::pr_draft_review`).
     fn post_review(&self, _pr: &tod_store::github::NodePr, _post: &ReviewPost) -> Result<(), String> {
         Err("this feed does not post reviews".to_string())
@@ -1449,6 +1688,12 @@ impl PrFeed for GithubFeed {
         Ok(same)
     }
 
+    fn post_comment(&self, pr: &tod_store::github::NodePr, body: &str) -> Result<(), String> {
+        self.0
+            .post_issue_comment(&pr.owner, &pr.repo, pr.pr_number, body)
+            .map_err(|err| format!("posting the comment on {}: {err}", pr.url))
+    }
+
     fn post_review(&self, pr: &tod_store::github::NodePr, post: &ReviewPost) -> Result<(), String> {
         self.0
             .post_review(&pr.owner, &pr.repo, pr.pr_number, &post.commit_id, &post.body, &post.lines)
@@ -1488,6 +1733,17 @@ pub fn feed_for(data_root: &std::path::Path) -> Option<std::sync::Arc<dyn PrFeed
     let store = tod_store::credentials::CredentialStore::from_data_root(data_root);
     let auth = tod_store::credentials::resolve_github_auth(&store)?;
     Some(std::sync::Arc::new(GithubFeed(tod_store::github::Github::new(auth))))
+}
+
+/// The project's readiness settings for `node`: the bots the user told it
+/// to go on without ([`crate::bot_silence`]) are left out.
+pub fn settings_for_node(
+    fleet: &tod_store::fleet::FleetStore,
+    node: uuid::Uuid,
+    data_root: &std::path::Path,
+) -> anyhow::Result<PrReadinessSettings> {
+    let settings = settings_at(data_root);
+    Ok(fleet.read(|conn| crate::bot_silence::settings_for_node(conn, node, settings))?)
 }
 
 /// The project's readiness settings; the defaults when unreadable.

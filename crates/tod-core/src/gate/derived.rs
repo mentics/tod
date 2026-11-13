@@ -803,7 +803,8 @@ fn pr_readiness_outcome(conn: &Connection, node_id: Uuid, which: Readiness) -> R
         Ok(found) => found,
         Err(outcome) => return Ok(outcome),
     };
-    let settings = readiness_settings(conn);
+    // A bot the user said to go on without is not required.
+    let settings = crate::bot_silence::settings_for_node(conn, node_id, readiness_settings(conn))?;
     let now = chrono::Utc::now();
     let mut assessed = Vec::new();
     for pr in &prs {
@@ -1650,7 +1651,7 @@ mod readiness_tests {
                 reviews: vec![],
         };
         let settings = PrReadinessSettings {
-            bots: vec![PrReviewBotSettings { name: "greptile".into(), min_score: 4, rerun_after_minutes: 10 }],
+            bots: vec![PrReviewBotSettings::new("greptile", 4, 10)],
             ..Default::default()
         };
         let now = chrono::DateTime::parse_from_rfc3339("2026-01-01T12:00:00Z").unwrap().with_timezone(&chrono::Utc);

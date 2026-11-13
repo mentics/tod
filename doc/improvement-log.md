@@ -40,6 +40,37 @@ turns, findings, run_state, node_timeline, journey records):
 - **Measure**: `broken` decisions whose text matches "not installed" / "not found" / "install" (should be zero); count of such decisions answered with "Fixed, try again" and no other change.
 
 ---
+## 2026-11-12: a review bot went silent, and each node handled it its own way
+
+- **Seen**: 7 nodes, 2026-11-11 17:47Z on (bot silent on flagship#6640, #6641, #6661, #6679, #6680,
+  kb#2866, kb#2885): four `pr_draft` nodes raised their own `broken` request, two stopped `pr_stuck`,
+  one asked the user to "Fix GitHub so a comment can be posted".
+- **Symptom**: the PR agent re-posted the bot's ask 3-5 times per PR (comments piling up, minutes
+  apart); each request worded the problem differently and none offered to proceed without the bot;
+  `pr_stuck: two turns in a row changed nothing on the pull request`; a `gh pr comment` that failed
+  twice 10 s apart with GraphQL "Something went wrong while executing your query" reached the user.
+- **Cause**: (1) an overdue bot review was `Work::BotReviewMissing`, so every `minutes` the agent
+  was sent a turn that could only ping; (2) such a turn changes nothing on the PR, so two of them
+  tripped the stuck counter, though no turn could have done anything; (3) nothing bounded or
+  deduplicated asks, and no rule for a bot that never comes (only the agent's own `broken`
+  request, differently each time); tod's own ask comment, posted as the user, would also have
+  counted as a person's feedback; (4) that GraphQL text was not a transient error, and neither a
+  GraphQL call nor a comment post was retried in `tod_store::github`.
+- **Fix**: an overdue bot is only waited for; tod posts the project's configured `ask` text
+  itself, at most `max_asks` per head and `ask_every_minutes` apart, counted from the comments;
+  a silent bot raises one pending `bot_silence` request per node with fixed wording listing the
+  asks and last activity, whose "Proceed without {bot}" answer removes the bot from the node's
+  settings for the babysitter and the gate's criteria; `Work::agent_can_fix` keeps unfixable work
+  out of the stuck counter; an `ask` comment is never feedback; GitHub's GraphQL hiccup is
+  transient and GraphQL calls and comment posts are retried (2/6/15 s) before an error is
+  returned. Spec: pr-readiness.md, "A bot that stays silent". Needs `ask:` set for the bot in
+  `tod.yml` (`pr_readiness.bots[]`); without it tod asks nobody and the request comes after
+  `rerun_after_minutes + max_asks * ask_every_minutes`. Agent-side `gh` failures inside an
+  agent's own turn remain the agent's to retry; tod no longer needs the agent to post.
+- **Measure**: agent turns on a PR per bot-silent head (target 0); ask comments per head
+  (target <= `max_asks`); `bot_silence` requests per node (target <= 1) and how many were answered
+  "Proceed without"; `pr_stuck` stops whose work was only a bot; transient GitHub errors that
+  reached a request (target 0).
 
 ## 2026-11-12: lost work left a node in review, asking the user in a loop
 

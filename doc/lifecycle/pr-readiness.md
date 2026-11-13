@@ -129,14 +129,15 @@ score. First supported: Greptile.
   a compare of 300 or more files, which GitHub cuts off) the assessment fails
   with that error, never a guess either way.
 - Threshold: `min_score = 4` for this project (4 or 5 passes).
-- Asking for a review: the app never asks a bot. How and when to ask (on a
-  draft, after a round of fixes) is project-specific, so it is in the
-  project's own skill for `pr_draft` and `pr_review`, and the agent does it.
-  When the bot has not reviewed the current head `rerun_after_minutes`
-  (default 10) after the head commit, and the agent has had no turn in that
-  time, the app sends the agent `Work::BotReviewMissing`; it may need
-  asking. That repeats at most once per `rerun_after_minutes`, and a bot
-  that never comes ends in the round limit.
+- Asking for a review: a bot that has not reviewed the current head
+  `rerun_after_minutes` (default 10) after the head commit is **waited
+  for**, never given to the agent as work: a turn can only ping, so it
+  burned turns and counted toward the stuck limit. When the project sets the
+  bot's `ask` text, tod posts it as a comment itself (see "A bot that stays
+  silent"); the project's skill may still ask at other moments. Only a bot
+  whose last score, on an earlier commit, is under the threshold is work
+  (`Work::BotReviewMissing`, once per bot review: the agent fixes what it
+  found, and does not ask).
 
 The bot's specifics (author, score pattern) are data on a `ReviewBot`
 definition in code (Greptile is the only built-in); the project config below
@@ -177,8 +178,8 @@ Each round reads every linked PR (`pr_readiness::Assessment`):
 
 1. Unanswered decision → stop for the user.
 2. **Work** (open threads, a failed check, a bot score under threshold not
-   yet seen by the agent, a bot review overdue, the branch behind its base,
-   a conflict, a person's review or comment since the agent's last turn) →
+   yet seen by the agent, an earlier low score of a bot that has not
+   reviewed the head, the branch behind its base, a conflict, a person's review or comment since the agent's last turn) →
    one agent turn with the work, then read again.
 3. **Waiting** (a bot has not reviewed the current head, checks still
    running, GitHub has not computed mergeability) → poll. No agent turn is
@@ -358,7 +359,59 @@ it is outward-facing, so it is bounded:
   decides whether to move the node on with the lifecycle dropdown.
 - A turn that changes nothing, replies to nothing, and leaves the gate
   unchanged twice in a row stops the run (`NeedsHuman::PrStuck`), like
-  `EvaluationStuck`.
+  `EvaluationStuck`. Only a turn the agent could have acted on counts:
+  work it cannot fix (`Work::agent_can_fix` is false: a bot that has not
+  reviewed and has no findings) never does.
+
+## A bot that stays silent
+
+Seen 2026-11-11/12: a review bot stopped answering on every pull request (an
+outage or quota on the GitHub App's side, which no node can fix). Nodes
+re-asked it turn after turn, stopped `pr_stuck`, or each asked the user in
+its own words. Now:
+
+1. **Waiting.** An overdue review is a `Wait::BotReview`, polled. Each
+   bot's `pr_readiness.bots` entry takes `ask` (the comment that asks it,
+   e.g. `"@somebot please review"`; unset, tod asks nobody), `ask_every_minutes`
+   (default 30) and `max_asks` (default 3).
+2. **Asking is tod's, bounded and deduplicated.** `Assessment::asks_due`: the
+   review is overdue, fewer than `max_asks` comments holding the `ask` text
+   (any author, case-insensitive) were posted since the head commit, and
+   the last was at least `ask_every_minutes` ago. `Autopilot::bot_waiting`
+   posts it through `PrFeed::post_comment` and remembers the head and count
+   so a read that has not caught up cannot post it twice. Asks come from the
+   comments themselves, so nothing extra is stored and the agent's pings
+   count. A comment holding an `ask` text is never feedback
+   (`Work::ReviewComments`), even after the bot is waived.
+3. **Silent.** Asked `max_asks` times, the last one `ask_every_minutes` ago,
+   and still no review: the node's one request is raised
+   (`tod_core::bot_silence`; pending decision on the node, protocol
+   `bot_silence`, reason `broken`, so it shows with the other requests) and
+   the run stops on it. With no `ask` text the same patience is measured
+   from the later of the head commit and the agent's last turn
+   (`rerun_after_minutes + max_asks * ask_every_minutes`). The wording is
+   fixed, with what was tried:
+
+   > {bot} has not reviewed {pull requests} after {n} asks for a review (last asked {time}; its last activity {time or "none seen"}). It may be down or out of quota, which this node cannot fix. Proceed without {bot}, or keep waiting?
+
+   Options: `Proceed without {bot}` and `Keep waiting`. At most one is
+   pending or answered per bot per node; "Keep waiting" holds the question
+   back for six hours.
+4. **Proceed without** is a standing answer on the node: the bot is left out
+   of `pr_readiness::settings_for_node`, which the babysitter, the gate's
+   criteria (`pr-approved.review-current`, `.review-score`, `pr-pr_review`)
+   and the waits all read, so nothing waits for, asks, or requires it. It
+   holds for the node's later heads too; there is no undo in the app yet.
+5. **Transient GitHub errors are retried.** `tod_store::github` retries a
+   GraphQL call and a comment post that failed transiently (HTTP 5xx/429
+   for both; "Something went wrong while executing your query" for GraphQL)
+   after 2, 6 and 15 seconds before the error is returned
+   (`is_transient`); a dropped connection is not retried for a post (it may
+   have gone through). An error that remains goes to
+   `github_wait::github_look_failed`: retried with backoff on the node's
+   wait while transient, a failure naming the error only when it is not or
+   the retries are spent. A post that fails never becomes a request to the
+   user to "fix GitHub" on the first hiccup.
 
 ## What is built where
 
@@ -396,10 +449,11 @@ it is outward-facing, so it is bounded:
 - Human and bot threads are treated alike; the agent replies and resolves.
 - Fixes are pushed and replies posted immediately; only the bot review is
   waited on, by polling.
-- The app never asks a bot for a review: that is project-specific, and in
-  the project's skill. A tod skill (`tod-fix-ci`) names no bot, and says
-  nothing about asking one, so it cannot contradict the project's skill run
-  beside it.
+- The app names no bot in code or prompts: how to ask a bot is the `ask`
+  text in the project's `pr_readiness` settings, and tod only posts it
+  (bounded, see "A bot that stays silent"). A tod skill (`tod-fix-ci`) names
+  no bot, and says nothing about asking one, so it cannot contradict the
+  project's skill run beside it.
 
 ## Open questions
 

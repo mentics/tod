@@ -240,7 +240,7 @@ fn look_at_github(
         cancel_github_waits(fleet, node)?;
         return Ok(GithubCheck::Clear);
     };
-    let settings = crate::pr_readiness::settings_at(data_root);
+    let settings = crate::pr_readiness::settings_for_node(fleet, node, data_root)?;
     let spec = if releasing { RELEASE_WAIT_SPEC.to_string() } else { merge_wait_spec(pr.pr_number) };
     let replaces = if releasing { "github:release:" } else { "github:pr:" };
     let what = if standing.len() > 1 { format!("{what} ({})", standing.join("; ")) } else { what };
@@ -263,7 +263,7 @@ fn check_ready_for_review(fleet: &FleetStore, node: uuid::Uuid, data_root: &std:
     let Some(feed) = crate::pr_readiness::feed_for(data_root) else {
         return Ok(GithubCheck::Unreadable("GitHub credentials are not set up".to_string()));
     };
-    let settings = crate::pr_readiness::settings_at(data_root);
+    let settings = crate::pr_readiness::settings_for_node(fleet, node, data_root)?;
     let answered_at = crate::pr_readiness::agent_answered_at(fleet, node)?;
     // The babysitter's own work comes first: a bot's review or running checks
     // it polls for, and what tod's own review still owes the pull request
@@ -368,7 +368,7 @@ fn check_in_review(fleet: &FleetStore, node: uuid::Uuid, data_root: &std::path::
     let Some(feed) = crate::pr_readiness::feed_for(data_root) else {
         return Ok(GithubCheck::Unreadable("GitHub credentials are not set up".to_string()));
     };
-    let settings = crate::pr_readiness::settings_at(data_root);
+    let settings = crate::pr_readiness::settings_for_node(fleet, node, data_root)?;
     let answered_at = crate::pr_readiness::agent_answered_at(fleet, node)?;
     let live = match crate::pr_readiness::live_answered(feed.as_ref(), &links.prs, &settings, answered_at) {
         Ok(live) => live,

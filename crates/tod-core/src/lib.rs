@@ -62,6 +62,7 @@ pub mod logging;
 pub mod media;
 pub mod skills;
 pub mod node_context;
+pub mod bot_silence;
 pub mod permission;
 pub mod phase;
 pub mod process;

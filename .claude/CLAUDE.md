@@ -169,11 +169,24 @@ behind its base, failing checks, a review bot's score for the current head)
 and says what is *work* (the agent fixes, merges the base in, and answers
 threads with `tod-cli pr threads answer`, which posts the reply and resolves
 the thread) and what is only *waiting* (a bot's review, CI), which the run
-does itself by polling. The app never asks a bot to review: that is
-project-specific, in the project's own skill; a review overdue is work that
-tells the agent (`Work::BotReviewMissing`). For the same reason no tod skill
-or role doc names a bot or says whether to ask one, so it cannot contradict
-the project's skill in the same prompt. The project's bots and round limits are
+does itself by polling. A bot that has not
+reviewed is only waited for, never agent work (`Work::BotReviewMissing` is
+left for a *low earlier score* the agent can fix, once): tod itself asks it by
+posting the bot's configured `ask` comment (`pr_readiness.bots[].ask`, the
+project's own words, so no bot is named in code or prompts), at most `max_asks`
+times per head and `ask_every_minutes` apart (`Autopilot::bot_waiting`;
+asks are counted from the comments on the pull request, so the agent's own
+pings count too). A bot still silent after that raises ONE pending decision
+(`tod_core::bot_silence`, protocol `bot_silence`, reason `broken`, options
+"Proceed without <bot>" / "Keep waiting"); "Proceed without" leaves the bot
+out of the node's settings (`pr_readiness::settings_for_node`) for every
+reader, the gate's `review-current`/`review-score` included. A turn on work
+the agent cannot fix is never counted toward "two turns changed nothing"
+(`Work::agent_can_fix`), and GitHub's transient failures (including GraphQL's
+"Something went wrong while executing your query") are retried with backoff
+in `tod_store::github` before any error reaches a person. No tod skill
+or role doc names a bot, so it cannot contradict the project's skill in the
+same prompt. The project's bots and round limits are
 `pr_readiness` in `tod.yml`. With the lifecycle config's **Include review
 steps** on for `pr_draft` (`lifecycle_config::resolve_pr_draft_review`), feedback
 is reviewed before it is pushed (`Autopilot::pr_change_reviewed`): the PR agent

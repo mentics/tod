@@ -178,6 +178,14 @@ fn default_rerun_after_minutes() -> u64 {
     10
 }
 
+fn default_ask_every_minutes() -> u64 {
+    30
+}
+
+fn default_max_asks() -> u32 {
+    3
+}
+
 fn default_max_thread_rounds() -> u32 {
     3
 }
@@ -199,9 +207,33 @@ pub struct PrReviewBotSettings {
     /// the pull request's agent is told it has not (it may need asking).
     #[serde(default = "default_rerun_after_minutes")]
     pub rerun_after_minutes: u64,
+    /// The comment tod posts on the pull request to ask the bot for a review
+    /// (`@somebot please review`): the project's own words, since the app
+    /// names no bot. Unset, tod asks nobody (the project's skill may).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ask: Option<String>,
+    /// Minutes between asks for the same head.
+    #[serde(default = "default_ask_every_minutes")]
+    pub ask_every_minutes: u64,
+    /// Asks for one head before the bot counts as silent and the user is
+    /// asked whether to go on without it.
+    #[serde(default = "default_max_asks")]
+    pub max_asks: u32,
 }
 
 impl PrReviewBotSettings {
+    /// A bot with the default asking limits and no ask text.
+    pub fn new(name: &str, min_score: u8, rerun_after_minutes: u64) -> Self {
+        Self {
+            name: name.to_string(),
+            min_score,
+            rerun_after_minutes,
+            ask: None,
+            ask_every_minutes: default_ask_every_minutes(),
+            max_asks: default_max_asks(),
+        }
+    }
+
     /// Parses `greptile=4, other=3` (the Settings text field): a bot's name
     /// and the lowest score that passes. A bot already in `existing` keeps
     /// its other tuning (`rerun_after_minutes`). A bare name takes the
@@ -227,11 +259,14 @@ impl PrReviewBotSettings {
             if out.iter().any(|b| b.name.eq_ignore_ascii_case(name)) {
                 return Err(format!("\"{name}\" is listed twice"));
             }
-            let rerun_after_minutes = existing
+            let mut bot = existing
                 .iter()
                 .find(|b| b.name.eq_ignore_ascii_case(name))
-                .map_or_else(default_rerun_after_minutes, |b| b.rerun_after_minutes);
-            out.push(Self { name: name.to_string(), min_score, rerun_after_minutes });
+                .cloned()
+                .unwrap_or_else(|| Self::new(name, min_score, default_rerun_after_minutes()));
+            bot.name = name.to_string();
+            bot.min_score = min_score;
+            out.push(bot);
         }
         Ok(out)
     }
@@ -263,6 +298,11 @@ pub struct PrReadinessSettings {
     /// person's review.
     #[serde(default)]
     pub review_schedule: ReviewSchedule,
+    /// The ask comments (lowercase) of bots a node was told to go on without
+    /// and so are no longer in `bots`: comments holding them are still tod's
+    /// own asks, never feedback. Never saved.
+    #[serde(skip)]
+    pub waived_asks: Vec<String>,
 }
 
 impl Default for PrReadinessSettings {
@@ -272,6 +312,7 @@ impl Default for PrReadinessSettings {
             max_thread_rounds: default_max_thread_rounds(),
             max_rounds: default_max_rounds(),
             review_schedule: ReviewSchedule::default(),
+            waived_asks: Vec::new(),
         }
     }
 }
@@ -1042,7 +1083,7 @@ mod tests {
 
     #[test]
     fn review_bots_parse_with_a_score_keep_their_tuning_and_round_trip() {
-        let existing = vec![PrReviewBotSettings { name: "greptile".into(), min_score: 4, rerun_after_minutes: 25 }];
+        let existing = vec![PrReviewBotSettings::new("greptile", 4, 25)];
         let list = PrReviewBotSettings::parse_list(" Greptile = 3 ", &existing).unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!((list[0].min_score, list[0].rerun_after_minutes), (3, 25));
@@ -1208,14 +1249,11 @@ mod tests {
                 browser: Some("C:/chrome/chrome.exe".into()),
             },
             pr_readiness: PrReadinessSettings {
-                bots: vec![PrReviewBotSettings {
-                    name: "greptile".into(),
-                    min_score: 4,
-                    rerun_after_minutes: 10,
-                }],
+                bots: vec![PrReviewBotSettings::new("greptile", 4, 10)],
                 max_thread_rounds: 3,
                 max_rounds: 4,
                 review_schedule: ReviewSchedule { start_hour: 9, ..ReviewSchedule::default() },
+                waived_asks: Vec::new(),
             },
             sandbox_idle: SandboxIdleSettings::default(),
             credentials_file_only: true,

@@ -1100,6 +1100,10 @@ impl Autopilot {
         use crate::pr_readiness::{self, Next as PrNext};
         let mut waited_since: Option<std::time::Instant> = None;
         let mut unchanged = 0u32;
+        // The asks for a bot's review this run has posted (pull request, bot,
+        // head, asks so far), so a read that has not caught up yet never
+        // makes it post the same one twice.
+        let mut asked: std::collections::HashSet<String> = std::collections::HashSet::new();
         // The findings last sent to the agent by name ([`OwnReview`]).
         let mut answered: Option<Vec<Uuid>> = None;
         // Like every phase: coming in, the agent's session and then each later
@@ -1155,7 +1159,7 @@ impl Autopilot {
                     "GitHub credentials are not set up",
                 )?));
             };
-            let settings = pr_readiness::settings_at(&self.config.data_root);
+            let settings = pr_readiness::settings_for_node(fleet, self.node, &self.config.data_root)?;
             let answered_at = pr_readiness::agent_answered_at(fleet, self.node)?;
             let live = match pr_readiness::live_answered(feed.as_ref(), &links.prs, &settings, answered_at) {
                 Ok(live) => {
@@ -1250,13 +1254,18 @@ impl Autopilot {
                     let same = now.as_ref().is_some_and(|n| {
                         n.iter().map(|p| p.fingerprint.clone()).collect::<Vec<_>>() == fingerprint
                     });
-                    unchanged = if same { unchanged + 1 } else { 0 };
-                    if unchanged >= 2 {
-                        return Ok(Some(Outcome::NeedsHuman {
-                            reason: NeedsHuman::PrStuck {
-                                why: "two turns in a row changed nothing on the pull request".to_string(),
-                            },
-                        }));
+                    // Only a turn that could have changed something is judged:
+                    // work the agent cannot fix (a bot that has not reviewed
+                    // and has no findings) is not its turn to lose.
+                    if works.iter().any(pr_readiness::Work::agent_can_fix) {
+                        unchanged = if same { unchanged + 1 } else { 0 };
+                        if unchanged >= 2 {
+                            return Ok(Some(Outcome::NeedsHuman {
+                                reason: NeedsHuman::PrStuck {
+                                    why: "two turns in a row changed nothing on the pull request".to_string(),
+                                },
+                            }));
+                        }
                     }
                 }
                 PrNext::Wait(waits) => {
@@ -1285,6 +1294,12 @@ impl Autopilot {
                         // time recorded (or by the review's webhook).
                         return Ok(Some(self.wait_for_review(fleet, &live, &settings)?));
                     }
+                    // A bot that has not come: tod asks it, a bounded number of
+                    // times, and when it stays silent asks the user once.
+                    if let Some(outcome) = self.bot_waiting(fleet, feed.as_ref(), &live, &mut asked)? {
+                        hook.waiting(None, None);
+                        return Ok(Some(outcome));
+                    }
                     let since = *waited_since.get_or_insert_with(std::time::Instant::now);
                     let what = wait_description(&waits);
                     let interval = if since.elapsed() >= PR_SLOW_AFTER {
@@ -1302,6 +1317,95 @@ impl Autopilot {
                 }
             }
         }
+    }
+
+    /// What waiting for a review bot owes (`doc/lifecycle/pr-readiness.md`,
+    /// "A bot that stays silent"), once nothing else is outstanding:
+    ///
+    /// - a bot asked as often as allowed that still has not reviewed the head
+    ///   raises the node's one request ([`crate::bot_silence`]) and stops the
+    ///   run on it (`Some`); a bot whose request is pending, answered, or held
+    ///   back by "Keep waiting" raises nothing;
+    /// - otherwise each review that is due is asked for, by posting the
+    ///   settings' `ask` comment (retried by the client when GitHub hiccups).
+    ///   A failure to post is a failed look at GitHub, handled where those are
+    ///   ([`github_wait::github_look_failed`]), never dropped.
+    ///
+    /// `asked` keeps what this run posted, so one head is asked at most once
+    /// per count whatever the next read shows.
+    fn bot_waiting(
+        &mut self,
+        fleet: &FleetStore,
+        feed: &dyn crate::pr_readiness::PrFeed,
+        live: &[crate::pr_readiness::LivePr],
+        asked: &mut std::collections::HashSet<String>,
+    ) -> Result<Option<Outcome>> {
+        use crate::bot_silence::{self, Tried};
+        let node = self.node;
+        let now = chrono::Utc::now();
+        let mut silent: Vec<Tried> = Vec::new();
+        for p in live {
+            for report in p.assessment.silent_bots() {
+                let name = &report.settings.name;
+                let at = match silent.iter().position(|t| t.bot.eq_ignore_ascii_case(name)) {
+                    Some(at) => at,
+                    None => {
+                        silent.push(Tried {
+                            bot: name.clone(),
+                            prs: Vec::new(),
+                            asks: 0,
+                            last_ask_at: None,
+                            last_activity_at: None,
+                        });
+                        silent.len() - 1
+                    }
+                };
+                let tried = &mut silent[at];
+                tried.prs.push(crate::pr_readiness::pr_label(&p.pr));
+                tried.asks = tried.asks.max(report.asks);
+                tried.last_ask_at = tried.last_ask_at.max(report.last_ask_at);
+                tried.last_activity_at = tried.last_activity_at.max(report.reviewed_at);
+            }
+        }
+        for tried in silent {
+            let standing = fleet.read(|conn| bot_silence::standing(conn, node, &tried.bot))?;
+            if !bot_silence::should_ask(standing, now) {
+                continue;
+            }
+            tracing::info!(%node, bot = %tried.bot, asks = tried.asks, "a review bot stayed silent: asking the user");
+            fleet
+                .interview(
+                    "autopilot",
+                    InterviewCommand::AskDecision {
+                        node_id: node,
+                        conversation_id: None,
+                        protocol: Some(bot_silence::PROTOCOL.to_string()),
+                        decision: bot_silence::new_decision(&tried),
+                    },
+                )
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            return Ok(Some(Outcome::NeedsHuman { reason: NeedsHuman::Decision { pending: 1 } }));
+        }
+        for p in live {
+            for ask in p.assessment.asks_due() {
+                let key = format!(
+                    "{}|{}|{}|{}",
+                    p.pr.url,
+                    ask.bot,
+                    p.head_sha.as_deref().unwrap_or(""),
+                    ask.asks
+                );
+                if !asked.insert(key) {
+                    continue;
+                }
+                tracing::info!(%node, bot = %ask.bot, pr = %p.pr.url, asks = ask.asks, "asking a review bot for a review");
+                if let Err(err) = feed.post_comment(&p.pr, &ask.text) {
+                    return Ok(Some(github_wait::github_look_failed(fleet, node, false, &err)?));
+                }
+                crate::pr_readiness::forget_snapshot(&p.pr);
+            }
+        }
+        Ok(None)
     }
 
     /// One round of work on the pull request's feedback in `pr_draft` with the

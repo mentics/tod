@@ -1040,8 +1040,8 @@ impl crate::pr_readiness::PrFeed for Sim {
         let turns = self.turns.load(SeqCst);
         let base = *self.base.lock().unwrap().get_or_insert(turns);
         let round = turns - base;
-        // The turn after the fix is the one told the bot has not reviewed.
-        if round >= 2 {
+        // After the fix, the bot is waited for (the agent takes no turn on it).
+        if round >= 1 {
             self.polls_after_nudge.fetch_add(1, SeqCst);
         }
         let mut comments = Vec::new();
@@ -1131,11 +1131,10 @@ fn babysits_a_pull_request_through_feedback_and_a_bots_review() {
     let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
     let steps: Vec<_> = pilot.state().steps.iter().map(|s| format!("{} {}->{}", s.step, s.from, s.to)).collect();
     assert_eq!(outcome, Outcome::Done, "{steps:#?}");
-    // The agent opened the PR, took a turn for the open thread, then one
-    // for the bot's missing review (asking it is the agent's), and the app
-    // waited for the review without posting anything itself.
+    // The agent opened the PR and took a turn for the open thread; the
+    // bot's missing review is waited for, with no turn spent on it.
     assert!(steps.iter().any(|s| s.starts_with("pr ")), "{steps:#?}");
-    assert!(agent.turns >= 2 + 2, "turns: {}", agent.turns);
+    assert!(agent.turns >= 2, "turns: {}", agent.turns);
     assert!(sim.polls_after_nudge.load(std::sync::atomic::Ordering::SeqCst) >= 3);
 }
 
@@ -1696,8 +1695,6 @@ fn a_pull_request_that_never_changes_stops_for_a_person() {
 enum Look {
     /// Main moved: the branch is behind (housekeeping).
     Behind,
-    /// The head changed and the bot has not reviewed it (housekeeping).
-    BotMissing,
     /// One open review thread (feedback).
     Thread,
     /// Nothing for the agent; only a person's review is missing.
@@ -1729,18 +1726,13 @@ impl crate::pr_readiness::PrFeed for Scripted {
         let turns = self.turns.load(std::sync::atomic::Ordering::SeqCst);
         let (script, base) = &*self.script.lock().unwrap();
         let look = script.get(turns - base).copied().unwrap_or(Look::HumanReview);
-        let bot_reviewed = !matches!(look, Look::BotMissing);
-        let comments = if bot_reviewed {
-            vec![IssueComment {
-                id: 2,
-                author: Some("greptile-apps".into()),
-                body: "Confidence Score: 5/5\n".into(),
-                created_at: "2021-01-01T00:00:00Z".into(),
-                updated_at: "2021-01-01T00:00:00Z".into(),
-            }]
-        } else {
-            Vec::new()
-        };
+        let comments = vec![IssueComment {
+            id: 2,
+            author: Some("greptile-apps".into()),
+            body: "Confidence Score: 5/5\n".into(),
+            created_at: "2021-01-01T00:00:00Z".into(),
+            updated_at: "2021-01-01T00:00:00Z".into(),
+        }];
         let behind = matches!(look, Look::Behind);
         Ok(PrSnapshot {
             status: PrStatus {
@@ -1796,7 +1788,7 @@ fn scripted_pr(script: Vec<Look>) -> (Fixture, Arc<Scripted>, FakeAgent) {
 #[test]
 fn rounds_of_housekeeping_do_not_stop_the_babysitter() {
     use Look::*;
-    let (fx, _, mut agent) = scripted_pr(vec![Behind, BotMissing, Behind, BotMissing, Behind, BotMissing]);
+    let (fx, _, mut agent) = scripted_pr(vec![Behind, Behind, Behind, Behind, Behind, Behind]);
     let mut pilot = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO);
     let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
     assert!(matches!(outcome, Outcome::Waiting { .. }), "{outcome:?}");
@@ -3408,4 +3400,233 @@ fn reviews_that_each_leave_findings_standing_stop_at_the_round_limit_naming_them
         other => panic!("{other:?}"),
     }
     assert!(openings(&fx, ProtocolKind::Review).len() == REVIEW_ROUND_LIMIT as usize, "no further review ran");
+}
+
+/// A pull request whose review bot may or may not come, and that keeps the
+/// comments posted on it. Seen live (2026-11): Greptile stopped answering,
+/// and the agent was sent turn after turn to ask it again.
+struct BotFeed {
+    /// RFC 3339: when the head commit was made.
+    head_at: String,
+    posted: std::sync::Mutex<Vec<String>>,
+    reads: std::sync::atomic::AtomicUsize,
+    /// The bot reviews on this read (counting from 1); never when `None`.
+    comes_on_read: Option<usize>,
+    post_error: std::sync::Mutex<Option<String>>,
+}
+
+impl BotFeed {
+    fn new(head_at: &str, comes_on_read: Option<usize>) -> Arc<Self> {
+        Arc::new(Self {
+            head_at: head_at.to_string(),
+            posted: Default::default(),
+            reads: Default::default(),
+            comes_on_read,
+            post_error: Default::default(),
+        })
+    }
+}
+
+impl crate::pr_readiness::PrFeed for BotFeed {
+    fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
+        use tod_store::github::{IssueComment, PrSnapshot, PrStatus};
+        let read = self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        // A second ago: the comments exist before the read that shows them.
+        let now = (chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        let mut comments: Vec<IssueComment> = self
+            .posted
+            .lock()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .map(|(i, body)| IssueComment {
+                id: i as i64 + 10,
+                author: Some("joel".into()),
+                body: body.clone(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            })
+            .collect();
+        if self.comes_on_read.is_some_and(|n| read >= n) {
+            comments.push(IssueComment {
+                id: 2,
+                author: Some("greptile-apps".into()),
+                body: "Confidence Score: 5/5\n".into(),
+                created_at: now.clone(),
+                updated_at: now,
+            });
+        }
+        Ok(PrSnapshot {
+            status: PrStatus {
+                mergeable: Some(true),
+                mergeable_state: Some("blocked".into()),
+                behind_by: Some(0),
+                checks: Some("success".into()),
+                head_sha: Some("0000001".into()),
+                head_committed_at: Some(self.head_at.clone()),
+                open: true,
+                reviewers: vec!["maria".into()],
+                base_ref: Some("main".into()),
+                ..Default::default()
+            },
+            threads: Vec::new(),
+            comments,
+            reviews: vec![],
+        })
+    }
+
+    fn post_comment(&self, _: &tod_store::github::NodePr, body: &str) -> Result<(), String> {
+        if let Some(err) = self.post_error.lock().unwrap().clone() {
+            return Err(err);
+        }
+        self.posted.lock().unwrap().push(body.to_string());
+        Ok(())
+    }
+}
+
+fn bot_decisions(fx: &Fixture) -> Vec<tod_store::decisions::Decision> {
+    fx.fleet
+        .read(|conn| Ok(DecisionRepo::new(conn).list_for_node(fx.node)?))
+        .unwrap()
+        .into_iter()
+        .filter(|d| d.protocol.as_deref() == Some(crate::bot_silence::PROTOCOL))
+        .collect()
+}
+
+fn bot_node(feed: Arc<BotFeed>, bot_yaml: &str) -> (Fixture, FakeAgent) {
+    let fx = bare();
+    retire_outside_criteria(&fx);
+    std::fs::write(fx.root.join("tod.yml"), format!("pr_readiness:\n  bots:\n    - name: greptile\n{bot_yaml}")).unwrap();
+    crate::pr_readiness::set_feed_override(Some(feed));
+    linked_to_prs(&fx, "pr_review", &["https://github.com/acme/app/pull/42"]);
+    let agent = FakeAgent::new(&fx.fleet);
+    (fx, agent)
+}
+
+#[test]
+fn a_silent_bot_is_asked_a_bounded_number_of_times_by_tod_then_the_user_is_asked_once() {
+    let feed = BotFeed::new("2020-01-01T00:00:00Z", None);
+    let (fx, mut agent) = bot_node(
+        feed.clone(),
+        "      rerun_after_minutes: 0\n      ask: \"@greptileai please review\"\n      ask_every_minutes: 0\n      max_asks: 3\n",
+    );
+    let run = |agent: &mut FakeAgent| {
+        autopilot(&fx, Budget::default())
+            .with_pr_poll_interval(Duration::ZERO)
+            .run(&fx.fleet, agent)
+            .unwrap()
+    };
+    let outcome = run(&mut agent);
+    assert_eq!(outcome, Outcome::NeedsHuman { reason: NeedsHuman::Decision { pending: 1 } });
+    // tod asked, three times and no more; the agent was never sent.
+    assert_eq!(*feed.posted.lock().unwrap(), vec!["@greptileai please review"; 3]);
+    assert_eq!(agent.turns, 0);
+    let decisions = bot_decisions(&fx);
+    assert_eq!(decisions.len(), 1);
+    let d = &decisions[0];
+    assert_eq!(d.reason, "broken");
+    assert!(
+        d.question.starts_with("greptile has not reviewed acme/app#42 after 3 asks for a review (last asked "),
+        "{}",
+        d.question
+    );
+    assert!(d.question.contains("its last activity none seen). It may be down or out of quota"), "{}", d.question);
+    assert!(d.question.ends_with("Proceed without greptile, or keep waiting?"), "{}", d.question);
+    assert_eq!(d.options, vec!["Proceed without greptile", "Keep waiting"]);
+
+    // Run again: the same one request, nothing more posted or asked.
+    assert_eq!(run(&mut agent), Outcome::NeedsHuman { reason: NeedsHuman::Decision { pending: 1 } });
+    assert_eq!(bot_decisions(&fx).len(), 1);
+    assert_eq!(feed.posted.lock().unwrap().len(), 3);
+
+    // "Proceed without greptile" is honored: the bot is no longer waited
+    // for, asked, or required, and the pull request waits for its person.
+    fx.fleet
+        .interview(
+            ACTOR_USER,
+            InterviewCommand::AnswerDecision { decision_id: d.id, option: Some(1), text: None },
+        )
+        .unwrap();
+    let outcome = run(&mut agent);
+    assert!(matches!(outcome, Outcome::Waiting { .. }), "{outcome:?}");
+    assert_eq!(feed.posted.lock().unwrap().len(), 3);
+    assert_eq!(bot_decisions(&fx).len(), 1);
+    assert_eq!(agent.turns, 0);
+    let settings = crate::pr_readiness::settings_for_node(&fx.fleet, fx.node, &fx.root).unwrap();
+    assert!(settings.bots.is_empty(), "{settings:?}");
+}
+
+#[test]
+fn keeping_waiting_holds_the_request_back_while_the_bot_stays_silent() {
+    let feed = BotFeed::new("2020-01-01T00:00:00Z", Some(40));
+    let (fx, mut agent) = bot_node(
+        feed.clone(),
+        "      rerun_after_minutes: 0\n      ask: \"@greptileai please review\"\n      ask_every_minutes: 0\n      max_asks: 1\n",
+    );
+    let mut pilot = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO);
+    assert!(matches!(
+        pilot.run(&fx.fleet, &mut agent).unwrap(),
+        Outcome::NeedsHuman { reason: NeedsHuman::Decision { .. } }
+    ));
+    let d = bot_decisions(&fx).remove(0);
+    fx.fleet
+        .interview(ACTOR_USER, InterviewCommand::AnswerDecision { decision_id: d.id, option: Some(2), text: None })
+        .unwrap();
+    // The bot comes on a later read: the run waits on, asks nothing new, and
+    // ends waiting for the person once the bot has reviewed.
+    let outcome = autopilot(&fx, Budget::default())
+        .with_pr_poll_interval(Duration::ZERO)
+        .run(&fx.fleet, &mut agent)
+        .unwrap();
+    assert!(matches!(outcome, Outcome::Waiting { .. }), "{outcome:?}");
+    assert_eq!(bot_decisions(&fx).len(), 1, "no second request");
+    assert_eq!(feed.posted.lock().unwrap().len(), 1);
+}
+
+/// Seen live: two nodes stopped `pr_stuck` ("two turns in a row changed
+/// nothing") when the only work was a bot's missing review, which the agent
+/// can only ask for.
+#[test]
+fn a_bot_that_is_only_slow_costs_no_agent_turn_and_never_makes_the_run_stuck() {
+    let feed = BotFeed::new(&chrono::Utc::now().to_rfc3339(), Some(6));
+    let (fx, mut agent) = bot_node(feed.clone(), "      rerun_after_minutes: 0\n");
+    let outcome = autopilot(&fx, Budget::default())
+        .with_pr_poll_interval(Duration::ZERO)
+        .run(&fx.fleet, &mut agent)
+        .unwrap();
+    assert!(matches!(outcome, Outcome::Waiting { .. }), "{outcome:?}");
+    assert_eq!(agent.turns, 0, "no turn is spent on a bot that has not come");
+    assert!(feed.reads.load(std::sync::atomic::Ordering::SeqCst) >= 6);
+    assert!(bot_decisions(&fx).is_empty());
+}
+
+/// Seen live: `gh pr comment` failed twice, ten seconds apart, with GitHub's
+/// "Something went wrong while executing your query", and the node asked the
+/// user to fix GitHub.
+#[test]
+fn a_transient_failure_to_post_the_ask_is_retried_not_put_to_the_user() {
+    let feed = BotFeed::new("2020-01-01T00:00:00Z", None);
+    let (fx, mut agent) = bot_node(
+        feed.clone(),
+        "      rerun_after_minutes: 0\n      ask: \"@greptileai please review\"\n      ask_every_minutes: 0\n",
+    );
+    *feed.post_error.lock().unwrap() =
+        Some("posting the comment on u: GitHub API error: Something went wrong while executing your query.".into());
+    let outcome = autopilot(&fx, Budget::default()).run(&fx.fleet, &mut agent).unwrap();
+    let Outcome::Waiting { what, due_at_ms } = &outcome else { panic!("{outcome:?}") };
+    assert!(what.contains("Something went wrong"), "{what}");
+    assert!(*due_at_ms > chrono::Utc::now().timestamp_millis());
+    assert!(bot_decisions(&fx).is_empty() && agent.turns == 0);
+    let wait = read_wait(&fx).expect("the failure is recorded on the node, and retried");
+    assert!(!wait.exhausted(), "{wait:?}");
+
+    // GitHub recovers: the ask goes out and the wait for the failure ends.
+    *feed.post_error.lock().unwrap() = None;
+    let outcome = autopilot(&fx, Budget::default())
+        .with_pr_poll_interval(Duration::ZERO)
+        .run(&fx.fleet, &mut agent)
+        .unwrap();
+    assert!(matches!(outcome, Outcome::NeedsHuman { .. } | Outcome::Waiting { .. }), "{outcome:?}");
+    assert!(!feed.posted.lock().unwrap().is_empty());
+    assert!(read_wait(&fx).is_none());
 }
