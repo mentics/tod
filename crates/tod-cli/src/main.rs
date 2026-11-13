@@ -19,6 +19,7 @@ mod skills;
 mod doc_sync;
 mod incoming;
 mod learn;
+mod lifecycle;
 mod interview;
 mod node;
 mod obligations;
@@ -66,6 +67,7 @@ NOUNS:
     verdicts               What verification found for each obligation of a node
     incoming               Changes a node inherits, and the verdict that resolves them
     learn                  A node's retrospective, stored once per pass
+    lifecycle              Move a node's lifecycle state (operator only, refused in an agent session)
     secrets                Run a command with stored secrets, without seeing them
     db                     Log in to the user's databases through their machine, without seeing the login
     environment            Variables and credentials defined for this work; ask the user for one
@@ -99,6 +101,7 @@ const NOUNS: &[(&str, &str)] = &[
     ("verdicts", crate::verdicts::USAGE),
     ("incoming", crate::incoming::USAGE),
     ("learn", crate::learn::USAGE),
+    ("lifecycle", crate::lifecycle::USAGE),
     ("secrets", crate::secrets::USAGE),
     ("db", crate::db::USAGE),
     ("environment", crate::environment::USAGE),
@@ -332,6 +335,7 @@ fn run(args: &[String]) -> anyhow::Result<String> {
         "verdicts" => verdicts::run(invocation),
         "incoming" => incoming::run(invocation),
         "learn" => learn::run(invocation),
+        "lifecycle" => lifecycle::run(invocation),
         "secrets" => secrets::run(invocation),
         "environment" => environment::run(invocation),
         "decisions" => decisions::run(invocation),
@@ -341,13 +345,13 @@ fn run(args: &[String]) -> anyhow::Result<String> {
         "journey" => journey::run(invocation),
         "skills" => skills::run(invocation),
         other => anyhow::bail!(
-            "unknown noun `{other}` (expected: node, obligations, content, plan, questions, memory, interview, visual-design, capabilities, changeset, tests, review, pr, verdicts, incoming, learn, secrets, db, environment, decisions, phase, wait, batch, journey, skills)"
+            "unknown noun `{other}` (expected: node, obligations, content, plan, questions, memory, interview, visual-design, capabilities, changeset, tests, review, pr, verdicts, incoming, learn, lifecycle, secrets, db, environment, decisions, phase, wait, batch, journey, skills)"
         ),
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::run;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -375,7 +379,7 @@ mod tests {
 
     /// A data root holding one Spec node and its interview session. The store
     /// is closed again so `tod-cli` opens it itself, as with no app running.
-    fn data_root() -> (PathBuf, Uuid, Uuid) {
+    pub(crate) fn data_root() -> (PathBuf, Uuid, Uuid) {
         let root = std::env::temp_dir().join(format!("tod-cli-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let fleet = Arc::new(FleetStore::open(&root).unwrap());
@@ -426,6 +430,15 @@ mod tests {
         .unwrap();
         drop(fleet);
         (root, node, session)
+    }
+
+    /// Sets a node's lifecycle state straight in the store, as a test's setup.
+    pub(crate) fn set_lifecycle(root: &PathBuf, node_id: Uuid, state: &str) {
+        let fleet = FleetStore::open(root).unwrap();
+        fleet
+            .enqueue_outline(OutlineMutation::SetLifecycle { node_id, state: state.into() })
+            .unwrap();
+        fleet.writer().flush().unwrap();
     }
 
     fn cli(root: &PathBuf, args: &[&str]) -> anyhow::Result<String> {

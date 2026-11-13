@@ -73,6 +73,9 @@ impl CommandResult {
 pub struct PhaseChange {
     /// The state the node was in (the same as the new one for a rerun).
     pub from: String,
+    /// Why the operator moved the node (`tod-cli lifecycle set --reason`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -201,14 +204,14 @@ impl<'a> TimelineRepo<'a> {
 
     /// A change of phase the node's lifecycle made (or, with `by_user`, the
     /// user). Nothing when the state did not change and this is not a rerun.
-    pub fn record_phase_change(&self, node: Uuid, from: &str, to: &str, by_user: bool) -> Result<()> {
+    pub fn record_phase_change(&self, node: Uuid, from: &str, to: &str, by_user: bool, reason: Option<&str>) -> Result<()> {
         let mut entry = TimelineEntry::new(
             node,
             KIND_PHASE,
             to,
             if from == to { format!("{to} run again") } else { format!("{from} \u{2192} {to}") },
             false,
-            serde_json::to_string(&PhaseChange { from: from.to_string() })?,
+            serde_json::to_string(&PhaseChange { from: from.to_string(), reason: reason.map(str::to_string) })?,
         );
         entry.by_user = by_user;
         self.record(&entry)
@@ -260,7 +263,7 @@ mod tests {
         let gate = || TimelineEntry::new(node, KIND_GATE, "active", "Gate", true, "[]".to_string());
         assert!(repo.record_gate_if_changed(&gate()).unwrap());
         std::thread::sleep(std::time::Duration::from_millis(2));
-        repo.record_phase_change(node, "active", "active", true).unwrap();
+        repo.record_phase_change(node, "active", "active", true, None).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(2));
         assert!(repo.record_gate_if_changed(&gate()).unwrap());
     }
@@ -269,8 +272,8 @@ mod tests {
     fn phase_changes_round_trip_with_who_made_them() {
         let (conn, node) = conn();
         let repo = TimelineRepo::new(&conn);
-        repo.record_phase_change(node, "design", "planning", false).unwrap();
-        repo.record_phase_change(node, "planning", "design", true).unwrap();
+        repo.record_phase_change(node, "design", "planning", false, None).unwrap();
+        repo.record_phase_change(node, "planning", "design", true, None).unwrap();
         let list = repo.list(node).unwrap();
         assert_eq!(list[0].phase_change().unwrap().from, "design");
         assert!(!list[0].by_user && list[1].by_user);

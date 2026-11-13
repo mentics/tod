@@ -13,6 +13,7 @@
 //! state still holds is [`crate::lifecycle_validity`].
 
 mod check_now;
+pub mod operator;
 pub use check_now::{CheckNow, check_now};
 
 use crate::task::model::{next_lifecycle, previous_lifecycle};
@@ -48,10 +49,7 @@ pub fn set_lifecycle(fleet: &FleetStore, node: Uuid, state: &str) -> Result<()> 
 /// change as theirs.
 pub fn set_lifecycle_by_user(fleet: &FleetStore, node: Uuid, state: &str) -> Result<()> {
     fleet
-        .enqueue_outline(OutlineMutation::SetLifecycleByUser {
-            node_id: node,
-            state: state.to_string(),
-        })
+        .enqueue_outline(operator::user_move(node, state, None))
         .map_err(|err| anyhow::anyhow!("{err:#}"))?;
     let _ = fleet.writer().flush();
     push_to_ticket(fleet, node, state);

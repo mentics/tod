@@ -334,6 +334,10 @@ pub enum OutlineMutation {
     SetLifecycleByUser {
         node_id: Uuid,
         state: String,
+        /// Why, when the operator gave one (`tod-cli lifecycle set`); kept on
+        /// the node's timeline entry.
+        #[serde(default)]
+        reason: Option<String>,
     },
     /// Start a new stay in the node's current lifecycle state: the state is
     /// run again as if just entered (`NodeRepo::restart_stay`).
@@ -921,8 +925,8 @@ impl OutlineMutation {
             OutlineMutation::SetLifecycle { node_id, state } => {
                 NodeRepo::new(conn).set_lifecycle(*node_id, state)?;
             }
-            OutlineMutation::SetLifecycleByUser { node_id, state } => {
-                NodeRepo::new(conn).set_lifecycle_by(*node_id, state, true)?;
+            OutlineMutation::SetLifecycleByUser { node_id, state, reason } => {
+                NodeRepo::new(conn).set_lifecycle_by(*node_id, state, true, reason.as_deref())?;
             }
             OutlineMutation::RestartLifecycleStay { node_id } => {
                 NodeRepo::new(conn).restart_stay(*node_id)?;
