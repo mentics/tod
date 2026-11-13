@@ -769,11 +769,15 @@ missing"),
         let implement = include_str!("../../tod/media/context/surface/implement.md");
         assert!(implement.contains("is in the wrong phase"), "implement.md must tell the agent to move a post-merge step");
         assert!(implement.contains("to the `merged` (or `released`) phase"));
-        assert!(implement.contains("the pull request's\n  checks are the verdict"));
+        assert!(implement.contains("mark it `implemented`"), "a CI-only step must end as implemented so the plan can finish");
+        assert!(implement.contains("`pr_draft`"));
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..").join("assets").join("process");
         if root.is_dir() {
             let released = std::fs::read_to_string(root.join("agents/state/released.md")).unwrap();
-            assert!(released.contains("the waiting happens inside this turn"));
+            assert!(released.contains("is never a question for the user: wait for it yourself, inside this turn"));
+            for named in ["the pull request's or `main`'s CI", "the release's deploy", "gh run watch", "background watcher"] {
+                assert!(released.contains(named), "released.md must name {named}");
+            }
             assert!(released.contains("no_progress"));
         }
     }

@@ -372,6 +372,27 @@ impl Github {
         Ok(PullRequest { number: raw.number, url: raw.html_url })
     }
 
+    /// Every check run of a commit, all pages. GitHub's default
+    /// `filter=latest` already returns only the latest run of each check name
+    /// (per app), so a rerun replaces the run it superseded; [`combine_checks`]
+    /// still ignores a cancelled run a later run of the same app and name
+    /// replaced, for a response that holds both.
+    fn get_check_runs(&self, owner: &str, repo: &str, sha: &str) -> Result<CheckRunsRaw, GithubError> {
+        let mut all = CheckRunsRaw::default();
+        for page in 1..=50 {
+            let got: CheckRunsRaw = self.get_json(&format!(
+                "/repos/{owner}/{repo}/commits/{sha}/check-runs?per_page=100&page={page}"
+            ))?;
+            let n = got.check_runs.len();
+            all.total_count = got.total_count;
+            all.check_runs.extend(got.check_runs);
+            if n == 0 || n < 100 || all.check_runs.len() as i64 >= all.total_count {
+                return Ok(all);
+            }
+        }
+        Err(GithubError::Api(format!("{owner}/{repo}@{sha}: more than 5000 check runs")))
+    }
+
     /// Fetch a pull request's live status: mergeable flag, mergeable state,
     /// combined check conclusion, and whether it has been merged.
     pub fn get_pr_status(&self, owner: &str, repo: &str, number: i64) -> Result<PrStatus, GithubError> {
@@ -381,13 +402,12 @@ impl Github {
         // Actions and apps), which the combined status leaves out.
         let checks = match &raw.head {
             Some(head) => {
+                // A failed look is an error, never "no checks": a caller that
+                // read `None` would treat the pull request as clear.
                 let statuses = self
-                    .get_json::<CombinedStatusRaw>(&format!("/repos/{owner}/{repo}/commits/{}/status", head.sha))
-                    .ok();
-                let runs = self
-                    .get_json::<CheckRunsRaw>(&format!("/repos/{owner}/{repo}/commits/{}/check-runs", head.sha))
-                    .ok();
-                combine_checks(statuses.as_ref(), runs.as_ref())
+                    .get_json::<CombinedStatusRaw>(&format!("/repos/{owner}/{repo}/commits/{}/status", head.sha))?;
+                let runs = self.get_check_runs(owner, repo, &head.sha)?;
+                combine_checks(Some(&statuses), Some(&runs))
             }
             None => None,
         };
@@ -1472,8 +1492,10 @@ struct CombinedStatusRaw {
     total_count: i64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct CheckRunsRaw {
+    #[serde(default)]
+    total_count: i64,
     #[serde(default)]
     check_runs: Vec<CheckRunRaw>,
 }
@@ -1484,9 +1506,17 @@ struct CheckRunRaw {
     conclusion: Option<String>,
     #[serde(default)]
     name: Option<String>,
+    /// The GitHub App that made the run; with the name it identifies a check.
+    #[serde(default)]
+    app: Option<CheckAppRaw>,
     /// RFC 3339, so the strings order by time.
     #[serde(default)]
     started_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+struct CheckAppRaw {
+    id: i64,
 }
 
 /// [`PrStatus::checks`] from the combined status and the check runs.
@@ -1514,10 +1544,14 @@ fn combine_checks(statuses: Option<&CombinedStatusRaw>, runs: Option<&CheckRunsR
     for run in all {
         if run.conclusion.as_deref() == Some("cancelled")
             && all.iter().any(|other| {
+                // Same app and name, both start times known: anything less
+                // is not known to be a replacement.
                 !std::ptr::eq(other, run)
-                    && other.name.is_some()
+                    && run.name.is_some()
                     && other.name == run.name
-                    && other.started_at > run.started_at
+                    && run.app.is_some()
+                    && other.app == run.app
+                    && matches!((&run.started_at, &other.started_at), (Some(a), Some(b)) if b > a)
             })
         {
             continue;
@@ -1947,7 +1981,7 @@ mod tests {
         let cancelled_alone = runs(r#"{"check_runs":[{"name":"a","status":"completed","conclusion":"cancelled","started_at":"2026-11-13T18:00:00Z"},{"name":"b","status":"completed","conclusion":"success"}]}"#);
         assert_eq!(combine_checks(None, Some(&cancelled_alone)).as_deref(), Some("failure"));
         // Its replacement finished green: the cancelled run no longer counts.
-        let replaced = runs(r#"{"check_runs":[{"name":"a","status":"completed","conclusion":"cancelled","started_at":"2026-11-13T18:00:00Z"},{"name":"a","status":"completed","conclusion":"success","started_at":"2026-11-13T18:05:00Z"}]}"#);
+        let replaced = runs(r#"{"check_runs":[{"name":"a","app":{"id":1},"status":"completed","conclusion":"cancelled","started_at":"2026-11-13T18:00:00Z"},{"name":"a","app":{"id":1},"status":"completed","conclusion":"success","started_at":"2026-11-13T18:05:00Z"}]}"#);
         assert_eq!(combine_checks(None, Some(&replaced)).as_deref(), Some("success"));
         // A replacement that failed is the failure; a replacement of another name does not clear it.
         let replaced_red = runs(r#"{"check_runs":[{"name":"a","status":"completed","conclusion":"cancelled","started_at":"2026-11-13T18:00:00Z"},{"name":"a","status":"completed","conclusion":"failure","started_at":"2026-11-13T18:05:00Z"}]}"#);
@@ -1956,6 +1990,75 @@ mod tests {
         assert_eq!(combine_checks(None, Some(&other_name)).as_deref(), Some("failure"));
         let real_failure = runs(r#"{"check_runs":[{"status":"completed","conclusion":"cancelled"},{"status":"completed","conclusion":"failure"},{"status":"in_progress","conclusion":null}]}"#);
         assert_eq!(combine_checks(None, Some(&real_failure)).as_deref(), Some("failure"));
+    }
+
+    const PR_JSON: &str = r#"{"head":{"sha":"abc"},"merged":true,"state":"open","mergeable":true,"mergeable_state":"clean"}"#;
+    const STATUS_JSON: &str = r#"{"state":"success","total_count":0}"#;
+
+    /// A page of `n` check runs named `name-<i>`, the last concluding `last`.
+    fn runs_page(from: usize, n: usize, total: usize, last: &str) -> &'static str {
+        let runs: Vec<String> = (0..n)
+            .map(|i| {
+                let conclusion = if i == n - 1 { last } else { "success" };
+                format!(r#"{{"name":"c{}","status":"completed","conclusion":"{conclusion}"}}"#, from + i)
+            })
+            .collect();
+        Box::leak(format!(r#"{{"total_count":{total},"check_runs":[{}]}}"#, runs.join(",")).into_boxed_str())
+    }
+
+    #[test]
+    fn check_runs_are_read_page_by_page_so_a_failure_past_the_first_page_counts() {
+        let (url, handle) = serve_canned(vec![
+            ("200 OK", PR_JSON),
+            ("200 OK", STATUS_JSON),
+            ("200 OK", runs_page(0, 100, 130, "success")),
+            ("200 OK", runs_page(100, 30, 130, "failure")),
+        ]);
+        let status = client(&url, &[]).get_pr_status("o", "r", 1).unwrap();
+        assert_eq!(status.checks.as_deref(), Some("failure"));
+        assert_eq!(handle.join().unwrap(), 4);
+    }
+
+    #[test]
+    fn a_failed_check_request_is_an_error_not_no_checks() {
+        // The check runs fail: the status is an error, never `checks: None`.
+        let (url, handle) = serve_canned(vec![
+            ("200 OK", PR_JSON),
+            ("200 OK", STATUS_JSON),
+            ("403 Forbidden", r#"{"message":"Resource not accessible by integration"}"#),
+        ]);
+        assert!(client(&url, &[]).get_pr_status("o", "r", 1).is_err());
+        handle.join().unwrap();
+        // So does the combined status.
+        let (url, handle) = serve_canned(vec![
+            ("200 OK", PR_JSON),
+            ("500 Internal Server Error", r#"{"message":"boom"}"#),
+        ]);
+        assert!(client(&url, &[]).get_pr_status("o", "r", 1).is_err());
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn a_cancelled_run_is_replaced_only_by_the_same_app_and_name_with_known_times() {
+        use super::{CheckRunsRaw, combine_checks};
+        let runs = |json: &str| -> CheckRunsRaw { serde_json::from_str(json).unwrap() };
+        let run = |app: i64, conclusion: &str, at: &str| {
+            let at = if at.is_empty() { String::new() } else { format!(r#","started_at":"{at}""#) };
+            format!(r#"{{"name":"build","app":{{"id":{app}}},"status":"completed","conclusion":"{conclusion}"{at}}}"#)
+        };
+        let two = |a: String, b: String| runs(&format!(r#"{{"check_runs":[{a},{b}]}}"#));
+        // Same name, other app: the later green run hides nothing.
+        let r = two(run(1, "cancelled", "2026-11-13T18:00:00Z"), run(2, "success", "2026-11-13T18:05:00Z"));
+        assert_eq!(combine_checks(None, Some(&r)).as_deref(), Some("failure"));
+        // Same app and name: replaced.
+        let r = two(run(1, "cancelled", "2026-11-13T18:00:00Z"), run(1, "success", "2026-11-13T18:05:00Z"));
+        assert_eq!(combine_checks(None, Some(&r)).as_deref(), Some("success"));
+        // The cancelled run has no start time: not known to be replaced.
+        let r = two(run(1, "cancelled", ""), run(1, "success", "2026-11-13T18:05:00Z"));
+        assert_eq!(combine_checks(None, Some(&r)).as_deref(), Some("failure"));
+        // The replacement has none: not known either.
+        let r = two(run(1, "cancelled", "2026-11-13T18:00:00Z"), run(1, "success", ""));
+        assert_eq!(combine_checks(None, Some(&r)).as_deref(), Some("failure"));
     }
 
     #[test]

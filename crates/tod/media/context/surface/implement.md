@@ -169,9 +169,13 @@ work around with fixtures never needs the user. When something does:
   to the `merged` (or `released`) phase and carry on; that phase's agent
   takes it. When the evidence is a test suite or build only CI can run
   (a server version or tool this sandbox cannot install), do not block either:
-  build and commit everything that makes CI run it, and the pull request's
-  checks are the verdict (a failing check is sent back to you as work). Block
-  with `access` only for access that no later phase or CI gets, and name which
+  build and commit everything that makes CI run it, rewrite the step to say
+  what you built ("CI runs the suites against that version"), note that the
+  pull request's checks are its verdict, and mark it `implemented`. The pull
+  request phase (`pr_draft`) is where that verdict is read: a failing check
+  there is sent back to you as work, so the step never needs to stay open and
+  the plan can finish. Your own recorded test run is still the run you can
+  make here. Block with `access` only for access that no later phase or CI gets, and name which
   one in `--needs`.
 - None of these is a reason: a step is large, you are not sure how to do it,
   the rest of the work is done and one layer is left (a UI over a finished
