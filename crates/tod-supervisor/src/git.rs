@@ -45,9 +45,30 @@ fn pinned_commit(parent: &Path, rel: &str) -> Option<String> {
 fn has_unpushed(repo: &Path, pinned: Option<&str>) -> Result<bool> {
     let mut args = vec!["rev-list", "-n1", "HEAD", "--not", "--remotes"];
     if let Some(p) = pinned {
+        ensure_commit(repo, p)?;
         args.push(p);
     }
     Ok(!git(repo, &args)?.is_empty())
+}
+
+/// Makes sure `repo` has commit `sha`. A merge of the base brings in the
+/// parent's new pointer for this submodule without the commit (tod fetches
+/// without recursing), and `rev-list` then dies with "bad object". Fetch it
+/// from the submodule's own `origin`; a commit that is not there either is an
+/// error saying so.
+fn ensure_commit(repo: &Path, sha: &str) -> Result<()> {
+    let commit = format!("{sha}^{{commit}}");
+    if git(repo, &["cat-file", "-e", &commit]).is_ok() {
+        return Ok(());
+    }
+    // By id first (the server may allow it), else everything.
+    if git(repo, &["fetch", "--quiet", "--no-recurse-submodules", "origin", sha]).is_err() {
+        git(repo, &["fetch", "--quiet", "--no-recurse-submodules", "origin"])
+            .with_context(|| format!("fetch the commit {sha} its parent pins"))?;
+    }
+    git(repo, &["cat-file", "-e", &commit])
+        .with_context(|| format!("the parent pins commit {sha}, which is not in its checkout or on its origin"))?;
+    Ok(())
 }
 
 /// The checkout's default branch, from `origin/HEAD`, when known.
@@ -242,6 +263,35 @@ mod tests {
         push_branch(&work).unwrap();
         assert!(run(&ws_remote, &["branch", "--list", "task/x"]).contains("task/x"));
         assert_eq!(run(&sub_remote, &["rev-parse", "task/x"]), run(&work.join("kb"), &["rev-parse", "HEAD"]));
+    }
+
+    /// The failure behind "fatal: bad object": the node merged a base that
+    /// bumped the submodule, without fetching the submodule, so the commit the
+    /// parent pins is not in the checkout.
+    #[test]
+    fn a_pinned_commit_the_base_merge_brought_in_unfetched_is_fetched() {
+        let (work, _ws_remote, sub_remote) = fixture();
+        let root = work.parent().unwrap().to_path_buf();
+        // Someone else bumps kb on main.
+        let subseed = root.join("subseed");
+        std::fs::write(subseed.join("b"), "b").unwrap();
+        run(&subseed, &["add", "."]);
+        run(&subseed, &["commit", "-qm", "bump"]);
+        run(&subseed, &["push", "-q", "origin", "HEAD:main"]);
+        let seed = root.join("seed");
+        run(&seed.join("kb"), &["fetch", "-q", "origin"]);
+        run(&seed.join("kb"), &["checkout", "-q", "origin/main"]);
+        run(&seed, &["commit", "-qam", "bump kb"]);
+        run(&seed, &["push", "-q", "origin", "HEAD:main"]);
+        // The node merges it, fetching without submodules.
+        run(&work, &["fetch", "-q", "--no-recurse-submodules", "origin"]);
+        run(&work, &["merge", "-q", "--no-edit", "origin/main"]);
+        let bumped = run(&work, &["rev-parse", "HEAD:kb"]);
+        let have = Command::new("git").arg("-C").arg(work.join("kb")).args(["cat-file", "-e", &bumped]).output().unwrap();
+        assert!(!have.status.success(), "precondition: the pinned commit is not fetched");
+        commit_in_kb(&work);
+        push_branch(&work).unwrap();
+        assert!(run(&sub_remote, &["branch", "--list", "task/x"]).contains("task/x"));
     }
 
     #[test]
