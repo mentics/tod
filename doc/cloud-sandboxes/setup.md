@@ -119,6 +119,7 @@ tod-sandbox fork dev2 dev2-copy                          # a copy of dev2 as it 
 tod-sandbox zed dev /root/project                        # open it in Zed
 tod-sandbox shell dev                                    # a terminal
 tod-sandbox exec dev -- git -C /root/project status      # one command
+tod-sandbox cp dev:/root/project/out.log ./               # a file, byte for byte (- for stdout)
 tod-sandbox list | status dev | delete dev | doctor
 ```
 

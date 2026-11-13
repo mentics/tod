@@ -1159,6 +1159,16 @@ impl SandboxExec {
             .with_context(|| format!("upload {path} to sandbox {}", self.name))
     }
 
+    /// Copies the file at `path` in the sandbox to `local` on this machine,
+    /// byte for byte, through Blaxel's filesystem API; a copy cut off part
+    /// way is never at `local`. Returns how many bytes it copied.
+    pub fn download_to_file(&self, path: &str, local: &std::path::Path) -> Result<u64> {
+        let conn = connect(&self.name)?;
+        let bx = Sandboxes::load(&data_root()?)?.blaxel()?;
+        bx.download_to_file(&conn.url, path, local)
+            .with_context(|| format!("download {path} from sandbox {} to {}", self.name, local.display()))
+    }
+
     /// Whether `path` is a directory in the sandbox.
     pub fn is_dir(&self, path: &str) -> Result<bool> {
         Ok(self.output("/", "test", &["-d", path])?.status.success())

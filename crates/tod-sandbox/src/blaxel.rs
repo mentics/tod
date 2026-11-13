@@ -7,6 +7,7 @@
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 pub const API: &str = "https://api.blaxel.ai/v0";
@@ -1170,6 +1171,32 @@ impl Blaxel {
 
     /// Reads a file from the sandbox (this wakes it).
     pub fn download(&self, url: &str, path: &str) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        self.download_to_writer(url, path, &mut bytes)?;
+        Ok(bytes)
+    }
+
+    /// Copies a file from the sandbox to `local` on this machine, byte for
+    /// byte (this wakes it). The bytes go to a temporary file beside `local`
+    /// that is renamed into place only once all of them have arrived, so a
+    /// copy cut off part way is never at `local`. Returns how many bytes it
+    /// copied.
+    pub fn download_to_file(&self, url: &str, path: &str, local: &Path) -> Result<u64> {
+        let dir = match local.parent() {
+            Some(d) if !d.as_os_str().is_empty() => d,
+            _ => Path::new("."),
+        };
+        let mut tmp = tempfile::NamedTempFile::new_in(dir)
+            .with_context(|| format!("create a temporary file in {}", dir.display()))?;
+        let n = self.download_to_writer(url, path, tmp.as_file_mut())?;
+        tmp.as_file_mut().sync_all().with_context(|| format!("write {}", tmp.path().display()))?;
+        tmp.persist(local).map_err(|e| anyhow::anyhow!("move the download into place at {}: {}", local.display(), e.error))?;
+        Ok(n)
+    }
+
+    /// Streams a sandbox file into `out` (nothing is held in memory), checking that every byte the API
+    /// said it would send arrived. Returns how many bytes it wrote.
+    pub fn download_to_writer(&self, url: &str, path: &str, out: &mut impl std::io::Write) -> Result<u64> {
         let target = format!("{url}/filesystem%2F{}", path.trim_start_matches('/'));
         let what = format!("download {path}");
         let mut resp = match self.send_retrying_idempotent(&what, || {
@@ -1184,7 +1211,25 @@ impl Blaxel {
             Answer::Ok(r) => r,
             Answer::Failed { status, body } => return Err(failure_error(&what, status, &body)),
         };
-        Ok(resp.body_mut().with_config().limit(u64::MAX).read_to_vec()?)
+        // A directory is answered with its listing as JSON, whatever was asked for.
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if content_type.starts_with("application/json") {
+            bail!("{what}: {path} is not a file (the sandbox answered with {content_type}; is it a directory?)");
+        }
+        let expected = resp.body().content_length();
+        let mut reader = resp.body_mut().with_config().limit(u64::MAX).reader();
+        let n = std::io::copy(&mut reader, out).with_context(|| format!("{what}: reading the file"))?;
+        if let Some(expected) = expected
+            && expected != n
+        {
+            bail!("{what}: got {n} bytes of the {expected} the sandbox said it would send");
+        }
+        Ok(n)
     }
 
     /// Writes a file into the sandbox (at most 5 MB per call).
@@ -1561,6 +1606,73 @@ mod http_tests {
         let (url, _) = stub(|_, _, _| (404, NOT_READY.to_string()));
         let err = client().wait_reachable(&url, Duration::from_millis(100)).unwrap_err();
         assert!(format!("{err:#}").contains("did not wake"), "{err:#}");
+    }
+
+    /// Answers one GET with `content_type` and `body`, claiming
+    /// `content_length` bytes (which may be more than it sends); returns the
+    /// base URL and the request's head.
+    fn file_stub(content_type: &'static str, body: Vec<u8>, content_length: usize) -> (String, Arc<Mutex<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let head = Arc::new(Mutex::new(String::new()));
+        let seen = head.clone();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.trim().is_empty() {
+                    break;
+                }
+                seen.lock().unwrap().push_str(&line);
+            }
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(&body);
+        });
+        (url, head)
+    }
+
+    #[test]
+    fn a_download_is_byte_for_byte_and_lands_whole() {
+        // Every byte value, line endings of both kinds, and bytes that are not UTF-8.
+        let mut bytes: Vec<u8> = (0..=255u8).cycle().take(70_000).collect();
+        bytes.extend_from_slice(b"\r\n\n\r\0\xff\xfe");
+        let (url, head) = file_stub("application/octet-stream", bytes.clone(), bytes.len());
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("out.bin");
+        let n = client().download_to_file(&url, "/tmp/data/x.bin", &local).unwrap();
+        assert_eq!(n, bytes.len() as u64);
+        assert_eq!(std::fs::read(&local).unwrap(), bytes);
+        let head = head.lock().unwrap().to_ascii_lowercase();
+        assert!(head.starts_with("get /filesystem%2ftmp/data/x.bin "), "{head}");
+        assert!(head.contains("accept: application/octet-stream"), "{head}");
+        // Nothing else was left beside it.
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn a_directory_is_an_error_and_writes_nothing() {
+        let (url, _) = file_stub("application/json", br#"{"files":[]}"#.to_vec(), 12);
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("out");
+        let err = client().download_to_file(&url, "/tmp", &local).unwrap_err();
+        assert!(format!("{err:#}").contains("is not a file"), "{err:#}");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_download_cut_off_part_way_is_an_error_and_leaves_the_old_file() {
+        let (url, _) = file_stub("application/octet-stream", vec![7u8; 1000], 5000);
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("out");
+        std::fs::write(&local, b"before").unwrap();
+        assert!(client().download_to_file(&url, "/x", &local).is_err());
+        assert_eq!(std::fs::read(&local).unwrap(), b"before");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]

@@ -91,6 +91,9 @@ status <name> [--json]   Whether a sandbox is running or in standby, and its
                          deployment status (does not wake it).
 exec <name> [--keep-awake] [--cwd DIR] -- <command...>
                          Run a command in the sandbox.
+cp <name>:<path> <local>  Copy a file from the sandbox to this machine, byte for
+                         byte. <path> is absolute; <local> may be a directory
+                         (the file keeps its name) or - for stdout. Wakes it.
 shell <name> [--cwd DIR] [--park SECS] [--run CMD] [--cli-relay]
       [--cli-relay-file FILE] [--forward [PORT=]HOST:PORT]... [--env NAME]...
                          Interactive shell; parks when idle so the sandbox sleeps.
@@ -293,6 +296,7 @@ fn run() -> Result<i32> {
             Ok(0)
         }
         "exec" => exec(&mut ctx, args, remote),
+        "cp" => copy_from(&mut ctx, args),
         "shell" => shell(&mut ctx, args),
         "agent" => agent(&mut ctx, args, remote),
         "zed" => zed(&mut ctx, args),
@@ -898,6 +902,51 @@ fn with_relay<T>(ctx: &mut Ctx, name: &str, f: impl Fn(&str, &str) -> Result<T>)
     f(&url, bx.token())
 }
 
+/// `cp <name>:<path> <local>`: one file from the sandbox, exactly as it is there.
+fn copy_from(ctx: &mut Ctx, mut args: Args) -> Result<i32> {
+    let from = args.positional("<name>:<path>")?;
+    let to = args.positional("local path")?;
+    args.done()?;
+    let (name, path) = parse_remote(&from)?;
+    let bx = ctx.blaxel()?;
+    let url = ctx.url(&bx, name)?;
+    if to == "-" {
+        let mut out = std::io::stdout().lock();
+        bx.download_to_writer(&url, path, &mut out)?;
+        out.flush()?;
+        return Ok(0);
+    }
+    let local = local_target(Path::new(&to), path)?;
+    let n = bx.download_to_file(&url, path, &local).with_context(|| format!("copy {from} to {}", local.display()))?;
+    eprintln!("copied {n} bytes to {}", local.display());
+    Ok(0)
+}
+
+/// `<name>:<path>`, with an absolute path.
+fn parse_remote(spec: &str) -> Result<(&str, &str)> {
+    let (name, path) = spec
+        .split_once(':')
+        .filter(|(name, path)| !name.is_empty() && !path.is_empty())
+        .ok_or_else(|| anyhow!("expected <name>:<path>, got {spec:?}"))?;
+    if !path.starts_with('/') {
+        bail!("{spec}: the path in the sandbox must be absolute");
+    }
+    if path.ends_with('/') {
+        bail!("{spec}: names a directory; cp copies one file");
+    }
+    Ok((name, path))
+}
+
+/// Where a copy of `remote` goes for `local`: into it, under the file's own
+/// name, when it is a directory.
+fn local_target(local: &Path, remote: &str) -> Result<PathBuf> {
+    if local.is_dir() {
+        let file = remote.rsplit('/').next().filter(|f| !f.is_empty()).ok_or_else(|| anyhow!("{remote} has no file name"))?;
+        return Ok(local.join(file));
+    }
+    Ok(local.to_path_buf())
+}
+
 fn exec(ctx: &mut Ctx, mut args: Args, remote: Vec<String>) -> Result<i32> {
     let name = args.positional("sandbox name")?;
     let keep_awake = args.flag("--keep-awake");
@@ -1299,5 +1348,28 @@ mod sweep_tests {
         assert!(parse_sweep(v(&["--min-age-hours", "soon"])).is_err());
         assert!(parse_sweep(v(&["--min-age-hours", "-1"])).is_err());
         assert!(parse_sweep(v(&["node-a"])).is_err());
+    }
+}
+
+#[cfg(test)]
+mod cp_tests {
+    use super::{local_target, parse_remote};
+    use std::path::Path;
+
+    #[test]
+    fn the_remote_is_a_name_and_an_absolute_file_path() {
+        assert_eq!(parse_remote("tod-x-1a2b3c:/tmp/a:b.txt").unwrap(), ("tod-x-1a2b3c", "/tmp/a:b.txt"));
+        for bad in ["tod-x", ":/tmp/a", "tod-x:", "tod-x:tmp/a", "tod-x:/tmp/"] {
+            assert!(parse_remote(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_local_directory_keeps_the_file_name() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(local_target(dir.path(), "/tmp/out.log").unwrap(), dir.path().join("out.log"));
+        let file = dir.path().join("renamed.log");
+        assert_eq!(local_target(&file, "/tmp/out.log").unwrap(), file);
+        assert_eq!(local_target(Path::new("x"), "/a/b").unwrap(), Path::new("x"));
     }
 }
