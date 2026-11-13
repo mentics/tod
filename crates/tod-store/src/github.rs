@@ -1482,15 +1482,24 @@ struct CheckRunsRaw {
 struct CheckRunRaw {
     status: String,
     conclusion: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    /// RFC 3339, so the strings order by time.
+    #[serde(default)]
+    started_at: Option<String>,
 }
 
 /// [`PrStatus::checks`] from the combined status and the check runs.
 ///
 /// A *cancelled* run is not a verdict on the code: a newer push or a
-/// concurrency group cancels it and a new run replaces it. While anything is
-/// still running it counts as pending (the replacement is on its way); only
-/// when nothing else is left does it count as a failure, so a run that was
-/// never replaced still reaches the agent (which can re-run it).
+/// concurrency group cancels it and a new run replaces it. A cancelled run is
+/// ignored when a later run of the same check name exists, whatever that run
+/// concluded. When it is the latest of its name it counts as pending while
+/// anything else is still running (a replacement may be on its way), and as
+/// a failure only when nothing is pending, so a run that was never replaced
+/// still reaches the agent (which can re-run it). The commit-status side
+/// needs no such rule: the combined status already holds only the latest
+/// state of each context.
 fn combine_checks(statuses: Option<&CombinedStatusRaw>, runs: Option<&CheckRunsRaw>) -> Option<String> {
     let mut states: Vec<&str> = Vec::new();
     let mut cancelled = false;
@@ -1501,7 +1510,18 @@ fn combine_checks(statuses: Option<&CombinedStatusRaw>, runs: Option<&CheckRunsR
             _ => "failure",
         });
     }
-    for run in runs.map(|r| r.check_runs.as_slice()).unwrap_or_default() {
+    let all = runs.map(|r| r.check_runs.as_slice()).unwrap_or_default();
+    for run in all {
+        if run.conclusion.as_deref() == Some("cancelled")
+            && all.iter().any(|other| {
+                !std::ptr::eq(other, run)
+                    && other.name.is_some()
+                    && other.name == run.name
+                    && other.started_at > run.started_at
+            })
+        {
+            continue;
+        }
         states.push(match (run.status.as_str(), run.conclusion.as_deref()) {
             ("completed", Some("success" | "neutral" | "skipped")) => "success",
             ("completed", Some("cancelled")) => {
@@ -1924,8 +1944,16 @@ mod tests {
             r#"{"check_runs":[{"status":"completed","conclusion":"cancelled"},{"status":"in_progress","conclusion":null},{"status":"completed","conclusion":"success"}]}"#,
         );
         assert_eq!(combine_checks(None, Some(&cancelled_and_running)).as_deref(), Some("pending"));
-        let cancelled_alone = runs(r#"{"check_runs":[{"status":"completed","conclusion":"cancelled"},{"status":"completed","conclusion":"success"}]}"#);
+        let cancelled_alone = runs(r#"{"check_runs":[{"name":"a","status":"completed","conclusion":"cancelled","started_at":"2026-11-13T18:00:00Z"},{"name":"b","status":"completed","conclusion":"success"}]}"#);
         assert_eq!(combine_checks(None, Some(&cancelled_alone)).as_deref(), Some("failure"));
+        // Its replacement finished green: the cancelled run no longer counts.
+        let replaced = runs(r#"{"check_runs":[{"name":"a","status":"completed","conclusion":"cancelled","started_at":"2026-11-13T18:00:00Z"},{"name":"a","status":"completed","conclusion":"success","started_at":"2026-11-13T18:05:00Z"}]}"#);
+        assert_eq!(combine_checks(None, Some(&replaced)).as_deref(), Some("success"));
+        // A replacement that failed is the failure; a replacement of another name does not clear it.
+        let replaced_red = runs(r#"{"check_runs":[{"name":"a","status":"completed","conclusion":"cancelled","started_at":"2026-11-13T18:00:00Z"},{"name":"a","status":"completed","conclusion":"failure","started_at":"2026-11-13T18:05:00Z"}]}"#);
+        assert_eq!(combine_checks(None, Some(&replaced_red)).as_deref(), Some("failure"));
+        let other_name = runs(r#"{"check_runs":[{"name":"a","status":"completed","conclusion":"cancelled","started_at":"2026-11-13T18:00:00Z"},{"name":"b","status":"completed","conclusion":"success","started_at":"2026-11-13T18:05:00Z"}]}"#);
+        assert_eq!(combine_checks(None, Some(&other_name)).as_deref(), Some("failure"));
         let real_failure = runs(r#"{"check_runs":[{"status":"completed","conclusion":"cancelled"},{"status":"completed","conclusion":"failure"},{"status":"in_progress","conclusion":null}]}"#);
         assert_eq!(combine_checks(None, Some(&real_failure)).as_deref(), Some("failure"));
     }

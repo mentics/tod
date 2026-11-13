@@ -699,6 +699,23 @@ missing"),
                 "{key}.md spells out a tod-cli invocation; \
                  document it under cli/ and reference it by name instead"
             );
+            // `<noun> <verb> --flag` is syntax too, with or without the binary.
+            for line in text.lines() {
+                let words: Vec<&str> = line.split_whitespace().collect();
+                for w in words.windows(3) {
+                    let clean = |s: &str| s.trim_matches(|c: char| c == '`' || c == ',' || c == '.').to_string();
+                    let (n, v, f) = (clean(w[0]), clean(w[1]), clean(w[2]));
+                    let noun = matches!(
+                        n.as_str(),
+                        "plan" | "node" | "obligations" | "verdicts" | "decisions" | "tests" | "review" | "phase"
+                            | "capabilities" | "lifecycle" | "content" | "pr" | "secrets"
+                    );
+                    assert!(
+                        !(noun && v.chars().all(|c| c.is_ascii_lowercase()) && f.starts_with("--")),
+                        "{key}.md spells out `{n} {v} {f}`; syntax lives under cli/, say it in prose"
+                    );
+                }
+            }
         }
     }
 
@@ -751,7 +768,7 @@ missing"),
     fn prompts_place_post_merge_steps_in_later_phases_and_wait_inside_the_turn() {
         let implement = include_str!("../../tod/media/context/surface/implement.md");
         assert!(implement.contains("is in the wrong phase"), "implement.md must tell the agent to move a post-merge step");
-        assert!(implement.contains("plan update --phase merged"));
+        assert!(implement.contains("to the `merged` (or `released`) phase"));
         assert!(implement.contains("the pull request's\n  checks are the verdict"));
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..").join("assets").join("process");
         if root.is_dir() {

@@ -39,7 +39,7 @@ first. Reach for `tod-cli` only when:
 - you need to re-check current state, since obligations can change after this
   session started and the inlined copy will not reflect that.
 
-`obligations list --kind constraint` is the way to re-verify every constraint
+`obligations list`, filtered to constraints, is the way to re-verify every constraint
 still holds before you consider a plan step done — don't rely on memory of the
 inlined snapshot for that check once real time has passed or the code has
 changed underneath you.
@@ -166,8 +166,8 @@ work around with fixtures never needs the user. When something does:
   A step whose evidence only exists once the change is merged or rolled out
   (apply Terraform in QA or prod, run a backfill, a deploy, a demonstration
   against a live environment) is not blocked: it is in the wrong phase. Move it
-  with `plan update --phase merged` (or `released`) and carry on; that phase's
-  agent takes it. When the evidence is a test suite or build only CI can run
+  to the `merged` (or `released`) phase and carry on; that phase's agent
+  takes it. When the evidence is a test suite or build only CI can run
   (a server version or tool this sandbox cannot install), do not block either:
   build and commit everything that makes CI run it, and the pull request's
   checks are the verdict (a failing check is sent back to you as work). Block

@@ -24,7 +24,7 @@ and obligations are what the change is for, so a fix never breaks one of them.
 
 Treat these blocks as a snapshot taken when this session started. Findings
 answered since then — by you, or by the user — are no longer yours to resolve;
-`review list --open` shows what is still open.
+`review list`, filtered to open findings, shows what is still open.
 
 ## Resolving a finding
 

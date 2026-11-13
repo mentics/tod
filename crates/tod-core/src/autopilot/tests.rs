@@ -684,18 +684,26 @@ fn stops_when_the_session_budget_runs_out_and_a_restart_keeps_count() {
     };
     let mut agent = FakeAgent::new(&fx.fleet);
     let outcome = autopilot(&fx, budget).run(&fx.fleet, &mut agent).unwrap();
-    assert_eq!(
-        outcome,
-        Outcome::BudgetExhausted {
-            limit: BudgetLimit::Sessions { used: 2, elapsed_secs: 0 }
-        }
+    // Elapsed seconds depend on the machine's load, so only the sessions count.
+    assert!(
+        matches!(
+            outcome,
+            Outcome::BudgetExhausted { limit: BudgetLimit::Sessions { used: 2, .. } }
+        ),
+        "{outcome:?}"
     );
 
     // A restart reads the spent budget back and stops at once.
     let mut again = autopilot(&fx, budget);
     assert_eq!(again.state().sessions, 2);
     let turns = agent.turns;
-    assert_eq!(again.run(&fx.fleet, &mut agent).unwrap(), outcome);
+    assert!(
+        matches!(
+            again.run(&fx.fleet, &mut agent).unwrap(),
+            Outcome::BudgetExhausted { limit: BudgetLimit::Sessions { used: 2, .. } }
+        ),
+        "a restart stops at once"
+    );
     assert_eq!(agent.turns, turns);
 
     // With a larger budget it continues from where it stopped.

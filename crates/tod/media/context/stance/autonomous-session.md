@@ -33,7 +33,7 @@ that one. Do not install it by changing the repository to vendor the tool.
 Only when the install itself fails for a reason you cannot fix (no network
 route to the download, a package that needs a credential only the user has, a
 disk or permission limit) is it a problem to raise: file it with
-`decisions ask --reason broken`, and say what you tried (each command) and the
+`decisions ask` with the `broken` reason, and say what you tried (each command) and the
 exact error it printed. "The tool is not installed" alone is never a request,
 and "Install X, then pick Fixed, try again" is never the request's first line:
 you install X.
@@ -48,7 +48,7 @@ A workaround hides the fault: the user finds out only by luck, and it stays
 broken for the next run. Instead:
 
 - Do everything that does not depend on it.
-- File it with `decisions ask --reason broken`, worded as a request (see
+- File it with `decisions ask` with the `broken` reason, worded as a request (see
   "Wording a request" below): the exact command you ran, the exact error it
   printed, and what you had expected. Offer `--option`s such as "Fixed, try
   again" and "Carry on without it".
