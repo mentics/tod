@@ -102,7 +102,7 @@ fn the_steps_and_verdicts_a_lost_node_had_are_open_work_again() {
     workspace_is_a_clone(&fx);
     in_review_with_done_steps(&fx);
     let cwd = tod_store::fleet::Workdir::host(fx.root.join("workspace"));
-    let repos = crate::lost_work::inspect(&cwd, None).unwrap();
+    let repos = crate::lost_work::inspect(&cwd, None, None).unwrap();
     assert!(crate::lost_work::is_lost(&repos), "{repos:?}");
     let proof = crate::lost_work::check(&fx.fleet, fx.node, "review").unwrap().expect("lost");
     assert_eq!(proof.done_steps, 2);

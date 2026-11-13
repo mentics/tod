@@ -226,7 +226,7 @@ fn pinned(parent: &Workdir, rel: &str) -> Result<Option<String>> {
 /// dirty: each submodule is looked at on its own, and a checkout whose
 /// submodules sit on newer commits than the ones it records (a sandbox forked
 /// from a golden that moved on) has done no work by that.
-fn state_of(repo: &Workdir, bases: &[String], what: &str, branch: Option<&str>) -> Result<RepoState> {
+fn state_of(repo: &Workdir, bases: &[String], what: &str, branch: Option<&str>, work_began_ms: Option<i64>) -> Result<RepoState> {
     if !git_text(repo, &["status", "--porcelain", "--ignore-submodules=all"])?.is_empty() {
         return Ok(RepoState::Dirty);
     }
@@ -258,13 +258,15 @@ fn state_of(repo: &Workdir, bases: &[String], what: &str, branch: Option<&str>) 
     // base (merged into it, then perhaps deleted on origin, or left behind it):
     // its work is in the default branch, not lost.
     //
-    // But only a tip that was never the base's own: tod puts every repository
-    // on the node's branch when it makes the checkout and pushes it, at the
-    // commit the base had then, so an empty branch is left on origin that the
-    // default branch later moves past. Its tip sits on the base's first-parent
-    // line (it was once the base's tip); a branch merged by a merge commit does
-    // not (its commits came in as the merge's second parent). Taking the stale
-    // empty branch for merged work hid the loss of ENG-2287's code for good.
+    // A tip on the base's first-parent line is ambiguous by ancestry alone: it
+    // is either the stub tod pushed when it made the checkout (the base's tip
+    // then; the default branch later moved past it, which hid the loss of
+    // ENG-2287's code) or a branch fast-forward merged into the base. What
+    // tells them apart is when the tip was committed: the stub is a commit the
+    // base already had before the node's first implementation conversation
+    // began, work is a commit made after. A tip off the line (merged by a merge
+    // commit) is merged work. With no implementation conversation to date it
+    // by, the tip is not called a stub: a false "lost" resets a finished node.
     if !tips.is_empty() {
         let mut base_tips = Vec::new();
         for base in bases {
@@ -274,8 +276,21 @@ fn state_of(repo: &Workdir, bases: &[String], what: &str, branch: Option<&str>) 
         for base in bases {
             on_the_line.extend(git_text(repo, &["rev-list", "--first-parent", base])?.lines().map(|l| l.trim().to_string()));
         }
-        if tips.iter().any(|tip| !base_tips.contains(tip) && !on_the_line.contains(tip)) {
-            return Ok(RepoState::BranchBehindBase);
+        for tip in tips.iter().filter(|tip| !base_tips.contains(tip)) {
+            if !on_the_line.contains(tip) {
+                return Ok(RepoState::BranchBehindBase);
+            }
+            let stub = match work_began_ms {
+                Some(began) => {
+                    let text = git_text(repo, &["log", "-1", "--format=%ct", tip])?;
+                    let secs: i64 = text.parse().with_context(|| format!("git log in {repo} printed `{text}`, not a commit time"))?;
+                    secs.saturating_mul(1000) < began
+                }
+                None => false,
+            };
+            if !stub {
+                return Ok(RepoState::BranchBehindBase);
+            }
         }
     }
     Ok(RepoState::Untouched)
@@ -327,13 +342,16 @@ fn is_checkout(cwd: &Workdir) -> Result<bool> {
 /// What the checkout at `cwd` and each initialized submodule hold; `branch` is
 /// the node's branch, else the one checked out. Empty when `cwd` is not a git
 /// work tree (there is no branch to have lost).
-pub fn inspect(cwd: &Workdir, branch: Option<&str>) -> Result<Vec<(String, RepoState)>> {
+///
+/// `work_began_ms` is when the node's first implementation conversation began
+/// (see [`state_of`]); `None` never takes a branch tip for a stub.
+pub fn inspect(cwd: &Workdir, branch: Option<&str>, work_began_ms: Option<i64>) -> Result<Vec<(String, RepoState)>> {
     if !is_checkout(cwd)? {
         return Ok(Vec::new());
     }
     // Only the node's own branch, as Files records it; with none known, HEAD
     // alone is compared (never a guess from the branch checked out).
-    let mut out = vec![(".".to_string(), state_of(cwd, &default_ref(cwd)?.into_iter().collect::<Vec<_>>(), "the checkout", branch)?)];
+    let mut out = vec![(".".to_string(), state_of(cwd, &default_ref(cwd)?.into_iter().collect::<Vec<_>>(), "the checkout", branch, work_began_ms)?)];
     // No `.gitmodules` is the only way to have none; a listing that fails is an error.
     let subs: Vec<String> = if git_text(cwd, &["ls-files", "--", ".gitmodules"])?.is_empty() {
         Vec::new()
@@ -356,7 +374,7 @@ pub fn inspect(cwd: &Workdir, branch: Option<&str>) -> Result<Vec<(String, RepoS
         // their default branch, ahead of what the checkout records.
         let sub = cwd.join(rel);
         let bases: Vec<String> = pinned(&parent, &in_parent)?.into_iter().chain(default_ref_opt(&sub)?).collect();
-        out.push((rel.clone(), state_of(&sub, &bases, &format!("submodule {rel}"), branch)?));
+        out.push((rel.clone(), state_of(&sub, &bases, &format!("submodule {rel}"), branch, work_began_ms)?));
     }
     Ok(out)
 }
@@ -405,6 +423,18 @@ pub fn is_about_lost_work(question: &str) -> bool {
     LOST_WORK_WORDS.iter().any(|w| q.contains(w))
 }
 
+/// When the node's first implementation conversation began (ms), the moment
+/// before which every commit on the default branch predates the node's work.
+pub fn work_began_ms(fleet: &FleetStore, node: Uuid) -> Result<Option<i64>> {
+    fleet.read(|conn| {
+        Ok(conn.query_row(
+            "SELECT MIN(created_at) FROM conversations WHERE focus_kind = 'node' AND focus_id = ?1 AND protocol = ?2",
+            rusqlite::params![node.as_bytes().to_vec(), tod_store::conversation::ProtocolKind::Implementation.as_str()],
+            |row| row.get::<_, Option<i64>>(0),
+        )?)
+    })
+}
+
 /// Whether the node, in `state`, has lost its work. `None` when the state is
 /// not one of [`STATES`], no implementation step is done, or there is no
 /// checkout to look at (Files not set up or not made: a launch says so
@@ -423,7 +453,8 @@ pub fn check(fleet: &FleetStore, node: Uuid, state: &str) -> Result<Option<Proof
         return Ok(None);
     };
     let branch = fleet.resolve_files_for_node(&node.to_string())?.and_then(|files| files.branch().map(str::to_string));
-    let repos = inspect(&cwd, branch.as_deref())?;
+    let began = work_began_ms(fleet, node)?;
+    let repos = inspect(&cwd, branch.as_deref(), began)?;
     Ok(is_lost(&repos).then(|| Proof { repos: repos.into_iter().map(|(name, _)| name).collect(), done_steps: done }))
 }
 
@@ -507,7 +538,7 @@ mod tests {
     }
 
     fn states(work: &Path) -> Vec<(String, RepoState)> {
-        inspect(&Workdir::host(work), None).unwrap()
+        inspect(&Workdir::host(work), None, None).unwrap()
     }
 
     #[test]
@@ -577,7 +608,7 @@ mod tests {
     fn a_failed_submodule_listing_is_an_error_not_no_submodules() {
         let (_dir, work) = fixture();
         std::fs::write(work.join(".gitmodules"), "[submodule \"kb\"\n").unwrap();
-        let err = format!("{:#}", inspect(&Workdir::host(&work), None).unwrap_err());
+        let err = format!("{:#}", inspect(&Workdir::host(&work), None, None).unwrap_err());
         // Git refuses a work tree whose .gitmodules is unreadable, at whichever
         // call comes first; it is never read as "no submodules".
         assert!(err.contains("git "), "{err}");
@@ -590,11 +621,11 @@ mod tests {
         run(&work, &["push", "-q", "origin", "HEAD:refs/heads/task/x"]);
         run(&work, &["checkout", "-q", "main"]);
         // The local branch has it.
-        let repos = inspect(&Workdir::host(&work), Some("task/x")).unwrap();
+        let repos = inspect(&Workdir::host(&work), Some("task/x"), None).unwrap();
         assert_eq!(repos[0].1, RepoState::OwnCommits, "{repos:?}");
         // Only origin has it.
         run(&work, &["branch", "-q", "-D", "task/x"]);
-        let repos = inspect(&Workdir::host(&work), Some("task/x")).unwrap();
+        let repos = inspect(&Workdir::host(&work), Some("task/x"), None).unwrap();
         assert_eq!(repos[0].1, RepoState::OwnCommits, "{repos:?}");
         assert!(!is_lost(&repos));
     }
@@ -605,12 +636,12 @@ mod tests {
         commit_in(&work, "w");
         run(&work, &["push", "-q", "origin", "HEAD:refs/heads/task/x"]);
         run(&work, &["checkout", "-q", "main"]);
-        run(&work, &["merge", "-q", "--no-ff", "-m", "merge task/x", "task/x"]);
+        run(&work, &["merge", "-q", "--ff-only", "task/x"]);
         commit_in(&work, "later");
         run(&work, &["push", "-q", "origin", "main"]);
         run(&work, &["branch", "-q", "-D", "task/x"]);
         run(&work, &["fetch", "-q", "origin"]);
-        let repos = inspect(&Workdir::host(&work), Some("task/x")).unwrap();
+        let repos = inspect(&Workdir::host(&work), Some("task/x"), Some(1)).unwrap();
         assert_eq!(repos[0].1, RepoState::BranchBehindBase, "{repos:?}");
         assert!(!is_lost(&repos));
     }
@@ -620,7 +651,7 @@ mod tests {
         let (_dir, work) = fixture();
         run(&work, &["update-ref", "-d", "refs/remotes/origin/main"]);
         run(&work, &["update-ref", "-d", "refs/remotes/origin/HEAD"]);
-        let err = format!("{:#}", inspect(&Workdir::host(&work), None).unwrap_err());
+        let err = format!("{:#}", inspect(&Workdir::host(&work), None, None).unwrap_err());
         assert!(err.contains("fetch origin"), "{err}");
     }
 
@@ -628,16 +659,16 @@ mod tests {
     fn a_subdirectory_of_another_repository_is_an_error() {
         let (_dir, work) = fixture();
         std::fs::create_dir(work.join("sub_dir")).unwrap();
-        let err = format!("{:#}", inspect(&Workdir::host(work.join("sub_dir")), None).unwrap_err());
+        let err = format!("{:#}", inspect(&Workdir::host(work.join("sub_dir")), None, None).unwrap_err());
         assert!(err.contains("not a checkout of its own"), "{err}");
     }
 
     #[test]
     fn a_bare_repository_or_git_directory_is_an_error() {
         let (dir, work) = fixture();
-        let err = format!("{:#}", inspect(&Workdir::host(dir.path().join("kb.git")), None).unwrap_err());
+        let err = format!("{:#}", inspect(&Workdir::host(dir.path().join("kb.git")), None, None).unwrap_err());
         assert!(err.contains("bare repository"), "{err}");
-        let err = format!("{:#}", inspect(&Workdir::host(work.join(".git")), None).unwrap_err());
+        let err = format!("{:#}", inspect(&Workdir::host(work.join(".git")), None, None).unwrap_err());
         assert!(err.contains("git directory") || err.contains("not a checkout"), "{err}");
     }
 
@@ -647,9 +678,9 @@ mod tests {
         // Work on a local branch the checkout is not on, and no branch named.
         commit_in(&work, "w");
         run(&work, &["checkout", "-q", "--detach", "origin/main"]);
-        let repos = inspect(&Workdir::host(&work), None).unwrap();
+        let repos = inspect(&Workdir::host(&work), None, None).unwrap();
         assert_eq!(repos[0].1, RepoState::Untouched, "{repos:?}");
-        let repos = inspect(&Workdir::host(&work), Some("task/x")).unwrap();
+        let repos = inspect(&Workdir::host(&work), Some("task/x"), None).unwrap();
         assert_eq!(repos[0].1, RepoState::OwnCommits, "{repos:?}");
     }
 
@@ -671,7 +702,7 @@ mod tests {
         run(&kb, &["checkout", "-q", "-B", "task/x", "origin/main"]);
         // The parent now reports the submodule as modified.
         assert!(run(&work, &["status", "--porcelain"]).contains("kb"));
-        let repos = inspect(&Workdir::host(&work), Some("task/x")).unwrap();
+        let repos = inspect(&Workdir::host(&work), Some("task/x"), None).unwrap();
         assert!(repos.iter().all(|(_, s)| *s == RepoState::Untouched), "{repos:?}");
         assert!(is_lost(&repos));
     }
@@ -686,7 +717,7 @@ mod tests {
         run(&kb, &["fetch", "-q", "origin"]);
         run(&kb, &["checkout", "-q", "-B", "task/x", "origin/main"]);
         commit_in(&kb, "mine");
-        let repos = inspect(&Workdir::host(&work), Some("task/x")).unwrap();
+        let repos = inspect(&Workdir::host(&work), Some("task/x"), None).unwrap();
         assert_eq!(repos[1].1, RepoState::OwnCommits, "{repos:?}");
         assert!(!is_lost(&repos));
     }
@@ -712,11 +743,11 @@ mod tests {
         assert_eq!(run(&shallow, &["rev-parse", "--is-shallow-repository"]), "true");
         // Without the correction git reports the one commit as not on origin/main.
         assert_eq!(run(&shallow, &["rev-list", "--count", "HEAD", "--not", "origin/main"]), "1");
-        let repos = inspect(&Workdir::host(&shallow), None).unwrap();
+        let repos = inspect(&Workdir::host(&shallow), None, None).unwrap();
         assert_eq!(repos[0].1, RepoState::Untouched, "{repos:?}");
         // A commit of the node's own on top is still work.
         commit_in(&shallow, "mine");
-        let repos = inspect(&Workdir::host(&shallow), None).unwrap();
+        let repos = inspect(&Workdir::host(&shallow), None, None).unwrap();
         assert_eq!(repos[0].1, RepoState::OwnCommits, "{repos:?}");
     }
 
@@ -725,10 +756,10 @@ mod tests {
         let (_dir, work) = fixture();
         commit_in(&work, "w");
         run(&work, &["checkout", "-q", "main"]);
-        run(&work, &["merge", "-q", "--no-ff", "-m", "merge task/x", "task/x"]);
+        run(&work, &["merge", "-q", "--ff-only", "task/x"]);
         commit_in(&work, "later");
         run(&work, &["push", "-q", "origin", "main"]);
-        let repos = inspect(&Workdir::host(&work), Some("task/x")).unwrap();
+        let repos = inspect(&Workdir::host(&work), Some("task/x"), Some(1)).unwrap();
         assert_eq!(repos[0].1, RepoState::BranchBehindBase, "{repos:?}");
     }
 
@@ -751,9 +782,30 @@ mod tests {
         run(&work.join("kb"), &["checkout", "-q", "task/x"]);
         run(&work, &["fetch", "-q", "origin"]);
         run(&work.join("kb"), &["fetch", "-q", "origin"]);
-        let repos = inspect(&Workdir::host(&work), Some("task/x")).unwrap();
+        // The implementation began after those commits were made.
+        let repos = inspect(&Workdir::host(&work), Some("task/x"), Some(i64::MAX)).unwrap();
         assert!(repos.iter().all(|(_, s)| *s == RepoState::Untouched), "{repos:?}");
         assert!(is_lost(&repos));
+        // With no implementation conversation to date it by, nothing is called lost.
+        let repos = inspect(&Workdir::host(&work), Some("task/x"), None).unwrap();
+        assert!(!is_lost(&repos), "{repos:?}");
+    }
+
+    /// A branch fast-forward merged into the default branch has its tip on the
+    /// default branch's first-parent line, just as a stub's tip is; only the
+    /// time its commit was made (after the implementation began) says it is work.
+    #[test]
+    fn a_fast_forward_merged_branch_is_not_a_stub() {
+        let (_dir, work) = fixture();
+        commit_in(&work, "w");
+        run(&work, &["push", "-q", "origin", "HEAD:refs/heads/task/x"]);
+        run(&work, &["checkout", "-q", "main"]);
+        run(&work, &["merge", "-q", "--ff-only", "task/x"]);
+        commit_in(&work, "later");
+        run(&work, &["push", "-q", "origin", "main"]);
+        let repos = inspect(&Workdir::host(&work), Some("task/x"), Some(1)).unwrap();
+        assert_eq!(repos[0].1, RepoState::BranchBehindBase, "{repos:?}");
+        assert!(!is_lost(&repos));
     }
 
     #[test]
