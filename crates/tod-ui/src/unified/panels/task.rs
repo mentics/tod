@@ -1636,9 +1636,9 @@ impl TaskPanel {
         // Status pieces wrap onto further lines when the panel is narrow;
         // long text keeps a readable minimum width instead of collapsing.
         let mut line = div().flex().flex_wrap().items_center().gap_x_2().gap_y_1().flex_auto().min_w(gpui::px(160.));
-        if !done {
-            line = line.child(self.render_phase_chip(cx));
-        }
+        // Shown in every state, `done` included: a node moved on by mistake
+        // is moved back from here.
+        line = line.child(self.render_phase_chip(cx));
         if let Some(cloud) = &self.runner.cloud {
             let mut text = match &self.runner.cloud_sandbox {
                 Some(sandbox) => format!("in the cloud (sandbox {sandbox})"),

@@ -104,7 +104,9 @@ as a request.
 
 One line for the task's **runner** (its lifecycle processor, one per task):
 the lifecycle state, what the agent is doing, how long, and tokens, with
-pause and resume at the end.
+pause and resume at the end. The state is a chip in every state, `done`
+included; picking another phase from it moves the node there at once,
+bypassing the gates (to correct a mistake).
 
 | Runner is | Line shows |
 |---|---|
@@ -112,7 +114,7 @@ pause and resume at the end.
 | waiting on a request | state · waiting and for how long |
 | paused by the user | state · paused · resume |
 | failed | state · the error · retry |
-| done | done |
+| done | done (the state chip still lists every other phase, to move it back) |
 
 Who the node is waiting on (the user, someone or something else, or nobody
 because it is being worked) is `tod_core::next_actor`'s answer, rendered by
