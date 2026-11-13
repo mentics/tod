@@ -31,6 +31,16 @@ turns, findings, run_state, node_timeline, journey records):
 
 ---
 
+## 2026-11-12: agent asked the user to install a missing tool
+
+- **Seen**: 1 node (update-db-monitors-to-filter-out-use…), 2026-11-12.
+- **Symptom**: a `broken` request: "Install terraform in the sandbox, then pick Fixed, try again", after `which terraform tofu` found nothing, for a plan step that runs `terraform plan`.
+- **Cause**: the autonomous stance listed "a tool is missing" among the faults not to work around and to file as `broken`, so the agent read installing the tool as a forbidden workaround. The sandbox is root-capable with internet access, so the install was one command.
+- **Fix**: `stance/autonomous-session.md` now has "A tool you lack, you install" (release binary, apt, pip, npm, cargo; the pinned version; ask only when the install itself fails, naming each command and error), "a tool is missing" is removed from the faults list there and in `domain/lifecycle.md`, and "Wording a request" says never to ask the user to install a program. Test `autonomous_stance_has_agent_install_missing_tools`. No tool list added to `bootstrap.sh`: the repository has no generic per-repository extra-tools place, and tools stay the agent's to install.
+- **Measure**: `broken` decisions whose text matches "not installed" / "not found" / "install" (should be zero); count of such decisions answered with "Fixed, try again" and no other change.
+
+---
+
 ## 2026-11-12: lost work left a node in review, asking the user in a loop
 
 - **Seen**: 2 nodes (ENG-2068, ENG-2287), in `review`; ENG-2068 asked twice.

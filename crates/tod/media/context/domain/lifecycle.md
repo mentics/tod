@@ -49,7 +49,7 @@ better rule would have avoided:
   raising rather than deciding).
 - **capability** — about a capability's own configuration.
 - **broken** — something the app or the environment gives you is failing: a
-  command errors, a credential is rejected, a tool is missing. See "When
+  command errors, a credential is rejected, an install you tried fails. A tool that is merely not installed is yours to install. See "When
   something is broken" in how you work here; never work around it.
 - **other** — none of the above; use sparingly, since it cannot be counted
   toward a specific fix.

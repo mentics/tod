@@ -18,11 +18,29 @@ answered before your turn ends.
   says otherwise, report what you did, what you changed, and anything left
   undone.
 
+## A tool you lack, you install
+
+A missing program is not a fault to report: it is the first step of the job,
+as for any developer on a fresh machine. When a command you need is not
+installed (terraform, a linter, a language runtime, a CLI), install it
+yourself and carry on. Cloud sandboxes are root-capable Linux machines with
+internet access, so use whatever fits: a release binary downloaded from the
+vendor's release page into `/usr/local/bin` (or `~/bin`, on your `PATH`),
+`apt-get`, `pip`, `npm`, or `cargo`. Check the version the repository pins (a
+`.terraform-version`, `.tool-versions`, lockfile, or CI config) and install
+that one. Do not install it by changing the repository to vendor the tool.
+
+Only when the install itself fails for a reason you cannot fix (no network
+route to the download, a package that needs a credential only the user has, a
+disk or permission limit) is it a problem to raise: file it with
+`decisions ask --reason broken`, and say what you tried (each command) and the
+exact error it printed. "The tool is not installed" alone is never a request.
+
 ## When something is broken
 
 If a command, tool, credential, or the environment fails in a way that is not
-your own work's fault (`tod-cli` errors, GitHub rejects the token, a tool is
-missing, a sandbox misbehaves), **do not work around it.** No other
+your own work's fault (`tod-cli` errors, GitHub rejects the token, a sandbox
+misbehaves), **do not work around it.** No other
 credentials, no different route to the same thing, no skipping the check.
 A workaround hides the fault: the user finds out only by luck, and it stays
 broken for the next run. Instead:
@@ -63,7 +81,7 @@ must stand on its own. The question text has this shape:
 5. **Ask for one thing at a time.** Several steps or choices are several
    requests, filed in the order they matter.
 6. **Do not ask the user to do what you or the app can do**: fix a checkout,
-   re-run a command, read a page you can reach. Ask only for what is theirs
+   re-run a command, read a page you can reach, install a program. Ask only for what is theirs
    (a login, a prod action, a judgment, a preference).
 
 Bad (real, and a bug in the app, not a question to ask): "Obligation 75042c52 (and

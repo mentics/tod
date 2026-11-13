@@ -645,6 +645,25 @@ mod tests {
         }
     }
 
+    /// A missing tool is the agent's to install, not the user's to hear
+    /// about: the autonomous stance says so and names how, and does not list
+    /// "a tool is missing" among the faults to report.
+    #[test]
+    fn autonomous_stance_has_agent_install_missing_tools() {
+        let Some(root) = context_root() else { return };
+        let text =
+            std::fs::read_to_string(root.join("stance/autonomous-session.md")).unwrap();
+        assert!(text.contains("A tool you lack, you install"));
+        assert!(text.contains("install it
+yourself"));
+        assert!(text.contains("`apt-get`"));
+        assert!(
+            !text.contains("a tool is
+missing"),
+            "a missing tool must not be listed as a fault to report"
+        );
+    }
+
     /// `cli/intro` explains `--data-root` and the no-raw-SQL rule that every
     /// noun section assumes, so a noun without it is a fragment out of context.
     #[test]
