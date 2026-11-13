@@ -966,8 +966,8 @@ impl SandboxBackend for BlaxelBackend {
     }
 
     fn secure_commits(&mut self, fleet: &FleetStore, node_id: &str, name: &str) -> Result<()> {
-        tod_store::fleet::provision::ensure_work_pushed(fleet, node_id)
-            .with_context(|| format!("sandbox {name} was not deleted"))
+        let info = self.bx.get(name).with_context(|| format!("look up sandbox {name}"))?;
+        tod_store::fleet::provision::ensure_work_pushed(fleet, node_id, name, info.as_ref())
     }
 
     fn checkpoint(&mut self, fleet: &FleetStore, node_id: &str, name: &str) -> Result<()> {

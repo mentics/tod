@@ -241,6 +241,28 @@ pub fn list_orphan_sandboxes_at(root: &Path, min_age: Duration) -> Result<Vec<Or
 
 fn delete_orphans_with(root: &Path, names: &[String], still: HashSet<String>) -> Result<Vec<String>> {
     let bx = tod_store::fleet::sandbox::Sandboxes::load(root)?.blaxel()?;
+    delete_orphans_via(
+        names,
+        &still,
+        // An orphan may hold a node's work (a record this machine does not
+        // hold, a lost location): the same guard as every node-sandbox delete.
+        &mut |name| {
+            let info = bx.get(name).with_context(|| format!("look up sandbox {name}"))?;
+            tod_store::fleet::provision::secure_sandbox_commits(info.as_ref(), name, None)
+        },
+        &mut |name| bx.delete(name),
+    )
+}
+
+/// [`delete_orphans_with`] over what looks at a sandbox and what deletes one.
+/// An orphan that holds commits no remote has (or cannot be looked at) is
+/// skipped with an error naming it, never deleted.
+fn delete_orphans_via(
+    names: &[String],
+    still: &HashSet<String>,
+    secure: &mut dyn FnMut(&str) -> Result<()>,
+    delete: &mut dyn FnMut(&str) -> Result<()>,
+) -> Result<Vec<String>> {
     let mut deleted = Vec::new();
     let mut failed = Vec::new();
     for name in names {
@@ -248,7 +270,11 @@ fn delete_orphans_with(root: &Path, names: &[String], still: HashSet<String>) ->
             failed.push(format!("{name}: not an orphan now (recorded by a node, too young, or gone)"));
             continue;
         }
-        match bx.delete(name) {
+        if let Err(err) = secure(name) {
+            failed.push(format!("{name}: {err:#}"));
+            continue;
+        }
+        match delete(name) {
             Ok(()) => {
                 tracing::info!("cloud: deleted orphan sandbox {name}");
                 deleted.push(name.clone());
@@ -292,6 +318,31 @@ pub fn age_text(age: Duration) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn an_orphan_holding_commits_no_remote_has_is_skipped_with_an_error_not_deleted() {
+        let names = vec!["node-a".to_string(), "node-b".to_string()];
+        let still: HashSet<String> = names.iter().cloned().collect();
+        let mut deleted = Vec::new();
+        let err = delete_orphans_via(
+            &names,
+            &still,
+            &mut |name| {
+                if name == "node-a" {
+                    anyhow::bail!("sandbox node-a was not deleted: 1 commit(s) in . that no remote has (newest: abc the fix)")
+                }
+                Ok(())
+            },
+            &mut |name| {
+                deleted.push(name.to_string());
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        let err = format!("{err:#}");
+        assert!(err.contains("node-a") && err.contains("the fix"), "{err}");
+        assert_eq!(deleted, ["node-b"], "the clean orphan went, the one with work did not");
+    }
 
     fn sandbox(name: &str, created: &str, node_env: bool) -> Value {
         let envs = if node_env { json!([{ "name": "TOD_NODE", "value": "n1" }]) } else { json!([]) };

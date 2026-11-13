@@ -630,25 +630,18 @@ pub fn refresh_sandbox_proxy(
                         "{name} holds uncommitted changes that recreating it would lose"
                     )));
                 }
-                Ok(false) => {
-                    progress(&format!("pushing the branch in {name}…"));
-                    if push_branches(&dir).is_err() {
-                        return Ok(SandboxRefresh::NeedsConfirmation(format!(
-                            "the branch could not be pushed from {name}, so recreating it could lose commits"
-                        )));
-                    }
-                }
+                Ok(false) => {}
                 Err(_) => {
                     return Ok(SandboxRefresh::NeedsConfirmation(format!(
                         "{name} could not be checked for unpushed work"
                     )));
                 }
             }
-        } else if matches!(dirty, Ok(false)) && push_branches(&dir).is_err() {
-            return Ok(SandboxRefresh::NeedsConfirmation(format!(
-                "the branch could not be pushed from {name}, so recreating it could lose commits"
-            )));
         }
+        // Commits are never given up, not even when the user agreed to lose
+        // uncommitted files: pushed, or an error and nothing is deleted.
+        progress(&format!("pushing the branches in {name}…"));
+        secure_sandbox_commits(Some(&info), &name, Some(&location))?;
     }
     // Its agent's session logs outlive it: the new sandbox gets them back
     // ([`make_sandbox`]), so the conversation resumes the same session.
@@ -1329,6 +1322,8 @@ pub fn retire_unusable_sandbox(fleet: &FleetStore, node_id: &str, progress: &mut
     };
     if let Some(why) = sandbox::dead_reason(&info) {
         progress(&format!("removing {name}: {why}…"));
+        // Dead: nothing to inspect (see `secure_sandbox_commits`, which says so).
+        secure_sandbox_commits(Some(&info), &name, location.as_ref())?;
         bx.delete(&name).with_context(|| format!("delete sandbox {name}"))?;
         wait_gone(&bx, &name)?;
         forget_location(&mut sandboxes)?;
@@ -1340,6 +1335,7 @@ pub fn retire_unusable_sandbox(fleet: &FleetStore, node_id: &str, progress: &mut
     progress("Upgrading the node's sandbox so it can run its autopilot…");
     super::session_log::pull_node(&root, node_id, &name)
         .with_context(|| format!("save {name}'s agent session logs; nothing was deleted"))?;
+    secure_sandbox_commits(Some(&info), &name, location.as_ref())?;
     super::node_checkpoint::checkpoint_node(fleet, node_id)
         .with_context(|| format!("checkpoint {name}'s uncommitted work; nothing was deleted"))?;
     bx.delete(&name).with_context(|| format!("delete sandbox {name}"))?;
@@ -1697,21 +1693,66 @@ pub fn ensure_work_pushed_in(dir: &Workdir) -> Result<()> {
     )
 }
 
-/// [`ensure_work_pushed_in`] for a node's sandbox. `Ok` when the node has no
-/// sandbox, or the sandbox is gone (there is nothing left to save). Runs git
-/// and the network and wakes the sandbox: never on the UI thread.
-pub fn ensure_work_pushed(fleet: &FleetStore, node_id: &str) -> Result<()> {
-    let Some(location) = node_location(fleet, node_id)? else { return Ok(()) };
-    if location.sandbox().is_none() {
+/// **The one guard in front of every delete of a node's sandbox** (the menu's
+/// Delete, the retire at `done`, Files location removal, recreating for new
+/// credentials, replacing an old-style sandbox, an orphan sweep): commits no
+/// remote has are pushed, and what cannot be pushed refuses the delete with an
+/// error naming the repository, the count and the newest subjects. Nothing in
+/// this crate may delete a node's sandbox without calling it first.
+///
+/// `info` is Blaxel's record of the sandbox (`None`: Blaxel has none, so
+/// there is nothing to delete). A sandbox whose record says it is dead
+/// ([`sandbox::dead_reason`]: failed, terminated, deleting, expired) cannot
+/// run git or anything else, so there is nothing to inspect: its work went
+/// when it died, and the delete only removes what is already gone. That is the
+/// one case that passes without looking; every other failure to look (the
+/// relay does not answer, no `origin`, git fails) is an error and nothing is
+/// deleted. `location` is the node's Files location when the sandbox is its
+/// recorded one (its directory is used), else the checkout is found in the
+/// sandbox ([`find_sandbox_checkout`]). Does not take the node lock, so a
+/// caller that holds it may call it. Runs git and the network and wakes the
+/// sandbox: never on the UI thread.
+pub fn secure_sandbox_commits(
+    info: Option<&tod_sandbox::blaxel::SandboxInfo>,
+    name: &str,
+    location: Option<&FilesLocation>,
+) -> Result<()> {
+    secure_sandbox_commits_with(info, name, || match location {
+        Some(l) if l.sandbox() == Some(name) => location_dir(l),
+        _ => Ok(Workdir::sandbox(name, find_sandbox_checkout(name)?)),
+    })
+}
+
+/// [`secure_sandbox_commits`] with the checkout supplied, so it can be tested
+/// against a local repository.
+fn secure_sandbox_commits_with(
+    info: Option<&tod_sandbox::blaxel::SandboxInfo>,
+    name: &str,
+    checkout: impl FnOnce() -> Result<Workdir>,
+) -> Result<()> {
+    let Some(info) = info else { return Ok(()) };
+    if sandbox::dead_reason(info).is_some() {
         return Ok(());
     }
-    let lock = node_lock(node_id);
-    let _held = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let dir = location_dir(&location)?;
+    let dir = checkout().with_context(|| format!("sandbox {name} was not deleted"))?;
     match ensure_work_pushed_in(&dir) {
         Err(err) if sandbox_is_gone(&err) => Ok(()),
-        other => other,
+        other => other.with_context(|| format!("sandbox {name} was not deleted")),
     }
+}
+
+/// [`secure_sandbox_commits`] for a node's own sandbox `name`, under the
+/// node's lock (for a caller that does not hold it). Looks the location up.
+pub fn ensure_work_pushed(
+    fleet: &FleetStore,
+    node_id: &str,
+    name: &str,
+    info: Option<&tod_sandbox::blaxel::SandboxInfo>,
+) -> Result<()> {
+    let location = node_location(fleet, node_id)?;
+    let lock = node_lock(node_id);
+    let _held = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    secure_sandbox_commits(info, name, location.as_ref())
 }
 
 /// Remove `node_id`'s location: refused while something runs in it or it
@@ -1747,7 +1788,15 @@ pub fn remove_location(
         LocationState::Clean => {
             let dir = location_dir(&location)?;
             progress(&format!("pushing the branch in {}…", location.describe()));
-            push_branches(&dir).with_context(|| format!("{} was kept", location.describe()))?;
+            if let Some(name) = location.sandbox() {
+                // Every commit, in every repository and branch, or nothing goes.
+                let sandboxes = Sandboxes::load(fleet.paths().root())?;
+                let info = sandboxes.blaxel()?.get(name)?;
+                secure_sandbox_commits(info.as_ref(), name, Some(&location))
+                    .with_context(|| format!("{} was kept", location.describe()))?;
+            } else {
+                push_branches(&dir).with_context(|| format!("{} was kept", location.describe()))?;
+            }
             if location.sandbox().is_some() {
                 // Clean and pushed: nothing a checkpoint holds is wanted.
                 crate::fleet::node_checkpoint::delete_in(&dir, node_id)
@@ -2048,6 +2097,67 @@ mod tests {
         ensure_work_pushed_in(&dir).unwrap();
         assert!(unpushed_commits(&dir).unwrap().is_empty());
         assert!(git(&remote, &["log", "--format=%s", "task/x"]).contains("the fix"));
+    }
+
+    /// The guard every node-sandbox delete shares (Files location removal,
+    /// recreating for credentials, the upgrade, the menu's delete through
+    /// `ensure_work_pushed`, orphans), against a local repository standing in
+    /// for the sandbox's checkout.
+    #[test]
+    fn the_shared_guard_pushes_commits_and_passes_only_what_has_nothing_to_inspect() {
+        let (_tmp, remote, work) = unpushed_fixture();
+        git(&work, &["commit", "-q", "--allow-empty", "-m", "the fix"]);
+        let live = info("node-x", "DEPLOYED");
+        secure_sandbox_commits_with(Some(&live), "node-x", || Ok(Workdir::host(&work))).unwrap();
+        assert!(git(&remote, &["log", "--format=%s", "task/x"]).contains("the fix"));
+
+        // Blaxel has none, or it is dead: nothing to inspect, the checkout is never asked for.
+        for gone in [None, Some(info("node-x", "FAILED")), Some(info("node-x", "TERMINATED"))] {
+            git(&work, &["commit", "-q", "--allow-empty", "-m", "unreachable"]);
+            secure_sandbox_commits_with(gone.as_ref(), "node-x", || panic!("a dead sandbox was inspected")).unwrap();
+        }
+        // A live one whose checkout cannot be found is refused, not passed.
+        let err = secure_sandbox_commits_with(Some(&live), "node-x", || bail!("relay does not answer")).unwrap_err();
+        let err = format!("{err:#}");
+        assert!(err.contains("was not deleted") && err.contains("relay does not answer"), "{err}");
+    }
+
+    #[test]
+    fn the_shared_guard_refuses_a_commit_on_a_branch_that_is_not_checked_out() {
+        let (_tmp, _remote, work) = unpushed_fixture();
+        git(&work, &["checkout", "-q", "-b", "scratch"]);
+        git(&work, &["commit", "-q", "--allow-empty", "-m", "side work"]);
+        git(&work, &["checkout", "-q", "task/x"]);
+        let err = secure_sandbox_commits_with(Some(&info("node-x", "DEPLOYED")), "node-x", || Ok(Workdir::host(&work)))
+            .unwrap_err();
+        let err = format!("{err:#}");
+        assert!(err.contains("side work") && err.contains("1 commit(s) in .") && err.contains("node-x was not deleted"), "{err}");
+    }
+
+    #[test]
+    fn the_shared_guard_refuses_a_commit_in_a_submodule_left_on_a_detached_head() {
+        let (tmp, _remote, work) = unpushed_fixture();
+        let (sub_remote, sub_seed) = (tmp.path().join("sub.git"), tmp.path().join("subseed"));
+        std::fs::create_dir_all(&sub_remote).unwrap();
+        std::fs::create_dir_all(&sub_seed).unwrap();
+        git(&sub_remote, &["init", "-q", "--bare", "-b", "main"]);
+        git(&sub_seed, &["init", "-q", "-b", "main"]);
+        git(&sub_seed, &["config", "user.email", "t@example.com"]);
+        git(&sub_seed, &["config", "user.name", "t"]);
+        git(&sub_seed, &["commit", "-q", "--allow-empty", "-m", "sub base"]);
+        git(&sub_seed, &["remote", "add", "origin", &sub_remote.to_string_lossy()]);
+        git(&sub_seed, &["push", "-q", "origin", "main"]);
+        git(&work, &["-c", "protocol.file.allow=always", "submodule", "add", "-q", &sub_remote.to_string_lossy(), "kb"]);
+        git(&work, &["commit", "-q", "-m", "add kb"]);
+        let kb = work.join("kb");
+        git(&kb, &["config", "user.email", "t@example.com"]);
+        git(&kb, &["config", "user.name", "t"]);
+        git(&kb, &["checkout", "-q", "--detach"]);
+        git(&kb, &["commit", "-q", "--allow-empty", "-m", "detached work"]);
+        let err = secure_sandbox_commits_with(Some(&info("node-x", "DEPLOYED")), "node-x", || Ok(Workdir::host(&work)))
+            .unwrap_err();
+        let err = format!("{err:#}");
+        assert!(err.contains("kb") && err.contains("detached work") && err.contains("no remote has"), "{err}");
     }
 
     #[test]
