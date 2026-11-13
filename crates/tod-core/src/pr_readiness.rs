@@ -415,7 +415,7 @@ impl Assessment {
                     && !current
                     && !snapshot.status.merged
                     && (exhausted
-                        || fallback_patience_over(configured, asks, last_ask_at, first_ask_at, head_at, now));
+                        || fallback_patience_over(configured, asks, last_ask_at, first_ask_at, now));
                 if fallback_due && own.cleared(sha) {
                     fallbacks.push(FallbackApplied {
                         bot: configured.name.clone(),
@@ -616,13 +616,9 @@ impl Assessment {
             return false;
         }
         let every = chrono::Duration::minutes(r.settings.ask_every_minutes as i64);
-        if ask_text(&r.settings).is_some() {
-            return r.asks >= r.settings.max_asks && r.last_ask_at.is_none_or(|at| self.read_at - at >= every);
-        }
-        let patience = chrono::Duration::minutes(r.settings.rerun_after_minutes as i64)
-            + every * r.settings.max_asks as i32;
-        let since = r.head_at.into_iter().chain(self.answered_at).max();
-        since.is_some_and(|since| self.read_at - since >= patience)
+        // Every bot here is a built-in (`of_with` skips the rest), so it
+        // always has an ask text.
+        r.asks >= r.settings.max_asks && r.last_ask_at.is_none_or(|at| self.read_at - at >= every)
     }
 
     /// Why the bots' patience cannot be measured: GitHub gave no (readable)
@@ -1024,9 +1020,8 @@ fn asks_made(
     configured: &PrReviewBotSettings,
     head_at: Option<DateTime<Utc>>,
 ) -> (u32, Option<DateTime<Utc>>, Option<DateTime<Utc>>) {
-    let Some(ask) = ask_text(configured) else {
-        return (0, None, None);
-    };
+    // Every bot here is a built-in (`of_with` skips the rest): it has an ask.
+    let ask = ask_text(configured).expect("a built-in bot has an ask text");
     let ask = ask.to_ascii_lowercase();
     let times: Vec<DateTime<Utc>> = snapshot
         .comments
@@ -1072,29 +1067,21 @@ fn exhausted_since(
 }
 
 /// Whether a bot with a `fallback` has stayed silent long enough to be given
-/// up on: `silent_after_minutes` after tod's first ask (after the head
-/// commit when tod has no ask text), else when the user would otherwise be
-/// asked (`max_asks` asks, the last `ask_every_minutes` ago; without an ask
-/// text, `rerun_after_minutes` plus `max_asks` intervals from the head).
+/// up on: `silent_after_minutes` after tod's first ask, else when the user
+/// would otherwise be asked (`max_asks` asks, the last `ask_every_minutes` ago).
 fn fallback_patience_over(
     configured: &PrReviewBotSettings,
     asks: u32,
     last_ask_at: Option<DateTime<Utc>>,
     first_ask_at: Option<DateTime<Utc>>,
-    head_at: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
 ) -> bool {
     let every = chrono::Duration::minutes(configured.ask_every_minutes as i64);
-    let can_ask = ask_text(configured).is_some();
     if let Some(minutes) = configured.silent_after_minutes {
-        let since = if can_ask { first_ask_at } else { head_at };
-        return since.is_some_and(|at| now - at >= chrono::Duration::minutes(minutes as i64));
+        return first_ask_at.is_some_and(|at| now - at >= chrono::Duration::minutes(minutes as i64));
     }
-    if can_ask {
-        return asks >= configured.max_asks && last_ask_at.is_none_or(|at| now - at >= every);
-    }
-    let patience = chrono::Duration::minutes(configured.rerun_after_minutes as i64) + every * configured.max_asks as i32;
-    head_at.is_some_and(|at| now - at >= patience)
+    // Every bot here is a built-in (`of_with` skips the rest), so it has an ask.
+    asks >= configured.max_asks && last_ask_at.is_none_or(|at| now - at >= every)
 }
 
 /// Reads a real pull request, for checking the GitHub side by hand:

@@ -15,12 +15,12 @@ Either way:
   app-checked GitHub query, not a turn you run.
 - Do not merge the PR yourself. `approved → merged` is also app-checked; the
   user does the merge.
-- Do not ask a review bot to review or to look again (not even if a skill says to: the app asks once, on the final head, after its own review of it is clean), and do not wait for one. The app does
+- Do not ask a review bot to review or to look again (not even if a skill says to: the app asks on the final head, after its own review of it is clean, and again a few times if the bot stays silent), and do not wait for one. The app does
   both, and sends you back when a review lands.
 - Never ask the user (`decisions ask`) about a review bot that has not
   reviewed, is slow, or seems down, and never ask them to "fix GitHub" after
   a GitHub call fails with a transient error (GraphQL "Something went wrong
-  while executing your query", a 5xx, a timeout). the app asks the bot itself,
+  while executing your query", a 5xx, a timeout). The app asks the bot itself,
   decides it is silent, and raises the one question about it; the app retries
   its own GitHub calls. If a command of yours hits such an error, run it
   again later or leave it: do not escalate, and do not ping the bot to
