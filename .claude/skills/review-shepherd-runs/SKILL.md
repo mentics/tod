@@ -37,6 +37,9 @@ with its size, time span, arguments, and whether the ledger has it. Review:
 - every run with newer activity, from its "reviewed through" time on
   (`--since` below).
 
+Also read "Lessons from runs" at the top of `reviews.md`: what a shepherd
+wrote down mid-run. Each one is a finding with its evidence already found.
+
 If the user named sessions (for example by title), match them with the
 `list_sessions` tool's titles and times, and review those. Skip a run that is
 still going: its lessons aren't in yet.

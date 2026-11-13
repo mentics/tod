@@ -1,5 +1,13 @@
 # shepherd-nodes reviews
 
+## Lessons from runs
+
+The shepherd adds here what it learned mid-run that the skill should have told
+it (it doesn't edit its own skill during a run). Each review folds these into
+the skill and clears the ones it applied.
+
+(none yet)
+
 ## Transcripts reviewed
 
 - `fec2b2b0-45ba-43a3-bacb-1d4613e56139` reviewed through 2026-11-12T23:12:20Z — Shepherd nodes for Eng tasks (1st run)
@@ -8,8 +16,15 @@
 ## 2026-11-13: the two "Eng tasks" runs
 
 Scope: every Lifecycle node under "Eng tasks" (`linear-tasks`, 46 nodes) on the
-live root. About 20 fixes merged and deployed across both runs. Applied: nothing
-yet (this review created the skill). All findings below are **open**.
+live root. About 20 fixes merged and deployed across both runs.
+
+**Applied 2026-11-13** to `shepherd-nodes/SKILL.md`, merged over 36eefdc7
+(every phase through `done`) and the other session's uncommitted edit (no
+"never start a node", no company names): A–F and 1–9 in the skill, B and G
+partly as tooling (`shepherd-nodes/scripts/survey.py`, a one-command sandbox
+probe). Finding 2 was already done by 36eefdc7. Still open: whether the
+shepherd may edit its own skill (F: it now writes lessons to this file
+instead), and the skill is ~325 lines, over the ~300 target.
 
 Profiles (`digest.py --stats`):
 - Run 1: 4 h 17 min, 2 compactions, 17 subagents, 140 Bash calls, 8 errors
