@@ -42,7 +42,16 @@ fn pinned_commit(parent: &Path, rel: &str) -> Option<String> {
 /// Whether `repo`'s HEAD has commits of the node's own that no remote has:
 /// not on any remote-tracking ref and not in the lineage `pinned` (what the
 /// parent recorded before the node's work) already holds.
+///
+/// The remote-tracking refs are refreshed first: a stale `origin/main` makes an
+/// upstream commit (a submodule checked out at what the base pins) look like
+/// the node's own. A failed fetch is an error naming the repository, never a
+/// guess from the stale refs. With no `origin` there is nothing to refresh.
 fn has_unpushed(repo: &Path, pinned: Option<&str>) -> Result<bool> {
+    if git(repo, &["remote", "get-url", "origin"]).is_ok() {
+        git(repo, &["fetch", "--quiet", "--no-recurse-submodules", "origin"])
+            .with_context(|| format!("refresh the remote refs of {} before checking for unpushed commits", repo.display()))?;
+    }
     let mut args = vec!["rev-list", "-n1", "HEAD", "--not", "--remotes"];
     if let Some(p) = pinned {
         ensure_commit(repo, p)?;
@@ -292,6 +301,46 @@ mod tests {
         commit_in_kb(&work);
         push_branch(&work).unwrap();
         assert!(run(&sub_remote, &["branch", "--list", "task/x"]).contains("task/x"));
+    }
+
+    /// The live failure: a submodule sitting on an upstream commit (what the
+    /// base pins) that its stale remote-tracking ref has not seen is not the
+    /// node's work, and nothing is pushed or failed.
+    #[test]
+    fn an_upstream_commit_behind_a_stale_remote_ref_is_not_the_nodes_own() {
+        let (work, _ws_remote, sub_remote) = fixture();
+        let root = work.parent().unwrap().to_path_buf();
+        let subseed = root.join("subseed");
+        std::fs::write(subseed.join("b"), "b").unwrap();
+        run(&subseed, &["add", "."]);
+        run(&subseed, &["commit", "-qm", "upstream"]);
+        run(&subseed, &["push", "-q", "origin", "HEAD:main"]);
+        let upstream = run(&subseed, &["rev-parse", "HEAD"]);
+        let kb = work.join("kb");
+        // Fetch the commit without updating origin/main, then sit on it detached.
+        run(&kb, &["fetch", "-q", "origin", &upstream]);
+        run(&kb, &["checkout", "-q", "--detach", &upstream]);
+        assert_ne!(run(&kb, &["rev-parse", "origin/main"]), upstream, "precondition: origin/main is stale");
+        push_branch(&work).unwrap();
+        assert!(run(&sub_remote, &["branch", "--list", "task/x"]).is_empty());
+    }
+
+    #[test]
+    fn an_own_commit_on_a_detached_head_still_fails_after_the_refresh() {
+        let (work, _ws_remote, sub_remote) = fixture();
+        run(&work.join("kb"), &["checkout", "-q", "--detach"]);
+        commit_in_kb(&work);
+        let err = format!("{:#}", push_branch(&work).unwrap_err());
+        assert!(err.contains("submodule kb") && err.contains("not known") || err.contains("nothing was pushed"), "{err}");
+        assert!(run(&sub_remote, &["branch", "--list", "task/x"]).is_empty());
+    }
+
+    #[test]
+    fn an_unreachable_origin_is_an_error_naming_the_repository() {
+        let (work, _ws_remote, _sub_remote) = fixture();
+        run(&work.join("kb"), &["remote", "set-url", "origin", "/nonexistent/kb.git"]);
+        let err = format!("{:#}", push_branch(&work).unwrap_err());
+        assert!(err.contains("submodule kb") && err.contains("refresh the remote refs"), "{err}");
     }
 
     #[test]

@@ -434,3 +434,11 @@ from Blaxel.
 - **Seen**: found by an independent review of the fix for ENG-2068's lost kb work; none hit a live node yet.
 - **Open**: (1) in a parent with no origin, a submodule commit the parent already records counts as the base, so it is not reported (only matters without a remote); (2) `let outcome = run?;` returns before the run-end push check, so a push failure is dropped when the run itself failed; (3) a parent with an origin but no `origin/main` ref may report a healthy detached submodule as unpushed (not reproduced); (4) the boundary-push test also passes on the old code, so it guards the wiring only loosely.
 - **Measure**: count of runs ending with a push failure named in their error.
+
+## 2026-11-12: supervisor push failed on a submodule sitting at an upstream commit
+
+- **Seen**: nodes `clean-up-dangling-manufacturer-stateme-2` and `data-fix-repoint-org-parts-on-deprecat-2` stopped `failed`: "submodule infra: it has commits of the node's own no remote has, but nothing was pushed (detached HEAD or no origin)".
+- **Symptom**: a submodule detached at an upstream commit of its default branch (c8623f6) was reported as holding the node's own work.
+- **Cause**: `has_unpushed` (`tod-supervisor/src/git.rs`) counted commits on no remote-tracking ref, but the submodule's `origin/main` was never refreshed (tod fetches without recursing), so an upstream commit looked like the node's. Not yet fixed: `tod_core::lost_work::state_of` compares against the same kind of possibly stale refs without fetching; it was left because that check inspects checkouts and says to fetch origin.
+- **Fix**: `has_unpushed` fetches `origin` (no submodule recursion) before deciding; a failed fetch is an error naming the repository, no fallback. Own commits on a detached HEAD still fail. Tests: `an_upstream_commit_behind_a_stale_remote_ref_is_not_the_nodes_own`, `an_own_commit_on_a_detached_head_still_fails_after_the_refresh`, `an_unreachable_origin_is_an_error_naming_the_repository`.
+- **Measure**: runs ending with "no remote has, but nothing was pushed" for a submodule whose HEAD is an ancestor of its origin's default branch (should be zero); runs failing with "refresh the remote refs".
