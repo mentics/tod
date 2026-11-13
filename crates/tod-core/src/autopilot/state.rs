@@ -152,6 +152,12 @@ pub struct LoopCounters {
     /// limit (`lifecycle.review_round_limit`).
     #[serde(default)]
     pub check_rounds: u32,
+    /// Reviews of the pull request's draft started before this (ms since the
+    /// epoch) are not counted toward the review round limit: a user's go-on
+    /// after a [`crate::autopilot::NeedsHuman::ReviewNotConverging`] stop moves
+    /// it to now, as those rounds are counted from the database, not here.
+    #[serde(default)]
+    pub review_floor_ms: i64,
     /// The fingerprint of the files the failing checks were last sent to the
     /// fix agent for: failing again on the same files means it changed nothing.
     #[serde(default)]
@@ -263,6 +269,7 @@ impl AutopilotState {
         state.current = None;
         state.pending_groups = None;
         state.loops.clear();
+        state.loops.review_floor_ms = now_ms();
         state.outcome = None;
         state.save(data_root, node)
     }

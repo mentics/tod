@@ -115,7 +115,7 @@ pub struct LocalRun {
 
 impl LocalRun {
     /// Start (or continue) `node`'s run. With `renew_budget` the run gets a
-    /// fresh budget first ([`Autopilot::renew_budget`]). `on_event` is called
+    /// fresh budget first ([`Autopilot::renew_budget`]); with `user_go_on` (the user asked, not a timer or a restart) a stop at a round limit starts a fresh set of rounds ([`Autopilot::user_go_on`]). `on_event` is called
     /// on the run's thread.
     pub fn start(
         fleet: Arc<FleetStore>,
@@ -124,9 +124,10 @@ impl LocalRun {
         node: Uuid,
         budget: Budget,
         renew_budget: bool,
+        user_go_on: bool,
         on_event: impl FnMut(LocalEvent) + Send + 'static,
     ) -> Result<Self> {
-        Self::start_with(fleet, agent, config, node, budget, renew_budget, None, on_event)
+        Self::start_with(fleet, agent, config, node, budget, renew_budget, user_go_on, None, on_event)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -137,6 +138,7 @@ impl LocalRun {
         node: Uuid,
         budget: Budget,
         renew_budget: bool,
+        user_go_on: bool,
         poll: Option<std::time::Duration>,
         mut on_event: impl FnMut(LocalEvent) + Send + 'static,
     ) -> Result<Self> {
@@ -174,6 +176,8 @@ impl LocalRun {
                     }
                     if renew_budget {
                         pilot.renew_budget()?;
+                    } else if user_go_on {
+                        pilot.user_go_on()?;
                     }
                     let outcome = pilot.run_with(&fleet, &mut SharedAgentAccess(&agent), &mut hook);
                     // Before the run stops for a wait, a request, or the end.

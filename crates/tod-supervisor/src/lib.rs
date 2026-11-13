@@ -812,6 +812,15 @@ pub fn wake(config: Config) -> Result<Woke> {
     consume_requests(&store, &taken, &consumer)?;
     let run = Autopilot::new(conversation, config.node, budget)
         .map(|pilot| pilot.with_poll_interval(config.poll))
+        .and_then(|mut pilot| {
+            // The user asked (Resume, a new session, a fresh budget): a stop at
+            // a round limit starts a fresh set of rounds. A wake nobody asked
+            // for leaves the limit in force.
+            if run_requested {
+                pilot.user_go_on()?;
+            }
+            Ok(pilot)
+        })
         .and_then(|mut pilot| loop {
             let outcome = pilot.run_with(&store, &mut agent, &mut hook)?;
             if std::mem::take(&mut hook.stop_pending) {

@@ -249,7 +249,7 @@ impl Runners {
                 None => {
                     tracing::info!(%node, "resuming the run the daemon was stopped on");
                     // A failure is recorded on the node by `start`.
-                    if let Err(err) = self.start(node, false) {
+                    if let Err(err) = self.start_auto(node) {
                         tracing::error!(%node, "could not resume: {err:#}");
                     }
                 }
@@ -299,7 +299,7 @@ impl Runners {
         for node in due {
             tracing::info!(%node, "the wait is due; checking again");
             // A failure is recorded on the node by `start`.
-            if let Err(err) = self.start(node, false) {
+            if let Err(err) = self.start_auto(node) {
                 tracing::error!(%node, "could not check the wait again: {err:#}");
             }
         }
@@ -328,7 +328,7 @@ impl Runners {
         }
         for node in resume {
             tracing::info!(%node, "the run's request was answered; continuing");
-            if let Err(err) = self.start(node, false) {
+            if let Err(err) = self.start_auto(node) {
                 tracing::error!(%node, "could not continue after the answer: {err:#}");
             }
         }
@@ -443,7 +443,7 @@ impl Runners {
                     dead.join();
                 }
                 tracing::warn!(%node, "desired to run but nothing is running it; starting it");
-                let started = self.start(node, false);
+                let started = self.start_auto(node);
                 // The restart is recorded where the journey records who is next.
                 actor_journey::record(&[actor_journey::Change {
                     node,
@@ -521,6 +521,16 @@ impl Runners {
     /// is left alone. When it cannot be started the failure is recorded as
     /// the run's outcome (the node shows it) and returned.
     pub fn start(&self, node: Uuid, renew_budget: bool) -> Result<()> {
+        self.start_as(node, renew_budget, true)
+    }
+
+    /// A start nobody asked for (a restart, a due wait, an answered request):
+    /// a stop at a round limit stays in force.
+    fn start_auto(&self, node: Uuid) -> Result<()> {
+        self.start_as(node, false, false)
+    }
+
+    fn start_as(&self, node: Uuid, renew_budget: bool, user_go_on: bool) -> Result<()> {
         // Refused before anything is recorded: the run is not this daemon's, so
         // a failure outcome saved here would only mask the supervisor's.
         match RunnerPlace::of(&self.inner.store, node)? {
@@ -536,7 +546,7 @@ impl Runners {
             }
             slot.starting = true;
         }
-        match self.spawn(node, renew_budget) {
+        match self.spawn(node, renew_budget, user_go_on) {
             Ok(run) => {
                 {
                     let mut slots = self.inner.slots.lock().expect("runner slots");
@@ -558,7 +568,7 @@ impl Runners {
         }
     }
 
-    fn spawn(&self, node: Uuid, renew_budget: bool) -> Result<LocalRun> {
+    fn spawn(&self, node: Uuid, renew_budget: bool, user_go_on: bool) -> Result<LocalRun> {
         let root = self.inner.store.paths().root().to_path_buf();
         let config = config(&root).map_err(|e| anyhow!("{e}"))?;
         let inner = self.inner.clone();
@@ -569,6 +579,7 @@ impl Runners {
             node,
             Budget::default(),
             renew_budget,
+            user_go_on,
             move |event| Inner::on_event(&inner, node, event),
         )
         .map_err(|e| anyhow!("Starting the runner failed: {e:#}"))

@@ -891,6 +891,7 @@ fn a_local_run_takes_the_node_to_done_on_its_own_thread() {
         fx.node,
         Budget::default(),
         false,
+        false,
         Some(Duration::ZERO),
         move |event| {
             let _ = tx.send(event);
@@ -931,6 +932,7 @@ fn a_local_run_asked_to_pause_stops_at_the_first_boundary() {
         config(&fx),
         fx.node,
         Budget::default(),
+        false,
         false,
         Some(Duration::ZERO),
         move |event| {
@@ -3547,6 +3549,71 @@ fn reviews_that_each_leave_findings_standing_stop_at_the_round_limit_naming_them
         other => panic!("{other:?}"),
     }
     assert!(openings(&fx, ProtocolKind::Review).len() == REVIEW_ROUND_LIMIT as usize, "no further review ran");
+}
+
+/// Seen live (ENG-2068, 2026-11): Resume and Rerun after a stop at the round
+/// limit stopped again at once, because the rounds were never counted afresh.
+#[test]
+fn a_user_go_on_after_the_review_round_limit_starts_a_fresh_set_of_rounds() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    let mut agent = FakeAgent::new(&fx.fleet);
+    agent.review_never_clean = true;
+    let reviews = |pilot: &Autopilot| pilot.state().steps.iter().filter(|s| s.step == "review").count();
+    let mut pilot = autopilot(&fx, Budget::default());
+    let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
+    assert!(matches!(&outcome, Outcome::NeedsHuman { reason: NeedsHuman::ReviewNotConverging { .. } }), "{outcome:?}");
+    assert_eq!(reviews(&pilot), REVIEW_ROUND_LIMIT as usize);
+
+    // A wake nobody asked for (a timer, a restart) leaves the limit in force.
+    let mut pilot = autopilot(&fx, Budget::default());
+    let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
+    assert!(matches!(&outcome, Outcome::NeedsHuman { reason: NeedsHuman::ReviewNotConverging { .. } }), "{outcome:?}");
+    assert_eq!(reviews(&pilot), REVIEW_ROUND_LIMIT as usize, "no further review ran");
+
+    // The user says go on (Resume, in a freshly loaded run as the supervisor's
+    // wake and the daemon's start build it): the next review runs.
+    let mut pilot = autopilot(&fx, Budget::default());
+    pilot.user_go_on().unwrap();
+    let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
+    match &outcome {
+        Outcome::NeedsHuman { reason: NeedsHuman::ReviewNotConverging { rounds, .. } } => {
+            assert_eq!(*rounds, REVIEW_ROUND_LIMIT)
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(reviews(&pilot), 2 * REVIEW_ROUND_LIMIT as usize, "a whole new set of rounds ran, then the limit held");
+
+    // And again, after the second limit.
+    let mut pilot = autopilot(&fx, Budget::default());
+    pilot.user_go_on().unwrap();
+    let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
+    assert!(matches!(&outcome, Outcome::NeedsHuman { reason: NeedsHuman::ReviewNotConverging { .. } }), "{outcome:?}");
+    assert_eq!(reviews(&pilot), 3 * REVIEW_ROUND_LIMIT as usize);
+}
+
+#[test]
+fn a_user_go_on_after_the_pr_draft_review_limit_counts_the_rounds_from_then() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    let feed = OwnReviewFeed::new(false);
+    crate::pr_readiness::set_feed_override(Some(feed.clone()));
+    with_pr_draft_review(&fx);
+    linked_to_prs(&fx, "pr_draft", &["https://github.com/acme/app/pull/42"]);
+    for n in 0..REVIEW_ROUND_LIMIT as usize {
+        seed_unclean_review(&fx, n);
+    }
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut pilot = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO);
+    let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
+    assert!(matches!(&outcome, Outcome::NeedsHuman { reason: NeedsHuman::ReviewNotConverging { .. } }), "{outcome:?}");
+    let before = openings(&fx, ProtocolKind::Review).len();
+
+    let mut pilot = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO);
+    pilot.user_go_on().unwrap();
+    std::thread::sleep(Duration::from_millis(3));
+    let _ = pilot.run(&fx.fleet, &mut agent).unwrap();
+    assert!(openings(&fx, ProtocolKind::Review).len() > before, "the next review ran after the user went on");
 }
 
 /// A pull request whose review bot may or may not come, and that keeps the

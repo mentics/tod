@@ -525,6 +525,37 @@ impl Autopilot {
         // clears the base-merge gap timestamp and count: a click of the user
         // (renew, rerun) is the one thing allowed to start a merge at once.
         self.state.loops.clear();
+        self.state.loops.review_floor_ms = state::now_ms();
+        self.save()
+    }
+
+    /// The user explicitly asked the node to go on (Resume, Start, Rerun this
+    /// phase, a keep-going or fresh-session request): when the run last
+    /// stopped at a round limit, the rounds count from now, as the stop's
+    /// text promises ("run it again for a fresh set of rounds"). Automatic
+    /// wakes (a retry timer, a poke, a restart) must not call this, or a
+    /// limit would never hold. Any other kind of stop leaves the counters
+    /// as they are.
+    pub fn user_go_on(&mut self) -> Result<()> {
+        let limit_stop = matches!(
+            &self.state.outcome,
+            Some(Outcome::NeedsHuman {
+                reason: NeedsHuman::ReviewNotConverging { .. }
+                    | NeedsHuman::ChecksNotConverging { .. }
+                    | NeedsHuman::PrStuck { .. }
+            })
+        );
+        if !limit_stop {
+            return Ok(());
+        }
+        let loops = &mut self.state.loops;
+        loops.review_rounds = 0;
+        loops.check_rounds = 0;
+        loops.checks_sent = None;
+        loops.pr_rounds = 0;
+        loops.pr_unchanged = 0;
+        loops.pr_housekeeping_rounds = 0;
+        loops.review_floor_ms = state::now_ms();
         self.save()
     }
 
@@ -1772,7 +1803,8 @@ impl Autopilot {
                 ChangeStep::Review => {
                     // Only consecutive reviews that did not come back clean count: a
                     // clean one of an earlier head proves convergence.
-                    let rounds = fleet.read(|conn| pr_draft_review::unconverged_rounds_since(conn, node, Some(made_at)))?;
+                    let floor = self.state.loops.review_floor_ms;
+                    let rounds = fleet.read(|conn| pr_draft_review::unconverged_rounds_since(conn, node, Some(made_at.max(floor))))?;
                     // A review the last run left unfinished is resumed, not a new round.
                     let resuming = self.state.current.as_ref().is_some_and(|c| {
                         c.protocol == protocol_name(ProtocolKind::Review) && c.lifecycle == pr_draft_review::STATE
@@ -1857,7 +1889,8 @@ impl Autopilot {
                 }
             }
             Owed::Review => {
-                let rounds = fleet.read(|conn| pr_draft_review::unconverged_rounds(conn, node))?;
+                let floor = self.state.loops.review_floor_ms;
+                let rounds = fleet.read(|conn| pr_draft_review::unconverged_rounds_since(conn, node, Some(floor)))?;
                 // A review the last run left unfinished is resumed, not a new round.
                 let resuming = self.state.current.as_ref().is_some_and(|c| {
                     c.protocol == protocol_name(ProtocolKind::Review) && c.lifecycle == pr_draft_review::STATE
