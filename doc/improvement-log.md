@@ -31,6 +31,24 @@ turns, findings, run_state, node_timeline, journey records):
 
 ---
 
+## 2026-11-12: lost work left a node in review, asking the user in a loop
+
+- **Seen**: 2 nodes (ENG-2068, ENG-2287), in `review`; ENG-2068 asked twice.
+- **Symptom**: the review agent raised a `broken` decision ("restore this task's kb code to the review checkout") offering "Send the task back to active to rebuild the change". Answering it moved nothing: the node stayed in `review`, its plan steps and verdicts stayed `verified`, and the agent asked again.
+- **Cause**: the implementation commits had been lost with a sandbox before they were pushed, so the checkout held plain main while the node's steps claimed the work done. Nothing in tod looked at the checkout against the steps, an answered decision is only sent to the agent, and "send it back" was an option the agent made up with no behaviour behind it.
+- **Fix**: `tod_core::lost_work` (`doc/lifecycle/lost-work.md`): in `verifying`/`review`/`pr`, a node with implemented or verified implementation steps whose checkout and submodules all have no commit beyond their base and nothing uncommitted is reopened by the autopilot, with no question: back to `active`, steps and verdicts open again, its `broken` questions withdrawn, a note on its activity. Commits on the node's branch (local or `origin/<branch>`) count wherever the checkout sits, a node branch on origin at a commit other than the base is not lost, and any git or Files failure is an error, never "not lost" (hardened after two independent reviews: only `broken` questions about the missing work are withdrawn and the rest named in the note, a merged node whose branch was deleted on origin is not lost, the Files directory must be a checkout of its own, and no branch is guessed from the checked-out one). Checked once per state per run and whenever a `broken` question is pending; a second finding in a run stops it (`NeedsHuman::LostWork`). The review and verify prompts no longer let an agent offer "send back" as an option; it asks one `broken` decision and tod resolves it from the checkout.
+- **Measure**: count of `lost_work` steps and `note` timeline entries titled "Lost work: implementation reopened"; runs stopped with `lost_work`; `broken` decisions in `review`/`verification` that stayed pending while the node's branch had no commits (should be zero).
+
+## 2026-11-12: work lost with a sandbox
+
+### A node's work committed in a submodule is never pushed, so a reclaimed sandbox takes it
+
+- **Seen**: 1 node confirmed (ENG-2068, 5631A571), 2026-11-10 to 2026-11-12; any cloud node whose work is in a submodule (`kb`, `flagship`, `ui`, `infra` of `cofactr/workspace`) is exposed. Verification ran on work that no longer existed, and review had to ask the user ("Restore this task's kb code to the review checkout...").
+- **Symptom**: the review session found /workspace/kb on the task branch equal to `origin/main`, the test file the verdicts cited nowhere, no branch for the task in the kb repository, and `workspace`'s task branch holding only a submodule pointer at kb's `main` commit.
+- **Cause**: implementation ran 2026-11-10 06:08-06:23 in the node's first sandbox. The supervisor's `git::push_branch` pushed only the workspace repository's branch; the commits were in the kb submodule, which was never pushed. Checkpoints (`checkpoint::save_repo`) keep only uncommitted work, so a committed, clean submodule had no checkpoint either. Blaxel reclaimed idle sandboxes (the app forgot 32 at 2026-11-10 14:42, and 8+ again at 2026-11-12 18:24), the node's sandbox was replaced from the golden, and nothing restored the work; its replacement note said only "made a new one". The app's own pushes (`provision::push_branches`, used by remove/refresh and the local runner) already covered submodules; only the supervisor's did not.
+- **Fix**: `tod_supervisor::git::push_branch` pushes the node's own branch (only that) in every submodule (a nested one before its parent) that has commits of its own beyond what the parent pinned and no remote has, then the parent's; a boundary push failure stops the run instead of warning; failures (a detached HEAD or default branch with such commits, a rejected push) come back together naming each repository, never skipped. It now runs at turn boundaries as well as steps, so an implement or fix turn's commits are pushed when the turn ends. The replacement note now says unpushed work is gone and to check the branch. Tests in `tod-supervisor` `git::tests`. Not done: checkpointing commits that are clean and unpushed during a long turn (a checkpoint holds only uncommitted work); the work of ENG-2068 itself is not recoverable (see the node's report).
+- **Measure**: count of replaced sandboxes (`cloud: replaced node ... sandbox`) whose node had plan steps implemented; submodule commits found on no remote branch when a sandbox is lost (not yet measured, nothing records it).
+
 ## 2026-11-12: bot review of a merge-only head
 
 ### The PR agent asks a review bot four times for a review it will never give, then stops
@@ -344,3 +362,65 @@ from Blaxel.
 - An unreadable `/proc/<pid>/cmdline` is skipped silently; a process that exits between the
   scan and the kill reads as "could not stop"; an unreaped zombie reads as still running;
   `python -u -m uvicorn` or `node --max-old-space-size 4096 vite` do not match.
+
+### `tod-cli db`: "owning machine not connected" while the machine was on
+
+- **Seen**: ENG node 5631A571 (clean-up-dangling-manufacturer-stateme-2), verify agent in its
+  sandbox, 2026-11-10 ~06:26Z (decision filed 1794291962980): "prod-kb was unreachable ...
+  (tod-cli db: owning machine not connected)", then asked the user. Also node 8f80f1e0 on
+  2026-11-06 (`... which is not connected` mid-`psql`).
+- **Symptom**: the agent stops and asks the user about access plumbing although the app and
+  `tod-agentd` were running.
+- **Cause**: not a stale pin: the node's `owner_client` (`app-1597fe1579e4`) is the live data
+  root's client id (`cloud-sync.json`). The orchestrator keeps `seen` (when each machine last
+  polled) in memory only, and refused a request **at once** when the owner had not polled in
+  the last 46 s. That window opens whenever the poll is away: an orchestrator redeploy or wake
+  (`seen` is empty), the daemon's poll timing out (`orchestrator broker: timeout: global`,
+  logged every ~16 min in `daemon/agentd.log`, e.g. 2026-11-10T05:44:42Z, just before 25
+  sandboxes were replaced at 05:47) and retrying 2 s + 4 s, or a 502 outage. A request landing
+  there got the error, and `tod-cli db` neither waited nor retried, and its docs told the agent
+  to hand the user a request.
+- **Fix**: the broker holds a request for an owner that is not connected for 60 s
+  (`NOT_CONNECTED_GRACE`) before failing, so the daemon's next poll takes it; the failure is
+  `retryable`, names the cause and says it is tod's to repair; `tod-cli db` asks again 3 more
+  times (10 s apart), then fails with an error that says to report a failure, not ask the user;
+  `cli/db.md` no longer tells the agent to file a request for this. Needs the orchestrator
+  redeployed (the grace) and `tod-cli` rebuilt/installed into sandboxes (the retry).
+- **Measure**: `db` errors containing "has not been connected" per week (target 0); requests
+  that waited in the broker for a reconnect.
+
+### Verification asks the user about obligations that act in the wrong phase
+
+- **Seen**: 2 nodes in `verifying`, 2026-11-12 (digikey-productdetails-404s-50-of-look-2:
+  requirements 75042c52 `released`, 4b52118d `design`; clean-up-dangling-manufacturer-stateme-2:
+  33abe1af, eef15342, b8247541 default `active`).
+- **Symptom**: the verify agent asked "How should the measurement be handled?" for obligations
+  that are about production after the rollout / after the cleanup asset runs on prod.
+- **Cause**: (a) the proposed/design/planning Done-when checklists and the evaluator never asked
+  whether each obligation acts where it can be shown true, and design.md let a requirement act in
+  `design` once refined; (b) verify.md told the agent to exercise every listed obligation, including
+  ones acting in `merged`/`released`/`design` (the loop never owed them), and the app refused every
+  agent obligation edit past `planning` with "ask the user", so a phase mistake could only become
+  a question.
+- **Fix**: the three role docs, `domain/obligations.md` and the evaluator state the rule and reject
+  a mistake; a verification conversation may move an obligation of its node to `merged`/`released`
+  itself in `verifying` (`settled::verify_may_retag`, only that, only later); that move does not
+  count as a plan change (`lifecycle_validity`); the Verify loop requires a plan step of that phase
+  for a requirement moved there (`untraced_for_later_phase`); verify.md and verifying.md give the
+  rule; autonomous-session.md's real bad example names it a bug in the app. No keyword check was
+  added: wording does not decide the phase. Hardened after review: the retag is limited to the
+  conversation's own node, needs a `--reason` kept in the change set, is refused for an obligation
+  with a `failed` verdict or a `failed` carrying step, and the trace check covers constraints and
+  needs a step of that phase or later. A `failed` verdict anywhere in the history blocks the
+  retag, and the reason needs at least 15 non-space characters. Known limit: a failed plan step
+  flipped to `verified` by the agent, then the obligation moved, is not caught (adversarial path,
+  out of scope).
+- **Measure**: `decisions` from a `verification` protocol whose evidence is an obligation acting in
+  `merged`/`released`/`design` or about production; obligations moved by a verification conversation
+  with no later-phase step; nodes sent back from `verifying` for an acts-in change.
+
+## 2026-11-12: open gaps in the supervisor's submodule push (721f1161)
+
+- **Seen**: found by an independent review of the fix for ENG-2068's lost kb work; none hit a live node yet.
+- **Open**: (1) in a parent with no origin, a submodule commit the parent already records counts as the base, so it is not reported (only matters without a remote); (2) `let outcome = run?;` returns before the run-end push check, so a push failure is dropped when the run itself failed; (3) a parent with an origin but no `origin/main` ref may report a healthy detached submodule as unpushed (not reproduced); (4) the boundary-push test also passes on the old code, so it guards the wiring only loosely.
+- **Measure**: count of runs ending with a push failure named in their error.

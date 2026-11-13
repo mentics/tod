@@ -436,3 +436,94 @@ impl tod_core::scheduler::Scheduler for FakeScheduler {
         Ok(())
     }
 }
+
+/// A node whose checkout has a submodule `kb` on a shared branch holding a
+/// commit of its own: the push at a boundary cannot take it, and says which
+/// repository.
+fn wake_with_unpushable_submodule(stop_marker: bool) -> anyhow::Result<Woke> {
+    let tmp = Temp(std::env::temp_dir().join(format!("tod-supervisor-pushfail-{}", Uuid::new_v4())));
+    let base = tmp.0.clone();
+    std::fs::create_dir_all(&base).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let orch_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tod_orchestrator::Server::new(tod_orchestrator::Config {
+        base: base.join("orchestrator"),
+        tod_cli: "tod-cli-not-used".into(),
+        tod_cli_prefix: Vec::new(),
+    })
+    .unwrap();
+    std::thread::spawn(move || server.serve(listener));
+    let app = base.join("app");
+    let node = app_database(&app);
+    let snap = base.join("snap.db");
+    tod_store::sync::snapshot(&app.join("tod.db"), &snap).unwrap();
+    ureq::post(format!("{orch_url}/users/alice/seed")).send(std::fs::read(&snap).unwrap()).unwrap();
+    let orchestrator = Orchestrator::new(orch_url, "alice", node.to_string());
+
+    let id = ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "protocol.file.allow=always"];
+    let g = |dir: &Path, args: &[&str]| {
+        let mut all = id.to_vec();
+        all.extend_from_slice(args);
+        git(dir, &all)
+    };
+    let (kb_origin, origin) = (base.join("kb.git"), base.join("origin.git"));
+    for r in [&kb_origin, &origin] {
+        std::fs::create_dir_all(r).unwrap();
+        git(r, &["init", "--bare", "--quiet", "-b", "main"]);
+    }
+    let seed = base.join("seed");
+    g(&base, &["clone", "-q", &kb_origin.to_string_lossy(), &seed.to_string_lossy()]);
+    std::fs::write(seed.join("a"), "a").unwrap();
+    g(&seed, &["add", "."]);
+    g(&seed, &["commit", "-qm", "kb"]);
+    g(&seed, &["push", "-q", "origin", "HEAD:main"]);
+    let workspace = base.join("workspace");
+    g(&base, &["clone", "-q", &origin.to_string_lossy(), &workspace.to_string_lossy()]);
+    g(&workspace, &["submodule", "add", "-q", &kb_origin.to_string_lossy(), "kb"]);
+    g(&workspace, &["commit", "-qm", "ws"]);
+    g(&workspace, &["push", "-q", "origin", "HEAD:main"]);
+    g(&workspace, &["checkout", "-q", "-b", "node-branch"]);
+    let kb = workspace.join("kb");
+    g(&kb, &["checkout", "-q", "-b", "shared/other"]);
+    std::fs::write(kb.join("work"), "w").unwrap();
+    g(&kb, &["add", "."]);
+    g(&kb, &["commit", "-qm", "work on another branch"]);
+
+    let state_dir = base.join("supervisor");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    if stop_marker {
+        std::fs::write(state_dir.join(tod_core::autopilot::STOP_NOW_REQUEST_FILE), "").unwrap();
+    }
+    wake(Config {
+        orchestrator,
+        node,
+        workspace,
+        state_dir,
+        agent: AgentKind::Mock,
+        holder: Arc::new(RelayHolder::new(fake_relay().0)),
+        transcripts: None,
+        media: media(),
+        budget: Budget { max_sessions: 1, max_duration: Duration::from_secs(600) },
+        guards: Default::default(),
+        poll: Duration::from_millis(20),
+        push_branch: true,
+        scheduler: None,
+        sandbox: "node-test".into(),
+    })
+}
+
+#[test]
+fn a_push_that_fails_at_a_boundary_fails_the_run_naming_the_repository() {
+    let err = wake_with_unpushable_submodule(false).expect_err("the run carried on past a push that failed");
+    let text = format!("{err:#}");
+    assert!(text.contains("submodule kb") && text.contains("shared/other"), "{text}");
+}
+
+#[test]
+fn a_users_stop_wins_over_a_failing_boundary_push_and_the_exit_push_still_reports_it() {
+    // The stop is honored at the boundary (not a failure of the boundary
+    // push); the push at the end of the run then fails it, naming the repository.
+    let err = wake_with_unpushable_submodule(true).expect_err("the exit push hid its failure");
+    let text = format!("{err:#}");
+    assert!(text.contains("when the run ended") && text.contains("submodule kb"), "{text}");
+}

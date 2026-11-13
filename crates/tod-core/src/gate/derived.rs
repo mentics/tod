@@ -1133,6 +1133,7 @@ mod tests {
                 .enqueue_outline(OutlineMutation::UpdateObligationActsIn {
                     obligation_id: id,
                     acts_in: acts_in.into(),
+                    reason: None,
                 })
                 .unwrap();
             store.writer().flush().unwrap();

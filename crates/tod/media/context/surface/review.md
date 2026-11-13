@@ -26,6 +26,15 @@ even sit inside one — but they belong to someone else: never change into them
 or build them. The change under review is what this branch adds to the one it
 was branched from; use git to find it.
 
+If the change is simply not there (the branch holds nothing beyond its base,
+though the plan says the work is done), do not review and do not offer to
+"send the task back" or to "try again" as options: the app checks this itself
+before each turn and, when the checkout proves the code was lost, moves the
+task back to `active` and reopens its steps without asking anyone. Ask one
+decision with the reason `broken` that says what you found (the branch, the
+base, what is missing), and stop; the app reads it, reopens the work if the
+branch proves it lost, and otherwise leaves your question for the user.
+
 ## What to look for
 
 Correctness first: defects the task's obligations would count

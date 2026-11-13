@@ -546,6 +546,8 @@ the same `git::push_branch`, moved to `tod-core`. Triggers:
 
 - at every **step boundary**, so a finished unit of work is on the remote and
   the next machine (after a move) has it;
+- at every **turn boundary** in a sandbox's supervisor too (an implement or
+  fix turn's commits must not wait for the step to end);
 - before the run **stops** for a wait, needs-human, or done;
 - before a node **moves** between locations (uncommitted work does not
   travel, so commit then push);
@@ -559,8 +561,15 @@ that shares the workspace and has no branch of its own must not push whatever
 is checked out, since `push_branch` pushes `HEAD` to its same-named branch.
 The push refuses a default branch.
 
-Cloud keeps nothing different, except that its VM is not expected to
-disappear; the push is the same for the reasons above, not for loss.
+**Submodules.** A node's work is often in a submodule (the parent records only
+its commit id, so a parent branch alone holds none of it). The supervisor's push
+(`tod_supervisor::git::push_branch`) pushes, deepest first, the node's own branch in
+each submodule that holds commits no remote has, then the parent's. A submodule
+with nothing of its own gets no branch. One on a detached HEAD or a default
+branch with such commits is an error naming it; every repository is still tried.
+
+Cloud: a sandbox is reclaimed by Blaxel while idle (seen 2026-11-10 and
+2026-11-12, tens of sandboxes at once), so the push is what keeps the work.
 
 ## Order
 

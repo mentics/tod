@@ -21,6 +21,8 @@ use tod_store::outline::repos::plan_steps::STATUS_BLOCKED;
 use tod_store::outline::{Capability, OutlineMutation};
 use tod_store::settings::InterviewContextSettings;
 
+mod lost_work;
+
 /// Plays every protocol's mock agent; each run finishes at once.
 struct FakeAgent {
     fleet: Arc<FleetStore>,

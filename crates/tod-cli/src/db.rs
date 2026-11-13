@@ -104,12 +104,19 @@ fn list(json: bool) -> Result<String> {
         .join("\n"))
 }
 
+/// Asks again this many times when the user's machine is not connected; each
+/// ask already waits up to a minute in the orchestrator.
+const NOT_CONNECTED_RETRIES: u32 = 3;
+const NOT_CONNECTED_PAUSE: Duration = Duration::from_secs(10);
+
 /// The orchestrator's broker, from the node's environment.
 struct Broker {
     url: String,
     user: String,
     node: String,
     agent: ureq::Agent,
+    /// The pause before asking again when the user's machine is not connected.
+    pause: Duration,
 }
 
 impl Broker {
@@ -128,13 +135,19 @@ impl Broker {
             node: var(NODE_ENV)?,
             // A login can wait for the user's machine to open a tunnel.
             agent: tod_core::scheduler::sandbox_agent(Duration::from_secs(120)),
+            pause: NOT_CONNECTED_PAUSE,
         })
     }
 
     /// The reply to `request`; an error carries the user's machine's reason.
     fn ask(&self, request: &serde_json::Value) -> Result<serde_json::Value> {
         let mut last = None;
-        for attempt in 0..4u64 {
+        let mut not_connected = 0u32;
+        let mut attempt = 0u64;
+        // A retry of a machine that is away (`continue`) does not use up the
+        // few tries for a failed connection.
+        while attempt < 4 {
+            attempt += 1;
             let mut req = self.agent.post(&self.url).header(USER_HEADER, &self.user).header(NODE_HEADER, &self.node);
             for (name, value) in tod_core::cloud_sync::my_contract().headers() {
                 req = req.header(name, &value);
@@ -155,13 +168,32 @@ impl Broker {
                         return Ok(value);
                     }
                     match value["error"].as_str() {
+                        // The user's machine is not connected right now (the
+                        // orchestrator already waited a minute for it). Its
+                        // daemon reconnects by itself, so wait and ask again,
+                        // for a bound; only then stop, naming the cause.
+                        Some(why) if value["retryable"].as_bool() == Some(true) => {
+                            not_connected += 1;
+                            if not_connected > NOT_CONNECTED_RETRIES {
+                                bail!(
+                                    "{why}. tod-cli asked {} times over about {} minutes and the machine never connected: \
+                                     this is a failure of tod's connection to the user's machine, not something to ask the user about; \
+                                     stop and report it as a failure with this error",
+                                    NOT_CONNECTED_RETRIES + 1,
+                                    (NOT_CONNECTED_RETRIES + 1) * 70 / 60
+                                );
+                            }
+                            eprintln!("tod-cli db: {why}; asking again ({not_connected} of {NOT_CONNECTED_RETRIES} retries)");
+                            std::thread::sleep(self.pause);
+                            continue;
+                        }
                         Some(why) => bail!("{why}"),
                         None => bail!("the orchestrator answered {status}: {}", body.trim().chars().take(300).collect::<String>()),
                     }
                 }
                 Err(err) => last = Some(anyhow!(err)),
             }
-            std::thread::sleep(Duration::from_millis(500 * (attempt + 1)));
+            std::thread::sleep(Duration::from_millis(500 * attempt));
         }
         Err(last.unwrap_or_else(|| anyhow!("no answer"))).context("could not reach the orchestrator's broker")
     }
@@ -292,6 +324,51 @@ mod tests {
         map_in(&hosts, &login("b.rds.example")).unwrap();
         let text = std::fs::read_to_string(&hosts).unwrap();
         assert!(!text.contains("a.rds.example") && text.contains("127.0.0.1 b.rds.example # tod db prod"), "{text}");
+    }
+
+    /// A one-connection-per-answer HTTP server giving `bodies` (status, body) in turn.
+    fn serve(answers: Vec<(u16, &'static str)>) -> String {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/users/u/broker/request", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for (status, body) in answers {
+                let Ok((mut conn, _)) = listener.accept() else { return };
+                let mut buf = [0u8; 8192];
+                let _ = conn.read(&mut buf);
+                let _ = write!(
+                    conn,
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        url
+    }
+
+    fn broker(url: String) -> Broker {
+        Broker {
+            url,
+            user: "u".into(),
+            node: "n".into(),
+            agent: tod_store::sandbox_http::sandbox_agent(Duration::from_secs(5)),
+            pause: Duration::from_millis(10),
+        }
+    }
+
+    const AWAY: &str = r#"{"ok":false,"retryable":true,"error":"node n belongs to machine m, which has not been connected"}"#;
+
+    #[test]
+    fn a_machine_that_is_away_is_asked_again_until_it_answers() {
+        let url = serve(vec![(503, AWAY), (503, AWAY), (200, r#"{"ok":true,"login":{}}"#)]);
+        assert_eq!(broker(url).ask(&serde_json::json!({})).unwrap()["ok"], true);
+    }
+
+    #[test]
+    fn a_machine_that_stays_away_ends_in_a_failure_that_is_not_a_question_for_the_user() {
+        let url = serve(vec![(503, AWAY); 4]);
+        let err = format!("{:#}", broker(url).ask(&serde_json::json!({})).unwrap_err());
+        assert!(err.contains("has not been connected") && err.contains("not something to ask the user about"), "{err}");
     }
 
     #[test]

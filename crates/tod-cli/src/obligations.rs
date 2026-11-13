@@ -25,7 +25,7 @@ COMMANDS:
     list       [--node <UUID>] [--search <TEXT>] [--kind requirement|constraint] [--inherited]
     show       <ID>
     add        --node <UUID> --kind requirement|constraint --body <TEXT> --phase requirements|design [--acts-in design|active|verifying|merged|released] [--section <NAME>] [--after <ID>] [--before]
-    update     <ID> [--body <TEXT>] [--section <NAME>] [--phase requirements|design|unknown] [--acts-in design|active|verifying|merged|released]      (--section \"\" clears it)
+    update     <ID> [--body <TEXT>] [--section <NAME>] [--phase requirements|design|unknown] [--acts-in design|active|verifying|merged|released] [--reason <TEXT>]      (--section \"\" clears it)
     move       <ID> --node <UUID>
     delete     <ID>
     deleted    --node <UUID> [--by user|agent|<SESSION>]      deleted obligations that can still be restored, newest first
@@ -336,6 +336,7 @@ fn add(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
             mutation: OutlineMutation::UpdateObligationActsIn {
                 obligation_id: id,
                 acts_in: acts_in.to_string(),
+                reason: None,
             },
             target: None,
         })?;
@@ -349,6 +350,7 @@ fn update(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
     let section = args.get("--section");
     let phase = args.get("--phase").map(normalize_phase).transpose()?;
     let acts_in = args.get("--acts-in").map(normalize_acts_in).transpose()?;
+    let reason = args.get("--reason");
     if body.is_none() && section.is_none() && phase.is_none() && acts_in.is_none() {
         anyhow::bail!("--body, --section, --phase, and/or --acts-in is required");
     }
@@ -386,6 +388,7 @@ fn update(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
             mutation: OutlineMutation::UpdateObligationActsIn {
                 obligation_id: id,
                 acts_in: acts_in.to_string(),
+                reason: reason.map(str::to_string),
             },
             target: target.take(),
         })?;

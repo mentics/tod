@@ -189,6 +189,10 @@ pub enum OutlineMutation {
     UpdateObligationActsIn {
         obligation_id: Uuid,
         acts_in: String,
+        /// Why it moves. Required of a verification conversation (it is
+        /// recorded with the change, in the change set); optional otherwise.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     /// Bulk-rename every obligation in `node_id`/`kind` whose section is
     /// `old_section` (`None` meaning the implicit "no section" bucket) to
@@ -739,6 +743,7 @@ impl OutlineMutation {
             OutlineMutation::UpdateObligationActsIn {
                 obligation_id,
                 acts_in,
+                ..
             } => {
                 let acts_in = parse_obligation_acts_in(acts_in)?;
                 ObligationRepo::new(conn).update_acts_in(*obligation_id, acts_in)?;

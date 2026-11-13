@@ -38,8 +38,12 @@ stays connected keeps its session. Run `db` again for the next command. Read
 the variables from the environment and never print them, write them to a
 file, or pass them as arguments.
 
-It needs the user's machine: it must be on, with the app running. If it is not,
-or the user's AWS session has expired, `db` fails and says so; that is
-something only the user can fix, so record what you need from the database as
-a request for them rather than retrying. Treat the database as production:
+It needs the user's machine to be on, with the app running. When it is not
+connected for a moment (the orchestrator restarted, a network gap), `db` waits
+and asks again by itself, for a few minutes: do not retry it yourself. If it
+still fails with "has not been connected", that is a failure of the app's own
+connection, not something to ask the user about: stop and report it as a
+failure with the error. Only an expired AWS session of the user's is theirs to
+fix; `db` says so, and then you record what you need from the database as a
+request for them. Treat the database as production:
 read what you need and do not change data unless the work calls for it.

@@ -7,7 +7,7 @@ as the 8-character prefix shown in listings.
 tod-cli --data-root <DATA_ROOT> obligations list       [--node <UUID>] [--search <TEXT>] [--kind requirement|constraint] [--inherited]
 tod-cli --data-root <DATA_ROOT> obligations show       <ID>
 tod-cli --data-root <DATA_ROOT> obligations add        --node <UUID> --kind requirement|constraint --body <TEXT> --phase requirements|design [--acts-in design|active|verifying|merged|released] [--section <NAME>] [--after <ID>] [--before]
-tod-cli --data-root <DATA_ROOT> obligations update     <ID> [--body <TEXT>] [--section <NAME>] [--phase requirements|design|unknown] [--acts-in design|active|verifying|merged|released]
+tod-cli --data-root <DATA_ROOT> obligations update     <ID> [--body <TEXT>] [--section <NAME>] [--phase requirements|design|unknown] [--acts-in design|active|verifying|merged|released] [--reason <TEXT>]
 tod-cli --data-root <DATA_ROOT> obligations move       <ID> --node <UUID>
 tod-cli --data-root <DATA_ROOT> obligations delete     <ID>
 tod-cli --data-root <DATA_ROOT> obligations deleted    --node <UUID> [--by user|agent|<SESSION>]
@@ -31,6 +31,15 @@ An obligation has two phases, set by two flags: `--phase` is the state it was
 The obligations concepts say how to set each. `--acts-in` is left off when it
 is `active`. Listings show it as `acts-in=<state>` when it is not. Inside an interview, an agent's `add` always writes its own session's phase —
 `--phase` there only matters when running `add` outside an interview.
+
+Past `planning` the app refuses every obligation change from an agent, with one
+exception: a verification session may `update <id> --acts-in merged|released
+--reason <TEXT>` on an obligation of its own node (in `verifying`) that acts in
+an earlier state, to hand it to the phase that can show it true. The `--reason`
+(at least 15 characters) is required and is kept with the change: say why nothing in the checkout can
+show it true. Refused when the obligation already has a `failed` verdict in its history or a
+`failed` plan step carries it: a recorded failure stays a failure. Nothing
+else, and never back.
 
 `deleted` and `history` list changes as `r-<n>`; deletions and edits stay
 restorable for 30 days. `restore r-<n>` puts back the obligation as it was

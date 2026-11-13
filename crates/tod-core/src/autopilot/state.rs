@@ -143,6 +143,11 @@ pub struct LoopCounters {
     /// fix agent for: failing again on the same files means it changed nothing.
     #[serde(default)]
     pub checks_sent: Option<String>,
+    /// Times the app reopened the node's implementation because its code was
+    /// lost ([`crate::lost_work`]); once is the repair, again means the rebuilt
+    /// work is gone too and the run stops for the user.
+    #[serde(default)]
+    pub lost_work_reopens: u32,
     /// Times a failed verification sent the node back to be fixed.
     #[serde(default)]
     pub fix_cycles: u32,

@@ -22,6 +22,35 @@ same ordering.
   an obligation stales them.
 - The change set records and reverses `acts_in` (`UpdateObligationActsIn`).
 
+## Where an obligation acts: the state that can deliver it
+
+`acts_in` is where the obligation can be **shown true**, not what it is about.
+One that holds only after the merge, a deploy, or a run on production ("after
+rollout, a query over `integration_status` shows...", "after the cleanup runs
+on prod, a query finds zero...") acts in `released` (or `merged` for what must
+precede the deploy), with a plan step of that phase that does the action.
+Left `active` or `design`, verification cannot exercise it and used to ask the
+user (2026-11-12: two nodes). Enforced by the role docs' Done-when checklists
+(`proposed`, `design`, `planning`) and the independent evaluator's rejection
+rule (`surface/evaluate.md`), not by a keyword check: wording does not decide
+it, so a deterministic test would be wrong both ways.
+
+**The verifier's rule.** From `ready` on, the app refuses an agent's
+obligation edits (`conversation::settled`), with one exception: a verification
+conversation may move an obligation of its own node (not another's), while
+the node is in `verifying`, to `merged` or `released` from an earlier state
+(`settled::verify_may_retag`). It needs a `--reason`, stored with the change
+(`UpdateObligationActsIn.reason`, in the change set's recorded mutation), and
+is refused when the obligation already has a `failed` verdict or a `failed`
+plan step carries it: a recorded failure stays a failure and cannot be moved
+away. It is recorded in the change set, and moving it
+does not send the node back (`lifecycle_validity::moved_to_later_phase`). The
+Verify loop then owes a trace: an obligation (any kind a plan step
+delivers, `needs_plan_step`, so constraints too) acting in `merged`/`released`
+that no plan step of that phase or a later one satisfies keeps the loop going until the agent adds one
+(`verify::untraced_for_later_phase`). The agent never `decisions ask`s about a
+phase mistake.
+
 ## Not enforced yet
 
 Proposed (requirements-introduced) obligations are not required to act in

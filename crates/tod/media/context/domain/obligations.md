@@ -13,7 +13,9 @@ order shown to the user in the app.
 Obligations are the user's. Once a task is past `planning`, you never add,
 change, move, or delete one yourself, even when the code or a reviewer
 disagrees with it: ask the user, quoting the change you propose and why, and
-the user makes it if they agree.
+the user makes it if they agree. The one exception is where an obligation
+acts (see "Acts in"): a verification session that finds one only a later phase
+can deliver moves it there itself.
 
 An obligation's text must stand on its own. It is stored with the outline, not
 beside any repository, so it cannot link to or name a file (a repo doc, a
@@ -70,6 +72,21 @@ questions and are set separately; the app shows both.
     design obligations that refine it. No plan step delivers it and
     verification does not rule on it; the design obligations that refine it are
     what get built and verified. Use it only when refining obligations exist.
+
+**Where it acts is where it can be shown true.** For every obligation ask:
+can a developer show this holds from the work in the task's checkout (the code
+built, its tests run, the app or a local harness exercised)? Then it acts in
+`active` (or `verifying`). If showing it needs the work to be merged, deployed,
+or run against production data, it acts in `merged` or `released`, whatever its
+wording: "after rollout, the failure rate drops", "after the cleanup runs on
+prod, a query finds none", "a query over production rows measures X", "once
+live, the alert fires". A statement about what production looks like after a
+run is true only after that run, so it acts in the phase whose step does the
+run (`released` for a run on production data or a measurement of the live
+system; `merged` for what must be in place before the deploy). Tag it that
+way when you write it; do not leave it `active` or `design` and let
+verification find out. The step that delivers it (the cleanup asset's run, the
+rollout) is a plan step of the same phase.
 
 Set `--phase` to the state you are working in. Set `--acts-in` only when it is
 not `active`. Do not leave it `active` for something no plan step can build
