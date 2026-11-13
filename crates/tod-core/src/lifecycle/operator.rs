@@ -33,6 +33,18 @@ pub fn user_move(node: Uuid, state: &str, reason: Option<&str>) -> OutlineMutati
         node_id: node,
         state: state.to_string(),
         reason: reason.map(str::to_string),
+        keep_decision: None,
+    }
+}
+
+/// [`user_move`] made by the answer to the request `decision`, which stays
+/// pending until its answer is recorded.
+pub fn user_move_answering(node: Uuid, state: &str, reason: Option<&str>, decision: Uuid) -> OutlineMutation {
+    match user_move(node, state, reason) {
+        OutlineMutation::SetLifecycleByUser { node_id, state, reason, .. } => {
+            OutlineMutation::SetLifecycleByUser { node_id, state, reason, keep_decision: Some(decision) }
+        }
+        other => other,
     }
 }
 

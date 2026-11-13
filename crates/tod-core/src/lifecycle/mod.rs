@@ -57,8 +57,16 @@ pub fn set_lifecycle_by_user(fleet: &FleetStore, node: Uuid, state: &str) -> Res
 /// write that did not land is an error: the caller (the chip, a request's
 /// answer) must not go on as if the node had moved.
 pub fn set_lifecycle_by_user_because(fleet: &FleetStore, node: Uuid, state: &str, reason: Option<&str>) -> Result<()> {
+    write_user_move(fleet, operator::user_move(node, state, reason), state)
+}
+
+fn write_user_move(fleet: &FleetStore, mutation: OutlineMutation, state: &str) -> Result<()> {
+    let OutlineMutation::SetLifecycleByUser { node_id: node, .. } = &mutation else {
+        anyhow::bail!("not a user move");
+    };
+    let node = *node;
     fleet
-        .enqueue_outline(operator::user_move(node, state, reason))
+        .enqueue_outline(mutation)
         .map_err(|err| anyhow::anyhow!("{err:#}"))?;
     fleet
         .writer()

@@ -451,6 +451,20 @@ impl<'a> DecisionRepo<'a> {
             .context("answer vanished after insert")
     }
 
+    /// Withdraw the node's pending decisions that have an option moving the
+    /// node, except `keep`: the node was moved by hand, so "send it back to
+    /// X" no longer describes it, and answering it later would redo a move
+    /// the person has already made their own way. Returns how many.
+    pub fn withdraw_moving_for_node(&self, node_id: Uuid, keep: Option<Uuid>) -> Result<usize> {
+        let keep = keep.map(uuid_to_blob);
+        Ok(self.conn.execute(
+            "UPDATE decisions SET status = 'withdrawn'
+             WHERE node_id = ?1 AND status = 'pending' AND option_moves <> '[]'
+               AND (?2 IS NULL OR id <> ?2)",
+            params![uuid_to_blob(node_id), keep],
+        )?)
+    }
+
     /// Withdraw a decision: it no longer needs an answer.
     pub fn withdraw(&self, id: Uuid) -> Result<()> {
         let changed = self.conn.execute(
