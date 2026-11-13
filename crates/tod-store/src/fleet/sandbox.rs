@@ -104,8 +104,23 @@ impl Sandboxes {
         Ok(removed)
     }
 
-    /// Deletes the sandbox in Blaxel and forgets it here ([`Self::forget`]).
-    pub fn delete(&mut self, bx: &Blaxel, name: &str) -> Result<()> {
+    /// Deletes a node's sandbox in Blaxel and forgets it here
+    /// ([`Self::forget`]). The only way this layer deletes a node sandbox:
+    /// it takes the [`Cleared`] that `provision::secure_sandbox_commits`
+    /// returns, which nothing else can make, so a delete without the commit
+    /// guard does not compile. (Goldens and `tod-sandbox delete` are not node
+    /// sandboxes and call `Blaxel::delete` themselves.)
+    pub fn delete(&mut self, bx: &Blaxel, cleared: &Cleared) -> Result<()> {
+        delete_cleared(bx, cleared)?;
+        self.forget(cleared.name())
+    }
+
+    /// The one unguarded delete of a node sandbox: one this very call just
+    /// made (forked or created seconds ago) that failed its own setup. Nothing
+    /// has run a node's work in it, so no commit of the node's can be in it,
+    /// and the guard (which needs the relay the failure may be about) would
+    /// only keep a useless sandbox. Never for a sandbox that existed before.
+    pub(super) fn delete_just_made(&mut self, bx: &Blaxel, name: &str) -> Result<()> {
         bx.delete(name)?;
         self.forget(name)
     }
@@ -384,7 +399,7 @@ impl Sandboxes {
             Err(err) => {
                 // Nothing has used it yet: leaving it would leak a sandbox
                 // per attempt (each one costs money and clutters the list).
-                let removed = match self.delete(&bx, name) {
+                let removed = match self.delete_just_made(&bx, name) {
                     Ok(()) => format!("{name} was deleted"),
                     Err(del) => format!("{name} could not be deleted either ({del:#}); `tod-sandbox delete {name}` removes it"),
                 };
@@ -546,10 +561,49 @@ impl Sandboxes {
 /// already says so.
 pub fn dead_reason(info: &tod_sandbox::blaxel::SandboxInfo) -> Option<String> {
     const DEAD: [&str; 6] = ["FAILED", "TERMINATED", "DELETING", "DELETED", "EXPIRED", "EXPIRING"];
+    reason_among(info, &DEAD)
+}
+
+/// Whether the sandbox is **certainly** past running anything, so there is
+/// nothing in it to inspect: [`dead_reason`] without `EXPIRING`, which is
+/// still running (and holding its work) until its TTL ends. Only the commit
+/// guard asks this; an expiring sandbox must be inspected.
+pub fn is_past_inspection(info: &tod_sandbox::blaxel::SandboxInfo) -> bool {
+    const PAST: [&str; 5] = ["FAILED", "TERMINATED", "DELETING", "DELETED", "EXPIRED"];
+    reason_among(info, &PAST).is_some()
+}
+
+fn reason_among(info: &tod_sandbox::blaxel::SandboxInfo, states: &[&str]) -> Option<String> {
     let field = |what: &str, value: &str| {
-        DEAD.contains(&value.to_ascii_uppercase().as_str()).then(|| format!("sandbox {} has {what} {value}", info.name))
+        states.contains(&value.to_ascii_uppercase().as_str()).then(|| format!("sandbox {} has {what} {value}", info.name))
     };
     field("status", &info.status).or_else(|| info.state.as_deref().and_then(|state| field("state", state)))
+}
+
+/// Proof that the commit guard (`provision::secure_sandbox_commits`) ran for
+/// the node sandbox `name` and passed. Only `provision` can make one, and
+/// [`Sandboxes::delete`] / [`delete_cleared`] need one, so no node sandbox is
+/// deleted without the guard.
+#[derive(Debug)]
+pub struct Cleared {
+    name: String,
+}
+
+impl Cleared {
+    pub(super) fn new(name: &str) -> Self {
+        Self { name: name.to_string() }
+    }
+
+    /// The sandbox the guard cleared.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// Deletes the node sandbox the guard cleared, in Blaxel only.
+pub fn delete_cleared(bx: &Blaxel, cleared: &Cleared) -> Result<()> {
+    bx.delete(cleared.name())?;
+    Ok(())
 }
 
 /// Whether a node sandbox's proxy was made with exactly the rules

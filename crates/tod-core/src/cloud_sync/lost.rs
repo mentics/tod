@@ -950,13 +950,15 @@ trait SandboxBackend {
 struct BlaxelBackend {
     sandboxes: tod_store::fleet::sandbox::Sandboxes,
     bx: tod_sandbox::blaxel::Blaxel,
+    /// What the commit guard cleared, which `delete` needs.
+    cleared: Option<tod_store::fleet::sandbox::Cleared>,
 }
 
 impl BlaxelBackend {
     fn load(root: &std::path::Path) -> Result<Self> {
         let sandboxes = tod_store::fleet::sandbox::Sandboxes::load(root)?;
         let bx = sandboxes.blaxel()?;
-        Ok(Self { sandboxes, bx })
+        Ok(Self { sandboxes, bx, cleared: None })
     }
 }
 
@@ -967,7 +969,8 @@ impl SandboxBackend for BlaxelBackend {
 
     fn secure_commits(&mut self, fleet: &FleetStore, node_id: &str, name: &str) -> Result<()> {
         let info = self.bx.get(name).with_context(|| format!("look up sandbox {name}"))?;
-        tod_store::fleet::provision::ensure_work_pushed(fleet, node_id, name, info.as_ref())
+        self.cleared = Some(tod_store::fleet::provision::ensure_work_pushed(fleet, node_id, name, info.as_ref())?);
+        Ok(())
     }
 
     fn checkpoint(&mut self, fleet: &FleetStore, node_id: &str, name: &str) -> Result<()> {
@@ -979,7 +982,9 @@ impl SandboxBackend for BlaxelBackend {
     }
 
     fn delete(&mut self, name: &str) -> Result<()> {
-        self.sandboxes.delete(&self.bx, name).with_context(|| format!("delete sandbox {name}"))
+        let cleared = self.cleared.take().filter(|c| c.name() == name);
+        let cleared = cleared.with_context(|| format!("the commit guard did not clear {name}; it was not deleted"))?;
+        self.sandboxes.delete(&self.bx, &cleared).with_context(|| format!("delete sandbox {name}"))
     }
 
     fn forget(&mut self, name: &str) -> Result<()> {

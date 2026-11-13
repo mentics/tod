@@ -14,7 +14,9 @@ fn main() -> anyhow::Result<()> {
     let name = location.sandbox().ok_or_else(|| anyhow::anyhow!("not a sandbox"))?.to_string();
     let mut sandboxes = Sandboxes::load(&root)?;
     let bx = sandboxes.blaxel()?;
-    sandboxes.delete(&bx, &name)?;
+    let info = bx.get(&name)?;
+    let cleared = provision::secure_sandbox_commits(info.as_ref(), &name, Some(&location))?;
+    sandboxes.delete(&bx, &cleared)?;
     fleet.enqueue(FleetMutation::DeleteFilesLocation { node_id: node })?;
     fleet.writer().flush()?;
     println!("deleted {name} and forgot the location");

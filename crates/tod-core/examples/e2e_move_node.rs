@@ -208,7 +208,7 @@ fn main() -> anyhow::Result<()> {
         for info in list {
             let name = info.name.clone();
             if name.contains(&nid[..8]) || name.contains("move-node") {
-                let _ = sb.delete(&bx, &name);
+                let _ = bx.delete(&name).map(|()| sb.forget(&name));
                 println!("deleted sandbox {name}");
             }
         }

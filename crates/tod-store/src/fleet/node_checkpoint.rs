@@ -306,7 +306,9 @@ mod tests {
             say("deleting the sandbox, as an expiry would");
             let mut sandboxes = Sandboxes::load(&root)?;
             let bx = sandboxes.blaxel()?;
-            sandboxes.delete(&bx, &first_sandbox)?;
+            // Simulating an expiry in a test sandbox of its own: not a node's delete.
+            bx.delete(&first_sandbox)?;
+            sandboxes.forget(&first_sandbox)?;
             // Blaxel keeps a deleted sandbox listed as TERMINATED for a while;
             // what the app acts on is the launch finding "no sandbox named",
             // so take that step (`retry_if_sandbox_lost` does) and move on.
@@ -340,7 +342,8 @@ mod tests {
             if let Some(name) = location.sandbox() {
                 let mut sandboxes = Sandboxes::load(&root).unwrap();
                 let bx = sandboxes.blaxel().unwrap();
-                let _ = sandboxes.delete(&bx, name);
+                let _ = bx.delete(name);
+                let _ = sandboxes.forget(name);
             }
         }
         result.unwrap();

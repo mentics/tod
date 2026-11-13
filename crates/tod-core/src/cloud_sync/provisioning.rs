@@ -241,6 +241,8 @@ pub fn list_orphan_sandboxes_at(root: &Path, min_age: Duration) -> Result<Vec<Or
 
 fn delete_orphans_with(root: &Path, names: &[String], still: HashSet<String>) -> Result<Vec<String>> {
     let bx = tod_store::fleet::sandbox::Sandboxes::load(root)?.blaxel()?;
+    // What the guard cleared, for the delete that follows it.
+    let cleared = std::cell::RefCell::new(None);
     delete_orphans_via(
         names,
         &still,
@@ -248,9 +250,14 @@ fn delete_orphans_with(root: &Path, names: &[String], still: HashSet<String>) ->
         // hold, a lost location): the same guard as every node-sandbox delete.
         &mut |name| {
             let info = bx.get(name).with_context(|| format!("look up sandbox {name}"))?;
-            tod_store::fleet::provision::secure_sandbox_commits(info.as_ref(), name, None)
+            *cleared.borrow_mut() = Some(tod_store::fleet::provision::secure_sandbox_commits(info.as_ref(), name, None)?);
+            Ok(())
         },
-        &mut |name| bx.delete(name),
+        &mut |name| {
+            let cleared = cleared.borrow_mut().take().filter(|c| c.name() == name);
+            let cleared = cleared.ok_or_else(|| anyhow!("the commit guard did not clear {name}; it was not deleted"))?;
+            tod_store::fleet::sandbox::delete_cleared(&bx, &cleared)
+        },
     )
 }
 

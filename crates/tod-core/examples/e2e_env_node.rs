@@ -84,7 +84,7 @@ fn main() -> anyhow::Result<()> {
     let mut sb = Sandboxes::load(&root)?;
     let bx = sb.blaxel()?;
     if !final_name.is_empty() && bx.get(&final_name)?.is_some() {
-        let _ = sb.delete(&bx, &final_name);
+        let _ = bx.delete(&final_name).map(|()| sb.forget(&final_name));
         println!("deleted {final_name}");
     }
     drop(store);
