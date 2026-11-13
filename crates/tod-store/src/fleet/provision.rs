@@ -1001,6 +1001,14 @@ fn retry_transient<T>(
     }
 }
 
+/// A failure before this attempt changed anything at Blaxel (the name settled,
+/// the golden resolved, credentials read): nothing to clean up, so a temporary
+/// one is simply tried again.
+fn before_anything_is_made(err: anyhow::Error) -> Attempt {
+    let retryable = tod_sandbox::blaxel::error_is_transient(&err);
+    Attempt { err, retryable }
+}
+
 fn make_sandbox_once(
     fleet: &FleetStore,
     files: &ResolvedFiles,
@@ -1019,16 +1027,16 @@ fn make_sandbox_once(
     let account = sandboxes.account()?.clone();
     let bx = sandboxes.blaxel()?;
     // Before anything is made.
-    let orchestrator = orchestrator_of(&mut sandboxes, &bx)?;
+    let orchestrator = orchestrator_of(&mut sandboxes, &bx).map_err(before_anything_is_made)?;
     let user = host.orchestrator_user(&root)?;
     let recorded = recorded_sandboxes(fleet, node_id)?;
-    let name = match choose_sandbox(&bx, &recorded, &node_row.slug, node_id, progress)? {
+    let name = match choose_sandbox(&bx, &recorded, &node_row.slug, node_id, progress).map_err(before_anything_is_made)? {
         Chosen::Reuse(name) => return Ok(reuse_sandbox(fleet, &name, location, branch, progress)?),
         Chosen::Make(name) => name,
     };
 
     let repo = host.node_repo(fleet, node_id)?;
-    let creds = node_proxy_credentials(fleet, &sandboxes, &bx, node_id, progress)?;
+    let creds = node_proxy_credentials(fleet, &sandboxes, &bx, node_id, progress).map_err(before_anything_is_made)?;
     let node_files = host.node_files(fleet.paths().root())?;
     let source = dev.sandbox_from.source();
     let agent = host.supervisor_agent();
@@ -1037,7 +1045,7 @@ fn make_sandbox_once(
     let fork_from = match &source {
         sandbox::NewSandboxSource::Fork(from) if from.trim() == tod_sandbox::config::GOLDEN => {
             // `repo` is the location's (`DevContainerSetting::repo_url`): whose golden.
-            Some(host.current_golden(&mut sandboxes, &bx, &repo.slug, progress)?)
+            Some(host.current_golden(&mut sandboxes, &bx, &repo.slug, progress).map_err(before_anything_is_made)?)
         }
         sandbox::NewSandboxSource::Fork(from) => Some(from.trim().to_string()),
         sandbox::NewSandboxSource::Image(_) => None,
@@ -1048,12 +1056,13 @@ fn make_sandbox_once(
     // gets them uploaded.
     let golden_has_tod_files = match &fork_from {
         Some(golden) => bx
-            .get(golden)?
+            .get(golden)
+            .map_err(before_anything_is_made)?
             .is_some_and(|info| info.label(tod_sandbox::golden::LABEL_FROM).is_some_and(|v| !v.is_empty())),
         None => false,
     };
     let image = match &source {
-        sandbox::NewSandboxSource::Image(image) => sandboxes.runtime_image(image, false, progress)?,
+        sandbox::NewSandboxSource::Image(image) => sandboxes.runtime_image(image, false, progress).map_err(before_anything_is_made)?,
         // Not used: a fork is made from its source, not from an image.
         sandbox::NewSandboxSource::Fork(_) => String::new(),
     };
@@ -1330,8 +1339,17 @@ fn discard_failed_sandbox(
     // before Blaxel made one leaves nothing, and the message must not say it
     // was deleted or kept.
     let todo = tod_sandbox::health::WHAT_TO_DO;
-    let existing = bx.get(name).map(|info| info.is_some());
     let transient = tod_sandbox::blaxel::error_is_transient(&err);
+    let mut existing = bx.get(name).map(|info| info.is_some());
+    // A fork that failed on a deadline may still be appearing at Blaxel: one
+    // look right after is not proof it is absent.
+    for _ in 0..3 {
+        if !(transient && matches!(existing, Ok(false))) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        existing = bx.get(name).map(|info| info.is_some());
+    }
     let keep = matches!(existing, Ok(true)) && (!transient || std::env::var_os("TOD_KEEP_FAILED_SANDBOX").is_some());
     let forget = || -> Result<()> {
         if recorded {
@@ -2093,6 +2111,14 @@ mod tests {
         assert_eq!(calls.get(), super::SANDBOX_RETRY_DELAYS.len() + 1);
         let text = format!("{err:#}");
         assert!(text.contains("tried 4 times") && text.contains("502 Bad Gateway"), "{text}");
+    }
+
+    #[test]
+    fn a_temporary_failure_before_anything_is_made_is_retryable() {
+        let t = super::before_anything_is_made(anyhow!("list sandboxes: 502 Bad Gateway"));
+        assert!(t.retryable);
+        let n = super::before_anything_is_made(anyhow!("tod lost track of a sandbox"));
+        assert!(!n.retryable);
     }
 
     #[test]

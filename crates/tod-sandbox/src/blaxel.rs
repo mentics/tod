@@ -129,6 +129,8 @@ pub fn text_is_transient(text: &str) -> bool {
         "503 service unavailable",
         "504 gateway timeout",
         "timed out",
+        "context deadline exceeded",
+        "deadline exceeded",
         "timeout",
         "connection refused",
         "connection reset",
@@ -1346,6 +1348,13 @@ pub fn jwt_expiry(token: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_bare_deadline_error_is_transient() {
+        assert!(text_is_transient("fork x from y: Post .../compute/instances?wait=false: context deadline exceeded"));
+        assert!(text_is_transient("fork y: 502 Bad Gateway Error 502: compute plane fork instance failed (FORK_FAILED)"));
+        assert!(!text_is_transient("fork y: 400 Bad Request: invalid image"));
+    }
+
     use super::*;
 
     #[test]
