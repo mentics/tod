@@ -2183,8 +2183,13 @@ impl PrFeed for GithubFeed {
         reviewed: &str,
         head: &str,
     ) -> Result<bool, String> {
-        // Both commits are immutable, and so is whether the change between
-        // them is the same: asked once.
+        // The commits are immutable and so is the base's tip (named by sha, not
+        // by the branch, which moves): asked once.
+        let base_sha = self
+            .0
+            .branch_sha(&pr.owner, &pr.repo, base)
+            .map_err(|err| format!("resolving base branch {base} to compare the bot's review with the head: {err}"))?;
+        let base = base_sha.as_str();
         static ANSWERS: std::sync::Mutex<Option<std::collections::HashMap<String, bool>>> = std::sync::Mutex::new(None);
         let key = format!("{}/{}|{base}|{reviewed}|{head}", pr.owner, pr.repo);
         if let Some(known) = ANSWERS.lock().unwrap().as_ref().and_then(|m| m.get(&key)) {

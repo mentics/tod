@@ -662,9 +662,11 @@ impl Github {
     /// diffs, so what a merge of the base brought in drops out of both): every
     /// file of the head's must be in the reviewed one's with the same added and
     /// removed lines (hunk positions and context are ignored, the base moves
-    /// them). A file only the reviewed change has is fine (the base absorbed
-    /// it); a file only the head has, or a differing one, is a real change and
-    /// `Ok(false)`, as is a `reviewed` that is no longer in the repository (a
+    /// them). A file only the reviewed change has is fine only if the head
+    /// has the reviewed version of it, or the base does (the base absorbed it,
+    /// compared by blob sha); otherwise the branch reverted or deleted it
+    /// since the review. A file only the head has, or a differing one, is a
+    /// real change and `Ok(false)`, as is a `reviewed` that is no longer in the repository (a
     /// force-push). `Err` when the comparison cannot be made (GitHub failing,
     /// an unknown base or head, more files than GitHub lists, a binary file
     /// whose patch GitHub omits), so a review is never counted current on a
@@ -688,7 +690,47 @@ impl Github {
             Err(GithubError::NotFound) => return Ok(false),
             Err(err) => return Err(err),
         };
-        change_covered(&reviewed_files, &head_files).map_err(GithubError::Api)
+        change_covered(&reviewed_files, &head_files, &mut |path, which| {
+            let reference = match which {
+                Which::Reviewed => reviewed,
+                Which::Head => head,
+                Which::Base => base,
+            };
+            self.blob_sha(owner, repo, path, reference)
+        })
+        .map_err(GithubError::Api)
+    }
+
+    /// The commit `branch` points at now.
+    pub fn branch_sha(&self, owner: &str, repo: &str, branch: &str) -> Result<String, GithubError> {
+        #[derive(Deserialize)]
+        struct C {
+            sha: String,
+        }
+        let c: C = self.get_json(&format!("/repos/{owner}/{repo}/commits/{branch}"))?;
+        Ok(c.sha)
+    }
+
+    /// The blob sha of `path` at `reference`, `None` when the file is not there.
+    fn blob_sha(&self, owner: &str, repo: &str, path: &str, reference: &str) -> Result<Option<String>, String> {
+        #[derive(Deserialize)]
+        struct F {
+            #[serde(default)]
+            sha: Option<String>,
+        }
+        let mut enc = String::new();
+        for b in path.bytes() {
+            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~' | b'/') {
+                enc.push(b as char);
+            } else {
+                enc.push_str(&format!("%{b:02X}"));
+            }
+        }
+        match self.get_json::<F>(&format!("/repos/{owner}/{repo}/contents/{enc}?ref={reference}")) {
+            Ok(f) => Ok(f.sha),
+            Err(GithubError::NotFound) => Ok(None),
+            Err(err) => Err(format!("reading {path} at {reference}: {err}")),
+        }
     }
 
     /// The files `base...head` changes, with patches. GitHub lists at most
@@ -1364,15 +1406,41 @@ fn change_lines(patch: &str) -> Vec<&str> {
     patch.lines().filter(|l| l.starts_with('+') || l.starts_with('-')).collect()
 }
 
+/// Which commit of a comparison a file is read at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Which {
+    Reviewed,
+    Head,
+    Base,
+}
+
 /// The most files GitHub lists of one compare.
 const COMPARE_FILE_LIMIT: usize = 300;
 
 /// Whether the change `head` makes is covered by `reviewed`: every file of
 /// `head` is in `reviewed` with the same renamed-from and the same added and
-/// removed lines. `reviewed` may have files `head` lacks. `Err` (with why)
-/// when a head file's patch, or its reviewed one, is missing and so cannot be
-/// told.
-pub fn change_covered(reviewed: &[CompareFile], head: &[CompareFile]) -> Result<bool, String> {
+/// removed lines. A file only `reviewed` has was either absorbed by the base
+/// (its head has nothing of its own there) or reverted by the branch; the two
+/// look alike in the diffs, so `blob(path, which)` (the file's blob sha at that
+/// commit, `None` when absent) tells them apart: it is covered only if the
+/// head's file is the reviewed one, or the base's is. Anything else is not
+/// covered. `Err` (with why) when a head file's patch, or its reviewed one, is
+/// missing and so cannot be told, or a blob cannot be read.
+pub fn change_covered(
+    reviewed: &[CompareFile],
+    head: &[CompareFile],
+    blob: &mut dyn FnMut(&str, Which) -> Result<Option<String>, String>,
+) -> Result<bool, String> {
+    for r in reviewed {
+        if head.iter().any(|h| h.filename == r.filename) {
+            continue;
+        }
+        let at_reviewed = blob(&r.filename, Which::Reviewed)?;
+        if at_reviewed == blob(&r.filename, Which::Head)? || at_reviewed == blob(&r.filename, Which::Base)? {
+            continue;
+        }
+        return Ok(false);
+    }
     for h in head {
         let Some(r) = reviewed.iter().find(|r| r.filename == h.filename) else {
             return Ok(false);
@@ -1409,32 +1477,60 @@ mod change_equal_tests {
     fn hunk_positions_and_context_do_not_matter() {
         let a = [file("a.rs", "@@ -1,3 +1,4 @@\n ctx\n+new\n ctx2")];
         let b = [file("a.rs", "@@ -40,3 +41,4 @@\n other ctx\n+new\n ctx3")];
-        assert_eq!(change_covered(&a, &b), Ok(true));
+        assert_eq!(change_covered(&a, &b, &mut blobs(None, None, None)), Ok(true));
+    }
+
+    fn blobs(
+        reviewed: Option<&'static str>,
+        head: Option<&'static str>,
+        base: Option<&'static str>,
+    ) -> impl FnMut(&str, Which) -> Result<Option<String>, String> {
+        move |_, w| {
+            Ok(match w {
+                Which::Reviewed => reviewed,
+                Which::Head => head,
+                Which::Base => base,
+            }
+            .map(String::from))
+        }
     }
 
     /// #6663: the reviewed diff had `.quality/baseline.json`, which the merged
-    /// main later replaced, so the head's diff lacks it.
+    /// main later replaced, so the head's diff lacks it: the base has the
+    /// reviewed version.
     #[test]
     fn a_file_the_base_absorbed_is_still_covered() {
         let reviewed = [file("a.rs", "@@ -1 +1 @@\n+new"), file(".quality/baseline.json", "@@ -1 +1 @@\n+{}")];
         let head = [file("a.rs", "@@ -9 +9 @@\n+new")];
-        assert_eq!(change_covered(&reviewed, &head), Ok(true));
+        assert_eq!(change_covered(&reviewed, &head, &mut blobs(Some("x"), Some("x"), Some("x"))), Ok(true));
+        assert_eq!(change_covered(&reviewed, &head, &mut blobs(Some("x"), Some("y"), Some("x"))), Ok(true));
+    }
+
+    /// A commit after the review reverted (or deleted) a reviewed file: the
+    /// diffs look like an absorbed one, but neither head nor base has the
+    /// reviewed version.
+    #[test]
+    fn a_revert_after_the_review_is_stale() {
+        let reviewed = [file("a.rs", "@@ -1 +1 @@\n+new"), file("b.rs", "@@ -1 +1 @@\n+b")];
+        let head = [file("a.rs", "@@ -9 +9 @@\n+new")];
+        assert_eq!(change_covered(&reviewed, &head, &mut blobs(Some("rev"), Some("old"), Some("old"))), Ok(false));
+        assert_eq!(change_covered(&reviewed, &head, &mut blobs(Some("rev"), None, Some("old"))), Ok(false));
     }
 
     #[test]
     fn a_new_or_differing_file_is_a_change() {
         let reviewed = [file("a.rs", "@@ -1 +1 @@\n+new"), file("c.rs", "+c")];
-        assert_eq!(change_covered(&reviewed, &[file("a.rs", "@@ -1 +1 @@\n+newer")]), Ok(false));
-        assert_eq!(change_covered(&reviewed, &[file("b.rs", "@@ -1 +1 @@\n+new")]), Ok(false));
-        assert_eq!(change_covered(&reviewed, &[reviewed[0].clone(), file("b.rs", "+x")]), Ok(false));
+        assert_eq!(change_covered(&reviewed, &[file("a.rs", "@@ -1 +1 @@\n+newer")], &mut blobs(None, None, None)), Ok(false));
+        assert_eq!(change_covered(&reviewed, &[file("b.rs", "@@ -1 +1 @@\n+new")], &mut blobs(None, None, None)), Ok(false));
+        assert_eq!(change_covered(&reviewed, &[reviewed[0].clone(), file("b.rs", "+x")], &mut blobs(None, None, None)), Ok(false));
         let renamed = CompareFile { previous_filename: Some("old.rs".into()), ..reviewed[0].clone() };
-        assert_eq!(change_covered(&reviewed, &[renamed]), Ok(false));
+        assert_eq!(change_covered(&reviewed, &[renamed], &mut blobs(None, None, None)), Ok(false));
     }
 
     #[test]
     fn a_missing_patch_cannot_be_compared() {
         let a = [CompareFile { patch: None, ..file("img.png", "") }];
-        assert!(change_covered(&a, &a).is_err());
+        assert!(change_covered(&a, &a, &mut blobs(None, None, None)).is_err());
     }
 }
 
@@ -1830,15 +1926,39 @@ mod tests {
         let handle = std::thread::spawn(move || {
             for (status, body) in &replies {
                 let (mut stream, _) = listener.accept().unwrap();
-                // The request is small: one read takes its head and body.
+                // Read the whole request (head, then the body its length names):
+                // closing with unread bytes resets the connection under the
+                // client, and a retry then fails with "connection reset".
+                let mut got = Vec::new();
                 let mut buf = [0u8; 8192];
-                let _ = stream.read(&mut buf);
+                loop {
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    got.extend_from_slice(&buf[..n]);
+                    let Some(end) = got.windows(4).position(|w| w == b"\r\n\r\n") else { continue };
+                    let head = String::from_utf8_lossy(&got[..end]).to_ascii_lowercase();
+                    let len = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if got.len() >= end + 4 + len {
+                        break;
+                    }
+                }
                 write!(
                     stream,
                     "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                     body.len()
                 )
                 .unwrap();
+                stream.flush().unwrap();
+                // Let the client close first, so nothing it sent is reset.
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                let _ = stream.shutdown(std::net::Shutdown::Write);
+                let _ = stream.read(&mut buf);
             }
             replies.len()
         });
