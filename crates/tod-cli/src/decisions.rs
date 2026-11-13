@@ -132,7 +132,7 @@ fn parse_move(raw: &str) -> anyhow::Result<OptionMove> {
         .map_err(|_| anyhow::anyhow!("--moves-to `{raw}`: `{option}` is not an option number"))?;
     let to = to.trim();
     tod_store::decisions::check_move_target(to).map_err(|err| anyhow::anyhow!("--moves-to `{raw}`: {err:#}"))?;
-    Ok(OptionMove { option, to: to.to_string() })
+    Ok(OptionMove { option, to: to.to_string(), asked_in: None })
 }
 
 fn parse_evidence(inv: &Invocation, raw: &str) -> anyhow::Result<EvidenceRef> {

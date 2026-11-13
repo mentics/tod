@@ -139,13 +139,24 @@ fn answer_with_reopen(
         // it has now are not the ones that were sent back.
         if decision.status != DECISION_PENDING {
             bail!(
-                "this request was already answered, and picking \"{}\" again would send the task back a second time: \
-                 use the task's state chip if that is what you want",
+                "this request was already answered; a changed answer does not move the task, so picking \"{}\" now \
+                 does nothing: use the task's state chip if it still needs to go back",
                 option
                     .and_then(|o| usize::try_from(o).ok().and_then(|i| decision.options.get(i.checked_sub(1)?)))
                     .map(String::as_str)
                     .unwrap_or("")
             );
+        }
+        // The question described the node as it was then. Rows from before the
+        // state was recorded have none and are not refused.
+        if let Some(asked) = option.and_then(|o| decision.asked_in_for(o)) {
+            let now = current_state(fleet, decision.node_id)?;
+            if now != asked && now != to {
+                bail!(
+                    "the task has moved on since this was asked (from `{asked}` to `{now}`), so sending it back to \
+                     `{to}` no longer fits: use the task's state chip if it still needs to go back"
+                );
+            }
         }
         let label = option
             .and_then(|o| usize::try_from(o).ok().and_then(|i| decision.options.get(i.checked_sub(1)?)))
@@ -222,7 +233,7 @@ mod tests {
     fn answering_a_send_back_option_moves_the_node_and_reopens_its_steps() {
         let fx = fixture();
         in_review_with_verified_steps(&fx);
-        let id = ask(&fx, vec![OptionMove { option: 1, to: "active".into() }]).unwrap();
+        let id = ask(&fx, vec![OptionMove { option: 1, to: "active".into(), asked_in: None }]).unwrap();
         assert_eq!(pending(&fx), 1);
 
         let answered = answer_decision(&fx.fleet, id, Some(1), None).unwrap();
@@ -242,7 +253,7 @@ mod tests {
     fn an_answer_that_failed_after_the_move_can_be_given_again() {
         let fx = fixture();
         in_review_with_verified_steps(&fx);
-        let id = ask(&fx, vec![OptionMove { option: 1, to: "active".into() }]).unwrap();
+        let id = ask(&fx, vec![OptionMove { option: 1, to: "active".into(), asked_in: None }]).unwrap();
         let err = answer_with(&fx.fleet, id, Some(1), None, |_| anyhow::bail!("disk full")).unwrap_err();
         assert!(format!("{err:#}").contains("disk full"), "{err:#}");
         // Moved, still asked.
@@ -259,7 +270,7 @@ mod tests {
     fn a_failed_reopen_says_the_task_was_moved_and_a_repeat_finishes_it() {
         let fx = fixture();
         in_review_with_verified_steps(&fx);
-        let id = ask(&fx, vec![OptionMove { option: 1, to: "active".into() }]).unwrap();
+        let id = ask(&fx, vec![OptionMove { option: 1, to: "active".into(), asked_in: None }]).unwrap();
         let err = answer_with_reopen(
             &fx.fleet,
             id,
@@ -283,7 +294,7 @@ mod tests {
     fn a_changed_answer_does_not_send_the_task_back_again() {
         let fx = fixture();
         in_review_with_verified_steps(&fx);
-        let id = ask(&fx, vec![OptionMove { option: 1, to: "active".into() }]).unwrap();
+        let id = ask(&fx, vec![OptionMove { option: 1, to: "active".into(), asked_in: None }]).unwrap();
         answer_decision(&fx.fleet, id, Some(1), None).unwrap();
         // The task is rebuilt, verified, and back in review.
         crate::lifecycle::set_lifecycle(&fx.fleet, fx.node, "review").unwrap();
@@ -306,7 +317,7 @@ mod tests {
     fn moving_the_node_by_hand_withdraws_a_pending_send_back_question() {
         let fx = fixture();
         in_review_with_verified_steps(&fx);
-        let moving = ask(&fx, vec![OptionMove { option: 1, to: "active".into() }]).unwrap();
+        let moving = ask(&fx, vec![OptionMove { option: 1, to: "active".into(), asked_in: None }]).unwrap();
         let plain = ask(&fx, vec![]).unwrap();
         // The chip's path (the CLI sends the same mutation).
         crate::lifecycle::set_lifecycle_by_user(&fx.fleet, fx.node, "active").unwrap();
@@ -317,15 +328,34 @@ mod tests {
         // Its own answer's move does not withdraw it.
         let fx = fixture();
         in_review_with_verified_steps(&fx);
-        let id = ask(&fx, vec![OptionMove { option: 1, to: "active".into() }]).unwrap();
+        let id = ask(&fx, vec![OptionMove { option: 1, to: "active".into(), asked_in: None }]).unwrap();
         answer_decision(&fx.fleet, id, Some(1), None).unwrap();
+    }
+
+    #[test]
+    fn a_question_asked_in_review_is_refused_once_the_gate_has_moved_the_node_on() {
+        let fx = fixture();
+        in_review_with_verified_steps(&fx);
+        let id = ask(&fx, vec![OptionMove { option: 1, to: "active".into(), asked_in: None }]).unwrap();
+        let d = fx.fleet.read(|conn| DecisionRepo::new(conn).get(id)).unwrap().unwrap();
+        assert_eq!(d.asked_in_for(1), Some("review"));
+        // Check now's path: the gate advances review to pr.
+        assert_eq!(crate::lifecycle::advance(&fx.fleet, fx.node).unwrap(), Some("pr"));
+
+        let err = answer_decision(&fx.fleet, id, Some(1), None).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("from `review` to `pr`") && text.contains("state chip"), "{text}");
+        assert_eq!(current_state(&fx.fleet, fx.node).unwrap(), "pr");
+        let steps = fx.fleet.list_plan_steps_for_node(fx.node).unwrap();
+        assert!(steps.iter().all(|s| s.status == STATUS_VERIFIED), "{steps:?}");
+        assert_eq!(pending(&fx), 1);
     }
 
     #[test]
     fn an_option_without_a_move_only_answers() {
         let fx = fixture();
         in_review_with_verified_steps(&fx);
-        let id = ask(&fx, vec![OptionMove { option: 1, to: "active".into() }]).unwrap();
+        let id = ask(&fx, vec![OptionMove { option: 1, to: "active".into(), asked_in: None }]).unwrap();
         let answered = answer_decision(&fx.fleet, id, Some(2), None).unwrap();
         assert_eq!(answered.moved_to, None);
         assert_eq!(current_state(&fx.fleet, fx.node).unwrap(), "review");
@@ -336,11 +366,11 @@ mod tests {
     fn a_move_that_cannot_be_made_fails_the_answer_and_records_nothing() {
         let fx = fixture();
         in_review_with_verified_steps(&fx);
-        let id = ask(&fx, vec![OptionMove { option: 1, to: "active".into() }]).unwrap();
+        let id = ask(&fx, vec![OptionMove { option: 1, to: "active".into(), asked_in: None }]).unwrap();
         // The node was moved by hand meanwhile: nothing left to send back.
         crate::lifecycle::set_lifecycle(&fx.fleet, fx.node, "planning").unwrap();
         let err = answer_decision(&fx.fleet, id, Some(1), None).unwrap_err();
-        assert!(format!("{err:#}").contains("not later than `active`"), "{err:#}");
+        assert!(format!("{err:#}").contains("moved on since"), "{err:#}");
         assert_eq!(pending(&fx), 1);
         assert_eq!(current_state(&fx.fleet, fx.node).unwrap(), "planning");
     }
@@ -350,9 +380,9 @@ mod tests {
         let fx = fixture();
         in_review_with_verified_steps(&fx);
         for to in ["pr_review", "approved", "done", "nonsense", "review", "pr"] {
-            assert!(ask(&fx, vec![OptionMove { option: 1, to: to.into() }]).is_err(), "{to}");
+            assert!(ask(&fx, vec![OptionMove { option: 1, to: to.into(), asked_in: None }]).is_err(), "{to}");
         }
-        let err = ask(&fx, vec![OptionMove { option: 3, to: "active".into() }]).unwrap_err();
+        let err = ask(&fx, vec![OptionMove { option: 3, to: "active".into(), asked_in: None }]).unwrap_err();
         assert!(format!("{err:#}").contains("option 3"), "{err:#}");
         assert_eq!(pending(&fx), 0);
     }

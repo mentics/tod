@@ -75,6 +75,13 @@ pub struct OptionMove {
     pub option: i64,
     /// The lifecycle state the node is sent back to.
     pub to: String,
+    /// The state the node was in when the question was asked, recorded by
+    /// `DecisionRepo::create`. The move describes that node; once the node
+    /// has gone on (the gate advanced it, a person moved it) it no longer
+    /// does, and answering it is refused. Rows made before this was
+    /// recorded have none, and are not refused.
+    #[serde(default)]
+    pub asked_in: Option<String>,
 }
 
 /// The first lifecycle state a decision's option may not move a node into:
@@ -134,6 +141,11 @@ impl Decision {
     /// The state picking `option` (1-based) moves the node back to, if it does.
     pub fn move_for(&self, option: i64) -> Option<&str> {
         self.moves.iter().find(|m| m.option == option).map(|m| m.to.as_str())
+    }
+
+    /// The state the node was in when picking `option` was offered, if known.
+    pub fn asked_in_for(&self, option: i64) -> Option<&str> {
+        self.moves.iter().find(|m| m.option == option).and_then(|m| m.asked_in.as_deref())
     }
 }
 
@@ -270,6 +282,7 @@ impl<'a> DecisionRepo<'a> {
             );
         }
         let mut seen = Vec::new();
+        let mut moves = Vec::new();
         for m in &decision.moves {
             if m.option < 1 || m.option > options.len() as i64 {
                 bail!(
@@ -298,6 +311,7 @@ impl<'a> DecisionRepo<'a> {
             if state_rank(&m.to) >= state_rank(&current) {
                 bail!("--moves-to {}: the node is in `{current}`, which is not later than `{}`", m.to, m.to);
             }
+            moves.push(OptionMove { option: m.option, to: m.to.clone(), asked_in: Some(current) });
         }
         let id = Uuid::new_v4();
         let now = now_ms();
@@ -315,7 +329,7 @@ impl<'a> DecisionRepo<'a> {
                 serde_json::to_string(&decision.evidence)?,
                 now,
                 reason,
-                serde_json::to_string(&decision.moves)?,
+                serde_json::to_string(&moves)?,
             ],
         )?;
         self.get(id)?.context("decision vanished after insert")
@@ -721,7 +735,7 @@ mod tests {
         let fx = setup();
         let repo = DecisionRepo::new(&fx.conn);
         let mut d = decision("Back?", &["Send it back"]);
-        d.moves = vec![OptionMove { option: 1, to: "active".into() }];
+        d.moves = vec![OptionMove { option: 1, to: "active".into(), asked_in: None }];
         // The node has no lifecycle state here.
         assert!(repo.create(fx.node, None, None, &d).is_err());
     }
