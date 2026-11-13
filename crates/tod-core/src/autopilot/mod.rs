@@ -415,6 +415,9 @@ pub struct Autopilot {
     poll: Duration,
     /// How often a pull request is read again while the run waits on it.
     pr_poll: Duration,
+    /// The least time between two rounds whose only work is merging a moved
+    /// base branch in ([`PR_HOUSEKEEPING_GAP`]).
+    housekeeping_gap: Duration,
     state: AutopilotState,
     /// Set by the user's request for a new session ([`AutopilotState::fresh_session`]):
     /// the next conversation is a new one, never a reopened one. Taken by
@@ -431,6 +434,14 @@ pub const PR_POLL: Duration = Duration::from_secs(60);
 /// less often.
 const PR_SLOW_AFTER: Duration = Duration::from_secs(60 * 60);
 const PR_SLOW_FACTOR: u32 = 5;
+/// On a busy base branch the pull request is behind again minutes after a
+/// merge. A round whose only work is that is started at most this often (it
+/// is waited for, not worked, in between)...
+pub const PR_HOUSEKEEPING_GAP: Duration = Duration::from_secs(30 * 60);
+/// ...and at most this many in a row before the run stops for the user, since
+/// a pull request that never gets ahead of its base is not converging. Seen
+/// live: two or three agent sessions per merge, all night.
+const PR_HOUSEKEEPING_LIMIT: u32 = 8;
 
 /// Who a request is consumed by when a runner on this machine takes it.
 pub const LOCAL_CONSUMER: &str = "autopilot:local";
@@ -447,6 +458,7 @@ impl Autopilot {
             budget,
             poll: Duration::from_millis(500),
             pr_poll: PR_POLL,
+            housekeeping_gap: PR_HOUSEKEEPING_GAP,
             state,
             fresh_session,
             lost_checked: None,
@@ -460,6 +472,13 @@ impl Autopilot {
     /// How often a pull request being waited on is read again.
     pub fn with_pr_poll_interval(mut self, pr_poll: Duration) -> Self {
         self.pr_poll = pr_poll;
+        self
+    }
+
+    /// The least time between two rounds whose only work is merging a moved
+    /// base branch in.
+    pub fn with_housekeeping_gap(mut self, gap: Duration) -> Self {
+        self.housekeeping_gap = gap;
         self
     }
 
@@ -510,8 +529,11 @@ impl Autopilot {
     /// The pull request has nothing left for the agent (clear, or waiting for
     /// a person): the next feedback starts the count of rounds again.
     fn reset_pr_rounds(&mut self) -> Result<()> {
-        if self.state.loops.pr_rounds != 0 {
-            self.state.loops.pr_rounds = 0;
+        let loops = &mut self.state.loops;
+        if loops.pr_rounds != 0 || loops.pr_unchanged != 0 || loops.pr_housekeeping_rounds != 0 {
+            loops.pr_rounds = 0;
+            loops.pr_unchanged = 0;
+            loops.pr_housekeeping_rounds = 0;
             self.save()?;
         }
         Ok(())
@@ -1099,7 +1121,6 @@ impl Autopilot {
     ) -> Result<Option<Outcome>> {
         use crate::pr_readiness::{self, Next as PrNext};
         let mut waited_since: Option<std::time::Instant> = None;
-        let mut unchanged = 0u32;
         // The asks for a bot's review this run has posted (pull request, bot,
         // head, asks so far), so a read that has not caught up yet never
         // makes it post the same one twice.
@@ -1226,6 +1247,44 @@ impl Autopilot {
                         self.state.loops.pr_rounds += 1;
                         self.save()?;
                     }
+                    // Merging a moved base in is all there is: a session costs
+                    // the same however little it does, and the base moves again
+                    // soon, so it is not started more often than the gap allows,
+                    // nor without end.
+                    if !change_owed && works.iter().all(|w| matches!(w, pr_readiness::Work::Behind)) {
+                        if self.state.loops.pr_housekeeping_rounds >= PR_HOUSEKEEPING_LIMIT {
+                            return Ok(Some(Outcome::NeedsHuman {
+                                reason: NeedsHuman::PrStuck {
+                                    why: format!(
+                                        "the base branch moved {} times in a row, each merge-in leaving the branch behind again: merge it in by hand when it settles",
+                                        self.state.loops.pr_housekeeping_rounds
+                                    ),
+                                },
+                            }));
+                        }
+                        let last = self.state.loops.pr_housekeeping_at_ms;
+                        let due = last + self.housekeeping_gap.as_millis() as i64;
+                        let now = chrono::Utc::now().timestamp_millis();
+                        if self.state.loops.pr_housekeeping_rounds > 0 && now < due {
+                            let interval = self.pr_poll.min(Duration::from_millis((due - now) as u64));
+                            let what = format!(
+                                "the base branch moved again; merging it in at most every {} minutes",
+                                self.housekeeping_gap.as_secs() / 60
+                            );
+                            hook.waiting(Some(&what), Some(now + interval.as_millis() as i64));
+                            if let Some(reason) = self.sleep_watching(fleet, hook, interval)? {
+                                hook.waiting(None, None);
+                                return Ok(Some(Outcome::Stopped { reason }));
+                            }
+                            continue;
+                        }
+                        self.state.loops.pr_housekeeping_rounds += 1;
+                        self.state.loops.pr_housekeeping_at_ms = now;
+                        self.save()?;
+                    } else if self.state.loops.pr_housekeeping_rounds != 0 {
+                        self.state.loops.pr_housekeeping_rounds = 0;
+                        self.save()?;
+                    }
                     let before = self.pr_report(fleet)?;
                     let fingerprint: Vec<String> = live.iter().map(|p| p.fingerprint.clone()).collect();
                     if reviewed {
@@ -1259,8 +1318,9 @@ impl Autopilot {
                     // work the agent cannot fix (a bot that has not reviewed
                     // and has no findings) is not its turn to lose.
                     if works.iter().any(pr_readiness::Work::agent_can_fix) {
-                        unchanged = if same { unchanged + 1 } else { 0 };
-                        if unchanged >= 2 {
+                        self.state.loops.pr_unchanged = if same { self.state.loops.pr_unchanged + 1 } else { 0 };
+                        self.save()?;
+                        if self.state.loops.pr_unchanged >= 2 {
                             return Ok(Some(Outcome::NeedsHuman {
                                 reason: NeedsHuman::PrStuck {
                                     why: "two turns in a row changed nothing on the pull request".to_string(),

@@ -492,6 +492,7 @@ fn autopilot(fx: &Fixture, budget: Budget) -> Autopilot {
     Autopilot::new(config(fx), fx.node, budget)
         .unwrap()
         .with_poll_interval(Duration::ZERO)
+        .with_housekeeping_gap(Duration::ZERO)
 }
 
 #[test]
@@ -1794,6 +1795,49 @@ fn rounds_of_housekeeping_do_not_stop_the_babysitter() {
     assert!(matches!(outcome, Outcome::Waiting { .. }), "{outcome:?}");
     assert_eq!(agent.turns, 6);
     assert_eq!(pilot.state().loops.pr_rounds, 0);
+}
+
+/// Stops the run after `n` looks at the pull request.
+struct StopAfter(u32);
+
+impl StepHook for StopAfter {
+    fn at(&mut self, _: &FleetStore, _: Boundary) -> Result<Option<String>> {
+        self.0 = self.0.saturating_sub(1);
+        Ok((self.0 == 0).then(|| "test over".to_string()))
+    }
+}
+
+/// Seen live (ENG-3095): on a busy base branch the pull request was behind
+/// again minutes after every merge, and each merge cost two or three agent
+/// sessions, all night, until the session budget was gone. A round that only
+/// merges the base in is started at most once per gap; in between the run waits.
+#[test]
+fn a_base_that_keeps_moving_is_waited_on_not_merged_in_every_poll() {
+    use Look::*;
+    let (fx, _, mut agent) = scripted_pr(vec![Behind; 20]);
+    let mut pilot = autopilot(&fx, Budget::default())
+        .with_pr_poll_interval(Duration::ZERO)
+        .with_housekeeping_gap(Duration::from_secs(3600));
+    let outcome = pilot.run_with(&fx.fleet, &mut agent, &mut StopAfter(40)).unwrap();
+    assert!(matches!(outcome, Outcome::Stopped { .. }), "{outcome:?}");
+    // One round (a turn) at the start; every other look waited.
+    assert_eq!(agent.turns, 1);
+    assert_eq!(pilot.state().loops.pr_housekeeping_rounds, 1);
+}
+
+#[test]
+fn a_base_that_never_stops_moving_ends_in_a_precise_stop() {
+    use Look::*;
+    let (fx, _, mut agent) = scripted_pr(vec![Behind; 20]);
+    let mut pilot = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO);
+    let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
+    match &outcome {
+        Outcome::NeedsHuman { reason: NeedsHuman::PrStuck { why } } => {
+            assert!(why.contains("base branch moved"), "{why}")
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(agent.turns, 8);
 }
 
 #[test]

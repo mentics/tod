@@ -127,6 +127,19 @@ pub struct LoopCounters {
     /// clear; reset when it is clear or waits for a person.
     #[serde(default)]
     pub pr_rounds: u32,
+    /// Consecutive agent turns that left the pull request exactly as it was
+    /// while work the agent could fix was shown. Persisted so a run that is
+    /// resumed (or woken) does not start the count again; reset with
+    /// `pr_rounds`.
+    #[serde(default)]
+    pub pr_unchanged: u32,
+    /// Consecutive rounds whose only work was merging a moved base branch in,
+    /// since the pull request last was clear or waited for a person.
+    #[serde(default)]
+    pub pr_housekeeping_rounds: u32,
+    /// When the last such round started (ms since the epoch).
+    #[serde(default)]
+    pub pr_housekeeping_at_ms: i64,
     /// Evaluator rejections in the current stay in the state being judged.
     #[serde(default)]
     pub evaluator_rejections: u32,

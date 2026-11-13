@@ -31,6 +31,15 @@ turns, findings, run_state, node_timeline, journey records):
 
 ---
 
+## 2026-11-13: sixty agent turns on a pull request that needed none (ENG-3095)
+
+- **Seen**: 1, ENG-3095 (`pr_draft` for 4 days, flagship#6659), 2026-11-09 to 2026-11-11. The run stopped on the supervisor budget request "Used 60 of 60 sessions (1.6 of 16 hours)".
+- **Symptom**: a node whose pull request was only waiting on a review bot and a busy base branch used up its whole session budget. The PR conversation holds ~60 agent turns, ten minutes apart or less ("merge the base in", "greptile has not reviewed the current head: if it has to be asked, ask it", "nothing to push"), plus 24 review and 7 fix sessions of tod's own review of those merges.
+- **Cause**: (1) a bot that had not reviewed was *work* for the agent (fixed since in e6a0d47e, 2026-11-12: it is a wait and tod asks); each agent turn that posted an ask changed the PR, so the "two turns changed nothing" guard never fired. (2) The base branch of that repository moves every few minutes, so "behind its base" was work again after every push; each merge cost a PR turn, a review round and a push turn, with no bound, because merging the base in is deliberately not a counted round. (3) The "unchanged" counter lived in a local variable of `babysit`, so every resume or wake started it again.
+- **Fix**: a round whose only work is merging a moved base in is started at most once per `PR_HOUSEKEEPING_GAP` (30 min; the run waits and polls in between, saying so) and at most `PR_HOUSEKEEPING_LIMIT` (8) in a row before stopping with `PrStuck` ("the base branch moved N times in a row..."); the counters (`loops.pr_housekeeping_*`, `loops.pr_unchanged`) are saved and reset when the PR is clear or waits for a person. All sessions in `pr_draft`/`pr_review` (entry turn, babysit turn, change-reviewed turns, skill groups, own review, fix) start in the one `babysit` loop, which now makes the decision before any of them.
+- **Tests**: `a_base_that_keeps_moving_is_waited_on_not_merged_in_every_poll`, `a_base_that_never_stops_moving_ends_in_a_precise_stop`.
+- **Measure**: agent turns per node per stay in `pr_draft` (target: a handful); budget requests whose sessions are mostly `pr` turns that changed nothing (should be 0).
+
 ## 2026-11-12: a person's "send the task back" answer moved nothing (ENG-2068, ENG-2287)
 
 - **Seen**: 1 kind, 2 nodes (ENG-2068 in `review`, ENG-2287 in `verifying`), 2026-11-12.
