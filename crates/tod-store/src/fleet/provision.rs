@@ -926,11 +926,89 @@ fn reuse_sandbox(
 fn make_sandbox(
     fleet: &FleetStore,
     files: &ResolvedFiles,
-    mut location: FilesLocation,
+    location: FilesLocation,
     branch: &str,
     none_saved: &mut Option<bool>,
     progress: &mut dyn FnMut(&str),
 ) -> Result<(FilesLocation, Vec<String>)> {
+    retry_transient(
+        SANDBOX_RETRY_DELAYS,
+        std::thread::sleep,
+        progress,
+        |progress| {
+            *none_saved = None;
+            make_sandbox_once(fleet, files, location.clone(), branch, none_saved, progress)
+        },
+    )
+}
+
+/// How long to wait before each further attempt at making a node's sandbox
+/// after a temporary failure (the network or Blaxel): four attempts over about
+/// three and a half minutes, then the node stops with the error.
+const SANDBOX_RETRY_DELAYS: &[std::time::Duration] = &[
+    std::time::Duration::from_secs(20),
+    std::time::Duration::from_secs(60),
+    std::time::Duration::from_secs(120),
+];
+
+/// A failed attempt at making a sandbox. `retryable` is true only when the
+/// failure is temporary ([`tod_sandbox::blaxel::error_is_transient`], the
+/// classification the orchestrator feed's retries use too) **and** the attempt
+/// cleaned up after itself (the half-made sandbox deleted, the location
+/// forgotten): then, and only then, another attempt cannot double-create. A
+/// kept sandbox, a failed delete or a failed check is never retried.
+struct Attempt {
+    err: anyhow::Error,
+    retryable: bool,
+}
+
+impl From<anyhow::Error> for Attempt {
+    fn from(err: anyhow::Error) -> Self {
+        Attempt { err, retryable: false }
+    }
+}
+
+/// Runs `op`, again after each of `delays` while it fails retryably (see
+/// [`Attempt`]); the last failure is returned with how many attempts were made.
+fn retry_transient<T>(
+    delays: &[std::time::Duration],
+    sleep: impl Fn(std::time::Duration),
+    progress: &mut dyn FnMut(&str),
+    mut op: impl FnMut(&mut dyn FnMut(&str)) -> std::result::Result<T, Attempt>,
+) -> Result<T> {
+    let mut attempt = 0usize;
+    loop {
+        attempt += 1;
+        match op(progress) {
+            Ok(done) => return Ok(done),
+            Err(failed) => match delays.get(attempt - 1) {
+                Some(wait) if failed.retryable => {
+                    progress(&format!(
+                        "making the sandbox failed temporarily (attempt {attempt} of {}); trying again in {}s: {:#}",
+                        delays.len() + 1,
+                        wait.as_secs(),
+                        failed.err
+                    ));
+                    tracing::warn!("making a node's sandbox failed temporarily (attempt {attempt}): {:#}", failed.err);
+                    sleep(*wait);
+                }
+                _ if failed.retryable => {
+                    return Err(failed.err.context(format!("tried {attempt} times over a few minutes")));
+                }
+                _ => return Err(failed.err),
+            },
+        }
+    }
+}
+
+fn make_sandbox_once(
+    fleet: &FleetStore,
+    files: &ResolvedFiles,
+    mut location: FilesLocation,
+    branch: &str,
+    none_saved: &mut Option<bool>,
+    progress: &mut dyn FnMut(&str),
+) -> std::result::Result<(FilesLocation, Vec<String>), Attempt> {
     use tod_sandbox::node;
     let host = super::sandbox_host::host()?;
     let dev = files.dev_container.clone().unwrap_or_default();
@@ -945,7 +1023,7 @@ fn make_sandbox(
     let user = host.orchestrator_user(&root)?;
     let recorded = recorded_sandboxes(fleet, node_id)?;
     let name = match choose_sandbox(&bx, &recorded, &node_row.slug, node_id, progress)? {
-        Chosen::Reuse(name) => return reuse_sandbox(fleet, &name, location, branch, progress),
+        Chosen::Reuse(name) => return Ok(reuse_sandbox(fleet, &name, location, branch, progress)?),
         Chosen::Make(name) => name,
     };
 
@@ -1233,7 +1311,8 @@ fn make_sandbox(
 ///   next start deletes it and makes a fresh one (`NameDecision::ReplaceFailed`).
 ///   `TOD_KEEP_FAILED_SANDBOX` keeps it for a temporary failure too.
 ///
-/// A failed delete is part of the error, never dropped.
+/// A failed delete is part of the error, never dropped. The result says whether
+/// [`make_sandbox`] may try again (a temporary failure that left nothing behind).
 #[allow(clippy::too_many_arguments)]
 fn discard_failed_sandbox(
     fleet: &FleetStore,
@@ -1244,7 +1323,9 @@ fn discard_failed_sandbox(
     name: &str,
     recorded: bool,
     err: anyhow::Error,
-) -> anyhow::Error {
+) -> Attempt {
+    // Set only when the failure is temporary and everything was cleaned up.
+    let mut retryable = false;
     // Whether Blaxel has a sandbox of that name: a fork or create that failed
     // before Blaxel made one leaves nothing, and the message must not say it
     // was deleted or kept.
@@ -1291,6 +1372,7 @@ fn discard_failed_sandbox(
                             format!("{name} was never made (Blaxel has no sandbox of that name), so nothing was deleted")
                         };
                         if transient {
+                            retryable = true;
                             format!(
                                 "{what}. This looks temporary (the network or Blaxel). {todo} start the node \
                                  again, which makes a fresh sandbox"
@@ -1307,7 +1389,7 @@ fn discard_failed_sandbox(
             }
         }
     };
-    err.context(cleaned)
+    Attempt { err: err.context(cleaned), retryable }
 }
 
 /// What [`retire_unusable_sandbox`] did about the sandbox a node's records name.
@@ -1968,6 +2050,69 @@ pub fn stale_locations(fleet: &FleetStore) -> Result<Vec<AffectedLocation>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_temporary_failure_that_cleaned_up_is_retried_then_stops_with_the_error() {
+        use std::cell::{Cell, RefCell};
+        let fork_502 = || anyhow!("fork x: 502 Bad Gateway Error 502: context deadline exceeded (FORK_FAILED)");
+        // Fails twice, then works: three attempts, two waits, nothing escapes.
+        let calls = Cell::new(0);
+        let waits = RefCell::new(Vec::new());
+        let said = RefCell::new(Vec::new());
+        let got = super::retry_transient(
+            super::SANDBOX_RETRY_DELAYS,
+            |d| waits.borrow_mut().push(d),
+            &mut |m: &str| said.borrow_mut().push(m.to_string()),
+            |_| {
+                calls.set(calls.get() + 1);
+                if calls.get() < 3 {
+                    Err(super::Attempt { err: fork_502(), retryable: true })
+                } else {
+                    Ok(7)
+                }
+            },
+        );
+        assert_eq!(got.unwrap(), 7);
+        assert_eq!(calls.get(), 3);
+        assert_eq!(waits.borrow().len(), 2);
+        assert!(said.borrow().iter().all(|m| m.contains("502 Bad Gateway")));
+        // The failure is the transient kind the retry is meant for.
+        assert!(tod_sandbox::blaxel::error_is_transient(&fork_502()));
+
+        // Always failing: stops after the last delay, naming the attempts and the error.
+        let calls = Cell::new(0);
+        let err = super::retry_transient(
+            super::SANDBOX_RETRY_DELAYS,
+            |_| {},
+            &mut |_: &str| {},
+            |_| -> std::result::Result<(), super::Attempt> {
+                calls.set(calls.get() + 1);
+                Err(super::Attempt { err: fork_502(), retryable: true })
+            },
+        )
+        .unwrap_err();
+        assert_eq!(calls.get(), super::SANDBOX_RETRY_DELAYS.len() + 1);
+        let text = format!("{err:#}");
+        assert!(text.contains("tried 4 times") && text.contains("502 Bad Gateway"), "{text}");
+    }
+
+    #[test]
+    fn a_failure_that_is_not_retryable_is_never_retried() {
+        // Kept sandbox, failed delete, or a cause tod does not know: one attempt.
+        let calls = std::cell::Cell::new(0);
+        let err = super::retry_transient(
+            super::SANDBOX_RETRY_DELAYS,
+            |_| panic!("must not wait"),
+            &mut |_: &str| {},
+            |_| -> std::result::Result<(), super::Attempt> {
+                calls.set(calls.get() + 1);
+                Err(anyhow!("tod lost track of a sandbox").into())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(calls.get(), 1);
+        assert!(format!("{err:#}").contains("lost track"));
+    }
+
     #[test]
     fn a_missing_sandbox_is_told_apart_from_other_failures() {
         let gone = anyhow!("no sandbox named tod-x-2-3").context("list submodules");
