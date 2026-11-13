@@ -3630,3 +3630,108 @@ fn a_transient_failure_to_post_the_ask_is_retried_not_put_to_the_user() {
     assert!(!feed.posted.lock().unwrap().is_empty());
     assert!(read_wait(&fx).is_none());
 }
+
+/// [`bot_node`] in `pr_draft` with the review steps on (and a finding from
+/// before the pull request, so the mock reviewer finds this head clean).
+fn bot_node_in_draft(feed: Arc<BotFeed>, bot_yaml: &str) -> (Fixture, FakeAgent) {
+    let fx = bare();
+    retire_outside_criteria(&fx);
+    std::fs::write(fx.root.join("tod.yml"), format!("pr_readiness:\n  bots:\n    - name: greptile\n{bot_yaml}")).unwrap();
+    crate::pr_readiness::set_feed_override(Some(feed));
+    with_pr_draft_review(&fx);
+    fx.fleet
+        .interview(
+            ACTOR_USER,
+            InterviewCommand::AddReviewFinding {
+                node_id: fx.node,
+                conversation_id: None,
+                finding: tod_store::review::NewFinding {
+                    severity: "low".into(),
+                    file: None,
+                    line: None,
+                    summary: "From the review before the pull request.".into(),
+                    detail: None,
+                },
+            },
+        )
+        .unwrap();
+    linked_to_prs(&fx, "pr_draft", &["https://github.com/acme/app/pull/42"]);
+    let agent = FakeAgent::new(&fx.fleet);
+    (fx, agent)
+}
+
+const TRANSIENT: &str = "posting the comment on u: GitHub API error: Something went wrong while executing your query.";
+
+/// A credit-limited bot is asked once per head, after tod's own review of that
+/// head is clean: the ask is attempted only once the review has run, and the
+/// one request to the user is still raised for a bot with no fallback.
+#[test]
+fn a_bot_is_asked_only_after_tods_own_review_of_the_head_is_clean() {
+    let feed = BotFeed::new("2020-01-01T00:00:00Z", None);
+    let (fx, mut agent) = bot_node_in_draft(
+        feed.clone(),
+        "      rerun_after_minutes: 0\n      ask: \"@greptileai please review\"\n      ask_every_minutes: 0\n      max_asks: 3\n",
+    );
+    // The ask cannot go out yet: whatever was attempted came after the review.
+    *feed.post_error.lock().unwrap() = Some(TRANSIENT.into());
+    let outcome = autopilot(&fx, Budget::default()).run(&fx.fleet, &mut agent).unwrap();
+    assert!(matches!(outcome, Outcome::Waiting { .. }), "{outcome:?}");
+    assert_eq!(openings(&fx, ProtocolKind::Review).len(), 1, "the own review ran before any ask was attempted");
+    assert!(feed.posted.lock().unwrap().is_empty());
+    let cleared = fx.fleet.read(|conn| crate::pr_draft_review::cleared_shas(conn, fx.node)).unwrap();
+    assert_eq!(cleared, vec!["0000001".to_string()]);
+
+    *feed.post_error.lock().unwrap() = None;
+    let outcome = autopilot(&fx, Budget::default())
+        .with_pr_poll_interval(Duration::ZERO)
+        .run(&fx.fleet, &mut agent)
+        .unwrap();
+    // Three asks, no more; the same head is not reviewed again; no fallback,
+    // so the user is asked, once.
+    assert_eq!(outcome, Outcome::NeedsHuman { reason: NeedsHuman::Decision { pending: 1 } });
+    assert_eq!(*feed.posted.lock().unwrap(), vec!["@greptileai please review"; 3]);
+    assert_eq!(openings(&fx, ProtocolKind::Review).len(), 1);
+    assert_eq!(bot_decisions(&fx).len(), 1);
+}
+
+/// A bot with `fallback: own_review` that stays silent is given up on for the
+/// head, with no question to the user, once tod's own review of it is clean:
+/// the skip is a note on the node and in the wait's words.
+#[test]
+fn a_silent_bot_with_a_fallback_is_given_up_on_visibly_without_asking_the_user() {
+    let feed = BotFeed::new("2020-01-01T00:00:00Z", None);
+    let (fx, mut agent) = bot_node_in_draft(
+        feed.clone(),
+        "      rerun_after_minutes: 0\n      ask: \"@greptileai please review\"\n      ask_every_minutes: 0\n      max_asks: 3\n      silent_after_minutes: 0\n      fallback: own_review\n",
+    );
+    let outcome = autopilot(&fx, Budget::default())
+        .with_pr_poll_interval(Duration::ZERO)
+        .run(&fx.fleet, &mut agent)
+        .unwrap();
+    let Outcome::Waiting { what, .. } = &outcome else {
+        panic!("{outcome:?} {:?} posted {:?}", bot_decisions(&fx).iter().map(|d| d.question.clone()).collect::<Vec<_>>(), feed.posted.lock().unwrap())
+    };
+    let note = "greptile did not review after 1 ask over 0 minutes; relying on tod's own review of 0000001";
+    assert!(what.contains(note), "{what}");
+    assert_eq!(*feed.posted.lock().unwrap(), vec!["@greptileai please review"], "asked once, then given up on");
+    assert!(bot_decisions(&fx).is_empty(), "no question to the user");
+    assert_eq!(openings(&fx, ProtocolKind::Review).len(), 1);
+    let timeline = fx.fleet.read(|conn| tod_store::node_timeline::TimelineRepo::new(conn).list(fx.node)).unwrap();
+    let notes: Vec<_> = timeline.iter().filter(|e| e.kind == tod_store::node_timeline::KIND_NOTE).collect();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(notes[0].title.contains("relying on tod's own review of 0000001"), "{}", notes[0].title);
+    assert_eq!(notes[0].detail, note);
+
+    // Run again: the same head is not noted twice, and nothing more is asked.
+    let _ = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO).run(&fx.fleet, &mut agent).unwrap();
+    let again = fx.fleet.read(|conn| tod_store::node_timeline::TimelineRepo::new(conn).list(fx.node)).unwrap();
+    assert_eq!(again.iter().filter(|e| e.kind == tod_store::node_timeline::KIND_NOTE).count(), 1);
+    assert_eq!(feed.posted.lock().unwrap().len(), 1);
+
+    // The waiver is read per head from this node's own review: another node
+    // has no cleared head, so nothing is waived for it.
+    let settings = crate::pr_readiness::settings_for_node(&fx.fleet, fx.node, &fx.root).unwrap();
+    assert!(settings.own_review.cleared(Some("0000001")), "{settings:?}");
+    let other = crate::pr_readiness::settings_for_node(&fx.fleet, Uuid::new_v4(), &fx.root).unwrap();
+    assert!(!other.own_review.cleared(Some("0000001")), "{other:?}");
+}

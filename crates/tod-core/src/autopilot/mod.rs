@@ -1171,6 +1171,7 @@ impl Autopilot {
                     return Ok(Some(github_wait::github_look_failed(fleet, self.node, false, &err)?));
                 }
             };
+            self.note_fallbacks(fleet, &live, phase_key)?;
             let mut overall = pr_readiness::overall(&live);
             // A change the agent made and tod has not reviewed or pushed yet
             // (the run stopped in between) is finished first, whatever the
@@ -1275,6 +1276,28 @@ impl Autopilot {
                     // waiting for a person must not put another's running
                     // checks on the review cadence.
                     let waits = short_waits(waits);
+                    // tod's own review of the head comes before a bot is
+                    // asked (its credits are for the final head), and a bot's
+                    // fallback relies on it: run it now, with nothing but
+                    // bots and that review outstanding, instead of waiting
+                    // out a bot nobody has asked yet.
+                    use pr_readiness::Wait as W;
+                    if before_review
+                        && waits.iter().any(|w| matches!(w, W::OwnReview { .. }))
+                        && waits.iter().all(|w| matches!(w, W::OwnReview { .. } | W::BotReview { .. }))
+                    {
+                        hook.waiting(None, None);
+                        match self.checks_round(fleet, agent, hook, "pr_draft")? {
+                            ChecksStep::Proceed => {}
+                            ChecksStep::Fixed => continue,
+                            ChecksStep::Stop(outcome) => return Ok(Some(outcome)),
+                        }
+                        match self.own_review(fleet, agent, hook, feed.as_ref(), &live, &mut answered)? {
+                            OwnReview::Again => continue,
+                            OwnReview::Stop(outcome) => return Ok(Some(outcome)),
+                            OwnReview::Clear => {}
+                        }
+                    }
                     if waits.is_empty() {
                         hook.waiting(None, None);
                         // Nothing is left for the agent: the next feedback
@@ -1301,7 +1324,10 @@ impl Autopilot {
                         return Ok(Some(outcome));
                     }
                     let since = *waited_since.get_or_insert_with(std::time::Instant::now);
-                    let what = wait_description(&waits);
+                    let mut what = wait_description(&waits);
+                    for note in live.iter().flat_map(|p| p.assessment.fallbacks.iter().map(|f| f.note())) {
+                        what.push_str(&format!("; {note}"));
+                    }
                     let interval = if since.elapsed() >= PR_SLOW_AFTER {
                         self.pr_poll * PR_SLOW_FACTOR
                     } else {
@@ -1356,6 +1382,7 @@ impl Autopilot {
                             asks: 0,
                             last_ask_at: None,
                             last_activity_at: None,
+                            exhausted: false,
                         });
                         silent.len() - 1
                     }
@@ -1365,6 +1392,7 @@ impl Autopilot {
                 tried.asks = tried.asks.max(report.asks);
                 tried.last_ask_at = tried.last_ask_at.max(report.last_ask_at);
                 tried.last_activity_at = tried.last_activity_at.max(report.reviewed_at);
+                tried.exhausted |= report.exhausted;
             }
         }
         for tried in silent {
@@ -1406,6 +1434,42 @@ impl Autopilot {
             }
         }
         Ok(None)
+    }
+
+    /// Records, once per bot, pull request and head, that a bot was given up
+    /// on by its `fallback` (`doc/lifecycle/pr-readiness.md`, "A bot that
+    /// stays silent"): a note on the node's activity, so the skip is never
+    /// silent. The task panel's status line says the same
+    /// ([`crate::pr_readiness::FallbackApplied::note`]).
+    fn note_fallbacks(
+        &self,
+        fleet: &FleetStore,
+        live: &[crate::pr_readiness::LivePr],
+        phase: &str,
+    ) -> Result<()> {
+        use tod_store::node_timeline::{KIND_NOTE, TimelineEntry, TimelineRepo};
+        let node = self.node;
+        for p in live {
+            for fallback in &p.assessment.fallbacks {
+                let head: String = fallback.head_sha.as_deref().unwrap_or("the head").chars().take(7).collect();
+                let title = format!(
+                    "{} given up on for {}: relying on tod's own review of {head}",
+                    fallback.bot,
+                    crate::pr_readiness::pr_label(&p.pr)
+                );
+                let known = fleet.read(|conn| {
+                    Ok(TimelineRepo::new(conn).list(node)?.iter().any(|e| e.kind == KIND_NOTE && e.title == title))
+                })?;
+                if known {
+                    continue;
+                }
+                tracing::info!(%node, bot = %fallback.bot, pr = %p.pr.url, "a review bot is given up on: {}", fallback.note());
+                let entry = TimelineEntry::new(node, KIND_NOTE, phase, title, false, fallback.note());
+                fleet.enqueue(tod_store::fleet::FleetMutation::RecordTimeline(Box::new(entry)))?;
+                fleet.writer().flush()?;
+            }
+        }
+        Ok(())
     }
 
     /// One round of work on the pull request's feedback in `pr_draft` with the
@@ -2141,6 +2205,7 @@ fn wait_description(waits: &[crate::pr_readiness::Wait]) -> String {
         .iter()
         .map(|w| match w {
             Wait::BotReview { bot, .. } => format!("{bot} review"),
+            Wait::OwnReview { bot } => format!("tod's own review of the head, before {bot} is asked"),
             Wait::ChecksRunning => "checks to finish".to_string(),
             Wait::GitHub => "GitHub".to_string(),
             Wait::HumanReview => "a review".to_string(),

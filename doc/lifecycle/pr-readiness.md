@@ -413,6 +413,55 @@ its own words. Now:
    the retries are spent. A post that fails never becomes a request to the
    user to "fix GitHub" on the first hiccup.
 
+6. **A bot is asked once, on the final head.** With **Include review steps**
+   on for `pr_draft`, tod does not ask a bot for a head until its own
+   Review -> Fix -> Review of that head is clean (`OwnReviewState::ask_allowed`,
+   read per node by `bot_silence::settings_for_node`), so a bot's review
+   credits are spent on the head that will be merged and never on one a later
+   push supersedes. Until then the wait is `Wait::OwnReview` and
+   `Autopilot::babysit` runs the review first. The PR agent never asks a bot
+   and no tod prompt names one; tod sends the agent what the bot finds. With
+   the review steps off, or in `pr_review` (which is reached only through the
+   clean own review), asking is as in item 2.
+7. **Fallback: rely on the own review.** A bot entry may set
+   `fallback: own_review`, with optional `silent_after_minutes`, and
+   optional `exhausted_pattern` (all unset by default; `silent_after_minutes`
+   without `fallback` is refused when the settings load):
+
+   ```yaml
+   pr_readiness:
+     bots:
+       - name: greptile
+         ask: "@greptileai please review"
+         silent_after_minutes: 60      # from the first ask on this head
+         fallback: own_review
+         exhausted_pattern: "run out of review credits"
+   ```
+
+   Once the bot is silent for that long (default: when the question in item 3
+   would be raised) or its latest comment since the head matches
+   `exhausted_pattern`, and tod's own review of **that head** is clean, the
+   bot is waived for that head: it is no longer waited for, asked, or
+   required by `pr-approved.review-current` / `.review-score`, and the user
+   is not asked. The waiver is per head and per node (a later push starts
+   again; nothing is stored beyond the review's own record), without the
+   decision. It is visible: a node-timeline note ("greptile did not review
+   after N asks over M minutes; relying on tod's own review of abcdef1") and
+   the same text in the task panel's status line. A bot without `fallback`
+   keeps item 3. The fallback needs the review steps on: with them off it is
+   ignored and the user is asked. If the own review is not clean, the bot
+   is neither waived nor asked again, and no question is raised: the review
+   goes first.
+8. **Out of credits is observable.** Greptile answers an ask when out of
+   credits with a comment (seen on Cofactr/kb#2881: "Your organization has
+   run out of review credits. Add credits to resume code reviews."), which
+   `gh` shows read-only. There is no built-in pattern (tod names no bot's
+   wording); set `exhausted_pattern` (a regex) and the bot counts as
+   exhausted at once: no more asks, and the question (or the fallback) comes
+   immediately, with wording that says it will not review. On
+   Cofactr/flagship#6640 the bot only went silent, so `silent_after_minutes`
+   covers that. A bot's own review on push is outside tod's control.
+
 ## What is built where
 
 - `tod-store`: PR thread, review, check and comment reads (GraphQL for

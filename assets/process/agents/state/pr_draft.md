@@ -27,7 +27,7 @@ A human reviewer's feedback comes after that, in `pr_review`.
 Do not rely on what the runner sent you or on GitHub's merge state alone: the merge state reads `blocked` while a review is missing, and that hides a branch that is behind its base. Check each of these yourself, and fix what fails:
 
 - **The branch is current.** Compare it with its base (`git fetch`, then see whether the base has commits the branch lacks); if it does, merge the base in.
-- **Every review bot the project names** (there may be several, or none) **has reviewed the current head, and its latest score for the head meets its threshold.** A score, or a review, left on an earlier commit does not count: if a bot has not reviewed the current head, ask it to, as the project's own skill says how, and fix what it finds that this change introduced.
+- **Every review bot the project names** (there may be several, or none) **has reviewed the current head, and its latest score for the head meets its threshold.** A score, or a review, left on an earlier commit does not count: you never ask a bot yourself, and the project's skills must not either (a bot's credits are spent once per pull request, on the final head): tod asks it, only after its own review of that head is clean, waits for it, and sends you what it finds, which you fix where this change introduced it.
 - **Every open review thread, from a person or a bot, is answered.**
 - **This phase's configured skills have been applied**, as the context lists them.
 

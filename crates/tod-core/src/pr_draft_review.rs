@@ -349,6 +349,24 @@ pub fn cleared(conn: &Connection, node: Uuid, heads: &BTreeMap<String, String>) 
     Ok((!open && round_clean(&findings, &latest)).then_some(latest))
 }
 
+/// The heads (commit SHAs) the stay's latest own review covered and left
+/// clean, as [`gate`] reads it: no open finding of any own review, and the
+/// latest review's round recorded nothing that stands. Empty when the review
+/// steps are off or no review has finished clean. What a review bot's ask and
+/// fallback wait for (`tod_store::OwnReviewState`).
+pub fn cleared_shas(conn: &Connection, node: Uuid) -> Result<Vec<String>> {
+    if !enabled(conn, node)? {
+        return Ok(Vec::new());
+    }
+    let Some(latest) = latest_review(conn, node)? else { return Ok(Vec::new()) };
+    let Some(heads) = reviewed_heads(conn, latest.id)? else { return Ok(Vec::new()) };
+    let findings = own_findings(conn, node)?;
+    if findings.iter().any(|f| f.is_open()) || !round_clean(&findings, &latest) {
+        return Ok(Vec::new());
+    }
+    Ok(heads.into_values().collect())
+}
+
 /// The `pr_draft → pr_review` gate's check (`pr-pr_review.own-review`), for
 /// pull requests whose heads are `heads` (by [`pr_label`]): `Ok` says why it
 /// passes, `Err` why not.

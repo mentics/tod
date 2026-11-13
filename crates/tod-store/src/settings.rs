@@ -219,9 +219,53 @@ pub struct PrReviewBotSettings {
     /// asked whether to go on without it.
     #[serde(default = "default_max_asks")]
     pub max_asks: u32,
+    /// With a `fallback`: minutes after tod's first ask for a head that the
+    /// bot is given up on (counted from that ask, never from the head
+    /// commit). Unset, the bot is given up on when it would otherwise be
+    /// called silent: `max_asks` asks made, the last `ask_every_minutes` ago.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub silent_after_minutes: Option<u64>,
+    /// What replaces a silent bot, with no question to the user, for the head
+    /// it stayed silent on. Unset, the user is asked once
+    /// (`tod_core::bot_silence`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<BotFallback>,
+    /// A regular expression over the bot's latest comment or review body
+    /// (written since the head commit) that says it will not review at all,
+    /// such as out of credits. A match skips the wait at once: the
+    /// `fallback`, or the question to the user when there is none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exhausted_pattern: Option<String>,
+}
+
+/// What stands in for a review bot that stayed silent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BotFallback {
+    /// tod's own review of the head (`tod_core::pr_draft_review`), once it is
+    /// clean, stands in for the bot's.
+    OwnReview,
+}
+
+impl BotFallback {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::OwnReview => "own_review",
+        }
+    }
 }
 
 impl PrReviewBotSettings {
+    /// Whether `body` says the bot is out of reviews (`exhausted_pattern`).
+    /// The pattern is checked when settings load ([`PrReadinessSettings::validate`]).
+    pub fn is_exhausted(&self, body: &str) -> bool {
+        self.exhausted_pattern
+            .as_deref()
+            .filter(|p| !p.trim().is_empty())
+            .and_then(|p| regex::Regex::new(p).ok())
+            .is_some_and(|re| re.is_match(body))
+    }
+
     /// A bot with the default asking limits and no ask text.
     pub fn new(name: &str, min_score: u8, rerun_after_minutes: u64) -> Self {
         Self {
@@ -231,6 +275,9 @@ impl PrReviewBotSettings {
             ask: None,
             ask_every_minutes: default_ask_every_minutes(),
             max_asks: default_max_asks(),
+            silent_after_minutes: None,
+            fallback: None,
+            exhausted_pattern: None,
         }
     }
 
@@ -303,6 +350,70 @@ pub struct PrReadinessSettings {
     /// own asks, never feedback. Never saved.
     #[serde(skip)]
     pub waived_asks: Vec<String>,
+    /// Where tod's own review of the node's pull requests stands, so that a
+    /// bot is asked only once it is clean and a `fallback` can stand in for
+    /// it. Read from the node's conversations
+    /// (`tod_core::bot_silence::settings_for_node`); never saved.
+    #[serde(skip)]
+    pub own_review: OwnReviewState,
+}
+
+/// What tod's own review of a node's pull requests says, for the bots' asks
+/// and fallbacks (`doc/lifecycle/pr-readiness.md`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OwnReviewState {
+    /// The node's lifecycle config includes the review steps in `pr_draft`.
+    pub enabled: bool,
+    /// The node is in `pr_draft`, where the autopilot runs the review.
+    pub in_draft: bool,
+    /// The node is in `pr_review`, which it reaches only through the
+    /// `pr_draft` gate that requires a clean own review: the review is not run
+    /// again there, so what it cleared still stands.
+    pub in_review: bool,
+    /// The heads (commit SHAs) the latest own review covered and left clean.
+    pub cleared_shas: Vec<String>,
+}
+
+impl OwnReviewState {
+    /// The own review stands cleared for `sha` (`None`: GitHub gave none).
+    pub fn cleared(&self, sha: Option<&str>) -> bool {
+        self.enabled && (self.in_review || sha.is_some_and(|sha| self.cleared_shas.iter().any(|c| c == sha)))
+    }
+
+    /// A bot may be asked for `sha`: with the review steps on in `pr_draft`
+    /// only once the own review of that head is clean, so a bot's credits are
+    /// spent on the final head and not on one a later push supersedes.
+    pub fn ask_allowed(&self, sha: Option<&str>) -> bool {
+        !(self.enabled && self.in_draft) || self.cleared(sha)
+    }
+
+    /// A `fallback` of own review can stand in for a bot on `sha`: the review
+    /// steps are on, and the review is either cleared already or will run
+    /// (the node is in `pr_draft`). Otherwise nothing would ever clear it, so
+    /// the bot is treated as one with no fallback.
+    pub fn fallback_usable(&self, sha: Option<&str>) -> bool {
+        self.enabled && (self.in_draft || self.cleared(sha))
+    }
+}
+
+impl PrReadinessSettings {
+    /// Rejects a setting that could never work, with what to change.
+    pub fn validate(&self) -> Result<()> {
+        for bot in &self.bots {
+            if bot.silent_after_minutes.is_some() && bot.fallback.is_none() {
+                bail!(
+                    "pr_readiness.bots[{}]: silent_after_minutes needs a fallback (own_review) to apply; without one the user is asked",
+                    bot.name
+                );
+            }
+            if let Some(pattern) = bot.exhausted_pattern.as_deref().filter(|p| !p.trim().is_empty())
+                && let Err(err) = regex::Regex::new(pattern)
+            {
+                bail!("pr_readiness.bots[{}].exhausted_pattern is not a regular expression: {err}", bot.name);
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Default for PrReadinessSettings {
@@ -313,6 +424,7 @@ impl Default for PrReadinessSettings {
             max_rounds: default_max_rounds(),
             review_schedule: ReviewSchedule::default(),
             waived_asks: Vec::new(),
+            own_review: OwnReviewState::default(),
         }
     }
 }
@@ -1038,6 +1150,7 @@ impl TodSettings {
             geometry.validate()?;
         }
         self.journeys.validate()?;
+        self.pr_readiness.validate()?;
         crate::branch_name::validate_template(&self.branch_template)?;
         Ok(())
     }
@@ -1080,6 +1193,28 @@ mod tests {
     use super::*;
     use crate::paths::{clear_data_root_override, set_data_root};
     use std::fs;
+
+    #[test]
+    fn a_bot_fallback_parses_defaults_to_none_and_is_validated() {
+        let plain = PrReviewBotSettings::new("greptile", 4, 10);
+        assert!((plain.silent_after_minutes, plain.fallback.clone(), plain.exhausted_pattern.clone()) == (None, None, None));
+        let yaml = "bots:\n  - name: greptile\n    silent_after_minutes: 45\n    fallback: own_review\n    exhausted_pattern: run out of review credits\n";
+        let s: PrReadinessSettings = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(s.bots[0].silent_after_minutes, Some(45));
+        assert_eq!(s.bots[0].fallback, Some(BotFallback::OwnReview));
+        assert!(s.bots[0].is_exhausted("Your organization has run out of review credits."));
+        assert!(!s.bots[0].is_exhausted("Confidence Score: 5/5"));
+        s.validate().unwrap();
+        let again: PrReadinessSettings = serde_yaml::from_str(&serde_yaml::to_string(&s).unwrap()).unwrap();
+        assert_eq!(again.bots, s.bots);
+
+        let mut no_fallback = s.clone();
+        no_fallback.bots[0].fallback = None;
+        assert!(no_fallback.validate().unwrap_err().to_string().contains("silent_after_minutes needs a fallback"));
+        let mut bad = s;
+        bad.bots[0].exhausted_pattern = Some("(".into());
+        assert!(bad.validate().is_err());
+    }
 
     #[test]
     fn review_bots_parse_with_a_score_keep_their_tuning_and_round_trip() {
@@ -1254,6 +1389,7 @@ mod tests {
                 max_rounds: 4,
                 review_schedule: ReviewSchedule { start_hour: 9, ..ReviewSchedule::default() },
                 waived_asks: Vec::new(),
+                own_review: OwnReviewState::default(),
             },
             sandbox_idle: SandboxIdleSettings::default(),
             credentials_file_only: true,

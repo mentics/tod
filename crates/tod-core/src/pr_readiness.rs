@@ -119,6 +119,53 @@ pub struct BotReport {
     pub ask_due: bool,
     /// When the head commit was made.
     pub head_at: Option<DateTime<Utc>>,
+    /// When the earliest of those asks was posted.
+    pub first_ask_at: Option<DateTime<Utc>>,
+    /// The bot's latest comment or review since the head commit says it will
+    /// not review (`exhausted_pattern`): out of credits, say.
+    pub exhausted: bool,
+    /// The bot has a `fallback` that can stand in for it on this head (see
+    /// `tod_store::OwnReviewState::fallback_usable`). Such a bot never raises
+    /// the user's question: it is waited for, then given up on.
+    pub fallback_usable: bool,
+    /// tod's own review of the head is owed before the bot is asked or its
+    /// fallback applies: the review steps are on in `pr_draft` and the head
+    /// is not yet cleared.
+    pub own_review_held: bool,
+}
+
+/// A bot given up on for a head, by its `fallback`: the gate relies on tod's
+/// own review of that head instead. Never silent: the task panel says so and
+/// the node's timeline records it ([`Self::note`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FallbackApplied {
+    pub bot: String,
+    pub head_sha: Option<String>,
+    pub asks: u32,
+    /// Minutes from the first ask to the read.
+    pub minutes: i64,
+    /// The bot said it will not review (`exhausted_pattern`), rather than
+    /// the time passing.
+    pub exhausted: bool,
+}
+
+impl FallbackApplied {
+    /// The line the task panel and the timeline show.
+    pub fn note(&self) -> String {
+        let head = self.head_sha.as_deref().map_or("the head".to_string(), |s| s.chars().take(7).collect());
+        let asks = format!("{} ask{}", self.asks, if self.asks == 1 { "" } else { "s" });
+        if self.exhausted {
+            format!(
+                "{} said it will not review (out of credits or at its limit) after {asks}; relying on tod's own review of {head}",
+                self.bot
+            )
+        } else {
+            format!(
+                "{} did not review after {asks} over {} minutes; relying on tod's own review of {head}",
+                self.bot, self.minutes
+            )
+        }
+    }
 }
 
 /// A review thread that still wants an answer.
@@ -173,6 +220,9 @@ pub struct Assessment {
     pub checks: Option<String>,
     pub open_threads: Vec<OpenThread>,
     pub bots: Vec<BotReport>,
+    /// Bots given up on for this head ([`FallbackApplied`]): not in `bots`,
+    /// so nothing waits for, asks, or requires them.
+    pub fallbacks: Vec<FallbackApplied>,
     pub human_review: HumanReview,
     /// Who GitHub still waits on for a review (logins, teams as `org/team`);
     /// empty when nobody was asked.
@@ -258,6 +308,9 @@ pub struct BotAsk {
 pub enum Wait {
     /// A bot has not reviewed the current head.
     BotReview { bot: String },
+    /// tod's own review of the head comes first: a bot is asked only for a
+    /// head that review has cleared, and its fallback relies on that review.
+    OwnReview { bot: String },
     ChecksRunning,
     /// GitHub has not computed mergeability yet.
     GitHub,
@@ -303,6 +356,8 @@ impl Assessment {
         let head_at = snapshot.status.head_committed_at.as_deref().and_then(parse_time);
         let sha = snapshot.status.head_sha.as_deref();
         let mut bots = Vec::new();
+        let mut fallbacks = Vec::new();
+        let own = &settings.own_review;
         for configured in &settings.bots {
             let Some(bot) = builtin_bot(&configured.name) else { continue };
             {
@@ -311,7 +366,9 @@ impl Assessment {
                     now.signed_duration_since(h)
                         >= chrono::Duration::minutes(configured.rerun_after_minutes as i64)
                 });
-                let (asks, last_ask_at) = asks_made(snapshot, bot, configured, head_at);
+                let (asks, last_ask_at, first_ask_at) = asks_made(snapshot, bot, configured, head_at);
+                let exhausted = !matches!(standing, BotStanding::Current { .. })
+                    && exhausted_since(snapshot, bot, configured, head_at);
                 let reviewed_at = snapshot
                     .reviews
                     .iter()
@@ -327,13 +384,36 @@ impl Assessment {
                     )
                     .filter_map(parse_time)
                     .max();
-                let waiting = !matches!(standing, BotStanding::Current { .. }) && overdue && !snapshot.status.merged;
+                let current = matches!(standing, BotStanding::Current { .. });
+                let waiting = !current && overdue && !snapshot.status.merged;
                 let every = chrono::Duration::minutes(configured.ask_every_minutes as i64);
                 let ask_gap_over = last_ask_at.is_none_or(|at| now - at >= every);
+                let fallback_usable = configured.fallback.is_some() && own.fallback_usable(sha);
+                let own_review_held = own.enabled && own.in_draft && !own.cleared(sha);
+                // A bot is given up on by its fallback when it said it will
+                // not review, or stayed silent past its patience.
+                let fallback_due = fallback_usable
+                    && !current
+                    && !snapshot.status.merged
+                    && (exhausted
+                        || fallback_patience_over(configured, asks, last_ask_at, first_ask_at, head_at, now));
+                if fallback_due && own.cleared(sha) {
+                    fallbacks.push(FallbackApplied {
+                        bot: configured.name.clone(),
+                        head_sha: sha.map(str::to_string),
+                        asks,
+                        minutes: first_ask_at.or(head_at).map_or(0, |at| (now - at).num_minutes().max(0)),
+                        exhausted,
+                    });
+                    continue;
+                }
                 let ask_due = waiting
                     && configured.ask.as_deref().map(str::trim).is_some_and(|a| !a.is_empty())
                     && asks < configured.max_asks
-                    && ask_gap_over;
+                    && ask_gap_over
+                    && own.ask_allowed(sha)
+                    && !exhausted
+                    && !fallback_due;
                 bots.push(BotReport {
                     settings: configured.clone(),
                     bot,
@@ -344,6 +424,10 @@ impl Assessment {
                     last_ask_at,
                     ask_due,
                     head_at,
+                    first_ask_at,
+                    exhausted,
+                    fallback_usable,
+                    own_review_held,
                 });
             }
         }
@@ -356,6 +440,7 @@ impl Assessment {
             checks: snapshot.status.checks.clone(),
             open_threads: snapshot.threads.iter().filter(|t| wants_answer(t)).map(open_thread).collect(),
             bots,
+            fallbacks,
             human_review: human_review(snapshot, head_at),
             requested_reviewers: snapshot.status.reviewers.clone(),
             review_comments: review_comments(
@@ -496,7 +581,19 @@ impl Assessment {
     }
 
     fn is_silent(&self, r: &BotReport) -> bool {
-        if matches!(r.standing, BotStanding::Current { .. }) || !r.overdue {
+        if matches!(r.standing, BotStanding::Current { .. }) {
+            return false;
+        }
+        // A bot with a usable fallback never asks the user: it is waited for
+        // and then given up on, or its wait goes on for tod's own review.
+        if r.fallback_usable {
+            return false;
+        }
+        // It said it will not come: nothing is gained by waiting.
+        if r.exhausted {
+            return true;
+        }
+        if !r.overdue {
             return false;
         }
         let every = chrono::Duration::minutes(r.settings.ask_every_minutes as i64);
@@ -539,7 +636,11 @@ impl Assessment {
         let mut waits = Vec::new();
         for report in &self.bots {
             if !matches!(report.standing, BotStanding::Current { .. }) {
-                waits.push(Wait::BotReview { bot: report.settings.name.clone() });
+                waits.push(if report.own_review_held {
+                    Wait::OwnReview { bot: report.settings.name.clone() }
+                } else {
+                    Wait::BotReview { bot: report.settings.name.clone() }
+                });
             }
         }
         if self.checks.as_deref() == Some("pending") {
@@ -903,9 +1004,9 @@ fn asks_made(
     bot: &ReviewBot,
     configured: &PrReviewBotSettings,
     head_at: Option<DateTime<Utc>>,
-) -> (u32, Option<DateTime<Utc>>) {
+) -> (u32, Option<DateTime<Utc>>, Option<DateTime<Utc>>) {
     let Some(ask) = configured.ask.as_deref().map(str::trim).filter(|a| !a.is_empty()) else {
-        return (0, None);
+        return (0, None, None);
     };
     let ask = ask.to_ascii_lowercase();
     let times: Vec<DateTime<Utc>> = snapshot
@@ -916,7 +1017,65 @@ fn asks_made(
         .filter_map(|c| parse_time(&c.created_at))
         .filter(|at| head_at.is_none_or(|h| *at >= h))
         .collect();
-    (times.len() as u32, times.into_iter().max())
+    (times.len() as u32, times.iter().copied().max(), times.iter().copied().min())
+}
+
+/// Whether the bot's latest comment or review, written since the head
+/// commit, matches its `exhausted_pattern`. Its latest word counts: a review
+/// that came after a credit notice means credits are back.
+fn exhausted_since(
+    snapshot: &PrSnapshot,
+    bot: &ReviewBot,
+    configured: &PrReviewBotSettings,
+    head_at: Option<DateTime<Utc>>,
+) -> bool {
+    if configured.exhausted_pattern.as_deref().is_none_or(|p| p.trim().is_empty()) {
+        return false;
+    }
+    let comments = snapshot
+        .comments
+        .iter()
+        .filter(|c| c.author.as_deref().is_some_and(|a| bot.is_author(a)))
+        .filter_map(|c| {
+            let at = parse_time(&c.updated_at).or_else(|| parse_time(&c.created_at))?;
+            Some((at, c.body.as_str()))
+        });
+    let reviews = snapshot
+        .reviews
+        .iter()
+        .filter(|r| r.author.as_deref().is_some_and(|a| bot.is_author(a)))
+        .filter_map(|r| Some((parse_time(&r.submitted_at)?, r.body.as_str())));
+    comments
+        .chain(reviews)
+        .filter(|(at, body)| !body.trim().is_empty() && head_at.is_none_or(|h| *at >= h))
+        .max_by_key(|(at, _)| *at)
+        .is_some_and(|(_, body)| configured.is_exhausted(body))
+}
+
+/// Whether a bot with a `fallback` has stayed silent long enough to be given
+/// up on: `silent_after_minutes` after tod's first ask (after the head
+/// commit when tod has no ask text), else when the user would otherwise be
+/// asked (`max_asks` asks, the last `ask_every_minutes` ago; without an ask
+/// text, `rerun_after_minutes` plus `max_asks` intervals from the head).
+fn fallback_patience_over(
+    configured: &PrReviewBotSettings,
+    asks: u32,
+    last_ask_at: Option<DateTime<Utc>>,
+    first_ask_at: Option<DateTime<Utc>>,
+    head_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> bool {
+    let every = chrono::Duration::minutes(configured.ask_every_minutes as i64);
+    let can_ask = configured.ask.as_deref().map(str::trim).is_some_and(|a| !a.is_empty());
+    if let Some(minutes) = configured.silent_after_minutes {
+        let since = if can_ask { first_ask_at } else { head_at };
+        return since.is_some_and(|at| now - at >= chrono::Duration::minutes(minutes as i64));
+    }
+    if can_ask {
+        return asks >= configured.max_asks && last_ask_at.is_none_or(|at| now - at >= every);
+    }
+    let patience = chrono::Duration::minutes(configured.rerun_after_minutes as i64) + every * configured.max_asks as i32;
+    head_at.is_some_and(|at| now - at >= patience)
 }
 
 /// Reads a real pull request, for checking the GitHub side by hand:
@@ -1394,6 +1553,229 @@ Not safe.
         assert!(just_pushed.silent_bots().is_empty());
     }
 
+    /// A bot with an ask, a fallback, and the node's own-review state.
+    fn fallback_settings(silent_after: Option<u64>, own: tod_store::OwnReviewState) -> PrReadinessSettings {
+        let mut s = asking_settings(30, 3);
+        s.bots[0].fallback = Some(tod_store::BotFallback::OwnReview);
+        s.bots[0].silent_after_minutes = silent_after;
+        s.own_review = own;
+        s
+    }
+
+    fn own_review(enabled: bool, in_draft: bool, cleared: &[&str]) -> tod_store::OwnReviewState {
+        tod_store::OwnReviewState {
+            enabled,
+            in_draft,
+            in_review: false,
+            cleared_shas: cleared.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    const HEAD: &str = "abcdef1234567";
+
+    fn asked_at(times: &[&str]) -> PrSnapshot {
+        snap(
+            status("blocked", "success"),
+            vec![],
+            times.iter().map(|t| ask_comment("joel", "@greptileai please review", t)).collect(),
+        )
+    }
+
+    /// Greptile is out of credits: ask it once per PR, on the final head,
+    /// only after tod's own review of that head is clean.
+    #[test]
+    fn a_bot_is_not_asked_before_tods_own_review_of_the_head_is_clean() {
+        let st = status("blocked", "success");
+        let held = Assessment::of(
+            &snap(st.clone(), vec![], vec![]),
+            &fallback_settings(None, own_review(true, true, &[])),
+            now(),
+        );
+        assert!(held.asks_due().is_empty(), "an unreviewed head is not asked");
+        assert_eq!(held.waits(), vec![Wait::OwnReview { bot: "greptile".into() }]);
+        assert!(held.bots[0].own_review_held);
+
+        // Once the review of this very head is clean, it is asked.
+        let clean = Assessment::of(
+            &snap(st.clone(), vec![], vec![]),
+            &fallback_settings(None, own_review(true, true, &[HEAD])),
+            now(),
+        );
+        assert_eq!(clean.asks_due().len(), 1);
+        assert_eq!(clean.waits(), vec![Wait::BotReview { bot: "greptile".into() }]);
+
+        // With the review steps off, it is asked as before.
+        let off = Assessment::of(&snap(st, vec![], vec![]), &fallback_settings(None, own_review(false, true, &[])), now());
+        assert_eq!(off.asks_due().len(), 1);
+    }
+
+    #[test]
+    fn a_head_a_later_push_superseded_is_never_asked() {
+        // The clean review covered an earlier head; the pull request moved on.
+        let a = Assessment::of(
+            &snap(status("blocked", "success"), vec![], vec![]),
+            &fallback_settings(None, own_review(true, true, &["1111111aaaaaaa"])),
+            now(),
+        );
+        assert!(a.asks_due().is_empty());
+        assert!(matches!(a.waits().as_slice(), [Wait::OwnReview { .. }]));
+        // A node past `pr_draft` (nothing there runs the review) is asked as before.
+        let later = Assessment::of(
+            &snap(status("blocked", "success"), vec![], vec![]),
+            &fallback_settings(None, own_review(true, false, &[])),
+            now(),
+        );
+        assert_eq!(later.asks_due().len(), 1);
+    }
+
+    #[test]
+    fn a_silent_bot_with_a_fallback_is_given_up_on_once_the_own_review_is_clean() {
+        // First asked 11:00, silent_after 60 minutes, read at 12:00.
+        let s = asked_at(&["2026-01-01T11:00:00Z"]);
+        let a = Assessment::of(&s, &fallback_settings(Some(60), own_review(true, true, &[HEAD])), now());
+        assert!(a.bots.is_empty(), "no longer waited for, asked or required");
+        assert!(a.silent_bots().is_empty(), "no question to the user");
+        assert_eq!(a.fallbacks.len(), 1);
+        assert_eq!(
+            a.fallbacks[0].note(),
+            "greptile did not review after 1 ask over 60 minutes; relying on tod's own review of abcdef1"
+        );
+        assert_eq!(a.next(), Next::Wait(vec![Wait::HumanReview]));
+        // Before the time is up it is still waited for.
+        let early = Assessment::of(&s, &fallback_settings(Some(61), own_review(true, true, &[HEAD])), now());
+        assert_eq!(early.bots.len(), 1);
+        assert!(early.fallbacks.is_empty());
+        // The status line says what happened.
+        let live = LivePr {
+            pr: tod_store::github::NodePr::new("o", "r", 1),
+            draft: false,
+            assessment: a,
+            fingerprint: String::new(),
+            head_sha: Some(HEAD.into()),
+            threads: vec![],
+            base_ref: None,
+        };
+        assert!(live.status().contains("relying on tod's own review of abcdef1"), "{}", live.status());
+    }
+
+    #[test]
+    fn the_default_patience_of_a_fallback_is_when_the_question_would_be_raised() {
+        let st = status("blocked", "success");
+        let three = vec![
+            ask_comment("joel", "@greptileai please review", "2026-01-01T10:00:00Z"),
+            ask_comment("joel", "@greptileai please review", "2026-01-01T10:30:00Z"),
+            ask_comment("joel", "@greptileai please review", "2026-01-01T11:00:00Z"),
+        ];
+        let a = Assessment::of(
+            &snap(st.clone(), vec![], three),
+            &fallback_settings(None, own_review(true, true, &[HEAD])),
+            now(),
+        );
+        assert_eq!(a.fallbacks.len(), 1);
+        // Two asks only: still waiting for the others.
+        let two = vec![
+            ask_comment("joel", "@greptileai please review", "2026-01-01T10:00:00Z"),
+            ask_comment("joel", "@greptileai please review", "2026-01-01T10:30:00Z"),
+        ];
+        let b = Assessment::of(&snap(st, vec![], two), &fallback_settings(None, own_review(true, true, &[HEAD])), now());
+        assert!(b.fallbacks.is_empty());
+    }
+
+    #[test]
+    fn a_silent_bot_with_a_fallback_is_not_given_up_on_while_the_own_review_is_not_clean() {
+        let s = asked_at(&["2026-01-01T10:00:00Z", "2026-01-01T10:30:00Z", "2026-01-01T11:00:00Z"]);
+        let a = Assessment::of(&s, &fallback_settings(Some(60), own_review(true, true, &[])), now());
+        assert!(a.fallbacks.is_empty());
+        assert_eq!(a.bots.len(), 1, "still waited for");
+        assert!(a.silent_bots().is_empty(), "and no question to the user either");
+        assert_eq!(a.waits(), vec![Wait::OwnReview { bot: "greptile".into() }]);
+        assert!(a.asks_due().is_empty(), "nor asked again: its patience is over");
+    }
+
+    #[test]
+    fn a_bot_without_a_fallback_still_raises_the_question() {
+        let s = asked_at(&["2026-01-01T10:00:00Z", "2026-01-01T10:30:00Z", "2026-01-01T11:00:00Z"]);
+        let mut settings = asking_settings(30, 3);
+        settings.own_review = own_review(true, true, &[HEAD]);
+        let a = Assessment::of(&s, &settings, now());
+        assert_eq!(a.silent_bots().len(), 1);
+        assert!(a.fallbacks.is_empty());
+        // A fallback that nothing could ever satisfy (review steps off) is
+        // not waited on either: the user is asked.
+        let off = Assessment::of(&s, &fallback_settings(Some(60), own_review(false, true, &[])), now());
+        assert_eq!(off.silent_bots().len(), 1);
+        assert!(off.fallbacks.is_empty());
+    }
+
+    #[test]
+    fn a_waiver_is_for_the_head_it_was_made_on() {
+        let s = asked_at(&["2026-01-01T11:00:00Z"]);
+        // The review that cleared the old head says nothing of this one.
+        let other = Assessment::of(&s, &fallback_settings(Some(60), own_review(true, true, &["1111111aaaaaaa"])), now());
+        assert!(other.fallbacks.is_empty());
+        assert_eq!(other.bots.len(), 1);
+        // A later push: asks since the new head's commit are the only ones
+        // counted, so the bot is asked again on it, and not waived.
+        let mut st = status("blocked", "success");
+        st.head_sha = Some("2222222bbbbbbb".into());
+        st.head_committed_at = Some("2026-01-01T11:30:00Z".into());
+        let pushed = snap(st, vec![], vec![ask_comment("joel", "@greptileai please review", "2026-01-01T11:00:00Z")]);
+        let again = Assessment::of(&pushed, &fallback_settings(Some(60), own_review(true, true, &["2222222bbbbbbb"])), now());
+        assert!(again.fallbacks.is_empty());
+        assert_eq!((again.bots[0].asks, again.asks_due().len()), (0, 1), "asked again on the new head");
+    }
+
+    /// Seen on a real pull request (Cofactr/kb#2881): Greptile answered an ask
+    /// within seconds with a comment of its own.
+    const CREDITS: &str = "Your organization has run out of review credits. [Add credits](https://app.greptile.com/-/switch-tenant?tenant=x) to resume code reviews.\n\n<!-- greptile-credit-pause:04319895 -->";
+
+    fn exhausted_settings(fallback: bool, own: tod_store::OwnReviewState) -> PrReadinessSettings {
+        let mut s = fallback_settings(None, own);
+        if !fallback {
+            s.bots[0].fallback = None;
+        }
+        s.bots[0].exhausted_pattern = Some("run out of review credits".into());
+        s
+    }
+
+    #[test]
+    fn a_bot_that_says_it_is_out_of_credits_is_not_waited_for() {
+        let s = snap(
+            status("blocked", "success"),
+            vec![],
+            vec![
+                ask_comment("joel", "@greptileai please review", "2026-01-01T11:00:00Z"),
+                ask_comment("greptile-apps[bot]", CREDITS, "2026-01-01T11:00:05Z"),
+            ],
+        );
+        // No fallback: the question to the user, at once, after one ask.
+        let q = Assessment::of(&s, &exhausted_settings(false, own_review(true, true, &[HEAD])), now());
+        assert!(q.bots[0].exhausted);
+        assert_eq!(q.silent_bots().len(), 1);
+        assert!(q.asks_due().is_empty(), "no more credits spent");
+        // A fallback: given up on, and the note says why.
+        let f = Assessment::of(&s, &exhausted_settings(true, own_review(true, true, &[HEAD])), now());
+        assert!(f.bots.is_empty());
+        assert!(f.fallbacks[0].exhausted);
+        assert!(f.fallbacks[0].note().contains("will not review"));
+        // Own review not clean yet: the wait goes on, with no question.
+        let held = Assessment::of(&s, &exhausted_settings(true, own_review(true, true, &[])), now());
+        assert!(held.silent_bots().is_empty() && held.fallbacks.is_empty());
+        // Without the pattern the text is only a comment.
+        let mut plain = exhausted_settings(false, own_review(true, true, &[HEAD]));
+        plain.bots[0].exhausted_pattern = None;
+        assert!(!Assessment::of(&s, &plain, now()).bots[0].exhausted);
+        // A notice from before the head commit, or one a later review
+        // follows, no longer says so.
+        let mut old = s.clone();
+        old.status.head_committed_at = Some("2026-01-01T11:30:00Z".into());
+        assert!(!Assessment::of(&old, &exhausted_settings(false, own_review(false, false, &[])), now()).bots[0].exhausted);
+        let mut back = s;
+        back.comments.push(comment("greptile-apps[bot]", "Confidence Score: 4/5", "2026-01-01T11:40:00Z"));
+        let a = Assessment::of(&back, &exhausted_settings(false, own_review(false, false, &[])), now());
+        assert!(matches!(a.bots[0].standing, BotStanding::Current { score: 4 }));
+    }
+
     #[test]
     fn work_the_agent_cannot_fix_is_not_a_turn_that_counts() {
         let missing = Work::BotReviewMissing { bot: "b".into(), minutes: 10, low_last_score: None };
@@ -1862,12 +2244,16 @@ impl LivePr {
         for wait in self.assessment.waits() {
             match wait {
                 Wait::BotReview { bot, .. } => parts.push(format!("waiting for {bot} review")),
+                Wait::OwnReview { bot } => parts.push(format!("waiting for tod's own review before {bot} is asked")),
                 Wait::ChecksRunning => parts.push("checks running".to_string()),
                 Wait::GitHub | Wait::HumanReview => {}
             }
         }
         if !self.assessment.unanswered_review_comments().is_empty() {
             parts.push("review comments to answer".to_string());
+        }
+        for fallback in &self.assessment.fallbacks {
+            parts.push(fallback.note());
         }
         parts.join(", ")
     }

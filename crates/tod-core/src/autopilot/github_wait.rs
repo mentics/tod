@@ -344,6 +344,13 @@ pub(super) fn review_wait_of(live: &[crate::pr_readiness::LivePr]) -> (String, S
             live.iter().map(|p| format!("{} {}", crate::pr_readiness::pr_label(&p.pr), p.status())).collect();
         what = format!("{what} ({})", each.join("; "));
     }
+    // A bot given up on is said so, never quietly left out of the wait.
+    // (With several pull requests each one's status already says it.)
+    if live.len() <= 1 {
+        for note in live.iter().flat_map(|p| p.assessment.fallbacks.iter().map(|f| f.note())) {
+            what.push_str(&format!("; {note}"));
+        }
+    }
     (spec, what)
 }
 
@@ -460,8 +467,10 @@ impl Autopilot {
             return Ok(());
         };
         let spec = match first {
-            Wait::BotReview { bot, .. } => {
-                let n = number_waiting(&|w| matches!(w, Wait::BotReview { bot: b, .. } if b == bot));
+            Wait::BotReview { bot, .. } | Wait::OwnReview { bot } => {
+                let n = number_waiting(
+                    &|w| matches!(w, Wait::BotReview { bot: b, .. } | Wait::OwnReview { bot: b } if b == bot),
+                );
                 bot_review_spec(n, bot)
             }
             Wait::ChecksRunning => checks_spec(number_waiting(&|w| matches!(w, Wait::ChecksRunning))),

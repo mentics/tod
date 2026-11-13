@@ -19,7 +19,7 @@
 
 use chrono::{DateTime, Utc};
 use tod_store::decisions::{Decision, DecisionRepo, NewDecision, REASON_BROKEN};
-use tod_store::settings::PrReadinessSettings;
+use tod_store::settings::{OwnReviewState, PrReadinessSettings};
 use uuid::Uuid;
 
 /// The `protocol` the request is recorded with.
@@ -42,6 +42,9 @@ pub struct Tried {
     pub last_ask_at: Option<DateTime<Utc>>,
     /// When the bot last reviewed or scored a pull request of the node.
     pub last_activity_at: Option<DateTime<Utc>>,
+    /// The bot said it will not review (its `exhausted_pattern` matched its
+    /// latest comment): no waiting would bring it.
+    pub exhausted: bool,
 }
 
 fn when(at: Option<DateTime<Utc>>, none: &str) -> String {
@@ -55,6 +58,16 @@ pub fn proceed_option(bot: &str) -> String {
 
 /// The request's question: one wording for every node and bot.
 pub fn question(tried: &Tried) -> String {
+    if tried.exhausted {
+        return format!(
+            "{bot} said it will not review {prs} (its latest comment matches the project's out-of-reviews pattern; asked {asks} time{plural}, last {asked}). Waiting will not bring it. Proceed without {bot}, or keep waiting?",
+            bot = tried.bot,
+            prs = tried.prs.join(", "),
+            asks = tried.asks,
+            plural = if tried.asks == 1 { "" } else { "s" },
+            asked = when(tried.last_ask_at, "never"),
+        );
+    }
     format!(
         "{bot} has not reviewed {prs} after {asks} ask{plural} for a review (last asked {asked}; its last activity {seen}). It may be down or out of quota, which this node cannot fix. Proceed without {bot}, or keep waiting?",
         bot = tried.bot,
@@ -169,7 +182,27 @@ pub fn settings_for_node(
     settings: PrReadinessSettings,
 ) -> anyhow::Result<PrReadinessSettings> {
     let waived = waived(conn, node)?;
-    Ok(if waived.is_empty() { settings } else { without_waived(&settings, &waived) })
+    let mut settings = if waived.is_empty() { settings } else { without_waived(&settings, &waived) };
+    // Where tod's own review stands: a bot is asked for a head only once it
+    // is clean, and a bot's `fallback` relies on it. Per head: the cleared
+    // heads are the ones the latest clean review covered, so a later push
+    // starts again. Nothing is read for a project with no bots.
+    if !settings.bots.is_empty() {
+        settings.own_review = own_review_state(conn, node)?;
+    }
+    Ok(settings)
+}
+
+/// [`OwnReviewState`] of `node`.
+pub fn own_review_state(conn: &rusqlite::Connection, node: Uuid) -> anyhow::Result<OwnReviewState> {
+    let enabled = crate::pr_draft_review::enabled(conn, node)?;
+    if !enabled {
+        return Ok(OwnReviewState::default());
+    }
+    let state = tod_store::outline::repos::NodeRepo::new(conn).get_lifecycle(node)?;
+    let in_draft = state.as_deref() == Some(crate::pr_draft_review::STATE);
+    let in_review = state.as_deref() == Some("pr_review");
+    Ok(OwnReviewState { enabled, in_draft, in_review, cleared_shas: crate::pr_draft_review::cleared_shas(conn, node)? })
 }
 
 /// The decision to record for `tried`.
@@ -186,7 +219,7 @@ pub fn new_decision(tried: &Tried) -> NewDecision {
 #[cfg(test)]
 pub(crate) fn waive_for_test(fleet: &tod_store::fleet::FleetStore, node: Uuid, bot: &str) {
     use tod_store::interview::{ACTOR_USER, InterviewCommand};
-    let tried = Tried { bot: bot.into(), prs: vec!["o/r#1".into()], asks: 3, last_ask_at: None, last_activity_at: None };
+    let tried = Tried { bot: bot.into(), prs: vec!["o/r#1".into()], asks: 3, last_ask_at: None, last_activity_at: None, exhausted: false };
     fleet
         .interview(
             "autopilot",
@@ -215,6 +248,7 @@ mod tests {
             asks: 3,
             last_ask_at: DateTime::parse_from_rfc3339("2026-11-12T10:00:00Z").ok().map(Into::into),
             last_activity_at: None,
+            exhausted: false,
         }
     }
 

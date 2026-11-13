@@ -511,3 +511,13 @@ from Blaxel.
 - **Decision**: a failure of the lost-work check still fails the run. It guards reopening and deleting work; skipping it on error would let a node proceed with its work unproven, which "errors are never hidden" forbids. The two causes are fixed instead, so only a real git failure stops a node, with its message.
 - **Tests**: `a_shallow_boundary_absent_from_the_repository_hides_nothing` (tod-core), `a_fetch_refspec_naming_a_branch_missing_on_origin_is_not_an_error` (tod-supervisor).
 - **Measure**: runs failing with "Not a valid commit name" or "couldn't find remote ref" (should be 0).
+
+## 2026-11-13: review-bot credits spent on superseded heads; a silent bot always stopped the node
+
+- **Seen**: Greptile credit limits; flagship#6640 went silent, kb#2881 answered an ask with "run out of review credits".
+- **Symptom**: asks were spent on heads a later push replaced, and a bot that could not review stopped each node on a request to the user although tod's own review was clean.
+- **Cause**: asks were due as soon as a head was overdue, before tod's own review of it; the only way out of a silent bot was the user's decision.
+- **Fix**: with the review steps on, a bot is asked only once tod's own review of that head is clean (`Wait::OwnReview` first); the PR agent never asks and prompts name no bot. Per-bot `silent_after_minutes`, `fallback: own_review` and `exhausted_pattern` (all unset by default) waive the bot per head, visibly (timeline note and status line); a bot without `fallback` keeps the decision. Everything through `settings_for_node`.
+- **Tests**: pr_readiness `a_bot_is_not_asked_before_tods_own_review_of_the_head_is_clean`, `a_head_a_later_push_superseded_is_never_asked`, `a_silent_bot_with_a_fallback_*`, `a_bot_without_a_fallback_still_raises_the_question`, `a_waiver_is_for_the_head_it_was_made_on`, `a_bot_that_says_it_is_out_of_credits_is_not_waited_for`; autopilot `a_bot_is_asked_only_after_tods_own_review_of_the_head_is_clean`, `a_silent_bot_with_a_fallback_is_given_up_on_visibly_without_asking_the_user`; tod-store `a_bot_fallback_parses_defaults_to_none_and_is_validated`.
+- **Not covered**: the waiver in `pr_review` rests on the `pr_draft` gate having required a clean review (the review is not rerun there). node_timeline is deliberately not in `journey_changes`, so no journey record.
+- **Measure**: asks per PR (target 1 per final head); `bot_silence` requests for bots with a fallback (target 0); timeline notes "relying on tod's own review".

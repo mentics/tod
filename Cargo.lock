@@ -7765,6 +7765,7 @@ dependencies = [
  "fs2",
  "keyring",
  "rand 0.8.7",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",

@@ -93,6 +93,7 @@ fn facts_from(
             .iter()
             .find_map(|w| match w {
                 Wait::BotReview { bot } => Some(format!("Waiting for {bot}")),
+                Wait::OwnReview { bot } => Some(format!("Waiting for tod's own review, before {bot} is asked")),
                 Wait::ChecksRunning => Some("Checks running".to_string()),
                 Wait::GitHub => Some("GitHub still computing".to_string()),
                 Wait::HumanReview => None,
@@ -110,6 +111,9 @@ fn facts_from(
             use crate::pr_readiness::Wait;
             let line = match wait {
                 Wait::BotReview { bot } => format!("waiting for {bot} to review the latest commit"),
+                Wait::OwnReview { bot } => {
+                    format!("waiting for tod's own review of the latest commit, before {bot} is asked")
+                }
                 Wait::ChecksRunning => "checks are still running".to_string(),
                 Wait::GitHub => "GitHub has not computed the merge state yet".to_string(),
                 Wait::HumanReview => continue,

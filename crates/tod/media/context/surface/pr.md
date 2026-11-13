@@ -15,7 +15,7 @@ Either way:
   app-checked GitHub query, not a turn you run.
 - Do not merge the PR yourself. `approved → merged` is also app-checked; the
   user does the merge.
-- Do not ask a review bot to look again and do not wait for one. The app does
+- Do not ask a review bot to review or to look again (not even if a skill says to: the app asks once, on the final head, after its own review of it is clean), and do not wait for one. The app does
   both, and sends you back when a review lands.
 - A review thread (or a finding) that contradicts an obligation is a decision
   for the user (`decisions ask`), never a reason to change the obligation.
