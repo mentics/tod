@@ -521,7 +521,9 @@ impl Autopilot {
         self.state.active_since_ms = None;
         self.state.sessions = 0;
         // Rounds on the pull request count from here (they are in `loops`):
-        // the user has seen why it stopped and wants it to go on.
+        // the user has seen why it stopped and wants it to go on. This also
+        // clears the base-merge gap timestamp and count: a click of the user
+        // (renew, rerun) is the one thing allowed to start a merge at once.
         self.state.loops.clear();
         self.save()
     }
@@ -529,10 +531,14 @@ impl Autopilot {
     /// The pull request has nothing left for the agent (clear, or waiting for
     /// a person): the next feedback starts the count of rounds again.
     /// The pull request is handed to a person: the base-branch merge count
-    /// starts again. Not on a merely clean read, which tod's own merge and
-    /// review can cause again and again.
+    /// may start again, but only when the last such round is long enough ago
+    /// (4 gaps). A clean read or a wait for a person that tod's own merge and
+    /// review brought about, between two rounds of a base that keeps moving,
+    /// must not restart the limit forever.
     fn reset_housekeeping(&mut self) -> Result<()> {
-        if self.state.loops.pr_housekeeping_rounds != 0 {
+        let loops = &self.state.loops;
+        let quiet_for = chrono::Utc::now().timestamp_millis() - loops.pr_housekeeping_at_ms;
+        if loops.pr_housekeeping_rounds != 0 && quiet_for >= 4 * self.housekeeping_gap.as_millis() as i64 {
             self.state.loops.pr_housekeeping_rounds = 0;
             self.save()?;
         }
@@ -1258,16 +1264,23 @@ impl Autopilot {
                         self.state.loops.pr_rounds += 1;
                         self.save()?;
                     }
-                    // Merging a moved base in is all there is: a session costs
-                    // the same however little it does, and the base moves again
-                    // soon, so it is not started more often than the gap allows,
-                    // nor without end.
-                    if !change_owed && works.iter().all(|w| matches!(w, pr_readiness::Work::Behind)) {
+                    // Merging a moved base in (Behind, or a Conflict with it) is
+                    // all there is: a session costs the same however little it
+                    // does, and the base moves again soon, so it is not started
+                    // more often than the gap allows, nor without end. A
+                    // conflict waits for the gap too: on a draft it is not
+                    // urgent, and a base that keeps conflicting is as much a
+                    // loop as one that keeps moving. The count is never reset
+                    // by a round of another kind (feedback is bounded by its own
+                    // rounds) but by `reset_housekeeping`.
+                    if !change_owed
+                        && works.iter().all(|w| matches!(w, pr_readiness::Work::Behind | pr_readiness::Work::Conflict))
+                    {
                         if self.state.loops.pr_housekeeping_rounds >= PR_HOUSEKEEPING_LIMIT {
                             return Ok(Some(Outcome::NeedsHuman {
                                 reason: NeedsHuman::PrStuck {
                                     why: format!(
-                                        "the base branch moved {} times in a row, each merge-in leaving the branch behind again: merge it in by hand when it settles",
+                                        "the base branch moved or conflicted {} times in a row, each merge-in leaving the branch behind again: merge it in by hand when it settles",
                                         self.state.loops.pr_housekeeping_rounds
                                     ),
                                 },
@@ -1279,7 +1292,7 @@ impl Autopilot {
                         if now < due {
                             let interval = self.pr_poll.min(Duration::from_millis((due - now) as u64));
                             let what = format!(
-                                "the base branch moved again; merging it in at most every {} minutes",
+                                "the base branch moved or conflicts again; merging it in at most every {} minutes",
                                 self.housekeeping_gap.as_secs() / 60
                             );
                             hook.waiting(Some(&what), Some(now + interval.as_millis() as i64));
@@ -1291,9 +1304,6 @@ impl Autopilot {
                         }
                         self.state.loops.pr_housekeeping_rounds += 1;
                         self.state.loops.pr_housekeeping_at_ms = now;
-                        self.save()?;
-                    } else if self.state.loops.pr_housekeeping_rounds != 0 {
-                        self.state.loops.pr_housekeeping_rounds = 0;
                         self.save()?;
                     }
                     let before = self.pr_report(fleet)?;

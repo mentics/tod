@@ -1709,6 +1709,8 @@ fn a_pull_request_that_never_changes_stops_for_a_person() {
 enum Look {
     /// Main moved: the branch is behind (housekeeping).
     Behind,
+    /// The branch conflicts with its base (housekeeping).
+    Conflict,
     /// One open review thread (feedback).
     Thread,
     /// Nothing for the agent; only a person's review is missing.
@@ -1748,10 +1750,11 @@ impl crate::pr_readiness::PrFeed for Scripted {
             updated_at: "2021-01-01T00:00:00Z".into(),
         }];
         let behind = matches!(look, Look::Behind);
+        let conflict = matches!(look, Look::Conflict);
         Ok(PrSnapshot {
             status: PrStatus {
-                mergeable: Some(true),
-                mergeable_state: Some(if behind { "behind" } else { "blocked" }.into()),
+                mergeable: Some(!conflict),
+                mergeable_state: Some(if conflict { "dirty" } else if behind { "behind" } else { "blocked" }.into()),
                 behind_by: Some(if behind { 3 } else { 0 }),
                 checks: Some("success".into()),
                 head_sha: Some(format!("{:07}", turns + 1)),
@@ -1859,6 +1862,51 @@ fn the_gap_between_base_merges_survives_a_clear_read() {
     let outcome = again.run_with(&fx.fleet, &mut agent, &mut StopAfter(20)).unwrap();
     assert!(matches!(outcome, Outcome::Stopped { .. }), "{outcome:?}");
     assert_eq!(agent.turns, 1, "the base moved again within the gap: waited, not merged");
+}
+
+#[test]
+fn a_conflicting_base_counts_toward_the_gap_and_the_limit() {
+    use Look::*;
+    let (fx, _, mut agent) = scripted_pr(vec![Conflict; 20]);
+    let mut pilot = autopilot(&fx, Budget::default())
+        .with_pr_poll_interval(Duration::ZERO)
+        .with_housekeeping_gap(Duration::from_secs(3600));
+    let outcome = pilot.run_with(&fx.fleet, &mut agent, &mut StopAfter(40)).unwrap();
+    assert!(matches!(outcome, Outcome::Stopped { .. }), "{outcome:?}");
+    assert_eq!(agent.turns, 1, "the gap holds for a conflict");
+    let (fx, _, mut agent) = scripted_pr(vec![Conflict; 20]);
+    let mut pilot = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO);
+    let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
+    assert!(matches!(&outcome, Outcome::NeedsHuman { reason: NeedsHuman::PrStuck { .. } }), "{outcome:?}");
+    assert_eq!(agent.turns, 8);
+}
+
+/// A failed look at GitHub after a turn says nothing about whether the turn
+/// changed anything: the count of unchanged turns stays.
+#[test]
+fn a_failed_read_after_a_turn_keeps_the_unchanged_count() {
+    use Look::*;
+    let (fx, _, mut agent) = scripted_pr(vec![Thread; 5]);
+    let turns = agent.shared_turns.clone().unwrap();
+    struct FailsAfterATurn {
+        inner: Arc<Scripted>,
+        turns: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl crate::pr_readiness::PrFeed for FailsAfterATurn {
+        fn snapshot(&self, pr: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
+            if self.turns.load(std::sync::atomic::Ordering::SeqCst) >= 1 {
+                return Err("GitHub is down".into());
+            }
+            self.inner.snapshot(pr)
+        }
+    }
+    let inner = Scripted::new(turns.clone(), vec![Thread; 5]);
+    crate::pr_readiness::set_feed_override(Some(Arc::new(FailsAfterATurn { inner, turns })));
+    let mut pilot = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO);
+    pilot.state.loops.pr_unchanged = 1;
+    let _ = pilot.run_with(&fx.fleet, &mut agent, &mut StopAfter(6)).unwrap();
+    assert_eq!(agent.turns, 1);
+    assert_eq!(pilot.state().loops.pr_unchanged, 1);
 }
 
 #[test]
