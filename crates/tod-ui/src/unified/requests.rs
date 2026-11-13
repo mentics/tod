@@ -1747,6 +1747,7 @@ mod tests {
             status: "answered".into(),
             created_at: asked.timestamp_millis(),
             reason: "intent".into(),
+            moves: Vec::new(),
         };
         let answer = DecisionAnswer {
             id: 1,
