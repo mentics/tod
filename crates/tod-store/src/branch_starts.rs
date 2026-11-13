@@ -5,9 +5,11 @@
 //! tip is, by construction, a commit with none of the node's work in it: the
 //! default branch's tip, or the commit the parent repository pins for a
 //! submodule. That commit is recorded here, once per node, branch and
-//! repository (`.` is the checkout itself). The first record wins: a later
-//! checkout of the same branch (a replacement sandbox, which finds the stub
-//! already on `origin`) records nothing and the original stands.
+//! repository (`.` is the checkout itself). A later checkout that again makes
+//! the branch fresh (a replacement sandbox, the old branch never pushed) records
+//! its own birth commit over the old one: the branch is new again, at a newer
+//! base. A later checkout that finds the branch on `origin` (the stub was pushed)
+//! records nothing and the earlier record stands.
 //!
 //! The lost-work rule (`tod_core::lost_work`) reads it to tell a *stub* (the
 //! branch is still at its birth commit, so no work was ever on it) from a
@@ -34,12 +36,13 @@ pub const CREATE_TABLE: &str = "
     );";
 
 /// Record `starts` (repository path to birth commit) for the node's `branch`;
-/// one already recorded for a repository is kept.
+/// a fresh birth replaces one recorded before for the same repository.
 pub fn record(conn: &Connection, node_id: &str, branch: &str, starts: &BTreeMap<String, String>) -> Result<()> {
     let blob = crate::fleet::repos::node_id_blob(node_id)?;
     for (repo, sha) in starts {
         conn.execute(
-            "INSERT OR IGNORE INTO node_branch_starts (node_id, branch, repo, sha, recorded_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO node_branch_starts (node_id, branch, repo, sha, recorded_at) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(node_id, branch, repo) DO UPDATE SET sha = excluded.sha, recorded_at = excluded.recorded_at",
             params![blob, branch, repo, sha, now_ms()],
         )?;
     }

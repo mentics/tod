@@ -2730,6 +2730,16 @@ mod tests {
         // Making it recorded where the branch was born, for the lost-work rule.
         let starts = store.read(|conn| crate::branch_starts::get(conn, &child, &branch)).unwrap();
         assert_eq!(starts.get(".").map(String::as_str), Some(latest.as_str()), "{starts:?}");
+        // A later make that again finds the branch fresh (its sandbox replaced,
+        // the old branch never pushed) replaces the record with its own birth.
+        let newer = std::collections::BTreeMap::from([(".".to_string(), "b".repeat(40))]);
+        store
+            .enqueue(FleetMutation::RecordBranchStarts { node_id: child.clone(), branch: branch.clone(), starts: newer.clone() })
+            .unwrap();
+        store.writer().flush().unwrap();
+        store.reload_if_stale().unwrap();
+        let starts = store.read(|conn| crate::branch_starts::get(conn, &child, &branch)).unwrap();
+        assert_eq!(starts, newer);
         let files = store.resolve_files_for_node(&child).unwrap().unwrap();
         assert_eq!(files.branch(), Some(branch.as_str()));
         assert_eq!(files.ready_directory(), Some(dir.clone()));
