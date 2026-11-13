@@ -296,6 +296,41 @@ fn refresh_locked(sandboxes: &mut Sandboxes, bx: &Blaxel, repo: &str, progress: 
 /// repository clones) and initializes its submodules. Then the same labels,
 /// `ready` last, and `sandboxes.toml` pointing at it. A failure deletes the
 /// half-made sandbox and names why; it never falls back to another golden.
+/// Removes the half-made golden `name` (see [`golden::half_made_action`]) and
+/// says what became of it; the bool is whether nothing is left at Blaxel.
+/// `recheck`: the failure was temporary, so a call that failed on a deadline
+/// may still be making the sandbox: a first look that finds nothing is
+/// repeated a few times before it is believed.
+fn clean_up_half_made(bx: &Blaxel, name: &str, old: &str, recheck: bool) -> (String, bool) {
+    let mut found = bx.get(name);
+    for _ in 0..3 {
+        if !(recheck && matches!(&found, Ok(None))) {
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(3));
+        found = bx.get(name);
+    }
+    match found {
+        Err(e) => (format!("tod could not check whether {name} exists ({e:#}); if `tod-sandbox list` shows it, delete it with `tod-sandbox delete {name}`"), false),
+        Ok(found) => {
+            let action = golden::half_made_action(name, old, found.as_ref());
+            let exists = found.is_some();
+            match &action {
+                golden::HalfMade::Delete => match bx.delete(name) {
+                    Ok(()) => (format!("the half-made {name} was deleted"), true),
+                    Err(cleanup) => (format!("deleting the half-made {name} failed too ({cleanup:#}); delete it with `tod-sandbox delete {name}`"), false),
+                },
+                golden::HalfMade::Keep(why) => (format!("{name} was left as it is: {why}"), golden::cleanup_left_nothing(exists, &action, false)),
+            }
+        }
+    }
+}
+
+/// `err`, marked [`golden::LeftBehind`] unless the cleanup left nothing.
+fn mark_if_left(err: anyhow::Error, clean: bool) -> anyhow::Error {
+    if clean { err } else { err.context(golden::LeftBehind) }
+}
+
 fn build_golden(
     sandboxes: &mut Sandboxes,
     bx: &Blaxel,
@@ -324,7 +359,12 @@ fn build_golden(
     let image = sandboxes.runtime_image("", false, progress)?;
     progress(&format!("creating {name} from {image}…"));
     let body = golden::build_body(&name, &image, &account.region, account.memory_mb, proxy);
-    bx.create_from_body(&body).with_context(|| format!("create {name} from {image}"))?;
+    if let Err(err) = bx.create_from_body(&body) {
+        // The call may have made the sandbox before it failed.
+        let err = err.context(format!("create {name} from {image}"));
+        let (after, clean) = clean_up_half_made(bx, &name, "", tod_sandbox::blaxel::error_is_transient(&err));
+        return Err(mark_if_left(err.context(format!("make the golden sandbox for {repo}: creating {name} failed; {after}")), clean));
+    }
     let policy = golden::StepRetry::default();
     let said = std::cell::RefCell::new(progress);
     let say = |m: &str| (said.borrow_mut())(m);
@@ -373,17 +413,14 @@ fn build_golden(
     })();
     if let Err(err) = made {
         // Nothing points at it yet; remove it unless it is somehow ready.
-        let after = match bx.get(&name).and_then(|found| match golden::half_made_action(&name, "", found.as_ref()) {
-            golden::HalfMade::Delete => bx.delete(&name).map(|()| format!("the half-made {name} was deleted")),
-            golden::HalfMade::Keep(why) => Ok(format!("{name} was left as it is: {why}")),
-        }) {
-            Ok(text) => text,
-            Err(cleanup) => format!("deleting the half-made {name} failed too ({cleanup:#}); delete it with `tod-sandbox delete {name}`"),
-        };
+        let (after, clean) = clean_up_half_made(bx, &name, "", false);
         sandboxes.config.sandboxes.retain(|s| s.name != name);
         // Not hidden if saving the forgetting fails too: said with the rest.
         let saved = sandboxes.save().err().map(|e| format!(" (and sandboxes.toml could not be saved: {e:#})")).unwrap_or_default();
-        return Err(err.context(format!("make the golden sandbox for {repo}: {name} was built but not finished; {after}{saved}. {repo} still has no golden")));
+        return Err(mark_if_left(
+            err.context(format!("make the golden sandbox for {repo}: {name} was built but not finished; {after}{saved}. {repo} still has no golden")),
+            clean,
+        ));
     }
     let account = sandboxes.config.blaxel.as_mut().ok_or_else(|| anyhow!("run `tod-sandbox setup` first"))?;
     account.set_golden(repo, &name);
@@ -462,7 +499,12 @@ fn refresh_with(
     // update once tod's files are installed in it (the same fork without
     // them keeps them). The node's own fork sets the proxy variables
     // (`node::fork_golden`).
-    bx.fork(origin, &name).with_context(|| format!("fork {origin}"))?;
+    if let Err(err) = bx.fork(origin, &name) {
+        // The call may have made the sandbox before it failed.
+        let err = err.context(format!("fork {origin}"));
+        let (after, clean) = clean_up_half_made(bx, &name, old, tod_sandbox::blaxel::error_is_transient(&err));
+        return Err(mark_if_left(err.context(format!("refresh the golden sandbox for {repo}: forking {name} failed; {after}")), clean));
+    }
     let policy = golden::StepRetry::default();
     let said = std::cell::RefCell::new(progress);
     let say = |m: &str| (said.borrow_mut())(m);
@@ -507,16 +549,13 @@ fn refresh_with(
         // A half-made golden must not stay for a later step to mistake for
         // one: remove it (`half_made_action` says whether it may be), and say
         // what happened to it.
-        let after = match bx.get(&name).and_then(|found| match golden::half_made_action(&name, old, found.as_ref()) {
-            golden::HalfMade::Delete => bx.delete(&name).map(|()| format!("the half-made {name} was deleted")),
-            golden::HalfMade::Keep(why) => Ok(format!("{name} was left as it is: {why}")),
-        }) {
-            Ok(text) => text,
-            Err(cleanup) => format!("deleting the half-made {name} failed too ({cleanup:#}); delete it with `tod-sandbox delete {name}`"),
-        };
-        return Err(err.context(format!(
-            "refresh the golden sandbox for {repo}: {name} was made from {old} but not finished; {after}. {repo}'s golden is still {old}"
-        )));
+        let (after, clean) = clean_up_half_made(bx, &name, old, false);
+        return Err(mark_if_left(
+            err.context(format!(
+                "refresh the golden sandbox for {repo}: {name} was made from {old} but not finished; {after}. {repo}'s golden is still {old}"
+            )),
+            clean,
+        ));
     }
 
     let account = sandboxes

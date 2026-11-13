@@ -307,6 +307,26 @@ pub fn half_made_action(new: &str, old: &str, found: Option<&SandboxInfo>) -> Ha
     HalfMade::Delete
 }
 
+/// Whether a failed golden step left nothing at Blaxel: Blaxel has no sandbox
+/// of the new name, or it was deleted. A kept one (`HalfMade::Keep`) or a
+/// failed delete leaves a sandbox behind.
+pub fn cleanup_left_nothing(exists: bool, action: &HalfMade, deleted: bool) -> bool {
+    !exists || (matches!(action, HalfMade::Delete) && deleted)
+}
+
+/// Carried in the error chain (`err.downcast_ref::<LeftBehind>()`) of a failed
+/// golden step that left a half-made sandbox at Blaxel. Whoever would try the
+/// step again must not: another attempt makes another golden, with another
+/// name, and this one stays.
+#[derive(Debug)]
+pub struct LeftBehind;
+
+impl std::fmt::Display for LeftBehind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a half-made sandbox was left at Blaxel")
+    }
+}
+
 /// Where the golden of a repository comes from (gap 15 of
 /// `doc/runner-menu/live-check-2026-11.md`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -490,6 +510,17 @@ mod tests {
         .unwrap_err();
         assert_eq!((calls, slept), (1, 0));
         assert!(err.to_string().contains("no space left"));
+    }
+
+    #[test]
+    fn a_retry_is_only_safe_when_the_cleanup_left_nothing() {
+        assert!(cleanup_left_nothing(false, &HalfMade::Keep("does not exist".into()), false));
+        assert!(cleanup_left_nothing(true, &HalfMade::Delete, true));
+        // Kept, or the delete failed: a sandbox is still there.
+        assert!(!cleanup_left_nothing(true, &HalfMade::Keep("not tod's".into()), false));
+        assert!(!cleanup_left_nothing(true, &HalfMade::Delete, false));
+        let err = anyhow::anyhow!("fork x: 502 Bad Gateway").context(LeftBehind);
+        assert!(err.downcast_ref::<LeftBehind>().is_some());
     }
 
     #[test]

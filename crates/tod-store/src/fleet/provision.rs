@@ -1001,11 +1001,18 @@ fn retry_transient<T>(
     }
 }
 
-/// A failure before this attempt changed anything at Blaxel (the name settled,
-/// the golden resolved, credentials read): nothing to clean up, so a temporary
-/// one is simply tried again.
+/// A failure before this attempt made the node's sandbox (the name settled,
+/// the golden resolved, credentials read, an existing sandbox reused). Another
+/// attempt starts over from `choose_sandbox`, which decides again from what is
+/// there now, so it is safe when the failure is temporary, with one exception:
+/// the golden step may have made a half-made golden it could not remove (a
+/// kept one, a failed delete), and a second attempt would make another golden
+/// beside it; that error carries [`tod_sandbox::golden::LeftBehind`] and is not
+/// retried. (`choose_sandbox`'s replacement of a failed or dead sandbox deletes
+/// only after the commits guard, and repeats the same decision when tried
+/// again.)
 fn before_anything_is_made(err: anyhow::Error) -> Attempt {
-    let retryable = tod_sandbox::blaxel::error_is_transient(&err);
+    let retryable = tod_sandbox::blaxel::error_is_transient(&err) && err.downcast_ref::<tod_sandbox::golden::LeftBehind>().is_none();
     Attempt { err, retryable }
 }
 
@@ -1031,7 +1038,11 @@ fn make_sandbox_once(
     let user = host.orchestrator_user(&root)?;
     let recorded = recorded_sandboxes(fleet, node_id)?;
     let name = match choose_sandbox(&bx, &recorded, &node_row.slug, node_id, progress).map_err(before_anything_is_made)? {
-        Chosen::Reuse(name) => return Ok(reuse_sandbox(fleet, &name, location, branch, progress)?),
+        // Makes nothing and deletes nothing (the node's own sandbox), so a
+        // temporary failure is simply tried again.
+        Chosen::Reuse(name) => {
+            return reuse_sandbox(fleet, &name, location, branch, progress).map_err(before_anything_is_made);
+        }
         Chosen::Make(name) => name,
     };
 
@@ -1342,9 +1353,15 @@ fn discard_failed_sandbox(
     let transient = tod_sandbox::blaxel::error_is_transient(&err);
     let mut existing = bx.get(name).map(|info| info.is_some());
     // A fork that failed on a deadline may still be appearing at Blaxel: one
-    // look right after is not proof it is absent.
+    // look right after is not proof it is absent. A look that itself failed
+    // temporarily is repeated too.
     for _ in 0..3 {
-        if !(transient && matches!(existing, Ok(false))) {
+        let look_again = match &existing {
+            Ok(false) => transient,
+            Err(e) => tod_sandbox::blaxel::error_is_transient(e),
+            Ok(true) => false,
+        };
+        if !look_again {
             break;
         }
         std::thread::sleep(std::time::Duration::from_secs(3));
@@ -2119,6 +2136,10 @@ mod tests {
         assert!(t.retryable);
         let n = super::before_anything_is_made(anyhow!("tod lost track of a sandbox"));
         assert!(!n.retryable);
+        // A golden step that could not remove its half-made sandbox: a retry
+        // would make a second golden beside it.
+        let left = super::before_anything_is_made(anyhow!("fork g: 502 Bad Gateway").context(tod_sandbox::golden::LeftBehind));
+        assert!(!left.retryable);
     }
 
     #[test]
