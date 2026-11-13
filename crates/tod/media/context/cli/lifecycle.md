@@ -14,7 +14,8 @@ states.
 
 `set` does what the task panel's state chip does: the node moves at once,
 bypassing the gates, and the change shows on its activity as the user's with
-the reason. A move back clears what certified the states being redone and
+the reason (prefixed `tod-cli: `). It does not advance the node's Linear
+ticket, as the chip does. A move back clears what certified the states being redone and
 reopens verified verdicts. `--reason` is required. Moving into `pr_review` or
 any later state is refused: marking the pull request ready and choosing a
 reviewer are the user's step.

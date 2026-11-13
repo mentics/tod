@@ -370,7 +370,9 @@ capability's settings) are recorded too, as one `capabilities` item per node;
 a disable archives every row it removes (`outline::archive`, following
 `ON DELETE CASCADE` from the schema) so reversing it restores them. Content and
 lifecycle mutations are not recorded, and nothing sets a lifecycle state
-except the lifecycle process.
+except the lifecycle process, with two deliberate exceptions for the user:
+the task panel's state chip and the operator's `tod-cli lifecycle set`
+(refused in agent sessions, and into `pr_review` or beyond).
 
 **Protocols.** A conversation's `protocol` (schema v39) decides what kind of
 conversation it is: the context recipe, the working directory, the turn

@@ -1,10 +1,12 @@
 //! `tod-cli lifecycle` — the operator's way to move a node's lifecycle state.
 //!
-//! The same act as the task panel's phase chip: both send
+//! The same store change as the task panel's phase chip: both send
 //! `tod_core::lifecycle::operator::user_move`, so a move back clears what
 //! certified the states being redone, reopens verified verdicts, cancels what
 //! the node waited on and retakes or clears the lifecycle baseline.
-//! Refused in an agent session, and into `pr_review` or beyond.
+//! Unlike the chip it does not advance the node's Linear ticket (that needs
+//! a second store writer beside the daemon). Refused in an agent session,
+//! and into `pr_review` or beyond.
 
 use crate::Invocation;
 use crate::args::Args;
@@ -23,7 +25,8 @@ COMMANDS:
 `set` moves the node to <STATE> at once, bypassing the gates, exactly as the
 task panel's state chip does: a move back clears what certified the states
 being redone and reopens verified verdicts. --reason is required and is kept
-on the node's activity. <NODE> is a node slug or full UUID.
+on the node's activity, prefixed `tod-cli:`. It does not advance the
+node's Linear ticket, as the chip does. <NODE> is a node slug or full UUID.
 It is for the operator only and is refused in an agent session. It also
 refuses `pr_review` and every state after it: marking the pull request ready
 and choosing a reviewer are the user's step.
@@ -58,7 +61,7 @@ fn set(inv: &Invocation, args: &Args, env: impl Fn(&str) -> Option<String>) -> a
     let client = InterviewClient::new(&inv.data_root, ACTOR_USER);
     let current = current_state(&client, node)?;
     operator::check_operator_target(&current, state)?;
-    client.outline(operator::user_move(node, state, Some(&reason)))?;
+    client.outline(operator::user_move(node, state, Some(&format!("tod-cli: {reason}"))))?;
     let now = current_state(&client, node)?;
     if now != *state {
         anyhow::bail!("asked to move the node to `{state}`, but it is in `{now}`");
@@ -166,7 +169,7 @@ mod tests {
         assert!(change.by_user, "shown as the user's move");
         let detail = change.phase_change().unwrap();
         assert_eq!(detail.from, "review");
-        assert_eq!(detail.reason.as_deref(), Some("work was lost"));
+        assert_eq!(detail.reason.as_deref(), Some("tod-cli: work was lost"));
         assert_eq!(verdict[&obligation].status, tod_store::verification::VERDICT_REOPENED);
     }
 }
