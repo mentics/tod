@@ -2138,7 +2138,7 @@ mod tests {
         assert!(!n.retryable);
         // A golden step that could not remove its half-made sandbox: a retry
         // would make a second golden beside it.
-        let left = super::before_anything_is_made(anyhow!("fork g: 502 Bad Gateway").context(tod_sandbox::golden::LeftBehind));
+        let left = super::before_anything_is_made(anyhow::Error::new(tod_sandbox::golden::LeftBehind("fork g: 502 Bad Gateway".into())));
         assert!(!left.retryable);
     }
 

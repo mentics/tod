@@ -318,14 +318,18 @@ pub fn cleanup_left_nothing(exists: bool, action: &HalfMade, deleted: bool) -> b
 /// golden step that left a half-made sandbox at Blaxel. Whoever would try the
 /// step again must not: another attempt makes another golden, with another
 /// name, and this one stays.
+/// Its text is the whole message for the user (the original error first,
+/// then the sandbox's name and what to do about it).
 #[derive(Debug)]
-pub struct LeftBehind;
+pub struct LeftBehind(pub String);
 
 impl std::fmt::Display for LeftBehind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("a half-made sandbox was left at Blaxel")
+        f.write_str(&self.0)
     }
 }
+
+impl std::error::Error for LeftBehind {}
 
 /// Where the golden of a repository comes from (gap 15 of
 /// `doc/runner-menu/live-check-2026-11.md`).
@@ -519,7 +523,7 @@ mod tests {
         // Kept, or the delete failed: a sandbox is still there.
         assert!(!cleanup_left_nothing(true, &HalfMade::Keep("not tod's".into()), false));
         assert!(!cleanup_left_nothing(true, &HalfMade::Delete, false));
-        let err = anyhow::anyhow!("fork x: 502 Bad Gateway").context(LeftBehind);
+        let err = anyhow::Error::new(LeftBehind("fork x: 502 Bad Gateway; tod-golden-x may exist".into()));
         assert!(err.downcast_ref::<LeftBehind>().is_some());
     }
 

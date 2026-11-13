@@ -328,7 +328,26 @@ fn clean_up_half_made(bx: &Blaxel, name: &str, old: &str, recheck: bool) -> (Str
 
 /// `err`, marked [`golden::LeftBehind`] unless the cleanup left nothing.
 fn mark_if_left(err: anyhow::Error, clean: bool) -> anyhow::Error {
-    if clean { err } else { err.context(golden::LeftBehind) }
+    if clean { err } else { anyhow::Error::new(golden::LeftBehind(format!("{err:#}"))) }
+}
+
+/// The failure of the call that makes a golden (a fork or create is a POST that
+/// is not idempotent, and Blaxel may make the sandbox after the call has
+/// failed, later than any look here): always [`golden::LeftBehind`], so no
+/// caller tries again and makes a second golden. The original error is first;
+/// the user is told the name to look for.
+fn made_call_failed(err: anyhow::Error, name: &str, repo: &str, after: &str) -> anyhow::Error {
+    anyhow::Error::new(golden::LeftBehind(format!(
+        "{err:#}; {after}. Blaxel may still make {name} after this failure, so tod does not try again: \
+         check `tod-sandbox list` for {name} and delete it with `tod-sandbox delete {name}` if it is there; {repo} has no new golden"
+    )))
+}
+
+/// A `sandboxes.toml` that could not record a golden Blaxel already has.
+fn save_failed(err: anyhow::Error, name: &str, repo: &str) -> anyhow::Error {
+    anyhow::Error::new(golden::LeftBehind(format!(
+        "{err:#}; {name} was made as the golden of {repo} but sandboxes.toml could not record it: delete it with `tod-sandbox delete {name}`"
+    )))
 }
 
 fn build_golden(
@@ -363,7 +382,8 @@ fn build_golden(
         // The call may have made the sandbox before it failed.
         let err = err.context(format!("create {name} from {image}"));
         let (after, clean) = clean_up_half_made(bx, &name, "", tod_sandbox::blaxel::error_is_transient(&err));
-        return Err(mark_if_left(err.context(format!("make the golden sandbox for {repo}: creating {name} failed; {after}")), clean));
+        let _ = clean;
+        return Err(made_call_failed(err, &name, repo, &after));
     }
     let policy = golden::StepRetry::default();
     let said = std::cell::RefCell::new(progress);
@@ -424,7 +444,7 @@ fn build_golden(
     }
     let account = sandboxes.config.blaxel.as_mut().ok_or_else(|| anyhow!("run `tod-sandbox setup` first"))?;
     account.set_golden(repo, &name);
-    sandboxes.save()?;
+    sandboxes.save().map_err(|e| save_failed(e, &name, repo))?;
     say(&format!("{name} is now the golden of {repo}"));
     Ok(name)
 }
@@ -503,7 +523,8 @@ fn refresh_with(
         // The call may have made the sandbox before it failed.
         let err = err.context(format!("fork {origin}"));
         let (after, clean) = clean_up_half_made(bx, &name, old, tod_sandbox::blaxel::error_is_transient(&err));
-        return Err(mark_if_left(err.context(format!("refresh the golden sandbox for {repo}: forking {name} failed; {after}")), clean));
+        let _ = clean;
+        return Err(made_call_failed(err, &name, repo, &after));
     }
     let policy = golden::StepRetry::default();
     let said = std::cell::RefCell::new(progress);
@@ -574,7 +595,7 @@ fn refresh_with(
     account.set_golden(repo, &name);
     // Whether anything else still points at the old one, as it stood.
     let wanted_elsewhere = account.golden_used_elsewhere(old, repo);
-    sandboxes.save()?;
+    sandboxes.save().map_err(|e| save_failed(e, &name, repo))?;
     say(&format!("{name} is now the golden of {repo}"));
 
     // Forks are independent of the sandbox they were made from, so nothing
