@@ -1830,6 +1830,29 @@ fn a_base_that_keeps_moving_is_waited_on_not_merged_in_every_poll() {
     assert_eq!(pilot.state().loops.pr_housekeeping_rounds, 1);
 }
 
+/// The gap runs from the last merge of the base whatever happened in
+/// between: a clear read (or a hand-off to a person) does not buy another
+/// immediate merge.
+#[test]
+fn the_gap_between_base_merges_survives_a_clear_read() {
+    use Look::*;
+    let (fx, feed, mut agent) = scripted_pr(vec![Behind, HumanReview]);
+    let gap = Duration::from_secs(3600);
+    let mut pilot = autopilot(&fx, Budget::default())
+        .with_pr_poll_interval(Duration::ZERO)
+        .with_housekeeping_gap(gap);
+    let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
+    assert!(matches!(outcome, Outcome::Waiting { .. }), "{outcome:?}");
+    assert_eq!(agent.turns, 1);
+    feed.restart(vec![Behind; 10]);
+    let mut again = autopilot(&fx, Budget::default())
+        .with_pr_poll_interval(Duration::ZERO)
+        .with_housekeeping_gap(gap);
+    let outcome = again.run_with(&fx.fleet, &mut agent, &mut StopAfter(20)).unwrap();
+    assert!(matches!(outcome, Outcome::Stopped { .. }), "{outcome:?}");
+    assert_eq!(agent.turns, 1, "the base moved again within the gap: waited, not merged");
+}
+
 #[test]
 fn a_base_that_never_stops_moving_ends_in_a_precise_stop() {
     use Look::*;

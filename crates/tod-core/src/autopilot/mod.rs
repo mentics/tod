@@ -528,12 +528,22 @@ impl Autopilot {
 
     /// The pull request has nothing left for the agent (clear, or waiting for
     /// a person): the next feedback starts the count of rounds again.
+    /// The pull request is handed to a person: the base-branch merge count
+    /// starts again. Not on a merely clean read, which tod's own merge and
+    /// review can cause again and again.
+    fn reset_housekeeping(&mut self) -> Result<()> {
+        if self.state.loops.pr_housekeeping_rounds != 0 {
+            self.state.loops.pr_housekeeping_rounds = 0;
+            self.save()?;
+        }
+        Ok(())
+    }
+
     fn reset_pr_rounds(&mut self) -> Result<()> {
         let loops = &mut self.state.loops;
-        if loops.pr_rounds != 0 || loops.pr_unchanged != 0 || loops.pr_housekeeping_rounds != 0 {
+        if loops.pr_rounds != 0 || loops.pr_unchanged != 0 {
             loops.pr_rounds = 0;
             loops.pr_unchanged = 0;
-            loops.pr_housekeeping_rounds = 0;
             self.save()?;
         }
         Ok(())
@@ -1227,6 +1237,7 @@ impl Autopilot {
                             OwnReview::Clear => {}
                         }
                     }
+                    self.reset_housekeeping()?;
                     return Ok(None);
                 }
                 PrNext::Work(works) => {
@@ -1265,7 +1276,7 @@ impl Autopilot {
                         let last = self.state.loops.pr_housekeeping_at_ms;
                         let due = last + self.housekeeping_gap.as_millis() as i64;
                         let now = chrono::Utc::now().timestamp_millis();
-                        if self.state.loops.pr_housekeeping_rounds > 0 && now < due {
+                        if now < due {
                             let interval = self.pr_poll.min(Duration::from_millis((due - now) as u64));
                             let what = format!(
                                 "the base branch moved again; merging it in at most every {} minutes",
@@ -1310,10 +1321,16 @@ impl Autopilot {
                     // A turn that left the pull request exactly as it was,
                     // twice: another would do the same.
                     let answered_at = pr_readiness::agent_answered_at(fleet, self.node)?;
-                    let now = pr_readiness::live_answered(feed.as_ref(), &links.prs, &settings, answered_at).ok();
-                    let same = now.as_ref().is_some_and(|n| {
-                        n.iter().map(|p| p.fingerprint.clone()).collect::<Vec<_>>() == fingerprint
-                    });
+                    let now = match pr_readiness::live_answered(feed.as_ref(), &links.prs, &settings, answered_at) {
+                        Ok(now) => now,
+                        Err(err) => {
+                            // The count is left as it was: a failed look says
+                            // nothing about whether the turn changed anything.
+                            hook.waiting(None, None);
+                            return Ok(Some(github_wait::github_look_failed(fleet, self.node, false, &err)?));
+                        }
+                    };
+                    let same = now.iter().map(|p| p.fingerprint.clone()).collect::<Vec<_>>() == fingerprint;
                     // Only a turn that could have changed something is judged:
                     // work the agent cannot fix (a bot that has not reviewed
                     // and has no findings) is not its turn to lose.
@@ -1370,9 +1387,13 @@ impl Autopilot {
                             match self.own_review(fleet, agent, hook, feed.as_ref(), &live, &mut answered)? {
                                 OwnReview::Again => continue,
                                 OwnReview::Stop(outcome) => return Ok(Some(outcome)),
-                                OwnReview::Clear => return Ok(None),
+                                OwnReview::Clear => {
+                                    self.reset_housekeeping()?;
+                                    return Ok(None);
+                                }
                             }
                         }
+                        self.reset_housekeeping()?;
                         // Hours or days: the run ends, and is woken at the
                         // time recorded (or by the review's webhook).
                         return Ok(Some(self.wait_for_review(fleet, &live, &settings)?));
