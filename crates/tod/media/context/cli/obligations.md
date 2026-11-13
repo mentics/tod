@@ -37,8 +37,10 @@ exception: a verification session may `update <id> --acts-in merged|released
 --reason <TEXT>` on an obligation of its own node (in `verifying`) that acts in
 an earlier state, to hand it to the phase that can show it true. The `--reason`
 (at least 15 characters) is required and is kept with the change: say why nothing in the checkout can
-show it true. Refused when the obligation already has a `failed` verdict in its history or a
-`failed` plan step carries it: a recorded failure stays a failure. Nothing
+show it true. Refused when the obligation has a `failed` verdict recorded in this stay in
+`verifying` or a `failed` plan step carries it: a recorded failure stays a
+failure (a `failed` verdict from before the task went back to implementation
+does not count). Nothing
 else, and never back.
 
 `deleted` and `history` list changes as `r-<n>`; deletions and edits stay

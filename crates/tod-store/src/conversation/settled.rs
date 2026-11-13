@@ -76,7 +76,7 @@ const MIN_REASON_CHARS: usize = 15;
 ///
 /// It needs a `reason`, kept with the change in the change set, and it is
 /// refused (an error that says why, not the generic one) for an obligation
-/// that already has a `failed` verdict or that a `failed` plan step carries:
+/// that has a `failed` verdict from this stay in `verifying` or that a `failed` plan step carries:
 /// a recorded failure stays a failure, so a move cannot hide one.
 fn verify_may_retag(
     conn: &Connection,
@@ -120,12 +120,21 @@ fn verify_may_retag(
             can show it true. Pass `--reason <TEXT>`."
         );
     }
-    // Any `failed` verdict in its history counts, not only the latest: failed
-    // then verified then moved is still a failure that was recorded.
+    // A `failed` verdict recorded in this stay in `verifying` counts, even if
+    // ruled on since (failed then verified then moved is still a recorded
+    // failure). One from an earlier stay does not: the node has been back
+    // through implementation since, and the failure it recorded (often "the
+    // code is not in the checkout") is the work this verification re-rules on;
+    // the obligation is retagged on what this stay found.
+    let stay_began = NodeRepo::new(conn)
+        .get_lifecycle_entered_for_nodes(&[obligation.node_id])?
+        .get(&obligation.node_id)
+        .map(|(_, at)| *at)
+        .unwrap_or(0);
     let failed_verdict = VerdictRepo::new(conn)
         .history_for_node(obligation.node_id)?
         .iter()
-        .any(|v| v.obligation_id == obligation.id && v.is_failed());
+        .any(|v| v.obligation_id == obligation.id && v.is_failed() && v.created_at >= stay_began);
     let plan = PlanStepRepo::new(conn);
     let mut failed_step = false;
     for step in plan.list_steps_for_obligation(obligation.id)? {
@@ -133,8 +142,8 @@ fn verify_may_retag(
     }
     if failed_verdict || failed_step {
         bail!(
-            "refused: this obligation already failed verification (a `failed` verdict or a \
-            `failed` plan step that carries it), and a recorded failure stays a failure: it \
+            "refused: this obligation already failed verification in this stay (a `failed` verdict \
+            or a `failed` plan step that carries it), and a recorded failure stays a failure: it \
             is not moved to a later phase. Leave it `failed`; implementation fixes it."
         );
     }
@@ -587,6 +596,24 @@ mod tests {
         let err = outline(&fx, &verify, retag(&fx, "released")).unwrap_err();
         assert!(format!("{err:#}").contains("stays a failure"), "{err:#}");
         assert_eq!(acts_in(&fx), "active");
+    }
+
+    /// A failure from an earlier stay in `verifying` (the node went back to
+    /// implementation since) does not stop the move; one from this stay does.
+    #[test]
+    fn a_failure_from_an_earlier_stay_does_not_block_the_move() {
+        let fx = setup("verifying");
+        let verify = conversation(&fx, ProtocolKind::Verification);
+        VerdictRepo::new(&fx.conn)
+            .record(fx.node, fx.obligation, None, "failed", "The code was missing.")
+            .unwrap();
+        // The node went back and came again: a new stay, later than the failure.
+        let nodes = NodeRepo::new(&fx.conn);
+        nodes.set_lifecycle(fx.node, "active").unwrap();
+        nodes.set_lifecycle(fx.node, "verifying").unwrap();
+        fx.conn.execute("UPDATE node_lifecycle SET updated_at = updated_at + 10000", []).unwrap();
+        outline(&fx, &verify, retag(&fx, "merged")).unwrap();
+        assert_eq!(acts_in(&fx), "merged");
     }
 
     #[test]

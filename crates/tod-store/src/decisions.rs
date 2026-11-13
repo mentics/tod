@@ -479,6 +479,15 @@ impl<'a> DecisionRepo<'a> {
         )?)
     }
 
+    /// Withdraw every pending decision of the node: it is finished, so
+    /// nothing is waiting on an answer (`crate::done_close`). Returns how many.
+    pub fn withdraw_pending_for_node(&self, node_id: Uuid) -> Result<usize> {
+        Ok(self.conn.execute(
+            "UPDATE decisions SET status = 'withdrawn' WHERE node_id = ?1 AND status = 'pending'",
+            params![uuid_to_blob(node_id)],
+        )?)
+    }
+
     /// Withdraw a decision: it no longer needs an answer.
     pub fn withdraw(&self, id: Uuid) -> Result<()> {
         let changed = self.conn.execute(

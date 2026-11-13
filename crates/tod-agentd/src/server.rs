@@ -197,6 +197,23 @@ fn watch_done_sandboxes(shared: Arc<Shared>) {
 /// `lost::retire_node_sandbox`, the task panel's delete without the user's "no sandbox until Start" flag. A pass
 /// that cannot even read the store is loud, never skipped.
 fn retire_pass(store: &tod_store::fleet::FleetStore) {
+    // Requests a finished node still holds (an older build, a late sync) are
+    // closed on the same minute.
+    match tod_core::run_state::close_done_nodes(store) {
+        Ok(nodes) if !nodes.is_empty() => {
+            tracing::info!("tod-agentd: closed the open requests of {} done node(s)", nodes.len());
+        }
+        Ok(_) => {}
+        Err(err) => {
+            let message = format!("Closing the open requests of done nodes failed: {err:#}");
+            tracing::warn!("tod-agentd: {message}");
+            tod_core::logging::buffer::record(
+                tod_core::logging::buffer::Level3::Error,
+                tod_core::logging::buffer::LogSource::App,
+                message,
+            );
+        }
+    }
     if let Err(err) = tod_core::sandbox_retire::retire_due(store) {
         let message = format!("Checking which done nodes' sandboxes to delete failed: {err:#}");
         tracing::warn!("tod-agentd: {message}");

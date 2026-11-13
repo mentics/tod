@@ -573,3 +573,30 @@ from Blaxel.
 - **Fix**: `make_sandbox` retries (`retry_transient`, delays 20s, 60s, 120s: four attempts) when the attempt failed with `blaxel::error_is_transient` (the classification the feed retries use) and cleaned up (half-made sandbox deleted, location forgotten, intent cleared): `Attempt::retryable`. A kept sandbox, a failed delete or check, or an unknown cause is never retried, so nothing is double-created, and a name Blaxel has that the location does not record is still the "lost track" error on the next attempt. Each retry is said in the progress; the final error says how many attempts were made.
 - **Tests**: `a_temporary_failure_that_cleaned_up_is_retried_then_stops_with_the_error`, `a_failure_that_is_not_retryable_is_never_retried` (the retry loop with a fake attempt; the Blaxel calls themselves need a real sandbox and are not covered).
 - **Measure**: nodes failed with "This looks temporary" from a sandbox creation (should be 0 unless Blaxel is down for several minutes); progress lines "making the sandbox failed temporarily".
+
+
+## 2026-11-13: a done node still asked for an answer (ENG-3043)
+
+- **Seen**: 1, ENG-3043, `done` for 4 hours; its run line still read "the agent asked you 1 question(s) and is waiting for your answer".
+- **Symptom**: a finished node showed a pending request to the user.
+- **Cause**: the supervisor's last `run_state` row (`waiting`/`request`) outlived the move to `done`, and nothing closed a node's pending decisions or settled its run state when it got there.
+- **Fix**: `tod_store::done_close::close`, called from `NodeRepo::set_lifecycle_by` (the one place the gate's advance, the state chip, `tod-cli lifecycle set` and the supervisor mirror all pass through), withdraws the node's pending decisions and sets a stale run state to `done`. `done_close::sweep` does the same for rows an older build left or a late sync wrote; `tod-agentd` runs it each minute with the sandbox-retire pass (`InterviewCommand::CloseDoneNodes`). Decisions have no withdrawal-reason column (no migration); `withdrawn` plus the run state text "the node reached done; its open requests were withdrawn" is the record.
+- **Tests**: `done_close::tests::*` (tod-store): reaching done, the chip path, a node not done keeps its requests, the sweep.
+- **Measure**: pending decisions or non-`done` run states on `done` nodes (should be 0).
+
+## 2026-11-13: the verifier asked the user to retag three prod-data requirements (ENG-2068)
+
+- **Seen**: 1, ENG-2068 in `verifying`: "Decide whether to move three prod-data requirements to act in the merged phase."
+- **Symptom**: the agent tried `obligations update --acts-in merged`, was refused, and asked the user instead.
+- **Cause**: the retag refused any obligation with a `failed` verdict anywhere in its history. These three had been failed in the previous stay because the code was missing; the node then went back to implementation, the code now exists, and the stale verdicts blocked a correct move.
+- **Fix**: only a `failed` verdict recorded in the current stay in `verifying` (or a `failed` plan step) blocks the retag (`settled::verify_may_retag`); one from an earlier stay does not. The verify surface and `cli/obligations.md` say so and tell the agent to move it and note why, never to ask.
+- **Tests**: `a_failure_from_an_earlier_stay_does_not_block_the_move`; the existing `a_failed_obligation_is_not_moved_to_a_later_phase` still holds for this-stay failures.
+- **Measure**: `missing_rule` requests from verification about an obligation's phase (target 0).
+
+## 2026-11-13: an agent asked the user to install terraform (ENG-2072)
+
+- **Seen**: 1, ENG-2072: "Install terraform in the sandbox, then pick Fixed, try again."
+- **Symptom**: the user was asked to do an install the agent could do.
+- **Cause**: asked before `stance/autonomous-session.md` carried "A tool you lack, you install" (5f7cb589); the section also did not cover a non-root sandbox user.
+- **Fix**: the section now names `~/.local/bin` for a non-root user and says an "Install X, then try again" request is never the form: the agent installs X. The repository pins versions in `.terraform-version`/`.tool-versions`/CI config, which the agent reads; `assets/sandbox/bootstrap.sh` is left as is (no per-repository tool list: the golden sandbox, `tod-sandbox golden refresh`, is where a repository's tools are baked).
+- **Measure**: `broken` requests whose text is a missing tool (target 0 unless the install itself failed).

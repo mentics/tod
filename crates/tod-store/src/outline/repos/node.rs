@@ -259,6 +259,11 @@ impl<'a> NodeRepo<'a> {
             if previous != state {
                 crate::waits::cancel_for_node(self.conn, node_id, &format!("the node left {previous}"))?;
                 crate::node_timeline::TimelineRepo::new(self.conn).record_phase_change(node_id, &previous, state, by_user, reason)?;
+                // A finished node waits on nobody: whichever way it got to
+                // done, its open requests and stale run state are closed.
+                if state == "done" {
+                    crate::done_close::close(self.conn, node_id, now)?;
+                }
             }
         }
         // What `ready` onwards is built on; see `crate::lifecycle_baseline`.

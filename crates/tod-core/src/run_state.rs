@@ -243,6 +243,24 @@ pub fn record(fleet: &FleetStore, node: Uuid, draft: Draft, writer: &str) -> Res
     Ok(result["changed"].as_bool().unwrap_or(false))
 }
 
+/// Closes what `done` nodes still have open: pending requests are withdrawn
+/// and a run state that is not `done` becomes `done`
+/// (`tod_store::done_close`). Returns the nodes changed.
+pub fn close_done_nodes(fleet: &FleetStore) -> Result<Vec<Uuid>> {
+    let result = fleet
+        .interview(
+            ACTOR,
+            tod_store::interview::InterviewCommand::CloseDoneNodes { at: tod_store::outline::uuid_blob::now_ms() },
+        )
+        .map_err(|e| anyhow!("close the requests of done nodes: {e}"))?;
+    Ok(result["nodes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str().and_then(|s| Uuid::parse_str(s).ok()))
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

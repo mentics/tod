@@ -12,6 +12,7 @@ pub mod credentials;
 pub mod deferrals;
 pub mod git_identity;
 pub mod decisions;
+pub mod done_close;
 pub mod environment;
 pub mod groups;
 pub mod lifecycle_config;

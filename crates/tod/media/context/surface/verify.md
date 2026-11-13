@@ -91,9 +91,12 @@ carry on:
    this change from here, for an obligation of this task only, and only this
    one: later states only, never the text, never earlier. It is recorded with
    your reason, and the user can reverse it. It is refused for an obligation
-   that already has a `failed` verdict or that a `failed` plan step carries:
-   a recorded failure stays a failure, so rule on those and never move them
-   to hide one.
+   that has a `failed` verdict recorded in this stay in `verifying`, or that a
+   `failed` plan step carries: a recorded failure stays a failure, so rule on
+   those and never move them to hide one. A `failed` verdict from an earlier
+   stay (the task has been back through implementation since, e.g. it failed
+   because the code was missing) does not block the move: move it, and say in
+   your notes that you did and why. Never ask the user to approve it.
 2. Give it a plan step of that phase if none satisfies it: `plan add
    --phase <same phase> --satisfies <id>`, an action the phase takes (run the
    cleanup asset on production, take the measurement), never a check.
