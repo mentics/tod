@@ -124,7 +124,10 @@ impl RefreshLock {
 
 impl Drop for RefreshLock {
     fn drop(&mut self) {
-        let _ = fs2::FileExt::unlock(&self.0);
+        if let Err(err) = fs2::FileExt::unlock(&self.0) {
+            // Released anyway when the file closes; said, not dropped.
+            tracing::error!("could not release golden-refresh.lock: {err}");
+        }
     }
 }
 
@@ -329,8 +332,10 @@ pub fn clear_left_behind(root: &std::path::Path, repo: &str) -> Result<bool> {
 }
 
 /// [`refresh_golden`] for every repository of this data root that has a
-/// golden, returning each new golden's name; stops at the first failure,
-/// which names its repository. Slow: never on the UI thread.
+/// golden, returning each new golden's name. A failure does not stop the
+/// others: every failure is returned together, each naming its repository
+/// (a [`golden::LeftBehind`] among them keeps that type). Slow: never on the
+/// UI thread.
 pub fn refresh_all_goldens(root: &std::path::Path, progress: &mut dyn FnMut(&str)) -> Result<Vec<String>> {
     let repos = tod_store::fleet::sandbox::golden_repos(root);
     if repos.is_empty() {
@@ -338,12 +343,33 @@ pub fn refresh_all_goldens(root: &std::path::Path, progress: &mut dyn FnMut(&str
     }
     let mut sandboxes = Sandboxes::load(root)?;
     let bx = sandboxes.blaxel()?;
-    let mut names = Vec::new();
-    for repo in repos {
+    refresh_each(&repos, |repo| {
         progress(&format!("{repo}: making its golden sandbox again…"));
-        names.push(refresh_golden(&mut sandboxes, &bx, &repo, progress).with_context(|| format!("refresh {repo}'s golden sandbox"))?);
+        refresh_golden(&mut sandboxes, &bx, repo, progress)
+    })
+}
+
+/// Runs `refresh` for each repository, past failures; see [`refresh_all_goldens`].
+fn refresh_each(repos: &[String], mut refresh: impl FnMut(&str) -> Result<String>) -> Result<Vec<String>> {
+    let mut names = Vec::new();
+    let mut failures = Vec::new();
+    let mut left_behind = false;
+    for repo in repos {
+        match refresh(repo) {
+            Ok(name) => names.push(name),
+            Err(err) => {
+                left_behind |= err.downcast_ref::<golden::LeftBehind>().is_some();
+                failures.push(format!("refresh {repo}'s golden sandbox: {err:#}"));
+            }
+        }
     }
-    Ok(names)
+    if failures.is_empty() {
+        Ok(names)
+    } else if left_behind {
+        Err(anyhow::Error::new(golden::LeftBehind(failures.join("; "))))
+    } else {
+        bail!("{}", failures.join("; "))
+    }
 }
 
 /// [`refresh_golden`] with the lock held and `sandboxes` current.
@@ -724,6 +750,28 @@ mod tests {
         assert!(text.starts_with("fork g: 502 Bad Gateway"), "{text}");
         assert!(text.contains("tod-sandbox delete tod-golden-a-b-1") && text.contains("a/b has no new golden"), "{text}");
         assert!(format!("{err:#}").starts_with("fork g: 502"));
+    }
+
+    #[test]
+    fn refreshing_all_goldens_goes_on_past_a_failure_and_reports_all() {
+        let repos = vec!["a/b".to_string(), "c/d".to_string(), "e/f".to_string()];
+        let mut tried = Vec::new();
+        let err = refresh_each(&repos, |repo| {
+            tried.push(repo.to_string());
+            match repo {
+                "a/b" => Err(anyhow::Error::new(golden::LeftBehind("a/b is left behind".into()))),
+                "c/d" => Ok("tod-golden-c-d-1".into()),
+                _ => Err(anyhow!("e/f: 502")),
+            }
+        })
+        .unwrap_err();
+        assert_eq!(tried, repos);
+        let text = left(&err).expect("typed: a left-behind failure is among them");
+        assert!(text.contains("a/b is left behind") && text.contains("e/f: 502"), "{text}");
+        let all = refresh_each(&repos[1..2], |_| Ok("n".into())).unwrap();
+        assert_eq!(all, vec!["n".to_string()]);
+        let plain = refresh_each(&repos[2..], |_| Err(anyhow!("e/f: 502"))).unwrap_err();
+        assert!(left(&plain).is_none());
     }
 
     #[test]

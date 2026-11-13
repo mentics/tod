@@ -53,7 +53,7 @@ struct Shared {
 pub fn run(data_root: &Path) -> Result<bool> {
     // The runs it hosts make a node's sandbox through `tod-store`'s one creator.
     tod_core::cloud_sync::register_sandbox_host();
-    spawn_golden_check(data_root);
+    spawn_golden_check(data_root)?;
     // This process has no log directory: its tracing goes to stderr, which
     // the starter files in `agentd.log`.
     tod_core::logging::init_stderr();
@@ -429,9 +429,9 @@ const GOLDEN_CHECK_EVERY: Duration = Duration::from_secs(10 * 60);
 /// only when this build's stamp is newer or the workspace's golden it was
 /// forked from has been replaced. A data root with no Blaxel account has
 /// nothing to check; any other failure is logged, and tried again next time.
-fn spawn_golden_check(data_root: &Path) {
+fn spawn_golden_check(data_root: &Path) -> Result<()> {
     let root = data_root.to_path_buf();
-    let _ = std::thread::Builder::new().name("tod-agentd-golden".into()).spawn(move || {
+    std::thread::Builder::new().name("tod-agentd-golden".into()).spawn(move || {
         loop {
             let result = (|| -> Result<()> {
                 let mut sandboxes = tod_store::fleet::sandbox::Sandboxes::load(&root)?;
@@ -446,5 +446,7 @@ fn spawn_golden_check(data_root: &Path) {
             }
             std::thread::sleep(GOLDEN_CHECK_EVERY);
         }
-    });
+    })
+    .context("start the background golden check thread")?;
+    Ok(())
 }
