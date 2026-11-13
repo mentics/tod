@@ -421,8 +421,17 @@ its own words. Now:
    push supersedes. Until then the wait is `Wait::OwnReview` and
    `Autopilot::babysit` runs the review first. The PR agent never asks a bot
    and no tod prompt names one; tod sends the agent what the bot finds. With
-   the review steps off, or in `pr_review` (which is reached only through the
-   clean own review), asking is as in item 2.
+   the review steps off, asking is as in item 2. In `pr_review` no own review
+   runs, so only the heads the review that cleared the `pr_draft` gate covered
+   count as cleared (`pr_draft_review::cleared_shas`, read from that review's
+   recorded heads): a head pushed in `pr_review` (the agent fixing a person's
+   feedback, or a person) is not asked and not waived, and a silent bot then
+   raises the question of item 3. A settings file that fails validation (or
+   cannot be read) is an error naming it (the babysitter waits as a failed
+   look, the gate criteria fail), never "no bots"; a pull request with no
+   head commit from GitHub is likewise an error while a bot and the own
+   review are in play. An `exhausted_pattern` that is not a regular
+   expression, or is empty, fails the settings load.
 7. **Fallback: rely on the own review.** A bot entry may set
    `fallback: own_review`, with optional `silent_after_minutes`, and
    optional `exhausted_pattern` (all unset by default; `silent_after_minutes`

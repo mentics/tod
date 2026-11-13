@@ -3678,7 +3678,7 @@ fn a_bot_is_asked_only_after_tods_own_review_of_the_head_is_clean() {
     assert!(matches!(outcome, Outcome::Waiting { .. }), "{outcome:?}");
     assert_eq!(openings(&fx, ProtocolKind::Review).len(), 1, "the own review ran before any ask was attempted");
     assert!(feed.posted.lock().unwrap().is_empty());
-    let cleared = fx.fleet.read(|conn| crate::pr_draft_review::cleared_shas(conn, fx.node)).unwrap();
+    let cleared = fx.fleet.read(|conn| crate::pr_draft_review::cleared_shas(conn, fx.node, false)).unwrap();
     assert_eq!(cleared, vec!["0000001".to_string()]);
 
     *feed.post_error.lock().unwrap() = None;
@@ -3732,6 +3732,18 @@ fn a_silent_bot_with_a_fallback_is_given_up_on_visibly_without_asking_the_user()
     // has no cleared head, so nothing is waived for it.
     let settings = crate::pr_readiness::settings_for_node(&fx.fleet, fx.node, &fx.root).unwrap();
     assert!(settings.own_review.cleared(Some("0000001")), "{settings:?}");
+    assert!(settings.own_review.in_review);
+    assert!(!settings.own_review.cleared(Some("2222222")), "a head pushed in pr_review is not cleared");
+    assert!(!settings.own_review.ask_allowed(Some("2222222")));
     let other = crate::pr_readiness::settings_for_node(&fx.fleet, Uuid::new_v4(), &fx.root).unwrap();
     assert!(!other.own_review.cleared(Some("0000001")), "{other:?}");
+
+    // Settings that fail validation are an error, never "no bots".
+    std::fs::write(
+        fx.root.join("tod.yml"),
+        "pr_readiness:\n  bots:\n    - name: greptile\n      silent_after_minutes: 5\n",
+    )
+    .unwrap();
+    let err = crate::pr_readiness::settings_for_node(&fx.fleet, fx.node, &fx.root).unwrap_err().to_string();
+    assert!(err.contains("silent_after_minutes needs a fallback"), "{err}");
 }

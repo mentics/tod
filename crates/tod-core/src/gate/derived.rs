@@ -784,17 +784,16 @@ enum Readiness {
 }
 
 /// The project's PR readiness settings, from the data root beside `conn`'s
-/// database; the defaults when they cannot be read.
-fn readiness_settings(conn: &Connection) -> tod_store::PrReadinessSettings {
-    let Some(db_path) = conn.path() else {
-        return Default::default();
-    };
-    let Some(data_root) = std::path::Path::new(db_path).parent() else {
-        return Default::default();
-    };
+/// database. A database with no data root beside it, or settings that cannot
+/// be read, are an error (the criterion then fails naming it), never "no bots".
+fn readiness_settings(conn: &Connection) -> std::result::Result<tod_store::PrReadinessSettings, String> {
+    let db_path = conn.path().ok_or("the database has no path, so the project's settings cannot be found")?;
+    let data_root = std::path::Path::new(db_path)
+        .parent()
+        .ok_or("the database has no folder, so the project's settings cannot be found")?;
     tod_store::TodSettings::load(&tod_store::TodPaths::at(data_root))
         .map(|settings| settings.pr_readiness)
-        .unwrap_or_default()
+        .map_err(|err| format!("the project's settings cannot be used for the pull request: {err:#}"))
 }
 
 /// One readiness criterion over every linked PR.
@@ -804,7 +803,11 @@ fn pr_readiness_outcome(conn: &Connection, node_id: Uuid, which: Readiness) -> R
         Err(outcome) => return Ok(outcome),
     };
     // A bot the user said to go on without is not required.
-    let settings = crate::bot_silence::settings_for_node(conn, node_id, readiness_settings(conn))?;
+    let configured = match readiness_settings(conn) {
+        Ok(settings) => settings,
+        Err(err) => return Ok(fail(err)),
+    };
+    let settings = crate::bot_silence::settings_for_node(conn, node_id, configured)?;
     let now = chrono::Utc::now();
     let mut assessed = Vec::new();
     for pr in &prs {
@@ -812,6 +815,9 @@ fn pr_readiness_outcome(conn: &Connection, node_id: Uuid, which: Readiness) -> R
             Ok(snapshot) => snapshot,
             Err(err) => return Ok(fail(format!("Could not read {}: {err}", pr.url))),
         };
+        if let Some(why) = crate::pr_readiness::own_review_head_missing(&snapshot, &settings) {
+            return Ok(fail(format!("{}: {why}", pr.url)));
+        }
         assessed.push((pr.url.clone(), crate::pr_readiness::Assessment::of(&snapshot, &settings, now)));
     }
     Ok(readiness_outcome(which, &assessed))
@@ -1619,6 +1625,21 @@ mod readiness_tests {
     use crate::pr_readiness::Assessment;
     use tod_store::github::{IssueComment, PrSnapshot, PrStatus, ReviewThread};
     use tod_store::{PrReadinessSettings, PrReviewBotSettings};
+
+    #[test]
+    fn settings_that_fail_validation_are_an_error_not_no_bots() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = Connection::open(dir.path().join("tod.db")).unwrap();
+        std::fs::write(
+            dir.path().join("tod.yml"),
+            "pr_readiness:\n  bots:\n    - name: greptile\n      silent_after_minutes: 5\n",
+        )
+        .unwrap();
+        let err = readiness_settings(&conn).unwrap_err();
+        assert!(err.contains("silent_after_minutes needs a fallback"), "{err}");
+        std::fs::write(dir.path().join("tod.yml"), "pr_readiness:\n  bots:\n    - name: greptile\n").unwrap();
+        assert_eq!(readiness_settings(&conn).unwrap().bots.len(), 1);
+    }
 
     fn assessed(state: &str, threads: Vec<ReviewThread>, review: Option<&str>) -> Vec<(String, Assessment)> {
         let snapshot = PrSnapshot {

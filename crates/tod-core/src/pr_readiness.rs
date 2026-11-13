@@ -1029,7 +1029,7 @@ fn exhausted_since(
     configured: &PrReviewBotSettings,
     head_at: Option<DateTime<Utc>>,
 ) -> bool {
-    if configured.exhausted_pattern.as_deref().is_none_or(|p| p.trim().is_empty()) {
+    if configured.exhausted_pattern.is_none() {
         return false;
     }
     let comments = snapshot
@@ -1734,7 +1734,7 @@ Not safe.
         if !fallback {
             s.bots[0].fallback = None;
         }
-        s.bots[0].exhausted_pattern = Some("run out of review credits".into());
+        s.bots[0].exhausted_pattern = Some(tod_store::ExhaustedPattern::new("run out of review credits").unwrap());
         s
     }
 
@@ -1774,6 +1774,38 @@ Not safe.
         back.comments.push(comment("greptile-apps[bot]", "Confidence Score: 4/5", "2026-01-01T11:40:00Z"));
         let a = Assessment::of(&back, &exhausted_settings(false, own_review(false, false, &[])), now());
         assert!(matches!(a.bots[0].standing, BotStanding::Current { score: 4 }));
+    }
+
+    #[test]
+    fn a_head_pushed_in_pr_review_is_neither_asked_nor_waived() {
+        // In `pr_review` no review runs: only the head the gate's review
+        // covered is cleared. The pull request has since moved on.
+        let state = tod_store::OwnReviewState {
+            enabled: true,
+            in_draft: false,
+            in_review: true,
+            cleared_shas: vec!["1111111aaaaaaa".into()],
+        };
+        let s = asked_at(&["2026-01-01T09:00:00Z", "2026-01-01T09:30:00Z", "2026-01-01T10:00:00Z"]);
+        let a = Assessment::of(&s, &fallback_settings(Some(0), state.clone()), now());
+        assert!(a.fallbacks.is_empty(), "not waived");
+        let fresh = Assessment::of(&snap(status("blocked", "success"), vec![], vec![]), &fallback_settings(None, state.clone()), now());
+        assert!(fresh.asks_due().is_empty(), "not asked");
+        // The head the review did clear is asked as usual.
+        let cleared = tod_store::OwnReviewState { cleared_shas: vec![HEAD.into()], ..state };
+        let ok = Assessment::of(&snap(status("blocked", "success"), vec![], vec![]), &fallback_settings(None, cleared), now());
+        assert_eq!(ok.asks_due().len(), 1);
+    }
+
+    #[test]
+    fn a_missing_head_commit_is_an_error_with_a_bot_and_the_own_review() {
+        let mut st = status("blocked", "success");
+        st.head_sha = None;
+        let s = snap(st, vec![], vec![]);
+        let settings = fallback_settings(None, own_review(true, true, &[]));
+        assert!(own_review_head_missing(&s, &settings).is_some_and(|m| m.contains("no head commit")));
+        assert!(own_review_head_missing(&s, &fallback_settings(None, own_review(false, true, &[]))).is_none());
+        assert!(own_review_head_missing(&s, &PrReadinessSettings::default()).is_none());
     }
 
     #[test]
@@ -2167,17 +2199,31 @@ pub fn settings_for_node(
     node: uuid::Uuid,
     data_root: &std::path::Path,
 ) -> anyhow::Result<PrReadinessSettings> {
-    let settings = settings_at(data_root);
+    let settings = settings_at(data_root)?;
     Ok(fleet.read(|conn| crate::bot_silence::settings_for_node(conn, node, settings))?)
 }
 
-/// The project's readiness settings; the defaults when unreadable. Private
-/// on purpose: it knows nothing of a bot the user waived, so every reader
-/// goes through [`settings_for_node`].
-fn settings_at(data_root: &std::path::Path) -> PrReadinessSettings {
+/// The project's readiness settings. A settings file that cannot be read or
+/// fails validation is an error naming it, never "no bots". Private on
+/// purpose: it knows nothing of a bot the user waived, so every reader goes
+/// through [`settings_for_node`].
+fn settings_at(data_root: &std::path::Path) -> anyhow::Result<PrReadinessSettings> {
     tod_store::TodSettings::load(&tod_store::TodPaths::at(data_root))
         .map(|settings| settings.pr_readiness)
-        .unwrap_or_default()
+        .map_err(|err| anyhow::anyhow!("the project's settings cannot be used for the pull request: {err:#}"))
+}
+
+/// Why a pull request's own review cannot be tied to its head, when it
+/// cannot: with a bot to ask or waive and the own review in play, GitHub gave
+/// no head commit. An error to report, never a wait that no review can end.
+pub fn own_review_head_missing(snapshot: &PrSnapshot, settings: &PrReadinessSettings) -> Option<String> {
+    let own = &settings.own_review;
+    (!settings.bots.is_empty()
+        && own.enabled
+        && (own.in_draft || own.in_review)
+        && !snapshot.status.merged
+        && snapshot.status.head_sha.is_none())
+    .then(|| "GitHub gave no head commit, so which head tod's own review covers cannot be told".to_string())
 }
 
 /// When the node's pull request agent last took a turn, if it has.
@@ -2290,7 +2336,7 @@ pub fn live_answered(
                 feed.same_change(pr, base, reviewed, head).map_err(|err| format!("{}: {err}", pr.url))
             })?
             .answered_through(answered_at);
-            if let Some(why) = assessment.head_time_missing() {
+            if let Some(why) = assessment.head_time_missing().or_else(|| own_review_head_missing(&snapshot, settings)) {
                 return Err(format!("{}: {why}", pr.url));
             }
             let mut open: Vec<&str> = assessment.open_threads.iter().map(|t| t.id.as_str()).collect();

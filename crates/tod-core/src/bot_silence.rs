@@ -202,7 +202,7 @@ pub fn own_review_state(conn: &rusqlite::Connection, node: Uuid) -> anyhow::Resu
     let state = tod_store::outline::repos::NodeRepo::new(conn).get_lifecycle(node)?;
     let in_draft = state.as_deref() == Some(crate::pr_draft_review::STATE);
     let in_review = state.as_deref() == Some("pr_review");
-    Ok(OwnReviewState { enabled, in_draft, in_review, cleared_shas: crate::pr_draft_review::cleared_shas(conn, node)? })
+    Ok(OwnReviewState { enabled, in_draft, in_review, cleared_shas: crate::pr_draft_review::cleared_shas(conn, node, in_review)? })
 }
 
 /// The decision to record for `tried`.

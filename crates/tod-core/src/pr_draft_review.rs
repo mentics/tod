@@ -354,11 +354,22 @@ pub fn cleared(conn: &Connection, node: Uuid, heads: &BTreeMap<String, String>) 
 /// latest review's round recorded nothing that stands. Empty when the review
 /// steps are off or no review has finished clean. What a review bot's ask and
 /// fallback wait for (`tod_store::OwnReviewState`).
-pub fn cleared_shas(conn: &Connection, node: Uuid) -> Result<Vec<String>> {
+///
+/// In `pr_review` (`in_review`), where no review runs, it is the heads the
+/// review that cleared the `pr_draft` gate covered (the latest own review of
+/// any stay), so a head pushed there is not cleared.
+pub fn cleared_shas(conn: &Connection, node: Uuid, in_review: bool) -> Result<Vec<String>> {
     if !enabled(conn, node)? {
         return Ok(Vec::new());
     }
-    let Some(latest) = latest_review(conn, node)? else { return Ok(Vec::new()) };
+    let latest = if in_review {
+        ConversationRepo::new(conn)
+            .latest_for_focus_with_protocol(Focus::Node(node), ProtocolKind::Review)?
+            .filter(|c| is_own(c, None))
+    } else {
+        latest_review(conn, node)?
+    };
+    let Some(latest) = latest else { return Ok(Vec::new()) };
     let Some(heads) = reviewed_heads(conn, latest.id)? else { return Ok(Vec::new()) };
     let findings = own_findings(conn, node)?;
     if findings.iter().any(|f| f.is_open()) || !round_clean(&findings, &latest) {

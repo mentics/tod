@@ -235,7 +235,7 @@ pub struct PrReviewBotSettings {
     /// such as out of credits. A match skips the wait at once: the
     /// `fallback`, or the question to the user when there is none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub exhausted_pattern: Option<String>,
+    pub exhausted_pattern: Option<ExhaustedPattern>,
 }
 
 /// What stands in for a review bot that stayed silent.
@@ -255,15 +255,61 @@ impl BotFallback {
     }
 }
 
+/// A bot's `exhausted_pattern`: a regular expression, compiled when it is
+/// read (a settings file with a bad one fails to load, naming the error), so
+/// a held pattern is always valid.
+#[derive(Debug, Clone)]
+pub struct ExhaustedPattern {
+    source: String,
+    re: regex::Regex,
+}
+
+impl ExhaustedPattern {
+    pub fn new(source: &str) -> Result<Self> {
+        if source.trim().is_empty() {
+            bail!("exhausted_pattern is empty, which would match every comment; remove it or give a pattern");
+        }
+        let re = regex::Regex::new(source)
+            .map_err(|err| anyhow::anyhow!("exhausted_pattern {source:?} is not a regular expression: {err}"))?;
+        Ok(Self { source: source.to_string(), re })
+    }
+
+    pub fn is_match(&self, body: &str) -> bool {
+        self.re.is_match(body)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.source
+    }
+}
+
+impl PartialEq for ExhaustedPattern {
+    fn eq(&self, other: &Self) -> bool {
+        self.source == other.source
+    }
+}
+
+impl Eq for ExhaustedPattern {}
+
+impl serde::Serialize for ExhaustedPattern {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.source)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ExhaustedPattern {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let source = String::deserialize(deserializer)?;
+        Self::new(&source).map_err(serde::de::Error::custom)
+    }
+}
+
 impl PrReviewBotSettings {
     /// Whether `body` says the bot is out of reviews (`exhausted_pattern`).
-    /// The pattern is checked when settings load ([`PrReadinessSettings::validate`]).
+    /// The pattern is compiled when settings load ([`ExhaustedPattern`]), so a
+    /// bad one is an error there and cannot be held here.
     pub fn is_exhausted(&self, body: &str) -> bool {
-        self.exhausted_pattern
-            .as_deref()
-            .filter(|p| !p.trim().is_empty())
-            .and_then(|p| regex::Regex::new(p).ok())
-            .is_some_and(|re| re.is_match(body))
+        self.exhausted_pattern.as_ref().is_some_and(|p| p.is_match(body))
     }
 
     /// A bot with the default asking limits and no ask text.
@@ -366,9 +412,9 @@ pub struct OwnReviewState {
     pub enabled: bool,
     /// The node is in `pr_draft`, where the autopilot runs the review.
     pub in_draft: bool,
-    /// The node is in `pr_review`, which it reaches only through the
-    /// `pr_draft` gate that requires a clean own review: the review is not run
-    /// again there, so what it cleared still stands.
+    /// The node is in `pr_review`: the review is not run there, so only a head
+    /// the gate's clean review covered (`cleared_shas`) counts, and a head
+    /// pushed there is never asked or waived.
     pub in_review: bool,
     /// The heads (commit SHAs) the latest own review covered and left clean.
     pub cleared_shas: Vec<String>,
@@ -377,14 +423,14 @@ pub struct OwnReviewState {
 impl OwnReviewState {
     /// The own review stands cleared for `sha` (`None`: GitHub gave none).
     pub fn cleared(&self, sha: Option<&str>) -> bool {
-        self.enabled && (self.in_review || sha.is_some_and(|sha| self.cleared_shas.iter().any(|c| c == sha)))
+        self.enabled && sha.is_some_and(|sha| self.cleared_shas.iter().any(|c| c == sha))
     }
 
     /// A bot may be asked for `sha`: with the review steps on in `pr_draft`
     /// only once the own review of that head is clean, so a bot's credits are
     /// spent on the final head and not on one a later push supersedes.
     pub fn ask_allowed(&self, sha: Option<&str>) -> bool {
-        !(self.enabled && self.in_draft) || self.cleared(sha)
+        !(self.enabled && (self.in_draft || self.in_review)) || self.cleared(sha)
     }
 
     /// A `fallback` of own review can stand in for a bot on `sha`: the review
@@ -405,11 +451,6 @@ impl PrReadinessSettings {
                     "pr_readiness.bots[{}]: silent_after_minutes needs a fallback (own_review) to apply; without one the user is asked",
                     bot.name
                 );
-            }
-            if let Some(pattern) = bot.exhausted_pattern.as_deref().filter(|p| !p.trim().is_empty())
-                && let Err(err) = regex::Regex::new(pattern)
-            {
-                bail!("pr_readiness.bots[{}].exhausted_pattern is not a regular expression: {err}", bot.name);
             }
         }
         Ok(())
@@ -1211,9 +1252,9 @@ mod tests {
         let mut no_fallback = s.clone();
         no_fallback.bots[0].fallback = None;
         assert!(no_fallback.validate().unwrap_err().to_string().contains("silent_after_minutes needs a fallback"));
-        let mut bad = s;
-        bad.bots[0].exhausted_pattern = Some("(".into());
-        assert!(bad.validate().is_err());
+        let bad = "bots:\n  - name: greptile\n    exhausted_pattern: \"(\"\n";
+        let err = serde_yaml::from_str::<PrReadinessSettings>(bad).unwrap_err().to_string();
+        assert!(err.contains("not a regular expression"), "{err}");
     }
 
     #[test]
