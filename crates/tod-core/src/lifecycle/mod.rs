@@ -50,10 +50,20 @@ pub fn set_lifecycle(fleet: &FleetStore, node: Uuid, state: &str) -> Result<()> 
 /// [`set_lifecycle`], by the user's own choice: the node's activity shows the
 /// change as theirs.
 pub fn set_lifecycle_by_user(fleet: &FleetStore, node: Uuid, state: &str) -> Result<()> {
+    set_lifecycle_by_user_because(fleet, node, state, None)
+}
+
+/// [`set_lifecycle_by_user`] with the reason kept on the timeline entry. A
+/// write that did not land is an error: the caller (the chip, a request's
+/// answer) must not go on as if the node had moved.
+pub fn set_lifecycle_by_user_because(fleet: &FleetStore, node: Uuid, state: &str, reason: Option<&str>) -> Result<()> {
     fleet
-        .enqueue_outline(operator::user_move(node, state, None))
+        .enqueue_outline(operator::user_move(node, state, reason))
         .map_err(|err| anyhow::anyhow!("{err:#}"))?;
-    let _ = fleet.writer().flush();
+    fleet
+        .writer()
+        .flush()
+        .map_err(|err| anyhow::anyhow!("the move to `{state}` was not written: {err:#}"))?;
     push_to_ticket(fleet, node, state);
     Ok(())
 }

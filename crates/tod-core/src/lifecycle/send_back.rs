@@ -15,7 +15,8 @@
 //! [`send_back`] is the shared function: every way a person sends a node back
 //! with a reason (this answer, a command) calls it, so they cannot differ.
 
-use super::{current_state, set_lifecycle_by_user};
+use super::operator::check_operator_target;
+use super::{current_state, set_lifecycle_by_user_because};
 use anyhow::{Context, Result, bail};
 use tod_store::decisions::{DECISION_WITHDRAWN, DecisionRepo, check_move_target};
 use tod_store::fleet::FleetStore;
@@ -27,29 +28,35 @@ fn rank(state: &str) -> Option<usize> {
     VALID_LIFECYCLE_STATES.iter().position(|s| *s == state)
 }
 
-/// Why `node` cannot be sent back to `to` now: `to` is not a state a node can
-/// be sent back to (a real one before `pr_review`), or the node is not past
-/// it. `Ok(current)` is the state it would leave.
-pub fn check(fleet: &FleetStore, node: Uuid, to: &str) -> Result<String> {
-    check_move_target(to)?;
-    let current = current_state(fleet, node)?;
-    match (rank(&current), rank(to)) {
-        (Some(from), Some(target)) if target < from => Ok(current),
-        _ => bail!("the node is in `{current}`, which is not later than `{to}`: there is nothing to send back"),
-    }
-}
-
-/// Move `node` back to `to` as the user's own choice (its activity shows the
-/// change as theirs), and when `to` is `active` or earlier open its
-/// implementation steps and verdicts again with `why`, so the work is rebuilt
-/// rather than judged done again. Returns the state it left.
+/// Move `node` back to `to` as the user's own choice (the same move as the
+/// task panel's chip and `tod-cli lifecycle set`: [`super::operator::user_move`]),
+/// and when `to` is `active` or earlier open its implementation steps and
+/// verdicts again with `why`, so the work is rebuilt rather than judged done
+/// again. Returns the state it left.
+///
+/// Safe to repeat: a node already in `to` (an earlier attempt moved it and
+/// then failed) is not moved again, and the reopen runs either way. The
+/// move and the reopen are two writes, not one transaction; an error between
+/// them leaves the node moved, and the repeat finishes it.
 pub fn send_back(fleet: &FleetStore, node: Uuid, to: &str, why: &str) -> Result<String> {
-    let from = check(fleet, node, to)?;
-    set_lifecycle_by_user(fleet, node, to)?;
+    check_move_target(to)?;
+    let from = current_state(fleet, node)?;
+    if from != to {
+        check_operator_target(&from, to)?;
+        match (rank(&from), rank(to)) {
+            (Some(f), Some(t)) if t < f => {}
+            _ => bail!("the node is in `{from}`, which is not later than `{to}`: there is nothing to send back"),
+        }
+        set_lifecycle_by_user_because(fleet, node, to, Some(why))?;
+        let now = current_state(fleet, node)?;
+        if now != to {
+            bail!("the node was asked to move from `{from}` to `{to}` but is in `{now}`");
+        }
+    }
     if rank(to) <= rank("active") {
         fleet
             .interview(ACTOR_USER, InterviewCommand::ReopenForRework { node_id: node, why: why.to_string() })
-            .with_context(|| format!("the node was moved back to `{to}`, but its steps could not be reopened"))?;
+            .with_context(|| format!("the node is in `{to}`, but its steps could not be reopened"))?;
     }
     Ok(from)
 }
@@ -69,6 +76,20 @@ pub fn answer_decision(
     decision_id: Uuid,
     option: Option<i64>,
     text: Option<String>,
+) -> Result<Answered> {
+    answer_with(fleet, decision_id, option, text, |command| {
+        fleet.interview(ACTOR_USER, command).map(|_| ()).map_err(anyhow::Error::from)
+    })
+}
+
+/// [`answer_decision`] with the recording of the answer given, so a test can
+/// fail it after the move.
+fn answer_with(
+    fleet: &FleetStore,
+    decision_id: Uuid,
+    option: Option<i64>,
+    text: Option<String>,
+    record: impl FnOnce(InterviewCommand) -> Result<()>,
 ) -> Result<Answered> {
     let decision = fleet
         .read(|conn| DecisionRepo::new(conn).get(decision_id))?
@@ -91,12 +112,12 @@ pub fn answer_decision(
             .with_context(|| format!("could not send the task back to `{to}` as \"{label}\" asks"))?;
         moved_to = Some(to);
     }
-    fleet
-        .interview(ACTOR_USER, InterviewCommand::AnswerDecision { decision_id, option, text })
-        .map_err(|err| match &moved_to {
-            Some(to) => anyhow::anyhow!("the task was sent back to `{to}`, but recording the answer failed: {err:#}"),
-            None => err.into(),
-        })?;
+    record(InterviewCommand::AnswerDecision { decision_id, option, text }).map_err(|err| match &moved_to {
+        Some(to) => anyhow::anyhow!(
+            "the task was sent back to `{to}`, but recording the answer failed: {err:#}; answer again to finish"
+        ),
+        None => err,
+    })?;
     Ok(Answered { moved_to })
 }
 
@@ -171,6 +192,23 @@ mod tests {
     }
 
     #[test]
+    fn an_answer_that_failed_after_the_move_can_be_given_again() {
+        let fx = fixture();
+        in_review_with_verified_steps(&fx);
+        let id = ask(&fx, vec![OptionMove { option: 1, to: "active".into() }]).unwrap();
+        let err = answer_with(&fx.fleet, id, Some(1), None, |_| anyhow::bail!("disk full")).unwrap_err();
+        assert!(format!("{err:#}").contains("disk full"), "{err:#}");
+        // Moved, still asked.
+        assert_eq!(current_state(&fx.fleet, fx.node).unwrap(), "active");
+        assert_eq!(pending(&fx), 1);
+        // The retry does not stop at "nothing to send back".
+        let answered = answer_decision(&fx.fleet, id, Some(1), None).unwrap();
+        assert_eq!(answered.moved_to.as_deref(), Some("active"));
+        assert_eq!(current_state(&fx.fleet, fx.node).unwrap(), "active");
+        assert_eq!(pending(&fx), 0);
+    }
+
+    #[test]
     fn an_option_without_a_move_only_answers() {
         let fx = fixture();
         in_review_with_verified_steps(&fx);
@@ -213,6 +251,8 @@ mod tests {
         assert_eq!(send_back(&fx.fleet, fx.node, "ready", "because").unwrap(), "review");
         assert_eq!(current_state(&fx.fleet, fx.node).unwrap(), "ready");
         assert!(send_back(&fx.fleet, fx.node, "pr_review", "x").is_err());
-        assert!(send_back(&fx.fleet, fx.node, "ready", "x").is_err());
+        // Repeating it is fine (a retry); going forward is not a send-back.
+        send_back(&fx.fleet, fx.node, "ready", "x").unwrap();
+        assert!(send_back(&fx.fleet, fx.node, "active", "x").is_err());
     }
 }

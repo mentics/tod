@@ -510,7 +510,14 @@ fn map_decision(row: &rusqlite::Row<'_>) -> rusqlite::Result<Decision> {
         status: row.get(7)?,
         created_at: row.get(8)?,
         reason: row.get(9)?,
-        moves: serde_json::from_str(&row.get::<_, String>(10)?).unwrap_or_default(),
+        moves: {
+            // A corrupt value must not read as "no moves": the answer would
+            // then move nothing, the failure this column exists to prevent.
+            let raw: String = row.get(10)?;
+            serde_json::from_str(&raw).map_err(|err| {
+                rusqlite::Error::FromSqlConversionFailure(10, rusqlite::types::Type::Text, Box::new(err))
+            })?
+        },
     })
 }
 
