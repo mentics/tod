@@ -69,9 +69,23 @@ fn emit_git_identity(manifest_dir: &Path) {
     // moves. A dev build does not: a commit would otherwise recompile this
     // crate and everything above it, and the stamp above already reruns this
     // script whenever the source changes, which is when the commit matters.
-    if std::env::var("PROFILE").is_ok_and(|p| p == "release") {
+    if is_release_profile() {
         track_git_head(manifest_dir);
     }
+}
+
+/// Whether this is the `release` profile itself. `PROFILE` cannot tell:
+/// it is `release` for every profile that inherits from release, which
+/// includes `dev-fast`, the one `scripts/run.sh` builds. The profile's own
+/// name is the directory cargo builds it in (`<target>/[<triple>/]<profile>/
+/// build/<pkg>-<hash>/out`).
+fn is_release_profile() -> bool {
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    out_dir
+        .ancestors()
+        .nth(3)
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == "release")
 }
 
 /// Reruns the build script when HEAD, or the ref it points to, changes. Paths

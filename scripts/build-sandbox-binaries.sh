@@ -7,11 +7,16 @@
 # tod-store (tod-supervisor, tod-orchestrator, once those crates exist) pulls
 # in bundled SQLite, which is C, so cross-compiling it needs a Linux C
 # toolchain for x86_64-unknown-linux-musl (as does ring, through rustls;
-# reqwest uses rustls, so there is no OpenSSL). This script builds those in a
-# Linux container when Docker is available (rust:1-alpine: a native musl
-# toolchain), else
-# tries `cargo zigbuild`; crates that need it are skipped, with instructions,
-# if neither is available.
+# reqwest uses rustls, so there is no OpenSSL). This script builds those with
+# `cargo zigbuild` when it is installed, else in a Linux container when Docker
+# is available (rust:1-alpine: a native musl toolchain); crates that need it
+# are skipped, with instructions, if neither is available.
+#
+# zigbuild comes first: it compiles natively, in one target directory every
+# worktree shares (below). The container is x86_64, so on an Apple Silicon
+# host it runs emulated, and its target volume is per checkout, so a new
+# worktree compiles every dependency again: an incremental rebuild that
+# zigbuild does in seconds takes minutes there. --docker forces the container.
 #
 # The container mounts the repository read-only and keeps its own cargo
 # target, registry, and git checkouts in Docker volumes
@@ -137,7 +142,9 @@ if command -v cargo-zigbuild >/dev/null 2>&1 && command -v zig >/dev/null 2>&1; 
 fi
 
 HAVE_DOCKER=0
-if [[ $USE_DOCKER != no ]] && command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+# Docker only when asked for, or when zigbuild is not installed (see the header).
+if [[ $USE_DOCKER == yes || ( $USE_DOCKER == auto && $HAVE_ZIGBUILD == 0 ) ]] \
+    && command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     HAVE_DOCKER=1
 fi
 if [[ $USE_DOCKER == yes && $HAVE_DOCKER == 0 ]]; then
@@ -150,9 +157,8 @@ if [[ ${#DOCKER_TEST[@]} -gt 0 ]]; then
     exit 0
 fi
 
-# With Docker (preferred over zigbuild, which cannot link OpenSSL for the
-# crates that need it), build every sandbox binary in one container
-# run: one cargo invocation shares the dependency graph.
+# With Docker (forced, or zigbuild is missing), build every sandbox binary in
+# one container run: one cargo invocation shares the dependency graph.
 if [[ $HAVE_DOCKER == 1 ]]; then
     PKGS=""
     BINS=""
@@ -233,7 +239,8 @@ if [[ -n $ZIG_PKGS ]]; then
                 || echo "warning: $b not found after zigbuild" >&2
         done
     else
-        echo "warning: cargo zigbuild failed for$ZIG_PKGS; see the fallback in this script's header" >&2
+        echo "error: cargo zigbuild failed for$ZIG_PKGS (--docker builds them in a container instead)" >&2
+        exit 1
     fi
 fi
 
