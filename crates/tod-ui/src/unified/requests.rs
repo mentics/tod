@@ -1232,7 +1232,7 @@ impl Requests {
                     .record_text(reason_label(item.reason)),
             )
             .child({
-                let when = when_label(item.since, chrono::Local::now().date_naive());
+                let when = format!("Asked {}", when_label(item.since, chrono::Local::now().date_naive()));
                 style::text_muted(div().text_xs().flex_none())
                     .child(when.clone())
                     .record_text(when)
@@ -1586,18 +1586,23 @@ impl Requests {
                 window,
                 cx,
             )))
+            .child(div().w_full().min_w_0().text_xs().child(selectable_text(
+                ("unified-decisions-log-answer", entry.answer.id as u64),
+                format!("Answered: {chosen}"),
+                window,
+                cx,
+            )))
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap_2()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(muted)
-                            .child(format!("Answered: {chosen} · {}", entry.answer.actor))
-                            .record_text(format!("Answered: {chosen} · {}", entry.answer.actor)),
-                    )
+                    .child({
+                        let times = log_times_label(&decision, &entry.answer, chrono::Local::now().date_naive());
+                        div().text_xs().text_color(muted).child(times.clone()).record_text(times)
+                    })
+                    .child(div().flex_1())
                     .child(
                         Button::new(("unified-decisions-change", entry.answer.id as u64))
                             .label(if changing { "Cancel" } else { "Change" })
@@ -1642,6 +1647,17 @@ impl Requests {
 /// A small label naming which kind a card is.
 fn kind_badge(label: &'static str) -> impl IntoElement {
     div().text_xs().child(label).record_text(label)
+}
+
+/// A log entry's times and who answered: "Asked Nov 12 14:03 · Answered
+/// 09:15 · user", in local time (see [`when_label`]).
+pub fn log_times_label(decision: &Decision, answer: &DecisionAnswer, today: chrono::NaiveDate) -> String {
+    format!(
+        "Asked {} · Answered {} · {}",
+        when_label(decision.created_at, today),
+        when_label(answer.answered_at, today),
+        answer.actor
+    )
 }
 
 /// "\"per invoice\"" or "\"free text\"" for one log entry.
@@ -1712,6 +1728,38 @@ mod tests {
         let ms = at.timestamp_millis();
         assert_eq!(when_label(ms, at.date_naive()), "14:32");
         assert_eq!(when_label(ms, at.date_naive().succ_opt().unwrap()), "Nov 5 14:32");
+    }
+
+    /// An answered request shows both when it was asked and when it was answered.
+    #[test]
+    fn log_times_show_when_asked_and_when_answered() {
+        use chrono::{Local, TimeZone};
+        let asked = Local.with_ymd_and_hms(2026, 11, 4, 8, 5, 0).single().unwrap();
+        let answered = Local.with_ymd_and_hms(2026, 11, 5, 14, 32, 0).single().unwrap();
+        let decision = Decision {
+            id: Uuid::new_v4(),
+            node_id: Uuid::new_v4(),
+            conversation_id: None,
+            protocol: None,
+            question: "Which?".into(),
+            options: Vec::new(),
+            evidence: Vec::new(),
+            status: "answered".into(),
+            created_at: asked.timestamp_millis(),
+            reason: "intent".into(),
+        };
+        let answer = DecisionAnswer {
+            id: 1,
+            decision_id: decision.id,
+            option: None,
+            text: Some("this one".into()),
+            actor: "user".into(),
+            answered_at: answered.timestamp_millis(),
+        };
+        assert_eq!(
+            log_times_label(&decision, &answer, answered.date_naive()),
+            "Asked Nov 4 08:05 · Answered 14:32 · user"
+        );
     }
 
     #[test]
