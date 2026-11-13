@@ -604,8 +604,8 @@ from Blaxel.
 - **Seen**: 1, ENG-2068 in `verifying`: "Decide whether to move three prod-data requirements to act in the merged phase."
 - **Symptom**: the agent tried `obligations update --acts-in merged`, was refused, and asked the user instead.
 - **Cause**: the retag refused any obligation with a `failed` verdict anywhere in its history. These three had been failed in the previous stay because the code was missing; the node then went back to implementation, the code now exists, and the stale verdicts blocked a correct move.
-- **Fix**: only a `failed` verdict recorded in the current stay in `verifying` (or a `failed` plan step) blocks the retag (`settled::verify_may_retag`); one from an earlier stay does not. The verify surface and `cli/obligations.md` say so and tell the agent to move it and note why, never to ask.
-- **Tests**: `a_failure_from_an_earlier_stay_does_not_block_the_move`; the existing `a_failed_obligation_is_not_moved_to_a_later_phase` still holds for this-stay failures.
+- **Fix**: only a `failed` verdict recorded in the current stay in `verifying` (or a `failed` plan step, by the step's `updated_at`, `PlanStepRepo::obligation_has_step_failed_since`) blocks the retag (`settled::verify_may_retag`); one from an earlier stay does not. A missing stay start is an error, not "count everything". A Rerun in `verifying` (`restart_stay` bumps the stay's `updated_at`) starts a new stay, so earlier failures can then be moved too. The verify surface and `cli/obligations.md` say so and tell the agent to move it and note why, never to ask.
+- **Tests**: `a_failure_from_an_earlier_stay_does_not_block_the_move`, `a_step_failed_in_an_earlier_stay_does_not_block_the_move`; the existing `a_failed_obligation_is_not_moved_to_a_later_phase` still holds for this-stay failures.
 - **Measure**: `missing_rule` requests from verification about an obligation's phase (target 0).
 
 ## 2026-11-13: an agent asked the user to install terraform (ENG-2072)

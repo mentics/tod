@@ -265,6 +265,9 @@ impl<'a> NodeRepo<'a> {
                     crate::done_close::close(self.conn, node_id, now)?;
                 }
             }
+        } else if state == "done" {
+            // Set straight to done with no earlier state: still finished.
+            crate::done_close::close(self.conn, node_id, now)?;
         }
         // What `ready` onwards is built on; see `crate::lifecycle_baseline`.
         let baselines = crate::lifecycle_baseline::BaselineRepo::new(self.conn);

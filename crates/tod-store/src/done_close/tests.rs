@@ -67,6 +67,15 @@ fn the_user_chip_path_closes_them_too() {
 }
 
 #[test]
+fn a_node_with_no_earlier_state_set_straight_to_done_closes_too() {
+    let fx = setup("verifying");
+    let id = ask(&fx);
+    fx.conn.execute("DELETE FROM node_lifecycle", []).unwrap();
+    NodeRepo::new(&fx.conn).set_lifecycle(fx.node, "done").unwrap();
+    assert_eq!(status(&fx, id), DECISION_WITHDRAWN);
+}
+
+#[test]
 fn a_node_not_done_keeps_its_requests() {
     let fx = setup("verifying");
     let id = ask(&fx);

@@ -388,6 +388,24 @@ impl<'a> PlanStepRepo<'a> {
         Ok(())
     }
 
+    /// Whether a plan step carrying `obligation_id` is `failed` and became so
+    /// at or after `since` (ms). A step's `updated_at` is when its status last
+    /// changed (`update_status`); `reopen_verification` and `reopen_lost_work`
+    /// leave failed steps untouched, so an earlier stay's failure keeps its old
+    /// time. Other edits to a failed step (text, phase, a reorder) also bump
+    /// `updated_at`, which can only make an old failure look recent: the
+    /// answer errs toward refusing, never toward hiding a failure.
+    pub fn obligation_has_step_failed_since(&self, obligation_id: Uuid, since: i64) -> Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM node_plan_steps s
+             JOIN node_plan_step_obligations o ON o.step_id = s.id
+             WHERE o.obligation_id = ?1 AND s.status = ?2 AND s.updated_at >= ?3",
+            params![uuid_to_blob(obligation_id), STATUS_FAILED, since],
+            |row| row.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
     /// Withdraw everything verification confirmed on `node_id`, because its
     /// code changed since: each `verified` step of `active` or `verifying`
     /// goes back to `implemented` (its note stays), and each `verified`

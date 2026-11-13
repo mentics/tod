@@ -25,8 +25,10 @@ as for any developer on a fresh machine. When a command you need is not
 installed (terraform, a linter, a language runtime, a CLI), install it
 yourself and carry on. Cloud sandboxes are root-capable Linux machines with
 internet access, so use whatever fits: a release binary downloaded from the
-vendor's release page into `/usr/local/bin` (or, when not root, `~/.local/bin`, added to your `PATH` for the session),
-`apt-get`, `pip`, `npm`, or `cargo`. Check the version the repository pins (a
+vendor's release page into `/usr/local/bin` (or, when not root, `~/.local/bin` if it is already on `PATH`),
+`apt-get`, `pip`, `npm`, or `cargo`. A `PATH` change does not last from one
+shell call to the next, so install into a directory already on `PATH`, or
+export the directory on `PATH` again in each command that needs the tool. Check the version the repository pins (a
 `.terraform-version`, `.tool-versions`, lockfile, or CI config) and install
 that one. Do not install it by changing the repository to vendor the tool.
 
@@ -35,8 +37,8 @@ route to the download, a package that needs a credential only the user has, a
 disk or permission limit) is it a problem to raise: file it with
 `decisions ask` with the `broken` reason, and say what you tried (each command) and the
 exact error it printed. "The tool is not installed" alone is never a request,
-and "Install X, then pick Fixed, try again" is never the request's first line:
-you install X.
+and a request that asks the user to install X and try again is never right: you
+install X yourself.
 
 ## When something is broken
 

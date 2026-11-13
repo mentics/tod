@@ -19,7 +19,6 @@ use super::repo::ConversationRepo;
 use super::types::{EntitySnapshot, ProtocolKind};
 use crate::interview::InterviewRepo;
 use crate::outline::OutlineMutation;
-use crate::outline::repos::plan_steps::STATUS_FAILED;
 use crate::outline::repos::{NodeRepo, ObligationRepo, PlanStepRepo};
 use crate::verification::VerdictRepo;
 use crate::outline::{ACTS_IN_MERGED, ACTS_IN_RELEASED};
@@ -130,16 +129,23 @@ fn verify_may_retag(
         .get_lifecycle_entered_for_nodes(&[obligation.node_id])?
         .get(&obligation.node_id)
         .map(|(_, at)| *at)
-        .unwrap_or(0);
+        .ok_or_else(|| {
+            // The node is in `verifying` (checked above), so it has a lifecycle
+            // row and a stay start. Without one we cannot tell this stay's
+            // failures from older ones; counting all or none would silently
+            // decide the question, so it is an error.
+            anyhow::anyhow!(
+                "cannot tell which failures belong to this stay: node {} is in `verifying` but \
+                has no recorded time of entering it",
+                obligation.node_id
+            )
+        })?;
     let failed_verdict = VerdictRepo::new(conn)
         .history_for_node(obligation.node_id)?
         .iter()
         .any(|v| v.obligation_id == obligation.id && v.is_failed() && v.created_at >= stay_began);
-    let plan = PlanStepRepo::new(conn);
-    let mut failed_step = false;
-    for step in plan.list_steps_for_obligation(obligation.id)? {
-        failed_step |= plan.get(step)?.is_some_and(|s| s.status == STATUS_FAILED);
-    }
+    let failed_step =
+        PlanStepRepo::new(conn).obligation_has_step_failed_since(obligation.id, stay_began)?;
     if failed_verdict || failed_step {
         bail!(
             "refused: this obligation already failed verification in this stay (a `failed` verdict \
@@ -614,6 +620,33 @@ mod tests {
         fx.conn.execute("UPDATE node_lifecycle SET updated_at = updated_at + 10000", []).unwrap();
         outline(&fx, &verify, retag(&fx, "merged")).unwrap();
         assert_eq!(acts_in(&fx), "merged");
+    }
+
+    /// A plan step that failed in an earlier stay does not block the move;
+    /// one that failed in this stay does.
+    #[test]
+    fn a_step_failed_in_an_earlier_stay_does_not_block_the_move() {
+        let fx = setup("verifying");
+        let verify = conversation(&fx, ProtocolKind::Verification);
+        let step = Uuid::new_v4();
+        let steps = PlanStepRepo::new(&fx.conn);
+        steps.insert_at(step, fx.node, 0, "Export it").unwrap();
+        steps.link_obligation(step, fx.obligation).unwrap();
+        steps.update_status(step, STATUS_FAILED, Some("Empty file."), None).unwrap();
+        // A new stay begins later than the failure.
+        fx.conn.execute("UPDATE node_lifecycle SET updated_at = updated_at + 10000", []).unwrap();
+        outline(&fx, &verify, retag(&fx, "merged")).unwrap();
+        assert_eq!(acts_in(&fx), "merged");
+        // A step that fails in this stay blocks it again.
+        let fx = setup("verifying");
+        let verify = conversation(&fx, ProtocolKind::Verification);
+        fx.conn.execute("UPDATE node_lifecycle SET updated_at = updated_at - 10000", []).unwrap();
+        let steps = PlanStepRepo::new(&fx.conn);
+        steps.insert_at(step, fx.node, 0, "Export it").unwrap();
+        steps.link_obligation(step, fx.obligation).unwrap();
+        steps.update_status(step, STATUS_FAILED, Some("Empty file."), None).unwrap();
+        let err = outline(&fx, &verify, retag(&fx, "released")).unwrap_err();
+        assert!(format!("{err:#}").contains("stays a failure"), "{err:#}");
     }
 
     #[test]

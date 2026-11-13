@@ -1,11 +1,13 @@
 //! What a node that reached `done` leaves behind: nothing that waits on the
-//! user. Entering `done` (`NodeRepo::set_lifecycle_by`, the one place every
-//! route goes through: the gate's advance, the state chip, `tod-cli
-//! lifecycle set`, the supervisor's mirror) calls [`close`], which withdraws
-//! the node's pending requests and moves a stale run state (`waiting`,
-//! `stopped`) to `done`, so a finished node never reads "the agent asked you
-//! a question". [`sweep`] does the same for rows left by an older build or
-//! written after the node finished (a supervisor's last beat, a sync).
+//! user. Entering `done` through `NodeRepo::set_lifecycle_by` (the gate's
+//! advance, the state chip, `tod-cli lifecycle set`; also from no earlier
+//! state) calls [`close`], which withdraws the node's pending requests and
+//! moves a stale run state (`waiting`, `stopped`) to `done`, so a finished
+//! node never reads "the agent asked you a question". It is not the only
+//! route: a synced `node_lifecycle` row (`sync::apply_one`), an archive
+//! restore and a task insert write the row directly. [`sweep`], which the
+//! agentd minute sweep runs, covers all of those, and rows left by an older
+//! build or written after the node finished (a supervisor's last beat, a sync).
 
 use crate::decisions::DecisionRepo;
 use crate::outline::uuid_blob::blob_to_uuid_sql;
