@@ -1523,8 +1523,55 @@ fn push_named_branch(dir: &Workdir, branch: &str) -> Result<()> {
     if !remote.lines().any(|r| r.trim() == "origin") {
         bail!("it has no origin remote to push {branch} to");
     }
-    dir.git(&["push", "--quiet", "-u", "origin", &format!("HEAD:refs/heads/{branch}")])
-        .with_context(|| format!("push {branch}"))?;
+    ensure_submodule_commits(dir)?;
+    // `check`: git refuses the push when a submodule commit this branch
+    // records is on none of that submodule's remotes, which is the loud
+    // answer (tod pushes each submodule's own branch first, deepest first).
+    dir.git(&[
+        "push",
+        "--quiet",
+        "--recurse-submodules=check",
+        "-u",
+        "origin",
+        &format!("HEAD:refs/heads/{branch}"),
+    ])
+    .with_context(|| format!("push {branch}"))?;
+    Ok(())
+}
+
+/// Make sure every initialized submodule of `repo` has the commit `repo`'s
+/// HEAD records for it. A fetch that skips submodules
+/// (`--no-recurse-submodules`) brings in a base branch's new gitlinks
+/// without their commits (a merge of the base does this), and git's push
+/// check then dies with "bad object" on a commit that is only not fetched
+/// here. Fetch it from the submodule's own `origin`; a commit that cannot
+/// be had there is an error naming the submodule and the commit.
+fn ensure_submodule_commits(repo: &Workdir) -> Result<()> {
+    for line in repo.git(&["ls-tree", "-r", "HEAD"])?.lines() {
+        let Some((meta, path)) = line.split_once('\t') else { continue };
+        let mut parts = meta.split(' ');
+        let (Some("160000"), Some(_), Some(sha)) = (parts.next(), parts.next(), parts.next()) else {
+            continue;
+        };
+        let sub = repo.join(path);
+        if sub.git(&["rev-parse", "--git-dir"]).is_err() {
+            continue; // not initialized here: nothing to check
+        }
+        let commit = format!("{sha}^{{commit}}");
+        if sub.git(&["cat-file", "-e", &commit]).is_ok() {
+            continue;
+        }
+        // By id first (the server may allow it), else everything.
+        if sub.git(&["fetch", "--quiet", "--no-recurse-submodules", "origin", sha]).is_err() {
+            sub.git(&["fetch", "--quiet", "--no-recurse-submodules", "origin"])
+                .with_context(|| format!("fetch submodule {path} in {repo}"))?;
+        }
+        sub.git(&["cat-file", "-e", &commit]).with_context(|| {
+            format!(
+                "submodule {path} in {repo}: the branch records commit {sha}, which is not in its checkout or on its origin"
+            )
+        })?;
+    }
     Ok(())
 }
 
@@ -1873,6 +1920,78 @@ mod tests {
         let out = Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
         assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
         String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A merge of the base brings in a submodule commit that was never
+    /// fetched (tod fetches without recursing); the push must fetch it, not
+    /// die with "bad object", and must refuse a commit that exists nowhere.
+    #[test]
+    fn push_fetches_a_submodule_commit_the_merge_brought_in() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // Local submodule clones are refused unless a call allows them.
+        let git = |d: &Path, args: &[&str]| {
+            let mut all = vec!["-c", "protocol.file.allow=always"];
+            all.extend_from_slice(args);
+            git(d, &all)
+        };
+        let sub_origin = root.join("sub.git");
+        let sub_seed = root.join("sub-seed");
+        let parent_origin = root.join("parent.git");
+        let parent_seed = root.join("parent-seed");
+        let work = root.join("work");
+        for d in [&sub_origin, &sub_seed, &parent_origin, &parent_seed] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let ident = |d: &Path| {
+            git(d, &["config", "user.email", "t@example.com"]);
+            git(d, &["config", "user.name", "t"]);
+            git(d, &["config", "protocol.file.allow", "always"]);
+        };
+        git(&sub_origin, &["init", "-q", "--bare", "-b", "main"]);
+        git(&sub_seed, &["init", "-q", "-b", "main"]);
+        ident(&sub_seed);
+        git(&sub_seed, &["commit", "-q", "--allow-empty", "-m", "a"]);
+        git(&sub_seed, &["remote", "add", "origin", &sub_origin.to_string_lossy()]);
+        git(&sub_seed, &["push", "-q", "origin", "main"]);
+        git(&parent_origin, &["init", "-q", "--bare", "-b", "main"]);
+        git(&parent_seed, &["init", "-q", "-b", "main"]);
+        ident(&parent_seed);
+        git(&parent_seed, &["submodule", "add", "-q", &sub_origin.to_string_lossy(), "infra"]);
+        git(&parent_seed, &["commit", "-q", "-m", "add infra"]);
+        git(&parent_seed, &["remote", "add", "origin", &parent_origin.to_string_lossy()]);
+        git(&parent_seed, &["push", "-q", "origin", "main"]);
+        git(root, &["clone", "-q", "--recurse-submodules",
+            &parent_origin.to_string_lossy(), &work.to_string_lossy()]);
+        ident(&work);
+        git(&work.join("infra"), &["config", "protocol.file.allow", "always"]);
+        git(&work, &["checkout", "-q", "-b", "task/x"]);
+        // Someone else bumps infra on main.
+        git(&sub_seed, &["commit", "-q", "--allow-empty", "-m", "b"]);
+        git(&sub_seed, &["push", "-q", "origin", "main"]);
+        git(&parent_seed.join("infra"), &["fetch", "-q", "origin"]);
+        git(&parent_seed.join("infra"), &["checkout", "-q", "origin/main"]);
+        git(&parent_seed, &["commit", "-q", "-am", "bump infra"]);
+        git(&parent_seed, &["push", "-q", "origin", "main"]);
+        // The node merges the base without fetching submodules.
+        git(&work, &["fetch", "-q", "--no-recurse-submodules", "origin"]);
+        git(&work, &["merge", "-q", "--no-edit", "origin/main"]);
+        git(&work, &["config", "push.recurseSubmodules", "check"]);
+        let bumped = git(&work, &["rev-parse", "HEAD:infra"]);
+        assert!(
+            Command::new("git").arg("-C").arg(work.join("infra")).args(["cat-file", "-e", &bumped])
+                .output().unwrap().status.code() != Some(0),
+            "precondition: the bumped commit is not fetched"
+        );
+        push_named_branch(&Workdir::host(&work), "task/x").unwrap();
+        git(&parent_origin, &["rev-parse", "refs/heads/task/x"]);
+
+        // A commit that exists nowhere is an error naming the submodule.
+        git(&work, &["update-index", "--add", "--cacheinfo",
+            "160000,1111111111111111111111111111111111111111,infra"]);
+        git(&work, &["commit", "-q", "-m", "bogus pointer"]);
+        let err = push_named_branch(&Workdir::host(&work), "task/x").unwrap_err();
+        assert!(format!("{err:#}").contains("infra"), "{err:#}");
     }
 
     /// A repository with a bare `origin`, one commit on main.
