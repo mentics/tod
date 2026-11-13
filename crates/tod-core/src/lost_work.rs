@@ -132,6 +132,71 @@ fn default_ref(repo: &Workdir) -> Result<Option<String>> {
     anyhow::bail!("{repo} has an origin but none of refs/remotes/origin/HEAD, main or master, so the node's base cannot be told; fetch origin")
 }
 
+/// [`default_ref`] for a repository the caller does not require one of: `None`
+/// when there is no `origin` or no default branch ref (a submodule is then
+/// compared with its pinned commit alone).
+fn default_ref_opt(repo: &Workdir) -> Result<Option<String>> {
+    if git_ref(repo, &["config", "--get", "remote.origin.url"])?.is_none() {
+        return Ok(None);
+    }
+    for candidate in ["refs/remotes/origin/HEAD", "refs/remotes/origin/main", "refs/remotes/origin/master"] {
+        if git_ref(repo, &["rev-parse", "--verify", "-q", &format!("{candidate}^{{commit}}")])?.is_some() {
+            return Ok(Some(candidate.to_string()));
+        }
+    }
+    Ok(None)
+}
+
+/// Parents of the commits a shallow repository stops at that are themselves
+/// in `repo` and reachable from one of `bases`. A shallow checkout hides the
+/// history below its boundary, so a commit that really is in a base's past can
+/// look like it is not (the pinned commit of a submodule, one commit behind a
+/// shallow `origin/main`); counting past these parents too keeps it from being
+/// taken for the node's own work.
+fn hidden_parents(repo: &Workdir, bases: &[String]) -> Result<Vec<String>> {
+    if git_text(repo, &["rev-parse", "--is-shallow-repository"])? != "true" {
+        return Ok(Vec::new());
+    }
+    let git_dir = git_text(repo, &["rev-parse", "--absolute-git-dir"])?;
+    let shallow_file = format!("{}/shallow", git_dir.trim_end_matches('/'));
+    let listing = repo.output("cat", &[&shallow_file]).with_context(|| format!("read {shallow_file} in {repo}"))?;
+    if !listing.status.success() {
+        anyhow::bail!("read {shallow_file} in {repo} failed: {}", String::from_utf8_lossy(&listing.stderr).trim());
+    }
+    let mut out = Vec::new();
+    for boundary in String::from_utf8_lossy(&listing.stdout).lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let mut under_base = false;
+        for base in bases {
+            let probe = repo
+                .git_output(&["merge-base", "--is-ancestor", boundary, base])
+                .with_context(|| format!("run git merge-base --is-ancestor in {repo}"))?;
+            match probe.status.code() {
+                Some(0) => under_base = true,
+                Some(1) => {}
+                _ => anyhow::bail!(
+                    "git merge-base --is-ancestor {boundary} {base} in {repo} failed: {}",
+                    String::from_utf8_lossy(&probe.stderr).trim()
+                ),
+            }
+        }
+        if !under_base {
+            continue;
+        }
+        for line in git_text(repo, &["cat-file", "-p", boundary])?.lines() {
+            let Some(parent) = line.strip_prefix("parent ") else { continue };
+            let parent = parent.trim();
+            // Present or not is the answer, so an exit status is read, not an error.
+            let present = repo
+                .git_output(&["cat-file", "-e", &format!("{parent}^{{commit}}")])
+                .with_context(|| format!("run git cat-file -e in {repo}"))?;
+            if present.status.success() {
+                out.push(parent.to_string());
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// The commit a submodule at `rel` in `parent` was pinned to before the
 /// node's work: its gitlink at the merge base of the parent's HEAD and its
 /// default branch. `None` when the parent has no origin or did not have it.
@@ -143,16 +208,21 @@ fn pinned(parent: &Workdir, rel: &str) -> Result<Option<String>> {
     Ok(git_ref(parent, &["rev-parse", "--verify", "-q", &format!("{merge_base}:{rel}")])?.filter(|s| !s.is_empty()))
 }
 
-/// What `repo` holds, against `base` (a ref or commit; `None` when there is no
-/// origin). Commits on the node's branch (`branch`: local or on `origin`)
-/// count wherever the checkout sits.
-fn state_of(repo: &Workdir, base: Option<&str>, what: &str, branch: Option<&str>) -> Result<RepoState> {
-    if !git_text(repo, &["status", "--porcelain"])?.is_empty() {
+/// What `repo` holds, against `bases` (refs or commits: the work is what none
+/// of them has; empty when there is no origin). Commits on the node's branch
+/// (`branch`: local or on `origin`) count wherever the checkout sits.
+///
+/// A changed recorded commit of a submodule does not make the repository
+/// dirty: each submodule is looked at on its own, and a checkout whose
+/// submodules sit on newer commits than the ones it records (a sandbox forked
+/// from a golden that moved on) has done no work by that.
+fn state_of(repo: &Workdir, bases: &[String], what: &str, branch: Option<&str>) -> Result<RepoState> {
+    if !git_text(repo, &["status", "--porcelain", "--ignore-submodules=all"])?.is_empty() {
         return Ok(RepoState::Dirty);
     }
-    let Some(base) = base else {
+    if bases.is_empty() {
         return Ok(RepoState::Unknown(format!("{what} has no origin to compare with")));
-    };
+    }
     let mut args = vec!["rev-list".to_string(), "--count".to_string(), "HEAD".to_string()];
     let mut tips = Vec::new();
     if let Some(branch) = branch {
@@ -164,7 +234,8 @@ fn state_of(repo: &Workdir, base: Option<&str>, what: &str, branch: Option<&str>
         }
     }
     args.push("--not".to_string());
-    args.push(base.to_string());
+    args.extend(bases.iter().cloned());
+    args.extend(hidden_parents(repo, bases)?);
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let counted = git_text(repo, &args)?;
     let count: u64 = counted
@@ -173,12 +244,15 @@ fn state_of(repo: &Workdir, base: Option<&str>, what: &str, branch: Option<&str>
     if count > 0 {
         return Ok(RepoState::OwnCommits);
     }
-    // The node's branch, here or on origin, is at a commit other than the base
-    // (merged into it, then perhaps deleted on origin, or left behind it): its
-    // work is in the default branch, not lost.
+    // The node's branch, here or on origin, is at a commit other than the
+    // base (merged into it, then perhaps deleted on origin, or left behind it):
+    // its work is in the default branch, not lost.
     if !tips.is_empty() {
-        let base_tip = git_text(repo, &["rev-parse", &format!("{base}^{{commit}}")])?;
-        if tips.iter().any(|tip| *tip != base_tip) {
+        let mut base_tips = Vec::new();
+        for base in bases {
+            base_tips.push(git_text(repo, &["rev-parse", &format!("{base}^{{commit}}")])?);
+        }
+        if tips.iter().any(|tip| !base_tips.contains(tip)) {
             return Ok(RepoState::BranchBehindBase);
         }
     }
@@ -237,7 +311,7 @@ pub fn inspect(cwd: &Workdir, branch: Option<&str>) -> Result<Vec<(String, RepoS
     }
     // Only the node's own branch, as Files records it; with none known, HEAD
     // alone is compared (never a guess from the branch checked out).
-    let mut out = vec![(".".to_string(), state_of(cwd, default_ref(cwd)?.as_deref(), "the checkout", branch)?)];
+    let mut out = vec![(".".to_string(), state_of(cwd, &default_ref(cwd)?.into_iter().collect::<Vec<_>>(), "the checkout", branch)?)];
     // No `.gitmodules` is the only way to have none; a listing that fails is an error.
     let subs: Vec<String> = if git_text(cwd, &["ls-files", "--", ".gitmodules"])?.is_empty() {
         Vec::new()
@@ -255,8 +329,12 @@ pub fn inspect(cwd: &Workdir, branch: Option<&str>) -> Result<Vec<(String, RepoS
             Some(p) => (cwd.join(p), rel[p.len() + 1..].to_string()),
             None => (cwd.clone(), rel.clone()),
         };
-        let base = pinned(&parent, &in_parent)?;
-        out.push((rel.clone(), state_of(&cwd.join(rel), base.as_deref(), &format!("submodule {rel}"), branch)?));
+        // The work is what neither the commit the parent pinned nor the
+        // submodule's own default branch has: a golden's submodules sit on
+        // their default branch, ahead of what the checkout records.
+        let sub = cwd.join(rel);
+        let bases: Vec<String> = pinned(&parent, &in_parent)?.into_iter().chain(default_ref_opt(&sub)?).collect();
+        out.push((rel.clone(), state_of(&sub, &bases, &format!("submodule {rel}"), branch)?));
     }
     Ok(out)
 }
@@ -539,6 +617,73 @@ mod tests {
         let repos = inspect(&Workdir::host(&work), None).unwrap();
         assert_eq!(repos[0].1, RepoState::Untouched, "{repos:?}");
         let repos = inspect(&Workdir::host(&work), Some("task/x")).unwrap();
+        assert_eq!(repos[0].1, RepoState::OwnCommits, "{repos:?}");
+    }
+
+    /// Seen live (ENG-2287): a sandbox forked from a golden whose submodules had
+    /// moved on sat on their default branches, ahead of the commits the checkout
+    /// records. The checkout then showed ` M kb`, which counted as uncommitted
+    /// work, and the submodules counted as commits beyond their *pinned* commit,
+    /// so a node whose code was gone was never reopened.
+    #[test]
+    fn submodules_ahead_of_the_pinned_commit_on_the_default_branch_are_not_work() {
+        let (dir, work) = fixture();
+        let root = dir.path();
+        // The submodule's default branch moves on after the workspace pinned it.
+        let subseed = root.join("subseed");
+        commit_in(&subseed, "later");
+        run(&subseed, &["push", "-q", "origin", "HEAD:main"]);
+        let kb = work.join("kb");
+        run(&kb, &["fetch", "-q", "origin"]);
+        run(&kb, &["checkout", "-q", "-B", "task/x", "origin/main"]);
+        // The parent now reports the submodule as modified.
+        assert!(run(&work, &["status", "--porcelain"]).contains("kb"));
+        let repos = inspect(&Workdir::host(&work), Some("task/x")).unwrap();
+        assert!(repos.iter().all(|(_, s)| *s == RepoState::Untouched), "{repos:?}");
+        assert!(is_lost(&repos));
+    }
+
+    #[test]
+    fn a_submodule_commit_of_the_nodes_own_is_still_work_beside_a_moved_on_default_branch() {
+        let (dir, work) = fixture();
+        let subseed = dir.path().join("subseed");
+        commit_in(&subseed, "later");
+        run(&subseed, &["push", "-q", "origin", "HEAD:main"]);
+        let kb = work.join("kb");
+        run(&kb, &["fetch", "-q", "origin"]);
+        run(&kb, &["checkout", "-q", "-B", "task/x", "origin/main"]);
+        commit_in(&kb, "mine");
+        let repos = inspect(&Workdir::host(&work), Some("task/x")).unwrap();
+        assert_eq!(repos[1].1, RepoState::OwnCommits, "{repos:?}");
+        assert!(!is_lost(&repos));
+    }
+
+    /// Seen live: a shallow submodule clone whose HEAD is the parent of the
+    /// shallow `origin/main` looked one commit ahead of it.
+    #[test]
+    fn a_commit_hidden_below_a_shallow_boundary_is_not_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let upstream = root.join("up");
+        std::fs::create_dir(&upstream).unwrap();
+        run(&upstream, &["init", "-q", "-b", "main"]);
+        for f in ["a", "b", "c"] {
+            commit_in(&upstream, f);
+        }
+        let parent = run(&upstream, &["rev-parse", "HEAD~1"]);
+        let url = format!("file://{}", upstream.display());
+        let shallow = root.join("shallow");
+        run(root, &["clone", "-q", "--depth", "1", &url, shallow.to_str().unwrap()]);
+        run(&shallow, &["fetch", "-q", "--depth", "1", "origin", &parent]);
+        run(&shallow, &["checkout", "-q", "-b", "t", &parent]);
+        assert_eq!(run(&shallow, &["rev-parse", "--is-shallow-repository"]), "true");
+        // Without the correction git reports the one commit as not on origin/main.
+        assert_eq!(run(&shallow, &["rev-list", "--count", "HEAD", "--not", "origin/main"]), "1");
+        let repos = inspect(&Workdir::host(&shallow), None).unwrap();
+        assert_eq!(repos[0].1, RepoState::Untouched, "{repos:?}");
+        // A commit of the node's own on top is still work.
+        commit_in(&shallow, "mine");
+        let repos = inspect(&Workdir::host(&shallow), None).unwrap();
         assert_eq!(repos[0].1, RepoState::OwnCommits, "{repos:?}");
     }
 

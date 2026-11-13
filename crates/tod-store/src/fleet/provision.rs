@@ -1624,6 +1624,96 @@ fn push_branches(dir: &Workdir) -> Result<()> {
     Ok(())
 }
 
+/// Commits that no remote has, in one repository of a checkout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unpushed {
+    /// The repository's path from the checkout (`.` is the checkout itself).
+    pub repo: String,
+    /// How many commits, on HEAD or any local branch, no remote-tracking ref has.
+    pub count: u64,
+    /// The newest few, as `<short sha> <subject>`.
+    pub newest: Vec<String>,
+}
+
+impl std::fmt::Display for Unpushed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} commit(s) in {} that no remote has (newest: {})", self.count, self.repo, self.newest.join("; "))
+    }
+}
+
+/// The commits in `dir` and each submodule (recursively) that no remote has:
+/// reachable from HEAD or a local branch, from no remote-tracking ref. A
+/// repository with no `origin` is an error (nothing could ever save its
+/// commits), and so is any git failure; never "none".
+pub fn unpushed_commits(dir: &Workdir) -> Result<Vec<Unpushed>> {
+    let mut out = Vec::new();
+    for repo in repos_deepest_first(dir)? {
+        let rel = {
+            let (root, here) = (dir.path_text(), repo.path_text());
+            let rel = here.strip_prefix(root.trim_end_matches('/')).unwrap_or("").trim_matches('/').to_string();
+            if rel.is_empty() { ".".to_string() } else { rel }
+        };
+        if repo.git(&["remote"])?.lines().all(|r| r.trim() != "origin") {
+            bail!("{rel} has no origin remote, so its commits cannot be saved anywhere");
+        }
+        let counted = repo.git(&["rev-list", "--count", "HEAD", "--branches", "--not", "--remotes"])?;
+        let count: u64 = counted.trim().parse().with_context(|| format!("git rev-list --count in {rel} printed `{counted}`"))?;
+        if count == 0 {
+            continue;
+        }
+        let newest = repo
+            .git(&["log", "-n", "3", "--format=%h %s", "HEAD", "--branches", "--not", "--remotes"])?
+            .lines()
+            .map(str::to_string)
+            .collect();
+        out.push(Unpushed { repo: rel, count, newest });
+    }
+    Ok(out)
+}
+
+/// Makes sure no commit in `dir` (the checkout and its submodules) is held by
+/// this checkout alone: the branches are pushed (the node's own, as at a step
+/// boundary), and what a remote still does not have afterwards is an error
+/// naming it. Called before a sandbox is deleted: what was only ever here is
+/// gone with it, and nothing may do that silently.
+pub fn ensure_work_pushed_in(dir: &Workdir) -> Result<()> {
+    let before = unpushed_commits(dir)?;
+    if before.is_empty() {
+        return Ok(());
+    }
+    let pushed = push_branches(dir);
+    let left = unpushed_commits(dir)?;
+    if left.is_empty() {
+        return Ok(());
+    }
+    let why = match pushed {
+        Ok(()) => "the push left them unpushed".to_string(),
+        Err(err) => format!("pushing failed: {err:#}"),
+    };
+    bail!(
+        "{} holds commits of the node's own that no remote has: {}. {why}. Push them, then try again",
+        dir,
+        left.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ")
+    )
+}
+
+/// [`ensure_work_pushed_in`] for a node's sandbox. `Ok` when the node has no
+/// sandbox, or the sandbox is gone (there is nothing left to save). Runs git
+/// and the network and wakes the sandbox: never on the UI thread.
+pub fn ensure_work_pushed(fleet: &FleetStore, node_id: &str) -> Result<()> {
+    let Some(location) = node_location(fleet, node_id)? else { return Ok(()) };
+    if location.sandbox().is_none() {
+        return Ok(());
+    }
+    let lock = node_lock(node_id);
+    let _held = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let dir = location_dir(&location)?;
+    match ensure_work_pushed_in(&dir) {
+        Err(err) if sandbox_is_gone(&err) => Ok(()),
+        other => other,
+    }
+}
+
 /// Remove `node_id`'s location: refused while something runs in it or it
 /// has uncommitted changes; otherwise its branch is pushed (a failed push
 /// keeps it) and the worktree or sandbox is deleted and forgotten. Slow:
@@ -1920,6 +2010,53 @@ mod tests {
         let out = Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
         assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
         String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A clone of a bare remote, on `task/x`. (tempdir, remote, clone)
+    fn unpushed_fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (remote, seed, work) = (root.join("remote.git"), root.join("seed"), root.join("work"));
+        std::fs::create_dir_all(&remote).unwrap();
+        std::fs::create_dir_all(&seed).unwrap();
+        git(&remote, &["init", "-q", "--bare", "-b", "main"]);
+        git(&seed, &["init", "-q", "-b", "main"]);
+        git(&seed, &["config", "user.email", "t@example.com"]);
+        git(&seed, &["config", "user.name", "t"]);
+        git(&seed, &["commit", "-q", "--allow-empty", "-m", "base"]);
+        git(&seed, &["remote", "add", "origin", &remote.to_string_lossy()]);
+        git(&seed, &["push", "-q", "origin", "main"]);
+        git(root, &["clone", "-q", &remote.to_string_lossy(), &work.to_string_lossy()]);
+        git(&work, &["config", "user.email", "t@example.com"]);
+        git(&work, &["config", "user.name", "t"]);
+        git(&work, &["checkout", "-q", "-b", "task/x"]);
+        (tmp, remote, work)
+    }
+
+    /// Seen live (ENG-2287): commits that only a sandbox had went with the
+    /// sandbox. Deleting one must push them first.
+    #[test]
+    fn commits_only_the_checkout_has_are_pushed_before_a_delete() {
+        let (_tmp, remote, work) = unpushed_fixture();
+        let dir = Workdir::host(&work);
+        assert!(unpushed_commits(&dir).unwrap().is_empty());
+        ensure_work_pushed_in(&dir).unwrap();
+        git(&work, &["commit", "-q", "--allow-empty", "-m", "the fix"]);
+        let found = unpushed_commits(&dir).unwrap();
+        assert_eq!((found[0].repo.as_str(), found[0].count), (".", 1), "{found:?}");
+        assert!(found[0].newest[0].ends_with("the fix"));
+        ensure_work_pushed_in(&dir).unwrap();
+        assert!(unpushed_commits(&dir).unwrap().is_empty());
+        assert!(git(&remote, &["log", "--format=%s", "task/x"]).contains("the fix"));
+    }
+
+    #[test]
+    fn commits_that_cannot_be_pushed_refuse_the_delete_naming_them() {
+        let (_tmp, _remote, work) = unpushed_fixture();
+        git(&work, &["commit", "-q", "--allow-empty", "-m", "the fix"]);
+        git(&work, &["remote", "set-url", "origin", "/nonexistent/remote.git"]);
+        let err = format!("{:#}", ensure_work_pushed_in(&Workdir::host(&work)).unwrap_err());
+        assert!(err.contains("the fix") && err.contains("no remote has") && err.contains("pushing failed"), "{err}");
     }
 
     /// A merge of the base brings in a submodule commit that was never

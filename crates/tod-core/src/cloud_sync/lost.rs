@@ -935,6 +935,10 @@ fn delete_plan_with(fleet: &FleetStore, node_id: &str, check_runner: bool) -> Re
 /// The Blaxel side of a delete, so the rest can be tested without Blaxel.
 trait SandboxBackend {
     fn exists(&mut self, name: &str) -> Result<bool>;
+    /// Refuses (an error naming the commits) while the sandbox holds commits
+    /// of the node's that no remote has, after pushing what can be pushed.
+    /// Runs even when the checkpoint is skipped.
+    fn secure_commits(&mut self, fleet: &FleetStore, node_id: &str, name: &str) -> Result<()>;
     /// Keeps the node's uncommitted work, found through its Files location;
     /// an error means nothing may be deleted.
     fn checkpoint(&mut self, fleet: &FleetStore, node_id: &str, name: &str) -> Result<()>;
@@ -959,6 +963,11 @@ impl BlaxelBackend {
 impl SandboxBackend for BlaxelBackend {
     fn exists(&mut self, name: &str) -> Result<bool> {
         Ok(self.bx.get(name).with_context(|| format!("look up sandbox {name}"))?.is_some())
+    }
+
+    fn secure_commits(&mut self, fleet: &FleetStore, node_id: &str, name: &str) -> Result<()> {
+        tod_store::fleet::provision::ensure_work_pushed(fleet, node_id)
+            .with_context(|| format!("sandbox {name} was not deleted"))
     }
 
     fn checkpoint(&mut self, fleet: &FleetStore, node_id: &str, name: &str) -> Result<()> {
@@ -1009,6 +1018,9 @@ fn delete_with(
     let name = plan.sandbox.as_str();
     let present = backend.exists(name)?;
     if present {
+        // Commits no remote has are never lost by a delete, not even the one
+        // that skips the checkpoint (that one gives up *uncommitted* work).
+        backend.secure_commits(fleet, node_id, name)?;
         if !force {
             backend.checkpoint(fleet, node_id, name)?;
         }
@@ -1235,6 +1247,8 @@ mod tests {
         /// Sandboxes Blaxel has.
         has: Vec<String>,
         checkpoint_fails: bool,
+        /// Commits only the sandbox has: the guard refuses with this text.
+        unpushed: Option<String>,
         checkpointed: Vec<String>,
         deleted: Vec<String>,
         forgotten: Vec<String>,
@@ -1243,6 +1257,12 @@ mod tests {
     impl SandboxBackend for Fake {
         fn exists(&mut self, name: &str) -> Result<bool> {
             Ok(self.has.iter().any(|n| n == name))
+        }
+        fn secure_commits(&mut self, _: &FleetStore, _: &str, name: &str) -> Result<()> {
+            match &self.unpushed {
+                Some(work) => anyhow::bail!("sandbox {name} was not deleted: {work}"),
+                None => Ok(()),
+            }
         }
         fn checkpoint(&mut self, _: &FleetStore, _: &str, name: &str) -> Result<()> {
             if self.checkpoint_fails {
@@ -1342,6 +1362,24 @@ mod tests {
         let mut fake = Fake { checkpoint_fails: true, ..has(&["node-f"]) };
         fx.run(true, &mut fake).unwrap();
         assert_eq!(fake.deleted, ["node-f"]);
+    }
+
+    /// Seen live (ENG-2287): a sandbox holding commits no remote had was
+    /// deleted, and the node's work with it. Neither the plain delete nor the
+    /// one that skips the checkpoint may do that.
+    #[test]
+    fn a_sandbox_with_commits_no_remote_has_is_not_deleted_even_anyway() {
+        let fx = fx();
+        fx.locate("node-u");
+        fx.cloud_row();
+        for force in [false, true] {
+            let mut fake = Fake { unpushed: Some("1 commit(s) in kb that no remote has (newest: abc the fix)".into()), ..has(&["node-u"]) };
+            let err = format!("{:#}", fx.run(force, &mut fake).unwrap_err());
+            assert!(err.contains("the fix") && err.contains("was not deleted"), "{err}");
+            assert!(fake.deleted.is_empty() && fake.checkpointed.is_empty());
+            assert!(fx.location().is_some(), "the location is kept");
+            assert!(fx.row().unwrap().lost_at.is_none(), "the row is not marked");
+        }
     }
 
     impl Fx {
