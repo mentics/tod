@@ -47,6 +47,15 @@ pub fn ensure_golden_current(sandboxes: &mut Sandboxes, bx: &Blaxel, repo: &str,
     let _lock = RefreshLock::take(&sandboxes.root)?;
     // What another process saved while this one waited.
     sandboxes.reload()?;
+    refuse_if_left_behind(&sandboxes.root, &repo)?;
+    let made = ensure_golden_current_locked(sandboxes, bx, &repo, progress);
+    record_if_left_behind(&sandboxes.root, &repo, made)
+}
+
+/// [`ensure_golden_current`] with the lock held, `sandboxes` current and no
+/// left-behind golden recorded.
+fn ensure_golden_current_locked(sandboxes: &mut Sandboxes, bx: &Blaxel, repo: &str, progress: &mut dyn FnMut(&str)) -> Result<String> {
+    let repo = repo.to_string();
     // Every look at Blaxel and at the disk this needs is independent of the
     // others (the golden, the workspace's original it was forked from, tod's
     // own files and their stamp), and each is a round trip or a hash, so they
@@ -126,12 +135,21 @@ impl Drop for RefreshLock {
 pub fn ensure_all_current(sandboxes: &mut Sandboxes, bx: &Blaxel, progress: &mut dyn FnMut(&str)) -> Result<()> {
     let repos: Vec<String> = sandboxes.account()?.goldens.keys().cloned().collect();
     let mut failures = Vec::new();
+    let mut left_behind = false;
     for repo in repos {
         if let Err(err) = ensure_golden_current(sandboxes, bx, &repo, progress) {
+            left_behind |= err.downcast_ref::<golden::LeftBehind>().is_some();
             failures.push(format!("{repo}: {err:#}"));
         }
     }
-    if failures.is_empty() { Ok(()) } else { bail!("{}", failures.join("; ")) }
+    if failures.is_empty() {
+        Ok(())
+    } else if left_behind {
+        // The type is kept: whoever runs this again must not make another golden.
+        Err(anyhow::Error::new(golden::LeftBehind(failures.join("; "))))
+    } else {
+        bail!("{}", failures.join("; "))
+    }
 }
 
 /// The original golden a refresh of `repo`'s golden `old` forks from, as a
@@ -246,7 +264,68 @@ pub fn refresh_golden(sandboxes: &mut Sandboxes, bx: &Blaxel, repo: &str, progre
     let repo = normalized(repo)?;
     let _lock = RefreshLock::take(&sandboxes.root)?;
     sandboxes.reload()?;
-    refresh_locked(sandboxes, bx, &repo, progress)
+    refuse_if_left_behind(&sandboxes.root, &repo)?;
+    let made = refresh_locked(sandboxes, bx, &repo, progress);
+    record_if_left_behind(&sandboxes.root, &repo, made)
+}
+
+/// Where a repository's left-behind golden is recorded: a file in the data
+/// root, so it survives restarts and is seen by the app, the daemon and the CLI.
+fn left_behind_path(root: &std::path::Path, repo: &str) -> std::path::PathBuf {
+    root.join("golden-left-behind").join(format!("{}.txt", repo.replace('/', "__")))
+}
+
+/// The record of a golden step that may have left a sandbox at Blaxel
+/// ([`golden::LeftBehind`]), if there is one for `repo`.
+pub fn left_behind_note(root: &std::path::Path, repo: &str) -> Option<String> {
+    std::fs::read_to_string(left_behind_path(root, &normalized(repo).ok()?)).ok()
+}
+
+/// A repository with a recorded left-behind golden is not tried again by
+/// anything (the daemon's check every ten minutes, a node's start, the
+/// settings button, `tod-sandbox golden refresh`): another attempt would make a
+/// second golden beside the first, which tod cannot see. Said as the error it
+/// is, with what to run.
+fn refuse_if_left_behind(root: &std::path::Path, repo: &str) -> Result<()> {
+    match std::fs::read_to_string(left_behind_path(root, repo)) {
+        Ok(note) => Err(anyhow::Error::new(golden::LeftBehind(format!(
+            "{repo}'s golden is not being made again until you act, because an earlier attempt may have left a sandbox at Blaxel \
+             (another attempt would make a second one): {note} Once it is dealt with, run `tod-sandbox golden clear {repo}`."
+        )))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(anyhow::Error::new(e).context(format!("read the left-behind record for {repo}"))),
+    }
+}
+
+/// Passes `made` through; a [`golden::LeftBehind`] failure is first recorded
+/// (see [`refuse_if_left_behind`]). A failure to record is said too.
+fn record_if_left_behind(root: &std::path::Path, repo: &str, made: Result<String>) -> Result<String> {
+    let Err(err) = made else { return made };
+    let Some(left) = err.downcast_ref::<golden::LeftBehind>() else { return Err(err) };
+    let path = left_behind_path(root, repo);
+    let wrote = path
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| if path.exists() { Ok(()) } else { std::fs::write(&path, &left.0) });
+    match wrote {
+        Ok(()) => Err(err),
+        Err(e) => Err(anyhow::Error::new(golden::LeftBehind(format!(
+            "{left}; and the record that stops tod making another golden could not be written to {} ({e}): do not start another refresh before dealing with it",
+            path.display()
+        )))),
+    }
+}
+
+/// `tod-sandbox golden clear <owner/name>`: the person has dealt with the
+/// left-behind sandbox, so the repository's golden may be made again. Returns
+/// whether there was a record.
+pub fn clear_left_behind(root: &std::path::Path, repo: &str) -> Result<bool> {
+    let path = left_behind_path(root, &normalized(repo)?);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(anyhow::Error::new(e).context(format!("remove {}", path.display()))),
+    }
 }
 
 /// [`refresh_golden`] for every repository of this data root that has a
@@ -381,8 +460,7 @@ fn build_golden(
     if let Err(err) = bx.create_from_body(&body) {
         // The call may have made the sandbox before it failed.
         let err = err.context(format!("create {name} from {image}"));
-        let (after, clean) = clean_up_half_made(bx, &name, "", tod_sandbox::blaxel::error_is_transient(&err));
-        let _ = clean;
+        let (after, _) = clean_up_half_made(bx, &name, "", tod_sandbox::blaxel::error_is_transient(&err));
         return Err(made_call_failed(err, &name, repo, &after));
     }
     let policy = golden::StepRetry::default();
@@ -522,8 +600,7 @@ fn refresh_with(
     if let Err(err) = bx.fork(origin, &name) {
         // The call may have made the sandbox before it failed.
         let err = err.context(format!("fork {origin}"));
-        let (after, clean) = clean_up_half_made(bx, &name, old, tod_sandbox::blaxel::error_is_transient(&err));
-        let _ = clean;
+        let (after, _) = clean_up_half_made(bx, &name, old, tod_sandbox::blaxel::error_is_transient(&err));
         return Err(made_call_failed(err, &name, repo, &after));
     }
     let policy = golden::StepRetry::default();
@@ -635,6 +712,52 @@ fn has_proxy_routes(record: &serde_json::Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn left(err: &anyhow::Error) -> Option<String> {
+        err.downcast_ref::<golden::LeftBehind>().map(|l| l.0.clone())
+    }
+
+    #[test]
+    fn a_failed_make_call_is_left_behind_with_the_original_error_first() {
+        let err = made_call_failed(anyhow!("fork g: 502 Bad Gateway"), "tod-golden-a-b-1", "a/b", "tod-golden-a-b-1 was left as it is: it does not exist");
+        let text = left(&err).expect("marked");
+        assert!(text.starts_with("fork g: 502 Bad Gateway"), "{text}");
+        assert!(text.contains("tod-sandbox delete tod-golden-a-b-1") && text.contains("a/b has no new golden"), "{text}");
+        assert!(format!("{err:#}").starts_with("fork g: 502"));
+    }
+
+    #[test]
+    fn a_failed_save_is_left_behind_naming_the_golden() {
+        let err = save_failed(anyhow!("disk full"), "tod-golden-a-b-1", "a/b");
+        let text = left(&err).expect("marked");
+        assert!(text.starts_with("disk full") && text.contains("tod-sandbox delete tod-golden-a-b-1"), "{text}");
+    }
+
+    #[test]
+    fn a_cleanup_that_left_something_marks_the_error_and_a_clean_one_does_not() {
+        assert!(left(&mark_if_left(anyhow!("wake: 502"), true)).is_none());
+        let kept = mark_if_left(anyhow!("wake: 502"), false);
+        assert!(left(&kept).is_some_and(|t| t.starts_with("wake: 502")));
+    }
+
+    #[test]
+    fn a_left_behind_golden_is_recorded_and_refused_until_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert!(refuse_if_left_behind(root, "a/b").is_ok());
+        // Another error is passed through, nothing recorded.
+        assert!(record_if_left_behind(root, "a/b", Err(anyhow!("nope"))).is_err());
+        assert!(refuse_if_left_behind(root, "a/b").is_ok());
+        let failed = Err(made_call_failed(anyhow!("fork g: 502 Bad Gateway"), "tod-golden-a-b-1", "a/b", "x"));
+        assert!(record_if_left_behind(root, "a/b", failed).is_err());
+        let refused = refuse_if_left_behind(root, "a/b").unwrap_err();
+        let text = left(&refused).expect("the refusal is typed, so make_sandbox does not retry it");
+        assert!(text.contains("tod-golden-a-b-1") && text.contains("tod-sandbox golden clear a/b"), "{text}");
+        assert!(refuse_if_left_behind(root, "c/d").is_ok());
+        assert!(clear_left_behind(root, "a/b").unwrap());
+        assert!(!clear_left_behind(root, "a/b").unwrap());
+        assert!(refuse_if_left_behind(root, "a/b").is_ok());
+    }
 
     /// Live: a golden made by `golden refresh` (a fork) came out with no proxy
     /// routing, and every node fork from it was refused. What it is given

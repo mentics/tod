@@ -40,6 +40,11 @@ golden [<repo>] [<sandbox>]
                          repository (owner/name): a node forks `golden` once, and
                          a new golden sandbox is set here. A `golden` of an older
                          sandboxes.toml is every repository's until it has its own.
+golden clear <owner/name>
+                         After a golden step failed in a way that may have left a
+                         sandbox at Blaxel, tod makes no further golden for the
+                         repository until this is run: delete the sandbox it names
+                         (`tod-sandbox list`), then clear.
 golden refresh <owner/name>
                          Make the repository's golden on this build. With a golden
                          of its own: fork the workspace's own golden it came from
@@ -574,6 +579,13 @@ fn database(ctx: &mut Ctx, mut args: Args) -> Result<i32> {
 
 fn golden(ctx: &mut Ctx, mut args: Args) -> Result<i32> {
     let first = args.positional("repository").ok();
+    if first.as_deref() == Some("clear") {
+        let repo = args.positional("repository")?;
+        args.done()?;
+        let cleared = tod_core::cloud_sync::golden::clear_left_behind(&ctx.root, &repo)?;
+        println!("{}", if cleared { "cleared: the golden may be made again" } else { "nothing was recorded for that repository" });
+        return Ok(0);
+    }
     if first.as_deref() == Some("refresh") {
         let repo = args.positional("repository").ok();
         args.done()?;
