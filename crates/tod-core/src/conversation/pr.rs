@@ -226,7 +226,7 @@ impl Protocol for PrProtocol {
         if prs.is_empty() {
             return Ok(None);
         }
-        if let Some(live) = live_prs(env, node, &prs) {
+        if let Some(live) = live_prs(env, node, &prs)? {
             return Ok(Some(live.iter().map(|p| p.fingerprint.clone()).collect::<Vec<_>>().join(" ")));
         }
         Ok(Some(
@@ -265,17 +265,25 @@ impl Protocol for PrProtocol {
     }
 }
 
-/// Every linked pull request as it stands now; `None` when none can be read.
+/// Every linked pull request as it stands now. `Ok(None)` only when there are
+/// no GitHub credentials at all (nothing to read with); every failure of a
+/// look (settings unreadable, GitHub failing, a head with no time while a bot
+/// has not reviewed) is an error, never a quiet fallback.
 fn live_prs(
     env: &ProtocolEnv<'_>,
     node: Uuid,
     prs: &[tod_store::github::NodePr],
-) -> Option<Vec<crate::pr_readiness::LivePr>> {
-    let feed = crate::pr_readiness::feed_for(env.data_root)?;
+) -> Result<Option<Vec<crate::pr_readiness::LivePr>>> {
+    let Some(feed) = crate::pr_readiness::feed_for(env.data_root) else {
+        return Ok(None);
+    };
     // A bot the user told the node to go on without is not read as missing.
-    let settings = crate::pr_readiness::settings_for_node(env.fleet, node, env.data_root).ok()?;
+    let settings = crate::pr_readiness::settings_for_node(env.fleet, node, env.data_root)
+        .context("reading the pull request readiness settings")?;
     // Called after an agent turn: whatever it was asked has had its answer.
-    crate::pr_readiness::live_answered(feed.as_ref(), prs, &settings, Some(chrono::Utc::now())).ok()
+    crate::pr_readiness::live_answered(feed.as_ref(), prs, &settings, Some(chrono::Utc::now()))
+        .map(Some)
+        .map_err(|why| anyhow::anyhow!("a look at the pull request failed: {why}"))
 }
 
 /// How to go about the work, after what it is.
@@ -632,13 +640,73 @@ open pr: Cloud test"), Some("Cloud test"));
             focus: Focus::Node(fx.node),
         };
         crate::pr_readiness::set_feed_override(Some(std::sync::Arc::new(BotSilent)));
-        let waiting = live_prs(&env, fx.node, std::slice::from_ref(&pr)).expect("read");
+        let waiting = live_prs(&env, fx.node, std::slice::from_ref(&pr)).expect("read").expect("a feed");
         crate::bot_silence::waive_for_test(&fx.fleet, fx.node, "greptile");
-        let waived = live_prs(&env, fx.node, std::slice::from_ref(&pr)).expect("read");
+        let waived = live_prs(&env, fx.node, std::slice::from_ref(&pr)).expect("read").expect("a feed");
         crate::pr_readiness::set_feed_override(None);
         assert!(!waiting[0].assessment.waits().is_empty(), "the bot is waited for before it is waived");
         assert!(waived[0].assessment.bots.is_empty(), "{:?}", waived[0].assessment.bots);
         assert!(waived[0].assessment.waits().iter().all(|w| matches!(w, crate::pr_readiness::Wait::HumanReview)));
+    }
+
+    /// A feed whose head has no commit time, with a bot that has not reviewed.
+    struct NoHeadTime;
+
+    impl crate::pr_readiness::PrFeed for NoHeadTime {
+        fn snapshot(&self, pr: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
+            let mut snap = BotSilent.snapshot(pr)?;
+            snap.status.head_committed_at = None;
+            Ok(snap)
+        }
+    }
+
+    fn lone_pr() -> tod_store::github::NodePr {
+        tod_store::github::NodePr {
+            owner: "o".into(),
+            repo: "r".into(),
+            pr_number: 1,
+            url: "https://github.com/o/r/pull/1".into(),
+        }
+    }
+
+    #[test]
+    fn a_failed_look_is_an_error_not_a_quiet_fallback() {
+        let fx = fixture();
+        std::fs::write(fx.root.join("tod.yml"), "pr_readiness:\n  bots:\n    - name: greptile\n").unwrap();
+        let pr = lone_pr();
+        fx.fleet
+            .interview(
+                "test",
+                tod_store::interview::InterviewCommand::RecordNodePr {
+                    node_id: fx.node,
+                    owner: "o".into(),
+                    repo: "r".into(),
+                    pr_number: 1,
+                    url: pr.url.clone(),
+                },
+            )
+            .unwrap();
+        let media = MediaPaths::discover().expect("media paths");
+        let env = ProtocolEnv {
+            fleet: &fx.fleet,
+            media: &media,
+            data_root: &fx.root,
+            conversation_id: Uuid::new_v4(),
+            focus: Focus::Node(fx.node),
+        };
+        // A head with no time while a bot has not reviewed.
+        crate::pr_readiness::set_feed_override(Some(std::sync::Arc::new(NoHeadTime)));
+        let no_time = live_prs(&env, fx.node, std::slice::from_ref(&pr));
+        let no_time_progress = PrProtocol.progress(&env);
+        assert!(no_time.is_err_and(|e| format!("{e:#}").contains("no time for the head commit")));
+        assert!(no_time_progress.is_err(), "progress must not fall back to the PR ids");
+        // A settings read that fails (the decisions it reads are gone).
+        crate::pr_readiness::set_feed_override(Some(std::sync::Arc::new(BotSilent)));
+        let db = rusqlite::Connection::open(fx.fleet.writer().db_path()).unwrap();
+        db.execute_batch("DROP TABLE decision_answers; DROP TABLE decisions;").unwrap();
+        let settings = live_prs(&env, fx.node, std::slice::from_ref(&pr));
+        crate::pr_readiness::set_feed_override(None);
+        assert!(settings.is_err_and(|e| format!("{e:#}").contains("readiness settings")));
     }
 
     #[test]

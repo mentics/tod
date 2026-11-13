@@ -82,6 +82,13 @@ turns, findings, run_state, node_timeline, journey records):
   error (`Assessment::head_time_missing`) from `live_answered` and `pr_actions::load`, so the
   babysitter shows it as a failed look at GitHub and the controls show it on the row.
   Regression tests: pr_actions, conversation::pr, pr_readiness.
+- **Second follow-up (found in review)**: `live_prs` still collapsed every failure to `None` with
+  `.ok()?` (a settings DB error, or `head_time_missing` from `live_answered`), and the driver read
+  `progress` with `.ok().flatten()`, so the babysitter's error became a fingerprint of PR ids and
+  the stuck/no-progress check ran on nothing. Fixed: `live_prs` returns `Result` (`Ok(None)` only
+  with no GitHub credentials at all), `PrProtocol::progress` propagates it, and the conversation
+  driver records it as an error turn and fails the turn (before and after it) instead of dropping
+  it. Regression test: `conversation::pr::tests::a_failed_look_is_an_error_not_a_quiet_fallback`.
 
 ## 2026-11-12: lost work left a node in review, asking the user in a loop
 

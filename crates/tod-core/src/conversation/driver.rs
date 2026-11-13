@@ -880,7 +880,16 @@ impl ConversationDriver {
         let report = fleet.read(|conn| ConversationRepo::new(conn).report_since(id, turn_seq))?;
         let next = {
             let env = self.env(fleet, id);
-            let after = self.protocol.progress(&env).ok().flatten();
+            let after = match self.protocol.progress(&env) {
+                Ok(after) => after,
+                Err(err) => {
+                    let err = err.context("reading the state the turn changed");
+                    let message = format!("{err:#}");
+                    self.append(fleet, id, TurnRole::Error, &message)?;
+                    self.last_error = Some(message);
+                    return Err(err);
+                }
+            };
             let progressed = match (&self.progress_before, &after) {
                 (Some(before), Some(after)) => before != after,
                 // Nothing to compare: never stop the loop for it.
@@ -1152,11 +1161,17 @@ impl ConversationDriver {
             }
             let mut turn_env = self.protocol.turn_env(&env);
             turn_env.extend(tod_cli_path_env());
-            (
-                cwd,
-                turn_env,
-                self.protocol.progress(&env).ok().flatten(),
-            )
+            let progress = match self.protocol.progress(&env) {
+                Ok(progress) => progress,
+                Err(err) => {
+                    let err = err.context("reading the state before the turn");
+                    let message = format!("{err:#}");
+                    self.append(fleet, id, TurnRole::Error, &message)?;
+                    self.last_error = Some(message);
+                    return Err(err);
+                }
+            };
+            (cwd, turn_env, progress)
         };
         let environment = launch_environment(fleet, self.focus, &cwd)?;
         // The node moved while its session was live: the agent process is
