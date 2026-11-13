@@ -298,8 +298,11 @@ fn check_ready_for_review(fleet: &FleetStore, node: uuid::Uuid, data_root: &std:
         // Feedback on the pull request, a draft included, is the agent's
         // work whether or not a person has taken it yet. Comments that
         // report no problem (a bot's score above its threshold) are not.
-        let work = crate::pr_readiness::Assessment::of(&snapshot, &settings, chrono::Utc::now())
-            .answered_through(answered_at)
+        let work = match crate::pr_readiness::assess(feed.as_ref(), pr, &snapshot, &settings, chrono::Utc::now()) {
+            Ok(assessment) => assessment,
+            Err(err) => return Ok(GithubCheck::Unreadable(format!("{label}: {err}"))),
+        }
+        .answered_through(answered_at)
             .work();
         if !work.is_empty() {
             feedback.push(format!("{label}: {}", work_description(&work)));

@@ -25,6 +25,10 @@ pub struct ReviewBot {
     /// What the bot's comment of findings it could not post inline (their
     /// lines are outside the diff) carries, when it leaves one.
     outside_diff_marker: Option<&'static str>,
+    /// The comment that asks this bot for a review, when the project's
+    /// settings give no `ask` of their own: without one tod could never ask,
+    /// and a bot would be called silent having never been asked.
+    default_ask: &'static str,
 }
 
 pub const GREPTILE: ReviewBot = ReviewBot {
@@ -32,7 +36,22 @@ pub const GREPTILE: ReviewBot = ReviewBot {
     author: "greptile-apps",
     score_label: "Confidence Score:",
     outside_diff_marker: Some("<!-- greptile_outside_diff -->"),
+    default_ask: "@greptileai please review",
 };
+
+/// The comment tod posts to ask `configured` for a review: the settings'
+/// `ask` when set, else the built-in bot's own. `None` for a bot tod does
+/// not know and has no `ask` for. Every reader of "what counts as an ask"
+/// goes through this, so the agent's own pings are counted the same way.
+pub fn ask_text(configured: &PrReviewBotSettings) -> Option<String> {
+    configured
+        .ask
+        .as_deref()
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+        .or_else(|| builtin_bot(&configured.name).map(|b| b.default_ask))
+        .map(str::to_string)
+}
 
 /// The built-in bot `name` selects.
 pub fn builtin_bot(name: &str) -> Option<&'static ReviewBot> {
@@ -408,7 +427,7 @@ impl Assessment {
                     continue;
                 }
                 let ask_due = waiting
-                    && configured.ask.as_deref().map(str::trim).is_some_and(|a| !a.is_empty())
+                    && ask_text(configured).is_some()
                     && asks < configured.max_asks
                     && ask_gap_over
                     && own.ask_allowed(sha)
@@ -450,8 +469,8 @@ impl Assessment {
                 &settings
                     .bots
                     .iter()
-                    .filter_map(|b| b.ask.as_deref())
-                    .map(|a| a.trim().to_ascii_lowercase())
+                    .filter_map(ask_text)
+                    .map(|a| a.to_ascii_lowercase())
                     .filter(|a| !a.is_empty())
                     .chain(settings.waived_asks.iter().cloned())
                     .collect::<Vec<_>>(),
@@ -563,7 +582,7 @@ impl Assessment {
         self.bots
             .iter()
             .filter(|r| r.ask_due)
-            .filter_map(|r| Some(BotAsk { bot: r.settings.name.clone(), text: r.settings.ask.clone()?, asks: r.asks }))
+            .filter_map(|r| Some(BotAsk { bot: r.settings.name.clone(), text: ask_text(&r.settings)?, asks: r.asks }))
             .collect()
     }
 
@@ -597,7 +616,7 @@ impl Assessment {
             return false;
         }
         let every = chrono::Duration::minutes(r.settings.ask_every_minutes as i64);
-        if r.settings.ask.as_deref().map(str::trim).is_some_and(|a| !a.is_empty()) {
+        if ask_text(&r.settings).is_some() {
             return r.asks >= r.settings.max_asks && r.last_ask_at.is_none_or(|at| self.read_at - at >= every);
         }
         let patience = chrono::Duration::minutes(r.settings.rerun_after_minutes as i64)
@@ -1005,7 +1024,7 @@ fn asks_made(
     configured: &PrReviewBotSettings,
     head_at: Option<DateTime<Utc>>,
 ) -> (u32, Option<DateTime<Utc>>, Option<DateTime<Utc>>) {
-    let Some(ask) = configured.ask.as_deref().map(str::trim).filter(|a| !a.is_empty()) else {
+    let Some(ask) = ask_text(configured) else {
         return (0, None, None);
     };
     let ask = ask.to_ascii_lowercase();
@@ -1066,7 +1085,7 @@ fn fallback_patience_over(
     now: DateTime<Utc>,
 ) -> bool {
     let every = chrono::Duration::minutes(configured.ask_every_minutes as i64);
-    let can_ask = configured.ask.as_deref().map(str::trim).is_some_and(|a| !a.is_empty());
+    let can_ask = ask_text(configured).is_some();
     if let Some(minutes) = configured.silent_after_minutes {
         let since = if can_ask { first_ask_at } else { head_at };
         return since.is_some_and(|at| now - at >= chrono::Duration::minutes(minutes as i64));
@@ -1535,24 +1554,6 @@ Not safe.
         assert_eq!(a.bots[0].last_ask_at, Some(at("2026-01-01T11:00:00Z")));
     }
 
-    #[test]
-    fn with_nothing_to_ask_with_a_bot_is_silent_after_the_time_the_asks_would_take() {
-        let st = status("blocked", "success");
-        // The default tuning: 10 minutes, then 3 asks 30 minutes apart.
-        let patience = |mins: i64| now() - chrono::Duration::minutes(mins);
-        let mut fresh = st.clone();
-        fresh.head_committed_at = Some(patience(99).to_rfc3339());
-        assert!(Assessment::of(&snap(fresh, vec![], vec![]), &settings(), now()).silent_bots().is_empty());
-        let mut stale = st;
-        stale.head_committed_at = Some(patience(101).to_rfc3339());
-        let silent = Assessment::of(&snap(stale, vec![], vec![]), &settings(), now());
-        assert_eq!(silent.silent_bots().len(), 1);
-        // The clock starts at the push, not at the commit: an agent turn ten
-        // minutes ago pushed it.
-        let just_pushed = silent.answered_through(Some(now() - chrono::Duration::minutes(10)));
-        assert!(just_pushed.silent_bots().is_empty());
-    }
-
     /// A bot with an ask, a fallback, and the node's own-review state.
     fn fallback_settings(silent_after: Option<u64>, own: tod_store::OwnReviewState) -> PrReadinessSettings {
         let mut s = asking_settings(30, 3);
@@ -1877,6 +1878,76 @@ Not safe.
         low.status.body = low.status.body.map(|b| b.replace("5/5", "2/5"));
         let a = Assessment::of_with(&low, &greptile_settings(), now(), &mut |_, _| Ok::<_, String>(true)).unwrap();
         assert_eq!(a.bots[0].standing, BotStanding::Current { score: 2 });
+    }
+
+    /// A feed that has one snapshot and says whether the head's change is the
+    /// reviewed commit's.
+    struct Stub {
+        snapshot: PrSnapshot,
+        same: bool,
+    }
+
+    impl PrFeed for Stub {
+        fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<PrSnapshot, String> {
+            Ok(self.snapshot.clone())
+        }
+        fn same_change(&self, _: &tod_store::github::NodePr, base: &str, _: &str, _: &str) -> Result<bool, String> {
+            assert_eq!(base, "main");
+            Ok(self.same)
+        }
+    }
+
+    fn node_pr() -> tod_store::github::NodePr {
+        tod_store::github::NodePr {
+            owner: "o".into(),
+            repo: "r".into(),
+            pr_number: 1,
+            url: "https://github.com/o/r/pull/1".into(),
+        }
+    }
+
+    /// ENG-2927: Greptile reviewed an earlier commit, the only commit since
+    /// merges main in. Every reader (the gate, the babysitter, the PR actions)
+    /// goes through `assess`, which asks the feed.
+    #[test]
+    fn a_review_is_current_when_the_head_only_merges_the_base_in_for_every_reader() {
+        let mut snapshot = reviewed_6a3e22b9();
+        snapshot.status.base_ref = Some("main".into());
+        let pr = node_pr();
+        for same in [true, false] {
+            set_feed_override(Some(std::sync::Arc::new(Stub { snapshot: snapshot.clone(), same })));
+            let feed = feed_override().unwrap();
+            let a = assess(feed.as_ref(), &pr, &snapshot, &greptile_settings(), now()).unwrap();
+            assert_eq!(matches!(a.bots[0].standing, BotStanding::Current { .. }), same);
+            let live = live(feed.as_ref(), &[pr.clone()], &greptile_settings()).unwrap();
+            assert_eq!(matches!(live[0].assessment.bots[0].standing, BotStanding::Current { .. }), same);
+        }
+        set_feed_override(None);
+    }
+
+    /// ENG-3093: no `ask` configured, so tod never asked and called the bot
+    /// silent after "0 asks". The built-in bot's own ask is the default, and
+    /// the agent's own ping (with its stray period) counts as an ask.
+    #[test]
+    fn a_bot_with_no_configured_ask_is_asked_by_default_and_not_called_silent_unasked() {
+        let st = status("blocked", "success");
+        let a = Assessment::of(&snap(st.clone(), vec![], vec![]), &settings(), now());
+        let due = a.asks_due();
+        assert_eq!(due.len(), 1, "tod asks with the built-in bot's own words");
+        assert_eq!(due[0].text, "@greptileai please review");
+        assert!(a.silent_bots().is_empty(), "never silent before it was asked");
+        // The agent pinged it three times, in its own words.
+        let comments = vec![
+            ask_comment("agent", "@greptileai please review.", "2026-01-01T10:00:00Z"),
+            ask_comment("agent", "@greptileai please review.", "2026-01-01T10:30:00Z"),
+            ask_comment("agent", "@GreptileAI please review.", "2026-01-01T11:00:00Z"),
+        ];
+        let a = Assessment::of(&snap(st, vec![], comments), &settings(), now());
+        assert_eq!(a.bots[0].asks, 3);
+        assert!(a.asks_due().is_empty());
+        assert_eq!(a.silent_bots().len(), 1);
+        // Unknown bots have no default.
+        assert_eq!(ask_text(&PrReviewBotSettings::new("nobody", 4, 10)), None);
     }
 
     #[test]
@@ -2316,6 +2387,28 @@ pub fn live(
     live_answered(feed, prs, settings, None)
 }
 
+/// `snapshot` of `pr` assessed against `settings`, comparing the commit a bot
+/// last reviewed with the head through `feed` (so a head that only merges the
+/// base in is still covered by the review). The one place every reader of a
+/// pull request's readiness (the gate's criteria, the babysitter, the PR
+/// actions) decides "the bot's review is current"; none calls
+/// [`Assessment::of`] with a comparison it cannot make.
+pub fn assess(
+    feed: &dyn PrFeed,
+    pr: &tod_store::github::NodePr,
+    snapshot: &PrSnapshot,
+    settings: &PrReadinessSettings,
+    now: DateTime<Utc>,
+) -> Result<Assessment, String> {
+    let base = snapshot.status.base_ref.clone();
+    Assessment::of_with(snapshot, settings, now, &mut |reviewed, head| {
+        let base = base.as_deref().ok_or_else(|| {
+            format!("{}: the base branch is unknown, so the bot's review of {reviewed} cannot be compared with head {head}", pr.url)
+        })?;
+        feed.same_change(pr, base, reviewed, head).map_err(|err| format!("{}: {err}", pr.url))
+    })
+}
+
 /// [`live`], with reviews up to `answered_at` counted as answered (see
 /// [`agent_answered_at`]).
 pub fn live_answered(
@@ -2328,14 +2421,7 @@ pub fn live_answered(
     prs.iter()
         .map(|pr| {
             let snapshot = feed.snapshot(pr).map_err(|err| format!("{}: {err}", pr.url))?;
-            let base = snapshot.status.base_ref.clone();
-            let assessment = Assessment::of_with(&snapshot, settings, now, &mut |reviewed, head| {
-                let base = base.as_deref().ok_or_else(|| {
-                    format!("{}: the base branch is unknown, so the bot's review of {reviewed} cannot be compared with head {head}", pr.url)
-                })?;
-                feed.same_change(pr, base, reviewed, head).map_err(|err| format!("{}: {err}", pr.url))
-            })?
-            .answered_through(answered_at);
+            let assessment = assess(feed, pr, &snapshot, settings, now)?.answered_through(answered_at);
             if let Some(why) = assessment.head_time_missing().or_else(|| own_review_head_missing(&snapshot, settings)) {
                 return Err(format!("{}: {why}", pr.url));
             }

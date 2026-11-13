@@ -209,7 +209,9 @@ pub struct PrReviewBotSettings {
     pub rerun_after_minutes: u64,
     /// The comment tod posts on the pull request to ask the bot for a review
     /// (`@somebot please review`): the project's own words, since the app
-    /// names no bot. Unset, tod asks nobody (the project's skill may).
+    /// names no bot. Unset, tod asks with the built-in bot's own default
+    /// (`tod_core::pr_readiness::ask_text`), so a bot is never called silent
+    /// having never been asked; a bot tod does not know is never asked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ask: Option<String>,
     /// Minutes between asks for the same head.

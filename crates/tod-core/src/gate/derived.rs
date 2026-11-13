@@ -809,16 +809,26 @@ fn pr_readiness_outcome(conn: &Connection, node_id: Uuid, which: Readiness) -> R
     };
     let settings = crate::bot_silence::settings_for_node(conn, node_id, configured)?;
     let now = chrono::Utc::now();
+    // The feed (the override in tests, else GitHub), so the bot's review is
+    // compared with the head the same way the babysitter compares it.
+    let feed: std::sync::Arc<dyn crate::pr_readiness::PrFeed> = match crate::pr_readiness::feed_override() {
+        Some(feed) => feed,
+        None => std::sync::Arc::new(crate::pr_readiness::GithubFeed(github)),
+    };
     let mut assessed = Vec::new();
     for pr in &prs {
-        let snapshot = match crate::pr_readiness::cached_snapshot(&github, pr) {
+        let snapshot = match feed.snapshot(pr) {
             Ok(snapshot) => snapshot,
             Err(err) => return Ok(fail(format!("Could not read {}: {err}", pr.url))),
         };
         if let Some(why) = crate::pr_readiness::own_review_head_missing(&snapshot, &settings) {
             return Ok(fail(format!("{}: {why}", pr.url)));
         }
-        assessed.push((pr.url.clone(), crate::pr_readiness::Assessment::of(&snapshot, &settings, now)));
+        let assessment = match crate::pr_readiness::assess(feed.as_ref(), pr, &snapshot, &settings, now) {
+            Ok(assessment) => assessment,
+            Err(err) => return Ok(fail(format!("Could not compare the bot's review with the head: {err}"))),
+        };
+        assessed.push((pr.url.clone(), assessment));
     }
     Ok(readiness_outcome(which, &assessed))
 }

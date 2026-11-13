@@ -1106,6 +1106,11 @@ impl crate::pr_readiness::PrFeed for Sim {
     fn releases(&self, _: &tod_store::github::NodePr) -> Result<Vec<tod_store::github::Release>, String> {
         Ok(finished_releases())
     }
+
+    // The app asks the bot itself, with the built-in bot's own words.
+    fn post_comment(&self, _: &tod_store::github::NodePr, _: &str) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 #[test]

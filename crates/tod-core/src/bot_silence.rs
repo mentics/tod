@@ -170,7 +170,7 @@ pub fn without_waived(settings: &PrReadinessSettings, waived: &[String]) -> PrRe
     settings.bots = kept;
     // Its asks stay on the pull request, and are still not feedback.
     settings.waived_asks.extend(
-        gone.iter().filter_map(|b| b.ask.as_deref()).map(|a| a.trim().to_ascii_lowercase()).filter(|a| !a.is_empty()),
+        gone.iter().filter_map(crate::pr_readiness::ask_text).map(|a| a.to_ascii_lowercase()),
     );
     settings
 }

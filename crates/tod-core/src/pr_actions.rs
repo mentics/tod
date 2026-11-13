@@ -76,8 +76,8 @@ fn facts_from(
     pr: &NodePr,
 ) -> Result<PrFacts, String> {
     let snapshot = feed.snapshot(pr)?;
-    let assessment =
-        crate::pr_readiness::Assessment::of(&snapshot, settings, chrono::Utc::now()).answered_through(answered_at);
+    let assessment = crate::pr_readiness::assess(feed, pr, &snapshot, settings, chrono::Utc::now())?
+        .answered_through(answered_at);
     if let Some(why) = assessment.head_time_missing() {
         return Err(format!("{}: {why}", pr.url));
     }

@@ -17,6 +17,14 @@ Either way:
   user does the merge.
 - Do not ask a review bot to review or to look again (not even if a skill says to: the app asks once, on the final head, after its own review of it is clean), and do not wait for one. The app does
   both, and sends you back when a review lands.
+- Never ask the user (`decisions ask`) about a review bot that has not
+  reviewed, is slow, or seems down, and never ask them to "fix GitHub" after
+  a GitHub call fails with a transient error (GraphQL "Something went wrong
+  while executing your query", a 5xx, a timeout). the app asks the bot itself,
+  decides it is silent, and raises the one question about it; the app retries
+  its own GitHub calls. If a command of yours hits such an error, run it
+  again later or leave it: do not escalate, and do not ping the bot to
+  work around it. A bot that has not reviewed is not a reason to stop.
 - A review thread (or a finding) that contradicts an obligation is a decision
   for the user (`decisions ask`), never a reason to change the obligation.
 

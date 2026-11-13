@@ -40,6 +40,16 @@ turns, findings, run_state, node_timeline, journey records):
 - **Tests**: `a_base_that_keeps_moving_is_waited_on_not_merged_in_every_poll`, `a_base_that_never_stops_moving_ends_in_a_precise_stop`.
 - **Measure**: agent turns per node per stay in `pr_draft` (target: a handful); budget requests whose sessions are mostly `pr` turns that changed nothing (should be 0).
 
+## 2026-11-13: six drafts stopped on a "Greptile did not review" request (ENG-2927, ENG-2923, ENG-2157, ENG-2057, ENG-3093, ENG-2228)
+
+- **Seen**: 1 kind, 6 nodes in `pr_draft`, 2026-11-13.
+- **Symptom**: nodes stopped on a pending request about the review bot: the PR agent raised it itself after pinging the bot 2-5 times (and in ENG-2228 after `gh pr comment` hit GitHub's transient "Something went wrong while executing your query", asking the user to "Fix GitHub"); tod's own `bot_silence` decision for ENG-3093 said "after 0 asks (last asked never)". ENG-2927's only commit after Greptile's review merged main in, so Greptile (`triggerOnUpdates: false`, drafts) rightly did not run again.
+- **Cause**: (1) the "head only merges the base in, so the review still covers it" comparison existed only in `pr_readiness::live`; the gate's `pr-approved.review-current` and `pr-pr_review.*` criteria, `pr_actions` and the babysitter's feedback check called `Assessment::of`, which never compares, so they judged the review stale. (2) A bot with no `ask` in `tod.yml` was never asked by tod (the live root has none) and, with nothing to ask with, was called silent by a time rule with `asks = 0`. (3) The PR role docs said not to ping the bot but nothing told the agent not to raise a request about it or about a transient GitHub error.
+- **Fix**: `pr_readiness::assess` (feed + pr + snapshot + settings) is the one place a review is judged current; `live`, the gate, `pr_actions` and `github_wait` use it (the gate reads the feed override too). `pr_readiness::ask_text` gives the built-in bot's own ask when settings have none, and it is what asks, the agent's pings (matched case-insensitively, trailing punctuation fine), waived asks and the patience rule use, so tod asks (via `post_issue_comment`, which retries a transient failure) before it can call a bot silent. `surface/pr.md`, `pr_draft.md` and `pr_review.md` forbid a request about a silent bot or a transient GitHub error. Tests: `pr_readiness::tests::a_review_is_current_when_the_head_only_merges_the_base_in_for_every_reader`, `a_bot_with_no_configured_ask_is_asked_by_default_and_not_called_silent_unasked`. Open: an agent request about a bot is still not refused or converted by tod (prompt only); already-raised requests need answering by hand.
+- **Measure**: pending requests on a node in `pr_draft`/`pr_review` whose subject is a bot or a GitHub error (should be 0); `bot_silence` decisions with `asks = 0` (should be 0).
+
+---
+
 ## 2026-11-12: a person's "send the task back" answer moved nothing (ENG-2068, ENG-2287)
 
 - **Seen**: 1 kind, 2 nodes (ENG-2068 in `review`, ENG-2287 in `verifying`), 2026-11-12.
