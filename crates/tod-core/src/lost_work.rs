@@ -257,12 +257,24 @@ fn state_of(repo: &Workdir, bases: &[String], what: &str, branch: Option<&str>) 
     // The node's branch, here or on origin, is at a commit other than the
     // base (merged into it, then perhaps deleted on origin, or left behind it):
     // its work is in the default branch, not lost.
+    //
+    // But only a tip that was never the base's own: tod puts every repository
+    // on the node's branch when it makes the checkout and pushes it, at the
+    // commit the base had then, so an empty branch is left on origin that the
+    // default branch later moves past. Its tip sits on the base's first-parent
+    // line (it was once the base's tip); a branch merged by a merge commit does
+    // not (its commits came in as the merge's second parent). Taking the stale
+    // empty branch for merged work hid the loss of ENG-2287's code for good.
     if !tips.is_empty() {
         let mut base_tips = Vec::new();
         for base in bases {
             base_tips.push(git_text(repo, &["rev-parse", &format!("{base}^{{commit}}")])?);
         }
-        if tips.iter().any(|tip| !base_tips.contains(tip)) {
+        let mut on_the_line = Vec::new();
+        for base in bases {
+            on_the_line.extend(git_text(repo, &["rev-list", "--first-parent", base])?.lines().map(|l| l.trim().to_string()));
+        }
+        if tips.iter().any(|tip| !base_tips.contains(tip) && !on_the_line.contains(tip)) {
             return Ok(RepoState::BranchBehindBase);
         }
     }
@@ -439,6 +451,17 @@ pub fn reopen(fleet: &FleetStore, node: Uuid, state: &str, proof: &Proof) -> Res
     Ok(())
 }
 
+/// [`check`] and [`reopen`] for a node in whatever state it is in now, for the
+/// moment a node's sandbox has just been made again, so a node waiting on
+/// someone (a request, a review) is sent back at once and not only when its
+/// next run starts. Whether it reopened the node.
+pub fn reopen_if_lost(fleet: &FleetStore, node: Uuid) -> Result<bool> {
+    let state = lifecycle::current_state(fleet, node)?;
+    let Some(proof) = check(fleet, node, &state)? else { return Ok(false) };
+    reopen(fleet, node, &state, &proof)?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -582,7 +605,7 @@ mod tests {
         commit_in(&work, "w");
         run(&work, &["push", "-q", "origin", "HEAD:refs/heads/task/x"]);
         run(&work, &["checkout", "-q", "main"]);
-        run(&work, &["merge", "-q", "--ff-only", "task/x"]);
+        run(&work, &["merge", "-q", "--no-ff", "-m", "merge task/x", "task/x"]);
         commit_in(&work, "later");
         run(&work, &["push", "-q", "origin", "main"]);
         run(&work, &["branch", "-q", "-D", "task/x"]);
@@ -702,11 +725,35 @@ mod tests {
         let (_dir, work) = fixture();
         commit_in(&work, "w");
         run(&work, &["checkout", "-q", "main"]);
-        run(&work, &["merge", "-q", "--ff-only", "task/x"]);
+        run(&work, &["merge", "-q", "--no-ff", "-m", "merge task/x", "task/x"]);
         commit_in(&work, "later");
         run(&work, &["push", "-q", "origin", "main"]);
         let repos = inspect(&Workdir::host(&work), Some("task/x")).unwrap();
         assert_eq!(repos[0].1, RepoState::BranchBehindBase, "{repos:?}");
+    }
+
+    /// ENG-2287: tod pushes the node's branch, empty, when it makes the
+    /// checkout; the default branch moves on, and that branch is then behind
+    /// it. It is no work, in the checkout or in a submodule.
+    #[test]
+    fn an_empty_branch_left_behind_by_the_default_branch_is_not_work() {
+        let (_dir, work) = fixture();
+        run(&work, &["push", "-q", "origin", "HEAD:refs/heads/task/x"]);
+        run(&work.join("kb"), &["push", "-q", "origin", "HEAD:refs/heads/task/x"]);
+        // Others move both default branches on.
+        run(&work, &["checkout", "-q", "main"]);
+        commit_in(&work, "later");
+        run(&work, &["push", "-q", "origin", "main"]);
+        run(&work.join("kb"), &["checkout", "-q", "main"]);
+        commit_in(&work.join("kb"), "kb-later");
+        run(&work.join("kb"), &["push", "-q", "origin", "main"]);
+        run(&work, &["checkout", "-q", "task/x"]);
+        run(&work.join("kb"), &["checkout", "-q", "task/x"]);
+        run(&work, &["fetch", "-q", "origin"]);
+        run(&work.join("kb"), &["fetch", "-q", "origin"]);
+        let repos = inspect(&Workdir::host(&work), Some("task/x")).unwrap();
+        assert!(repos.iter().all(|(_, s)| *s == RepoState::Untouched), "{repos:?}");
+        assert!(is_lost(&repos));
     }
 
     #[test]

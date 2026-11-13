@@ -937,6 +937,16 @@ impl OutlineMutation {
                 nodes.set_lifecycle_by(*node_id, state, true, reason.as_deref())?;
                 if before.as_deref() != Some(state.as_str()) {
                     crate::decisions::DecisionRepo::new(conn).withdraw_moving_for_node(*node_id, *keep_decision)?;
+                    if let Some(from) = before.as_deref() {
+                        crate::lifecycle_reset::rework_after_user_move(
+                            conn,
+                            *node_id,
+                            from,
+                            state,
+                            reason.as_deref(),
+                            *keep_decision,
+                        )?;
+                    }
                 }
             }
             OutlineMutation::RestartLifecycleStay { node_id } => {

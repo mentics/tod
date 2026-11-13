@@ -9,6 +9,15 @@
 //! count within the stay that recorded them (`crate::phase`), and a node
 //! that leaves a state starts a new stay when it comes back.
 //!
+//! [`rework_after_user_move`] is the other half, for the user's own move (the
+//! phase chip, `tod-cli lifecycle set`, a request's answer): back at `active`
+//! or earlier, the implementation steps recorded done are opened again, since
+//! the gate out of `active` ("every step implemented") would otherwise pass at
+//! once and send the node straight on with the work it was sent back to redo
+//! (ENG-2287: a node moved from review to active was back in verifying 97
+//! minutes later with no implementation run); and the questions the redone
+//! states asked are withdrawn, since their stay is over.
+//!
 //! Transcripts, review findings and the verdict history stay: they are what
 //! happened, not what currently holds.
 //! [`NodeRepo::set_lifecycle`](crate::outline::repos::NodeRepo::set_lifecycle)
@@ -93,6 +102,40 @@ pub fn clear_certifications(conn: &Connection, node_id: Uuid, from: &str, to: &s
             node_id,
             &format!("The node moved back from {from} to {to}: verify again."),
         )?;
+    }
+    Ok(())
+}
+
+/// Open the node's implementation again and withdraw what the redone states
+/// asked, after the user moved it back from `from` to `to`. Does nothing for
+/// any other move. `keep` is the request this very move answers, which stays
+/// pending until its answer is recorded.
+pub fn rework_after_user_move(
+    conn: &Connection,
+    node_id: Uuid,
+    from: &str,
+    to: &str,
+    reason: Option<&str>,
+    keep: Option<Uuid>,
+) -> Result<()> {
+    let (Some(from_rank), Some(to_rank)) = (rank(from), rank(to)) else {
+        return Ok(());
+    };
+    if to_rank >= from_rank {
+        return Ok(());
+    }
+    let redone: Vec<&str> = VALID_LIFECYCLE_STATES[to_rank..=from_rank].to_vec();
+    let protocols: Vec<&str> = ["implementation", "verification", "review", "fix", "pr"]
+        .into_iter()
+        .filter(|p| protocol_state(p).is_some_and(|s| redone.contains(&s)))
+        .collect();
+    crate::decisions::DecisionRepo::new(conn).withdraw_for_protocols(node_id, &protocols, keep)?;
+    if to_rank <= rank("active").unwrap_or(0) {
+        let why = match reason.map(str::trim).filter(|r| !r.is_empty()) {
+            Some(reason) => format!("The node was moved back from {from} to {to}: {reason}. Implement it again."),
+            None => format!("The node was moved back from {from} to {to}. Implement it again."),
+        };
+        crate::outline::repos::PlanStepRepo::new(conn).reopen_lost_work(node_id, &why)?;
     }
     Ok(())
 }

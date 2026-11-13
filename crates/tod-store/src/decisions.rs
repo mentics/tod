@@ -488,6 +488,22 @@ impl<'a> DecisionRepo<'a> {
         )?)
     }
 
+    /// Withdraw the node's pending decisions asked by an agent of one of
+    /// `protocols`, except `keep`: the stay they were asked in is over (the
+    /// node was moved back past it). Returns how many.
+    pub fn withdraw_for_protocols(&self, node_id: Uuid, protocols: &[&str], keep: Option<Uuid>) -> Result<usize> {
+        let mut withdrawn = 0;
+        for protocol in protocols {
+            withdrawn += self.conn.execute(
+                "UPDATE decisions SET status = 'withdrawn'
+                 WHERE node_id = ?1 AND status = 'pending' AND protocol = ?2
+                   AND (?3 IS NULL OR id <> ?3)",
+                params![uuid_to_blob(node_id), protocol, keep.map(uuid_to_blob)],
+            )?;
+        }
+        Ok(withdrawn)
+    }
+
     /// Withdraw a decision: it no longer needs an answer.
     pub fn withdraw(&self, id: Uuid) -> Result<()> {
         let changed = self.conn.execute(

@@ -208,12 +208,16 @@ mod tests {
     }
 
     fn ask(fx: &Fixture, moves: Vec<OptionMove>) -> anyhow::Result<Uuid> {
+        ask_as(fx, "review", moves)
+    }
+
+    fn ask_as(fx: &Fixture, protocol: &str, moves: Vec<OptionMove>) -> anyhow::Result<Uuid> {
         let value = fx.fleet.interview(
             ACTOR_USER,
             InterviewCommand::AskDecision {
                 node_id: fx.node,
                 conversation_id: None,
-                protocol: Some("review".into()),
+                protocol: Some(protocol.into()),
                 decision: NewDecision {
                     question: "The change is gone from the branch. What now?\n\nBackground.".into(),
                     options: vec!["Send the task back to active to rebuild the change".into(), "Leave it".into()],
@@ -318,7 +322,8 @@ mod tests {
         let fx = fixture();
         in_review_with_verified_steps(&fx);
         let moving = ask(&fx, vec![OptionMove { option: 1, to: "active".into(), asked_in: None }]).unwrap();
-        let plain = ask(&fx, vec![]).unwrap();
+        // Not about a state the move redoes: it stays.
+        let plain = ask_as(&fx, "permission", vec![]).unwrap();
         // The chip's path (the CLI sends the same mutation).
         crate::lifecycle::set_lifecycle_by_user(&fx.fleet, fx.node, "active").unwrap();
         let status = |id| fx.fleet.read(|conn| DecisionRepo::new(conn).get(id)).unwrap().unwrap().status;
@@ -397,5 +402,41 @@ mod tests {
         // Repeating it is fine (a retry); going forward is not a send-back.
         send_back(&fx.fleet, fx.node, "ready", "x").unwrap();
         assert!(send_back(&fx.fleet, fx.node, "active", "x").is_err());
+    }
+
+    /// ENG-2287: a node moved review -> active by the chip or the operator
+    /// command kept its steps verified, so the gate out of active passed at
+    /// once and it was back in verifying with no implementation run.
+    #[test]
+    fn the_users_move_back_to_active_reopens_the_steps_and_withdraws_the_redone_stays_questions() {
+        let fx = fixture();
+        in_review_with_verified_steps(&fx);
+        let review = ask(&fx, vec![]).unwrap();
+        let verify = ask_as(&fx, "verification", vec![]).unwrap();
+        let pr = ask_as(&fx, "pr", vec![]).unwrap();
+        crate::lifecycle::set_lifecycle_by_user_because(&fx.fleet, fx.node, "active", Some("the code was lost")).unwrap();
+
+        assert_eq!(current_state(&fx.fleet, fx.node).unwrap(), "active");
+        let steps = fx.fleet.list_plan_steps_for_node(fx.node).unwrap();
+        assert!(steps.iter().all(|s| s.status == STATUS_PENDING || s.status == STATUS_READY), "{steps:?}");
+        let status = |id| fx.fleet.read(|conn| DecisionRepo::new(conn).get(id)).unwrap().unwrap().status;
+        assert_eq!(status(review), DECISION_WITHDRAWN);
+        assert_eq!(status(verify), DECISION_WITHDRAWN);
+        //  is later than the state it left: not part of the stay it redoes.
+        assert_eq!(status(pr), DECISION_PENDING);
+    }
+
+    #[test]
+    fn a_move_back_that_stops_after_active_leaves_the_steps_and_a_forward_move_touches_nothing() {
+        let fx = fixture();
+        in_review_with_verified_steps(&fx);
+        // Back to verifying: the implementation still holds.
+        crate::lifecycle::set_lifecycle_by_user(&fx.fleet, fx.node, "verifying").unwrap();
+        let steps = fx.fleet.list_plan_steps_for_node(fx.node).unwrap();
+        assert!(steps.iter().all(|s| s.status == STATUS_VERIFIED), "{steps:?}");
+        // Forward again.
+        crate::lifecycle::set_lifecycle_by_user(&fx.fleet, fx.node, "review").unwrap();
+        let steps = fx.fleet.list_plan_steps_for_node(fx.node).unwrap();
+        assert!(steps.iter().all(|s| s.status == STATUS_VERIFIED), "{steps:?}");
     }
 }
