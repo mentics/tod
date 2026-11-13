@@ -1,15 +1,17 @@
 ---
 name: shepherd-nodes
-description: Watch the nodes the user names (by ticket, slug, or a parent node for its subtree) on the live data root as tod moves them from proposed to pr_draft. Wherever one gets stuck, find out why, make tod handle that case itself (a bug fix or an enhancement, done by subagents and merged to main), redeploy and restart, and get the node moving again. Use when asked to shepherd, babysit or unstick the live nodes, or to make the lifecycle run without help.
+description: Watch the nodes the user names (by ticket, slug, or a parent node for its subtree) on the live data root as tod moves them through every phase, from proposed to done. Wherever one gets stuck, find out why, make tod handle that case itself (a bug fix or an enhancement, done by subagents and merged to main), redeploy and restart, and get the node moving again. Use when asked to shepherd, babysit or unstick the live nodes, or to make the lifecycle run without help.
 user_invocable: true
 ---
 
 ## The goal
 
 Once the user starts a node, tod is meant to take it from `proposed` all the
-way to `pr_draft` with no help, and to stop only for what only the user can
-decide. It should end waiting for the user to click **Open** on a clean PR and
-choose a reviewer. It does not always get there yet. Some nodes stop on bugs.
+way to `done` with no help, and to stop only for what only a person can do.
+Up to `pr_draft` it should end waiting for the user to click **Open** on a
+clean PR and choose a reviewer. After that it should keep the PR clean through
+human review, wait for the merge and the release, then do the post-release
+work and the retrospective on its own. It does not always get there yet. Some nodes stop on bugs.
 Others stop because the app or its prompts are not smart enough for the case:
 an unclear request, an error with no way forward, a loop that gives up early.
 
@@ -28,8 +30,8 @@ else; other nodes with a lifecycle may be run by hand or left alone on purpose.
 - Each item may be a Linear ticket (`ENG-2925`), a node slug, or a node UUID.
 - A parent node (such as a project or `ENG work`) means every node under it
   that has Lifecycle.
-- With no argument, don't guess: list the started nodes from `proposed` to
-  `pr_draft` (ticket, title, state, run state) and ask which to shepherd.
+- With no argument, don't guess: list the started nodes that are not `done`
+  (ticket, title, state, run state) and ask which to shepherd.
 - Resolve every item with `tod-cli node show` before starting, and say which
   nodes are in scope. An item that matches nothing is an error to report, not
   something to skip.
@@ -46,6 +48,10 @@ else; other nodes with a lifecycle may be run by hand or left alone on purpose.
 - Only the nodes in scope, and only once the user has started them. Never start a node, and never move one to
   `pr_review`. Never mark a PR ready or request a reviewer: that is the
   user's step.
+- Never approve, merge or release a Cofactr PR, and never move a node past a
+  gate with the lifecycle chip or `tod-cli lifecycle set`. A person's review,
+  the merge and the release are the only stops after `pr_draft`; everything
+  else is tod's to do, and yours to make tod do.
 - Never push to, comment on, or edit a Cofactr PR or branch yourself. The
   node's agent does that, as the product should. Reading with `gh` is fine.
 - Never label a node sandbox `keep-when-idle=true`. Letting idle node
@@ -118,8 +124,7 @@ current with `origin/main`:
 
 ## The loop
 
-Every node in `proposed`, `design`, `planning`, `ready`, `active`,
-`verifying`, `review`, `pr` and `pr_draft` that is in scope:
+Every node in scope that is not `done`, in any phase:
 
 1. **Survey.** For each node, read:
    - its state, and its run state from `run_state` (working, waiting on
@@ -142,21 +147,34 @@ Every node in `proposed`, `design`, `planning`, `ready`, `active`,
    - a status that says something untrue;
    - an error with no next step;
    - setup that fails;
-   - a request that only asks the user because tod lacked a capability.
+   - a request that only asks the user because tod lacked a capability;
+   - after `pr_draft`: review feedback the babysitter does not take up, an
+     approved PR left behind its base, a merge or release that tod did not
+     notice (wait never satisfied, webhook missed), a post-release check or
+     retrospective that fails or loops.
 4. **Get the node moving** with the improved tod: Resume, "Resume with a fresh
    budget", Check now, Rerun this phase, Run with a new session, or Reset
    environment, whichever the cause calls for.
-5. **A node is done** when it sits in `pr_draft` waiting for the user to mark
-   the PR ready, and:
-   - checks are green;
-   - the review bot's verdict is current for the head;
-   - no thread is open;
-   - the PR is mergeable;
-   - tod's own review is clean.
+5. **A node is parked** (nothing for you to do until a person acts) only in
+   these cases, and only while every condition holds:
+   - `pr_draft`, waiting for the user to mark the PR ready and pick a
+     reviewer: checks green, the review bot's verdict current for the head, no
+     thread open, the PR mergeable, tod's own review clean.
+   - `pr_review`, waiting only for a person's review: the same conditions. A
+     person's comment or "changes requested" is work for tod's babysitter,
+     not a stop.
+   - `approved`, waiting only for a person to merge: the PR still clean and
+     mergeable (a base that moved on or a new conflict is tod's to fix).
+   - `merged`, waiting only for a release whose notes name the PR.
+   - A request that only the user can answer (see below).
 
-   Leave it there.
-6. Repeat until every node is done or waiting on something only the user can
-   decide. Between passes, wait on real events (a subagent finishing, a
+   Anything else is progress to be made. In `merged` (after the release),
+   `released` and `learn` the phase agent does the work and the gate checks
+   it; a stop there is a gap like any other.
+6. **A node is finished** when it reaches `done` (and its sandbox is retired).
+7. Repeat until every node is finished or parked. Parked nodes still need a
+   look on each pass: a person may have acted (reviewed, merged, released),
+   and tod must then move on by itself. If it does not, that is a gap. Between passes, wait on real events (a subagent finishing, a
    scheduled look); don't poll tightly.
 
 ## Requests to the user
@@ -220,6 +238,14 @@ Facts:
   to change: tell them why.
 - **Bot findings:** a PR whose bot posts real new findings each round is
   doing real work. It is not stuck.
+- **After `pr_draft`** (`doc/lifecycle/pr-readiness.md`, `phase-agents.md`):
+  `pr_review` is run by the babysitter until `pr-approved.*` passes and a
+  person approves; `approved` waits on `github:pr:<n>:merged`; `merged` waits
+  on `github:release:published` for a release naming the PR, then its phase
+  agent certifies with evidence; `released` certifies a post-release smoke;
+  `learn` records the retrospective (`learn-recorded`). Waits in `waits` are
+  woken by webhook or the next scheduled look; a wait past its `due_at` with
+  the event already on GitHub is a gap.
 
 Shell:
 - In zsh, `$B:refs` inside double quotes is a modifier. Write `${B}:refs`.
