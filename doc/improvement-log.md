@@ -546,3 +546,22 @@ from Blaxel.
 - **Cause**: the chip (`TaskPanel::set_phase` -> `lifecycle::set_lifecycle_by_user`) was the only route; `tod-cli` has no lifecycle verb, on purpose, since nothing but the lifecycle process may set a state.
 - **Fix**: `tod-cli lifecycle set <NODE> <STATE> --reason <TEXT>`, for the operator only. It sends the same store mutation as the chip (`tod_core::lifecycle::operator::user_move`, which `set_lifecycle_by_user` now uses too), so a move back clears certifications, reopens verified verdicts, cancels waits and retakes/clears the baseline, and shows on the node's activity as the user's, with the reason (`PhaseChange.reason`). It is refused in an agent session (`TOD_INTERVIEW_ACTOR`, `TOD_IMPLEMENT_NODE` or `TOD_IMPLEMENT_CONVERSATION` set), into `pr_review` or any later state, into the current state, and without `--reason`. Tests: `review_to_active_has_the_effects_of_the_chip`, `pr_review_is_refused_and_nothing_moves`, `an_agent_session_is_refused_and_nothing_moves`, `a_reason_is_required` (tod-cli), `operator::tests::*` (tod-core). Not done: the chip itself still allows `pr_review` and later (it is the user's own click); the CLI does not push the Linear ticket's state or record a `UserAction` journey event (the journey's change feed still records the transition).
 - **Measure**: moves of a node's state made by clicking the chip over the control socket (should be 0 for shepherd runs); `tod-cli lifecycle set` refusals from an agent session (should be 0).
+
+## 2026-11-13: four stopped nodes (ENG-2594, ENG-3067, ENG-2552, ENG-3129)
+
+- **Seen**: 4 nodes stopped on the live root.
+- **ENG-3067 (`pr_stuck`)**
+  - *Symptom*: stopped after two turns that "changed nothing", with all checks green and no open thread.
+  - *Cause*: a `missing migrations` run was cancelled by a newer run while its replacement (and other checks) were still running. `combine_checks` read any completed non-success run, `cancelled` included, as `failure`, and `failure` outranks `pending`, so the assessment said "a check is failing" (`Work::FailingChecks`, which the agent can fix). The agent could only say the run was cancelled and re-run it; twice.
+  - *Fix*: a cancelled run is pending while anything else runs, and a failure only when nothing replaces it (tod-store `github::combine_checks`). Test `a_cancelled_run_is_pending_while_others_run_and_a_failure_only_when_nothing_replaces_it`.
+  - *Measure*: `pr_stuck` stops whose last agent turns say "cancelled" or "re-ran the failed job" (target 0).
+- **ENG-2594 (`no_progress` in `released`)**
+  - *Symptom*: after the user answered the post-release decision with "wait for the KB deploy", the released agent's next turn ended "I'll resume when the background watcher reports", changing nothing; the run stopped. The deploy had succeeded by then.
+  - *Cause*: nothing wakes a finished session; the prompt said to ask and end the turn but not that a chosen wait is done inside the turn.
+  - *Fix*: `released.md` step 7 (wait by polling inside the turn, never end promising to resume; ask again if too long). Test `prompts_place_post_merge_steps_in_later_phases_and_wait_inside_the_turn`.
+  - *Measure*: `no_progress` stops in `released`/`merged` whose last turn promises to resume (target 0).
+- **ENG-2552, ENG-3129 (`request`: steps handed back)**
+  - *Symptom*: steps blocked as `access`: QA spike, QA apply/demonstration (needs AWS/SSM and Terraform in QA), and PG 18 suite runs (the sandbox's db is PG 17, no docker, no apt network).
+  - *Cause*: the QA apply and demonstration only exist after merge, and a PG 18 test run is what the pull request's CI does once the pin lands; both were put in `active` and blocked, and `implement.md` said nothing about moving or delegating them.
+  - *Fix*: `implement.md` "Leaving work for the user": before `access`, move a post-merge step to `merged`/`released` with `plan update --phase`, and for CI-only evidence build what makes CI run it and let the PR's checks decide; `access` only for access nothing later gets, naming which in `--needs`. Same test as above. Not fixed in code: tod cannot grant AWS/QA access (a user call for the one genuinely pre-merge spike).
+  - *Measure*: steps blocked `access` whose `needs` names QA/prod/apply/deploy or a server version (target 0).

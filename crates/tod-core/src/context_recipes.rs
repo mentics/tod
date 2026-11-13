@@ -744,6 +744,23 @@ missing"),
         );
     }
 
+    /// Seen live (ENG-2552, ENG-3129, ENG-2594): steps handed back as `access`
+    /// that only a later phase or CI could take, and a released agent that
+    /// ended its turn "to resume when the deploy reports", which nothing wakes.
+    #[test]
+    fn prompts_place_post_merge_steps_in_later_phases_and_wait_inside_the_turn() {
+        let implement = include_str!("../../tod/media/context/surface/implement.md");
+        assert!(implement.contains("is in the wrong phase"), "implement.md must tell the agent to move a post-merge step");
+        assert!(implement.contains("plan update --phase merged"));
+        assert!(implement.contains("the pull request's\n  checks are the verdict"));
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..").join("assets").join("process");
+        if root.is_dir() {
+            let released = std::fs::read_to_string(root.join("agents/state/released.md")).unwrap();
+            assert!(released.contains("the waiting happens inside this turn"));
+            assert!(released.contains("no_progress"));
+        }
+    }
+
     /// The same rule over `assets/process/`. The interview role docs (and the
     /// since-removed ones for the old spec-writing agent) carried their own command table, abbreviated and already
     /// drifted from the binary (the interview one omitted `obligations add

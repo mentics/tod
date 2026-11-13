@@ -1485,8 +1485,15 @@ struct CheckRunRaw {
 }
 
 /// [`PrStatus::checks`] from the combined status and the check runs.
+///
+/// A *cancelled* run is not a verdict on the code: a newer push or a
+/// concurrency group cancels it and a new run replaces it. While anything is
+/// still running it counts as pending (the replacement is on its way); only
+/// when nothing else is left does it count as a failure, so a run that was
+/// never replaced still reaches the agent (which can re-run it).
 fn combine_checks(statuses: Option<&CombinedStatusRaw>, runs: Option<&CheckRunsRaw>) -> Option<String> {
     let mut states: Vec<&str> = Vec::new();
+    let mut cancelled = false;
     if let Some(s) = statuses.filter(|s| s.total_count > 0) {
         states.push(match s.state.as_str() {
             "success" => "success",
@@ -1497,9 +1504,16 @@ fn combine_checks(statuses: Option<&CombinedStatusRaw>, runs: Option<&CheckRunsR
     for run in runs.map(|r| r.check_runs.as_slice()).unwrap_or_default() {
         states.push(match (run.status.as_str(), run.conclusion.as_deref()) {
             ("completed", Some("success" | "neutral" | "skipped")) => "success",
+            ("completed", Some("cancelled")) => {
+                cancelled = true;
+                continue;
+            }
             ("completed", _) => "failure",
             _ => "pending",
         });
+    }
+    if cancelled && !states.contains(&"failure") {
+        states.push(if states.contains(&"pending") { "pending" } else { "failure" });
     }
     ["failure", "pending", "success"]
         .into_iter()
@@ -1897,6 +1911,23 @@ mod tests {
         assert_eq!(combine_checks(Some(&status("success", 2)), Some(&running)).as_deref(), Some("pending"));
         assert_eq!(combine_checks(Some(&status("success", 1)), Some(&failed)).as_deref(), Some("failure"));
         assert_eq!(combine_checks(Some(&status("error", 1)), None).as_deref(), Some("failure"));
+    }
+
+    /// Seen live (ENG-3067): a run cancelled by a newer one, with the
+    /// replacement still running, read as "a check is failing"; the agent
+    /// could change nothing and the node stopped `pr_stuck`.
+    #[test]
+    fn a_cancelled_run_is_pending_while_others_run_and_a_failure_only_when_nothing_replaces_it() {
+        use super::{CheckRunsRaw, combine_checks};
+        let runs = |json: &str| -> CheckRunsRaw { serde_json::from_str(json).unwrap() };
+        let cancelled_and_running = runs(
+            r#"{"check_runs":[{"status":"completed","conclusion":"cancelled"},{"status":"in_progress","conclusion":null},{"status":"completed","conclusion":"success"}]}"#,
+        );
+        assert_eq!(combine_checks(None, Some(&cancelled_and_running)).as_deref(), Some("pending"));
+        let cancelled_alone = runs(r#"{"check_runs":[{"status":"completed","conclusion":"cancelled"},{"status":"completed","conclusion":"success"}]}"#);
+        assert_eq!(combine_checks(None, Some(&cancelled_alone)).as_deref(), Some("failure"));
+        let real_failure = runs(r#"{"check_runs":[{"status":"completed","conclusion":"cancelled"},{"status":"completed","conclusion":"failure"},{"status":"in_progress","conclusion":null}]}"#);
+        assert_eq!(combine_checks(None, Some(&real_failure)).as_deref(), Some("failure"));
     }
 
     #[test]

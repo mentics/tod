@@ -162,6 +162,17 @@ work around with fixtures never needs the user. When something does:
     gave (`--tried`). Something you have not tried is not something you lack.
 - `--why` is why you cannot go on until the user acts. The user reads it, so
   make it complete on its own.
+- **Before you choose `access`, ask whether the step is in the right place.**
+  A step whose evidence only exists once the change is merged or rolled out
+  (apply Terraform in QA or prod, run a backfill, a deploy, a demonstration
+  against a live environment) is not blocked: it is in the wrong phase. Move it
+  with `plan update --phase merged` (or `released`) and carry on; that phase's
+  agent takes it. When the evidence is a test suite or build only CI can run
+  (a server version or tool this sandbox cannot install), do not block either:
+  build and commit everything that makes CI run it, and the pull request's
+  checks are the verdict (a failing check is sent back to you as work). Block
+  with `access` only for access that no later phase or CI gets, and name which
+  one in `--needs`.
 - None of these is a reason: a step is large, you are not sure how to do it,
   the rest of the work is done and one layer is left (a UI over a finished
   backend, say), or code that already exists — including code you wrote
