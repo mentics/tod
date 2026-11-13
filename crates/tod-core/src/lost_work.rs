@@ -165,6 +165,16 @@ fn hidden_parents(repo: &Workdir, bases: &[String]) -> Result<Vec<String>> {
     }
     let mut out = Vec::new();
     for boundary in String::from_utf8_lossy(&listing.stdout).lines().map(str::trim).filter(|l| !l.is_empty()) {
+        // A boundary whose object this repository does not hold (a shallow
+        // file may name one, as a fork's does) cannot hide anything below it.
+        // Absent is the answer here, so an exit status is read, not an error;
+        // a commit that is present is probed below and any failure there is one.
+        let present = repo
+            .git_output(&["cat-file", "-e", &format!("{boundary}^{{commit}}")])
+            .with_context(|| format!("run git cat-file -e in {repo}"))?;
+        if !present.status.success() {
+            continue;
+        }
         let mut under_base = false;
         for base in bases {
             let probe = repo

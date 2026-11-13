@@ -1595,7 +1595,7 @@ fn ensure_submodule_commits(repo: &Workdir) -> Result<()> {
         }
         // By id first (the server may allow it), else everything.
         if sub.git(&["fetch", "--quiet", "--no-recurse-submodules", "origin", sha]).is_err() {
-            sub.git(&["fetch", "--quiet", "--no-recurse-submodules", "origin"])
+            sub.git(&["fetch", "--quiet", "--no-recurse-submodules", "origin", "+refs/heads/*:refs/remotes/origin/*"])
                 .with_context(|| format!("fetch submodule {path} in {repo}"))?;
         }
         sub.git(&["cat-file", "-e", &commit]).with_context(|| {

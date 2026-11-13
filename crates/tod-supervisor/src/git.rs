@@ -28,6 +28,12 @@ pub fn is_protected(branch: &str, default: Option<&str>) -> bool {
     default == Some(branch) || matches!(branch, "main" | "master" | "trunk" | "develop")
 }
 
+/// Every branch of `origin`, spelled out. A bare `git fetch origin` follows the
+/// remote's configured refspec, and a clone made for one branch (a submodule
+/// whose `remote.origin.fetch` names the node's branch) fails with "couldn't
+/// find remote ref" while that branch is not on origin yet.
+const ALL_BRANCHES: &str = "+refs/heads/*:refs/remotes/origin/*";
+
 /// The commit the parent of a submodule pinned before the node's work: the
 /// gitlink at `rel` (its path in that parent) at the merge base of the
 /// parent's HEAD and its `origin` default branch. Commits reachable from it
@@ -49,7 +55,7 @@ fn pinned_commit(parent: &Path, rel: &str) -> Option<String> {
 /// guess from the stale refs. With no `origin` there is nothing to refresh.
 fn has_unpushed(repo: &Path, pinned: Option<&str>) -> Result<bool> {
     if git(repo, &["remote", "get-url", "origin"]).is_ok() {
-        git(repo, &["fetch", "--quiet", "--no-recurse-submodules", "origin"])
+        git(repo, &["fetch", "--quiet", "--no-recurse-submodules", "origin", ALL_BRANCHES])
             .with_context(|| format!("refresh the remote refs of {} before checking for unpushed commits", repo.display()))?;
     }
     let mut args = vec!["rev-list", "-n1", "HEAD", "--not", "--remotes"];
@@ -72,7 +78,7 @@ fn ensure_commit(repo: &Path, sha: &str) -> Result<()> {
     }
     // By id first (the server may allow it), else everything.
     if git(repo, &["fetch", "--quiet", "--no-recurse-submodules", "origin", sha]).is_err() {
-        git(repo, &["fetch", "--quiet", "--no-recurse-submodules", "origin"])
+        git(repo, &["fetch", "--quiet", "--no-recurse-submodules", "origin", ALL_BRANCHES])
             .with_context(|| format!("fetch the commit {sha} its parent pins"))?;
     }
     git(repo, &["cat-file", "-e", &commit])
