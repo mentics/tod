@@ -811,9 +811,23 @@ impl Autopilot {
         if self.lost_checked.as_deref() == Some(lifecycle) && !asked {
             return Ok(ChecksStep::Proceed);
         }
+        let first_look = self.lost_checked.as_deref() != Some(lifecycle);
         self.lost_checked = Some(lifecycle.to_string());
-        let Some(proof) = crate::lost_work::check(fleet, self.node, lifecycle)? else {
-            return Ok(ChecksStep::Proceed);
+        let proof = match crate::lost_work::check(fleet, self.node, lifecycle)? {
+            crate::lost_work::Finding::Lost(proof) => proof,
+            crate::lost_work::Finding::Unproven(reasons) => {
+                // Nothing is reopened on a guess: the run goes on, and the
+                // node's activity says once per state that it could not tell.
+                let detail = format!("In {lifecycle}: {}", reasons.join("; "));
+                tracing::info!("lost work not proven for node {}: {detail}", self.node);
+                if first_look {
+                    let entry = tod_store::node_timeline::TimelineEntry::new(self.node, tod_store::node_timeline::KIND_NOTE, lifecycle, "Lost work: not proven either way", false, detail);
+                    fleet.enqueue(tod_store::fleet::FleetMutation::RecordTimeline(Box::new(entry)))?;
+                    fleet.writer().flush()?;
+                }
+                return Ok(ChecksStep::Proceed);
+            }
+            crate::lost_work::Finding::NotLooked | crate::lost_work::Finding::Kept => return Ok(ChecksStep::Proceed),
         };
         hook.working_on("reopening the implementation: the node's code is not on its branch");
         if self.state.loops.lost_work_reopens >= 1 {

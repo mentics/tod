@@ -33,8 +33,20 @@ decide. It holds when all of these are true:
      the parent's merge base with that default branch.
 
 Commits on the node's branch (local, or `origin/<branch>`) count wherever the
-checkout sits, and a node branch on `origin` at a commit other than the base
-(merged into the default branch, or behind it) is not lost. A repository with
+checkout sits. A branch with nothing beyond the base is either a **stub** (it
+never held work) or merged work, and ancestry cannot tell them apart (a
+fast-forward merged branch and a stub both end on the default branch's
+first-parent line; a squash or rebase merge with the branch deleted leaves no
+branch at all). So a stub is a recorded fact: when tod makes a node's
+checkout it records, per repository, the commit the new branch was born at
+(`tod_store::branch_starts`, from `fleet::checkout_start::capture`; only for a
+branch with no `origin/<branch>`, at the default tip or the pinned commit), and a
+branch tip is a stub only if it equals that record. A tip off the line is
+merged; a tip that differs from a record has moved on, so merged. With **no
+record**, **no branch known**, or **no branch ref** to look at, the repository
+proves nothing (`RepoState::Unknown`, `Finding::Unproven`): nothing is
+reopened, and the autopilot notes it once per state. A merged node is never
+called lost; when unsure, it is not. A repository with
 no `origin` proves nothing, so the rule stays silent. Every other git failure
 (a submodule listing, a missing default-branch ref, an unreadable count) is an
 error naming the command, and so is a stale or missing Files location: the

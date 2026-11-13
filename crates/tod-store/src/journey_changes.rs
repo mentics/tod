@@ -71,6 +71,9 @@
 //! - `check_runs` (`crate::check_runs`) — the latest result of each gate check,
 //!   machine-local; its output may hold source text, and the gate's own
 //!   result already journals pass or fail.
+//! - `node_branch_starts` (`crate::branch_starts`) — the commit a node's branch
+//!   was born at, read off a checkout when tod makes it: machine-local derived
+//!   data the lost-work rule reads, not an edit anyone made.
 //! - `gate_criteria` — a global catalog with no `node_id`.
 //! - `incoming_changes` — a queue over changes that are already journaled at
 //!   their source; recording it too would double-count the same edit.

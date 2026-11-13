@@ -94,6 +94,12 @@ pub enum FleetMutation {
     DeleteFilesLocation {
         node_id: String,
     },
+    /// Where a node's branch was born, per repository ([`crate::branch_starts`]).
+    RecordBranchStarts {
+        node_id: String,
+        branch: String,
+        starts: std::collections::BTreeMap<String, String>,
+    },
     /// A node's sandbox proxy holds the user's credentials as of `at` (ms).
     MarkFilesCredsSynced {
         node_id: String,
@@ -303,6 +309,7 @@ impl FleetMutation {
                 | FleetMutation::RecordFilesLocation { .. }
                 | FleetMutation::DeleteFilesLocation { .. }
                 | FleetMutation::MarkFilesCredsSynced { .. }
+                | FleetMutation::RecordBranchStarts { .. }
                 | FleetMutation::UpsertNodeAgent { .. }
                 | FleetMutation::UpdateAgentRunReconnect { .. }
                 | FleetMutation::ClearAgentRunReconnect { .. }
@@ -408,6 +415,9 @@ impl FleetMutation {
             }
             FleetMutation::DeleteFilesLocation { node_id } => {
                 crate::fleet::repos::files_location::FilesLocationRepo::new(conn).delete(node_id)?;
+            }
+            FleetMutation::RecordBranchStarts { node_id, branch, starts } => {
+                crate::branch_starts::record(conn, node_id, branch, starts)?;
             }
             FleetMutation::MarkFilesCredsSynced { node_id, at } => {
                 crate::fleet::repos::files_location::FilesLocationRepo::new(conn).mark_creds_synced(node_id, *at)?;

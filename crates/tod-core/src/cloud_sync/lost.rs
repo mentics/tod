@@ -551,8 +551,16 @@ fn replace_with(
             // back now, not when someone finds it (`crate::lost_work`). A
             // failed look is shown, not dropped.
             match crate::lost_work::reopen_if_lost(fleet, row.node_id) {
-                Ok(true) => tracing::warn!("cloud: node {id}'s new sandbox {name} holds none of its work: the implementation was reopened"),
-                Ok(false) => {}
+                Ok(crate::lost_work::Finding::Lost(_)) => {
+                    tracing::warn!("cloud: node {id}'s new sandbox {name} holds none of its work: the implementation was reopened")
+                }
+                // Not proven either way: nothing is reopened; say so on the node.
+                Ok(crate::lost_work::Finding::Unproven(reasons)) => {
+                    let why = reasons.join("; ");
+                    tracing::warn!("cloud: node {id}'s new sandbox {name}: lost work not proven either way, nothing reopened: {why}");
+                    set_note(&id, Some(format!("Its sandbox {} was replaced by {name}; whether the node's work is on its branch could not be proven either way, so nothing was reopened: {why}", row.sandbox)));
+                }
+                Ok(crate::lost_work::Finding::Kept | crate::lost_work::Finding::NotLooked) => {}
                 Err(err) => {
                     tracing::error!("cloud: looking for lost work in node {id}'s new sandbox {name}: {err:#}");
                     set_note(&id, Some(format!("Its sandbox {} was replaced by {name}, but its work could not be checked: {err:#}", row.sandbox)));

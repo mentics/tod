@@ -29,6 +29,17 @@ fn workspace_is_a_clone(fx: &Fixture) -> PathBuf {
     std::fs::remove_dir_all(&workspace).unwrap();
     git_in(&fx.root, &["clone", "-q", origin.to_str().unwrap(), workspace.to_str().unwrap()]);
     git_in(&workspace, &["checkout", "-q", "-b", "task/x"]);
+    // What making the checkout records: the node's branch, and where it was born.
+    fx.fleet
+        .enqueue(tod_store::fleet::FleetMutation::UpdateTaskBranch { id: fx.node.to_string(), branch: Some("task/x".into()) })
+        .unwrap();
+    let starts = tod_store::fleet::checkout_start::capture(&tod_store::fleet::Workdir::host(&workspace), "task/x").unwrap();
+    assert!(starts.contains_key("."), "{starts:?}");
+    fx.fleet
+        .enqueue(tod_store::fleet::FleetMutation::RecordBranchStarts { node_id: fx.node.to_string(), branch: "task/x".into(), starts })
+        .unwrap();
+    fx.fleet.writer().flush().unwrap();
+    fx.fleet.reload_if_stale().unwrap();
     workspace
 }
 
@@ -102,9 +113,10 @@ fn the_steps_and_verdicts_a_lost_node_had_are_open_work_again() {
     workspace_is_a_clone(&fx);
     in_review_with_done_steps(&fx);
     let cwd = tod_store::fleet::Workdir::host(fx.root.join("workspace"));
-    let repos = crate::lost_work::inspect(&cwd, None, None).unwrap();
+    let starts = fx.fleet.read(|c| tod_store::branch_starts::get(c, &fx.node.to_string(), "task/x")).unwrap();
+    let repos = crate::lost_work::inspect(&cwd, Some("task/x"), &starts).unwrap();
     assert!(crate::lost_work::is_lost(&repos), "{repos:?}");
-    let proof = crate::lost_work::check(&fx.fleet, fx.node, "review").unwrap().expect("lost");
+    let proof = crate::lost_work::check(&fx.fleet, fx.node, "review").unwrap().lost().expect("lost");
     assert_eq!(proof.done_steps, 2);
     crate::lost_work::reopen(&fx.fleet, fx.node, "review", &proof).unwrap();
     assert_eq!(lifecycle::current_state(&fx.fleet, fx.node).unwrap(), "active");
@@ -114,7 +126,7 @@ fn the_steps_and_verdicts_a_lost_node_had_are_open_work_again() {
         .unwrap();
     assert!(statuses.iter().all(|s| s == "ready" || s == "pending"), "{statuses:?}");
     // Nothing more to find once the steps are open.
-    assert!(crate::lost_work::check(&fx.fleet, fx.node, "verifying").unwrap().is_none());
+    assert!(crate::lost_work::check(&fx.fleet, fx.node, "verifying").unwrap().lost().is_none());
 }
 
 #[test]
@@ -125,7 +137,7 @@ fn a_branch_with_commits_of_its_own_is_never_reopened() {
     git_in(&workspace, &["add", "."]);
     git_in(&workspace, &["commit", "-qm", "the node's work"]);
     in_review_with_done_steps(&fx);
-    assert!(crate::lost_work::check(&fx.fleet, fx.node, "review").unwrap().is_none());
+    assert!(crate::lost_work::check(&fx.fleet, fx.node, "review").unwrap().lost().is_none());
     assert_eq!(lifecycle::current_state(&fx.fleet, fx.node).unwrap(), "review");
 }
 
@@ -133,7 +145,7 @@ fn a_branch_with_commits_of_its_own_is_never_reopened() {
 fn a_node_with_no_done_steps_is_not_lost_work() {
     let fx = setup();
     workspace_is_a_clone(&fx);
-    assert!(crate::lost_work::check(&fx.fleet, fx.node, "review").unwrap().is_none());
+    assert!(crate::lost_work::check(&fx.fleet, fx.node, "review").unwrap().lost().is_none());
 }
 
 #[test]
@@ -142,7 +154,7 @@ fn lost_work_is_only_looked_for_where_implementation_is_claimed_done() {
     workspace_is_a_clone(&fx);
     in_review_with_done_steps(&fx);
     for state in ["design", "planning", "active", "merged", "pr_draft"] {
-        assert!(crate::lost_work::check(&fx.fleet, fx.node, state).unwrap().is_none(), "{state}");
+        assert!(crate::lost_work::check(&fx.fleet, fx.node, state).unwrap().lost().is_none(), "{state}");
     }
 }
 
@@ -187,7 +199,7 @@ fn only_the_broken_questions_of_the_checking_agents_are_withdrawn() {
             },
         )
         .unwrap();
-    let proof = crate::lost_work::check(&fx.fleet, fx.node, "review").unwrap().expect("lost");
+    let proof = crate::lost_work::check(&fx.fleet, fx.node, "review").unwrap().lost().expect("lost");
     crate::lost_work::reopen(&fx.fleet, fx.node, "review", &proof).unwrap();
     let pending: Vec<String> = fx
         .fleet
@@ -208,4 +220,35 @@ fn a_stale_files_location_is_an_error_not_silence() {
     // The fixture's workspace is not a repository; remove it so Files is missing.
     std::fs::remove_dir_all(fx.root.join("workspace")).unwrap();
     assert!(crate::lost_work::check(&fx.fleet, fx.node, "review").is_err());
+}
+
+/// A branch fast-forward merged into main and deleted, in a node whose branch
+/// start was never recorded (a node made before tod recorded it): nothing is
+/// proven, so nothing is reopened, and the node's activity says so once.
+#[test]
+fn a_merged_branch_with_no_recorded_start_is_not_proven_lost_and_not_reopened() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    let workspace = workspace_is_a_clone(&fx);
+    let conn = rusqlite::Connection::open(fx.fleet.paths().db()).unwrap();
+    conn.execute("DELETE FROM node_branch_starts", []).unwrap();
+    drop(conn);
+    std::fs::write(workspace.join("work"), "w").unwrap();
+    git_in(&workspace, &["add", "."]);
+    git_in(&workspace, &["commit", "-qm", "the node's work"]);
+    git_in(&workspace, &["checkout", "-q", "main"]);
+    git_in(&workspace, &["merge", "-q", "--ff-only", "task/x"]);
+    git_in(&workspace, &["push", "-q", "origin", "main"]);
+    git_in(&workspace, &["branch", "-q", "-D", "task/x"]);
+    git_in(&workspace, &["fetch", "-q", "--prune", "origin"]);
+    in_review_with_done_steps(&fx);
+    let finding = crate::lost_work::check(&fx.fleet, fx.node, "review").unwrap();
+    assert!(matches!(finding, crate::lost_work::Finding::Unproven(_)), "{finding:?}");
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut pilot = autopilot(&fx, Budget::default());
+    let _ = pilot.run(&fx.fleet, &mut agent).unwrap();
+    assert!(pilot.state().steps.iter().all(|s| s.step != "lost_work"), "{:#?}", pilot.state().steps);
+    assert_ne!(lifecycle::current_state(&fx.fleet, fx.node).unwrap(), "active");
+    let timeline = fx.fleet.read(|c| tod_store::node_timeline::TimelineRepo::new(c).list(fx.node)).unwrap();
+    assert_eq!(timeline.iter().filter(|e| e.title == "Lost work: not proven either way" && e.phase == "review").count(), 1, "{timeline:#?}");
 }

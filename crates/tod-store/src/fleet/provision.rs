@@ -295,6 +295,17 @@ pub fn make_location(
         .directory()
         .ok_or_else(|| anyhow!("made {} but found no directory in it", location.describe()))?;
     let mut warnings = warnings;
+    // Where the node's branch started, before anything is restored into it:
+    // what the lost-work rule tells a stub from merged work by. A failure
+    // leaves no record (the rule then proves nothing) and is shown.
+    match crate::fleet::checkout_start::capture(&dir, &branch) {
+        Ok(starts) if !starts.is_empty() => {
+            fleet.enqueue(FleetMutation::RecordBranchStarts { node_id: node_id.to_string(), branch: branch.clone(), starts })?;
+            fleet.writer().flush()?;
+        }
+        Ok(_) => {}
+        Err(err) => warnings.push(format!("Where the branch started was not recorded, so lost work cannot be told from merged work: {err:#}")),
+    }
     if location.sandbox().is_some() {
         // A sandbox that expired took its uncommitted work with it; the
         // last checkpoint is on the remote (`fleet::checkpoint`).
@@ -2716,6 +2727,9 @@ mod tests {
         assert_eq!(worktree::current_branch(&dir).as_deref(), Some(branch.as_str()));
         // The new branch starts from the latest of origin, not the stale main.
         assert_eq!(dir.git(&["rev-parse", "HEAD"]).unwrap(), latest);
+        // Making it recorded where the branch was born, for the lost-work rule.
+        let starts = store.read(|conn| crate::branch_starts::get(conn, &child, &branch)).unwrap();
+        assert_eq!(starts.get(".").map(String::as_str), Some(latest.as_str()), "{starts:?}");
         let files = store.resolve_files_for_node(&child).unwrap().unwrap();
         assert_eq!(files.branch(), Some(branch.as_str()));
         assert_eq!(files.ready_directory(), Some(dir.clone()));

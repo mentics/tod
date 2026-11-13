@@ -675,6 +675,9 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     // The latest result of each gate check: machine-local, not journaled
     // (`crate::check_runs`).
     crate::check_runs::migrate(conn)?;
+    // Where each node's branch was born, for the lost-work rule: machine-local,
+    // no schema version, not journaled (`crate::branch_starts`).
+    conn.execute_batch(crate::branch_starts::CREATE_TABLE)?;
     // The user's deferrals of nodes: machine-local, not synced, journaled.
     conn.execute_batch(crate::deferrals::CREATE_TABLE)?;
     conn.execute_batch(&crate::journey_changes::deferrals_triggers_sql())?;
