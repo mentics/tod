@@ -365,6 +365,7 @@ fn request(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
             options: tod_core::environment_request::options(),
             evidence: Vec::new(),
             reason: tod_store::decisions::REASON_ACCESS.into(),
+            moves: Vec::new(),
         },
     })?;
     let _ = result;

@@ -26,6 +26,13 @@ decision with the reason `broken` that says what you found (the branch, the
 base, what is missing), and stop; the app reads it, reopens the work if the
 branch proves it lost, and otherwise leaves your question for the user.
 
+When the problem is anything else that only rebuilding fixes (not lost code),
+and you want the user to decide whether to send the task back, offer it as an
+option that carries the move, never as plain words: the app moves the task
+only for an option made with the move (see the `decisions` commands), and
+your session cannot. A plain "send the task back" option leaves the task where
+it is and you asking again.
+
 ## What you were given up front
 
 The context below inlines the task's obligation hierarchy, its plan steps

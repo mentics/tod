@@ -57,6 +57,7 @@ fn ask_broken(fx: &Fixture, protocol: &str) {
                     options: vec!["Fixed: try again".into()],
                     evidence: Vec::new(),
                     reason: tod_store::decisions::REASON_BROKEN.into(),
+                    moves: Vec::new(),
                 },
             },
         )
@@ -165,6 +166,7 @@ fn only_the_broken_questions_of_the_checking_agents_are_withdrawn() {
                     options: vec!["Fixed".into()],
                     evidence: Vec::new(),
                     reason: tod_store::decisions::REASON_BROKEN.into(),
+                    moves: Vec::new(),
                 },
             },
         )

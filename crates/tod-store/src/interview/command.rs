@@ -331,6 +331,11 @@ pub enum InterviewCommand {
     /// Open a node's implementation steps and verdicts again because its
     /// branch holds none of their code (`PlanStepRepo::reopen_lost_work`).
     ReopenLostWork { node_id: Uuid, why: String },
+    /// Open a node's implementation steps and verdicts again because the user
+    /// sent the node back to rebuild them (a decision option that moves the
+    /// node: `tod_core::lifecycle::send_back`). Same effect on the steps as
+    /// `ReopenLostWork` (`PlanStepRepo::reopen_lost_work`).
+    ReopenForRework { node_id: Uuid, why: String },
     /// Withdraw a pending decision that no longer needs an answer
     /// (`DecisionRepo::withdraw`): the app's own, when what it asked about
     /// was settled without the user.
@@ -1171,7 +1176,8 @@ pub fn execute(
                 .reopen_verification(*node_id, why)?;
             Ok(json!({ "steps": steps, "verdicts": verdicts }))
         }
-        InterviewCommand::ReopenLostWork { node_id, why } => {
+        InterviewCommand::ReopenLostWork { node_id, why }
+        | InterviewCommand::ReopenForRework { node_id, why } => {
             let (steps, verdicts) = crate::outline::repos::PlanStepRepo::new(conn)
                 .reopen_lost_work(*node_id, why)?;
             Ok(json!({ "steps": steps, "verdicts": verdicts }))

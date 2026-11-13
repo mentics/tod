@@ -31,6 +31,14 @@ turns, findings, run_state, node_timeline, journey records):
 
 ---
 
+## 2026-11-12: a person's "send the task back" answer moved nothing (ENG-2068, ENG-2287)
+
+- **Seen**: 1 kind, 2 nodes (ENG-2068 in `review`, ENG-2287 in `verifying`), 2026-11-12.
+- **Symptom**: a request offered "Send the task back to active to rebuild the change"; the person picked it; the node stayed in `review` with its steps verified, the agent was only told the answer as text and asked again. A person then moved both nodes by hand with the task panel's state chip.
+- **Cause**: an option was only text. Answering recorded the answer and told the asking agent; nothing moved the node, and the agent has no way to. The lost-work rule (deb5524e, 3ffd4575, 1d6bfb92) closed the one case where the checkout proves the code is gone (and the verify/review prompts stopped offering "send back" there), but any other answer that means "move this node back" still depended on an agent that cannot.
+- **Fix**: an option can carry the move (`tod-cli decisions ask --moves-to <N>:<STATE>`, `decisions.option_moves`, schema v94; only a state earlier than the node's current one and before `pr_review`). Answering it calls one function, `tod_core::lifecycle::send_back` (via `send_back::answer_decision`, the only way `AgentRuns::record_decision_answer` records an answer): it validates, moves the node as the user's own move (same as the state chip, `set_lifecycle_by_user`, which also clears what the states redone certified), reopens the implementation steps and verdicts when the target is `active` or earlier, then records the answer; a move that cannot be made fails the answer with the reason and records nothing. The asking agent is told the app has moved the node. `cli/decisions.md` and the verify and review surfaces tell agents to offer a send-back only as such an option. Tests: `lifecycle::send_back::tests`, `tod_store::decisions` (validation), `tod_cli` doc sync.
+- **Measure**: pending requests whose option text says "send back"/"rework" with no move (should be 0); requests re-asked on the same node within one stay after an answer that was a send-back.
+
 ## 2026-11-12: agent asked the user to install a missing tool
 
 - **Seen**: 1 node (update-db-monitors-to-filter-out-use…), 2026-11-12.

@@ -670,13 +670,13 @@ impl AgentRuns {
             .with_context(|| format!("decision {decision_id} not found"))?;
         let option_index = option.map(|o| o as i64);
 
-        fleet.interview(
-            ACTOR_USER,
-            InterviewCommand::AnswerDecision {
-                decision_id,
-                option: option_index,
-                text: text.clone(),
-            },
+        // An option that sends the node back moves it first (and fails the
+        // answer, recording nothing, when it cannot): `tod_core::lifecycle::send_back`.
+        let answered = tod_core::lifecycle::send_back::answer_decision(
+            fleet,
+            decision_id,
+            option_index,
+            text.clone(),
         )?;
 
         let after = fleet
@@ -706,6 +706,12 @@ impl AgentRuns {
                     tod_core::environment_request::was_provided(&after.decision, option_index),
                 )
             });
+        let moved = answered.moved_to.as_ref().map(|to| {
+            format!(
+                "\n\nThe app has already moved the task back to `{to}` and reopened its \
+                 implementation steps, as the user chose. Do nothing more in this session."
+            )
+        });
         let message = match credential {
             Some(message) => message,
             None => match before.answers.last() {
@@ -726,7 +732,7 @@ impl AgentRuns {
             },
         };
 
-        Ok(Some((conversation_id, message)))
+        Ok(Some((conversation_id, format!("{message}{}", moved.unwrap_or_default()))))
     }
 
     /// Records the user's answer to `decision_id` (append-only: a change of

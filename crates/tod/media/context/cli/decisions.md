@@ -7,7 +7,7 @@ as what a node with nothing on it is for. You only ask; answering is the
 user's.
 
 ```
-tod-cli --data-root <DATA_ROOT> decisions ask  [--node <NODE_UUID>] <QUESTION> [--option <TEXT> (repeatable)] [--evidence <KIND>:<ID> (repeatable)] [--reason <KIND>]
+tod-cli --data-root <DATA_ROOT> decisions ask  [--node <NODE_UUID>] <QUESTION> [--option <TEXT> (repeatable)] [--evidence <KIND>:<ID> (repeatable)] [--reason <KIND>] [--moves-to <N>:<STATE> (repeatable)]
 tod-cli --data-root <DATA_ROOT> decisions list [--node <NODE_UUID>] [--all]
 tod-cli --data-root <DATA_ROOT> decisions show <DECISION_ID>
 ```
@@ -32,6 +32,15 @@ in full or as the 8-character prefix listings show.
 - `--reason`: one of `intent`, `missing_rule`, `conflict`, `access`, `risk`,
   `capability`, `broken`, `other` — defaults to `other` when omitted. See "Asking the
   user" for what each means.
+- `--moves-to <N>:<STATE>`: repeatable. Option N (1-based, as numbered in
+  `--option` order) sends the node back to `STATE` when the user picks it: the
+  app moves the node itself, as the user's own move, and when `STATE` is
+  `active` or earlier it reopens the node's implementation steps and
+  verdicts. An option that offers to send the task back, rework it, or start
+  an earlier state over must carry this: nothing else moves the node, and
+  your session cannot, so a plain option worded that way does nothing. `STATE`
+  must be earlier than the node's current state and before `pr_review`; the
+  ask fails otherwise.
 
 `list` shows a node's pending decisions, oldest first; `--all` also lists
 answered and withdrawn ones. `show` prints one decision and its full answer

@@ -2118,6 +2118,7 @@ impl Autopilot {
                                 options: permission::options(&request.title),
                                 evidence: Vec::new(),
                                 reason: REASON_ACCESS.to_string(),
+                                moves: Vec::new(),
                             },
                         },
                     )

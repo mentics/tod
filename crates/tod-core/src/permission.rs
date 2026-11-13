@@ -200,6 +200,7 @@ mod tests {
                 status: "answered".into(),
                 created_at: 0,
                 reason: "access".into(),
+                moves: vec![],
             },
             answers: vec![DecisionAnswer {
                 id: 1,

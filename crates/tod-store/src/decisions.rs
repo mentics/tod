@@ -65,6 +65,42 @@ pub const DECISION_REASONS: [&str; 8] = [
     REASON_OTHER,
 ];
 
+/// What picking an option does besides telling the agent: the app moves the
+/// node back to the lifecycle state `to`, as the task panel's state chip does
+/// (`tod_core::lifecycle::send_back`). A person answering "send the task back
+/// to active" is deciding to move the node, and no agent has a way to.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OptionMove {
+    /// 1-based, as options are numbered to the user.
+    pub option: i64,
+    /// The lifecycle state the node is sent back to.
+    pub to: String,
+}
+
+/// The first lifecycle state a decision's option may not move a node into:
+/// from here on the work is out on a pull request, and only the node's own
+/// run (or the user's state chip) takes it there.
+pub const FIRST_UNREACHABLE_STATE: &str = "pr_review";
+
+fn state_rank(state: &str) -> Option<usize> {
+    crate::settings::VALID_LIFECYCLE_STATES.iter().position(|s| *s == state)
+}
+
+/// Whether an option may send a node back to `state`: a real lifecycle state
+/// before [`FIRST_UNREACHABLE_STATE`].
+pub fn check_move_target(state: &str) -> Result<()> {
+    let Some(rank) = state_rank(state) else {
+        bail!(
+            "`{state}` is not a lifecycle state (expected one of {})",
+            crate::settings::VALID_LIFECYCLE_STATES.join(", ")
+        );
+    };
+    if rank >= state_rank(FIRST_UNREACHABLE_STATE).unwrap_or(usize::MAX) {
+        bail!("an option cannot move a node into `{state}`: only states before {FIRST_UNREACHABLE_STATE} can be sent back to");
+    }
+    Ok(())
+}
+
 /// A typed pointer to whatever backs up a decision's question: an
 /// obligation, a plan step, a test run, a conversation, a review finding, or
 /// another node.
@@ -90,6 +126,15 @@ pub struct Decision {
     /// Why the agent could not settle this itself, one of
     /// [`DECISION_REASONS`].
     pub reason: String,
+    /// The options that move the node when picked.
+    pub moves: Vec<OptionMove>,
+}
+
+impl Decision {
+    /// The state picking `option` (1-based) moves the node back to, if it does.
+    pub fn move_for(&self, option: i64) -> Option<&str> {
+        self.moves.iter().find(|m| m.option == option).map(|m| m.to.as_str())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,6 +169,12 @@ pub struct NewDecision {
     /// One of [`DECISION_REASONS`]; empty defaults to `other`.
     #[serde(default)]
     pub reason: String,
+    /// Options that send the node back to an earlier state when picked
+    /// (`tod-cli decisions ask --moves-to`). Each `option` names one of
+    /// `options`, each `to` a state before the node's current one and before
+    /// `pr_review`.
+    #[serde(default)]
+    pub moves: Vec<OptionMove>,
 }
 
 pub const CREATE_TABLE: &str = "
@@ -155,7 +206,21 @@ pub const CREATE_TABLE: &str = "
 ";
 
 const DECISION_COLUMNS: &str =
-    "id, node_id, conversation_id, protocol, question, options, evidence, status, created_at, reason";
+    "id, node_id, conversation_id, protocol, question, options, evidence, status, created_at, reason, option_moves";
+
+/// `decisions.option_moves` (an option that sends the node back); a no-op
+/// when the column is already there.
+pub fn add_option_moves(conn: &Connection) -> Result<()> {
+    let has: bool = conn.query_row(
+        "SELECT COUNT(*) > 0 FROM pragma_table_info('decisions') WHERE name = 'option_moves'",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has {
+        conn.execute_batch("ALTER TABLE decisions ADD COLUMN option_moves TEXT NOT NULL DEFAULT '[]';")?;
+    }
+    Ok(())
+}
 
 const ANSWER_COLUMNS: &str = "id, decision_id, option_index, text, actor, answered_at";
 
@@ -204,12 +269,42 @@ impl<'a> DecisionRepo<'a> {
                 DECISION_REASONS.join("|")
             );
         }
+        let mut seen = Vec::new();
+        for m in &decision.moves {
+            if m.option < 1 || m.option > options.len() as i64 {
+                bail!(
+                    "--moves-to names option {}, but the decision has {} option(s)",
+                    m.option,
+                    options.len()
+                );
+            }
+            if seen.contains(&m.option) {
+                bail!("option {} is given two --moves-to states", m.option);
+            }
+            seen.push(m.option);
+            check_move_target(&m.to)?;
+            // Only a move back is a send-back: the node must be past it now.
+            let current: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT state FROM node_lifecycle WHERE node_id = ?1",
+                    params![uuid_to_blob(node_id)],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(current) = current else {
+                bail!("--moves-to: the node has no lifecycle, so there is no earlier state to go back to");
+            };
+            if state_rank(&m.to) >= state_rank(&current) {
+                bail!("--moves-to {}: the node is in `{current}`, which is not later than `{}`", m.to, m.to);
+            }
+        }
         let id = Uuid::new_v4();
         let now = now_ms();
         self.conn.execute(
             "INSERT INTO decisions
-             (id, node_id, conversation_id, protocol, question, options, evidence, status, created_at, reason)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?9)",
+             (id, node_id, conversation_id, protocol, question, options, evidence, status, created_at, reason, option_moves)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?9, ?10)",
             params![
                 uuid_to_blob(id),
                 uuid_to_blob(node_id),
@@ -220,6 +315,7 @@ impl<'a> DecisionRepo<'a> {
                 serde_json::to_string(&decision.evidence)?,
                 now,
                 reason,
+                serde_json::to_string(&decision.moves)?,
             ],
         )?;
         self.get(id)?.context("decision vanished after insert")
@@ -414,6 +510,7 @@ fn map_decision(row: &rusqlite::Row<'_>) -> rusqlite::Result<Decision> {
         status: row.get(7)?,
         created_at: row.get(8)?,
         reason: row.get(9)?,
+        moves: serde_json::from_str(&row.get::<_, String>(10)?).unwrap_or_default(),
     })
 }
 
@@ -586,6 +683,26 @@ mod tests {
         assert_eq!(with_answers.answers[1].text.as_deref(), Some("changed my mind"));
         // Still answered, not reset.
         assert_eq!(repo.get(d.id).unwrap().unwrap().status, DECISION_ANSWERED);
+    }
+
+    #[test]
+    fn an_option_move_targets_only_states_before_pr_review() {
+        for ok in ["proposed", "design", "planning", "ready", "active", "verifying", "review", "pr", "pr_draft"] {
+            check_move_target(ok).unwrap();
+        }
+        for bad in ["pr_review", "approved", "merged", "released", "learn", "done", "nope", ""] {
+            assert!(check_move_target(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_move_needs_a_lifecycle_to_go_back_in() {
+        let fx = setup();
+        let repo = DecisionRepo::new(&fx.conn);
+        let mut d = decision("Back?", &["Send it back"]);
+        d.moves = vec![OptionMove { option: 1, to: "active".into() }];
+        // The node has no lifecycle state here.
+        assert!(repo.create(fx.node, None, None, &d).is_err());
     }
 
     #[test]

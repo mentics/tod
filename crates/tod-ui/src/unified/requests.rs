@@ -582,7 +582,10 @@ impl Requests {
                 })
                 .collect(),
             focused: None,
-            notices: vec![decision.question.clone()],
+            // An option that moves the node is part of what the user saw.
+            notices: std::iter::once(decision.question.clone())
+                .chain(decision.moves.iter().map(|m| format!("option {} sends the task back to {}", m.option, m.to)))
+                .collect(),
         }
     }
 

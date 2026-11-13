@@ -13,7 +13,7 @@ use crate::args::Args;
 use tod_core::conversation::implement::{IMPLEMENT_CONVERSATION_ENV, IMPLEMENT_NODE_ENV};
 use tod_store::conversation::ConversationRepo;
 use tod_store::decisions::{
-    DECISION_REASONS, Decision, DecisionRepo, EVIDENCE_KINDS, EvidenceRef, NewDecision,
+    DECISION_REASONS, Decision, DecisionRepo, EVIDENCE_KINDS, EvidenceRef, NewDecision, OptionMove,
 };
 use tod_store::interview::{InterviewCommand, InterviewRepo, short_id};
 use uuid::Uuid;
@@ -26,7 +26,7 @@ Inside a conversation --node defaults to the node it is about, and asks are
 filed under that conversation and its protocol.
 
 COMMANDS:
-    ask   [--node <UUID>] <QUESTION> [--option <TEXT> (repeatable)] [--evidence <KIND>:<ID> (repeatable)] [--reason <KIND>]
+    ask   [--node <UUID>] <QUESTION> [--option <TEXT> (repeatable)] [--evidence <KIND>:<ID> (repeatable)] [--reason <KIND>] [--moves-to <N>:<STATE> (repeatable)]
     list  [--node <UUID>] [--all]
     show  <ID>
 
@@ -36,7 +36,10 @@ none asks for a free-text answer), any --evidence links the user should be able 
 answering, each `kind:id` (an obligation or plan step may be given as its 8-character prefix) with kind one of: obligation, plan_step, test_run,
 conversation, finding, node, and --reason, one of:
 intent, missing_rule, conflict, access, risk, capability, broken, other (defaults to
-other when omitted).
+other when omitted). --moves-to makes option N (1-based) send the node back to
+STATE when the user picks it: the app moves the node itself, as the user's own
+move, and reopens its implementation steps when STATE is active or earlier. STATE
+must be before the node's current state and before pr_review.
 `list` shows a node's pending decisions, oldest first; --all includes
 answered and withdrawn ones too.
 `show` prints one decision and its full answer log, oldest first.
@@ -112,9 +115,24 @@ pub(crate) fn report_broken(inv: &Invocation, what: &str) -> anyhow::Result<bool
             options: vec!["Fixed, try again".to_string(), "Carry on without it".to_string()],
             evidence: Vec::new(),
             reason: tod_store::decisions::REASON_BROKEN.to_string(),
+            moves: Vec::new(),
         },
     })?;
     Ok(true)
+}
+
+/// `--moves-to <N>:<STATE>`: option N (1-based) sends the node back to STATE.
+fn parse_move(raw: &str) -> anyhow::Result<OptionMove> {
+    let (option, to) = raw
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("--moves-to must be `<option number>:<state>` (got `{raw}`)"))?;
+    let option: i64 = option
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("--moves-to `{raw}`: `{option}` is not an option number"))?;
+    let to = to.trim();
+    tod_store::decisions::check_move_target(to).map_err(|err| anyhow::anyhow!("--moves-to `{raw}`: {err:#}"))?;
+    Ok(OptionMove { option, to: to.to_string() })
 }
 
 fn parse_evidence(inv: &Invocation, raw: &str) -> anyhow::Result<EvidenceRef> {
@@ -164,6 +182,11 @@ fn ask(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
         }
         None => String::new(),
     };
+    let moves = args
+        .get_all("--moves-to")
+        .iter()
+        .map(|raw| parse_move(raw))
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let (conversation_id, mut protocol) = asking_conversation(inv)?;
     // The orchestrator filing one of the app's own stop questions.
     if let Ok(kind) = std::env::var(tod_core::stop_questions::KIND_ENV)
@@ -180,6 +203,7 @@ fn ask(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
             options,
             evidence,
             reason,
+            moves,
         },
     })?;
     let id = result
@@ -204,6 +228,7 @@ fn decision_json(d: &Decision) -> serde_json::Value {
         "evidence": d.evidence.iter().map(|e| serde_json::json!({"kind": e.kind, "id": e.id.to_string()})).collect::<Vec<_>>(),
         "status": d.status,
         "reason": d.reason,
+        "moves": d.moves.iter().map(|m| serde_json::json!({"option": m.option, "to": m.to})).collect::<Vec<_>>(),
     })
 }
 
@@ -214,7 +239,10 @@ fn decision_line(d: &Decision) -> String {
         d.options
             .iter()
             .enumerate()
-            .map(|(i, o)| format!("{}. {o}", i + 1))
+            .map(|(i, o)| match d.move_for(i as i64 + 1) {
+                Some(to) => format!("{}. {o} (moves the node back to {to})", i + 1),
+                None => format!("{}. {o}", i + 1),
+            })
             .collect::<Vec<_>>()
             .join(" | ")
     };
