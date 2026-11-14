@@ -826,4 +826,22 @@ mod tests {
         ));
         assert!(matches!(decide(&fx, false, 1, false), Next::Done(Stop::NoProgress)));
     }
+
+    /// ENG-3129: the agent started a long run, ended its first turn saying it
+    /// was waiting, and the loop stopped as "no progress" with nothing
+    /// recorded. A quiet first turn continues; a quiet continuation stops.
+    #[test]
+    fn a_first_turn_that_only_waited_continues_and_a_second_one_stops() {
+        let fx = planned(&[STATUS_IMPLEMENTED]);
+        assert!(matches!(decide(&fx, false, 0, false), Next::Continue { .. }));
+        assert!(matches!(decide(&fx, false, 1, false), Next::Done(Stop::NoProgress)));
+    }
+
+    /// A step of a later phase (`merged`) is not owed by verification.
+    #[test]
+    fn a_post_merge_step_is_not_owed_by_verification() {
+        use tod_store::outline::repos::plan_steps::due_by;
+        assert!(!due_by("merged", VERIFYING));
+        assert!(due_by("verifying", VERIFYING));
+    }
 }

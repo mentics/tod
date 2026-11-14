@@ -878,6 +878,7 @@ impl ConversationDriver {
             events.push(ConversationEvent::Notice(notice));
         }
         let report = fleet.read(|conn| ConversationRepo::new(conn).report_since(id, turn_seq))?;
+        let mut quiet_turn = false;
         let next = {
             let env = self.env(fleet, id);
             let after = match self.protocol.progress(&env) {
@@ -895,6 +896,7 @@ impl ConversationDriver {
                 // Nothing to compare: never stop the loop for it.
                 _ => true,
             };
+            quiet_turn = !progressed;
             self.protocol.next(&TurnContext {
                 env: &env,
                 report: report.as_ref(),
@@ -938,6 +940,11 @@ impl ConversationDriver {
             }
             Next::Continue { message, .. } => {
                 self.continuations += 1;
+                let message = if quiet_turn {
+                    format!("{}{message}", super::protocol::QUIET_TURN_NOTE)
+                } else {
+                    message
+                };
                 self.append(fleet, id, TurnRole::Continuation, &message)?;
                 self.resend(fleet, agent, id, message)?;
                 events.push(ConversationEvent::Continued);

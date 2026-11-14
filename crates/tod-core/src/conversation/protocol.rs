@@ -105,11 +105,26 @@ pub fn cap_or_stall(turn: &TurnContext<'_>) -> Option<Next> {
     if turn.continuations >= CONTINUATION_CAP {
         return Some(Next::Done(Stop::ContinuationCap));
     }
-    if !turn.progressed {
+    // The first turn after a user message or a fresh start changing nothing
+    // is not a stall: the agent may have started a run in the background and
+    // ended its turn waiting on it. The driver sends it [`QUIET_TURN_NOTE`]
+    // with the protocol's own continuation; only a continuation that changes
+    // nothing stops the loop.
+    if !turn.progressed && turn.continuations > 0 {
         return Some(Next::Done(Stop::NoProgress));
     }
     None
 }
+
+/// Put ahead of a loop's continuation when the turn it follows changed
+/// nothing the protocol tracks (see [`cap_or_stall`]). Nothing is parsed from
+/// the reply: whatever the agent said, it is told to finish its wait in the
+/// turn and record the result.
+pub const QUIET_TURN_NOTE: &str = "Your last turn ended without recording anything. If you were waiting on a run \
+you started (a test suite, a build, a workflow, anything in the background), do not end a turn while you wait: \
+wait for it inside this turn (run it in the foreground, or poll it until it finishes), then record the results \
+with `tod-cli`. Nothing continues on its own after you stop; a turn that ends while waiting hands the work back \
+unfinished.\n\n";
 
 /// Something the user should hear about when a run ends.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,8 +141,9 @@ pub struct TurnContext<'a> {
     pub report: Option<&'a Value>,
     /// Continuations already sent for the user message being answered.
     pub continuations: u32,
-    /// Whether [`Protocol::progress`] changed over this turn. Always true for
-    /// the first turn after a user message, which has nothing to compare to.
+    /// Whether [`Protocol::progress`] changed over this turn (true when the
+    /// protocol does not track progress). A quiet first turn is not a stall:
+    /// see [`cap_or_stall`].
     pub progressed: bool,
 }
 
