@@ -241,7 +241,7 @@ mod tests {
     /// A workspace with one submodule (`kb`), both cloned from bare remotes
     /// and on the node's branch. Returns (checkout, workspace remote, kb remote).
     fn fixture() -> (PathBuf, PathBuf, PathBuf) {
-        let root = std::env::temp_dir().join(format!("tod-sup-git-{}", std::process::id()))
+        let root = tod_test_util::scratch_dir(format!("tod-sup-git-{}", std::process::id()))
             .join(format!("{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
         std::fs::create_dir_all(&root).unwrap();
         let (sub_remote, ws_remote) = (root.join("kb.git"), root.join("ws.git"));

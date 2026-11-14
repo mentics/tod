@@ -23,7 +23,7 @@ mod tests {
     const COPY_EVERY: usize = 10;
 
     fn build_dataset() -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!("tod-gen-bench-{}", Uuid::new_v4()));
+        let root = tod_test_util::scratch_dir(format!("tod-gen-bench-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let db_path = root.join("tod.db");
         let conn = open_writer_connection(&db_path).unwrap();

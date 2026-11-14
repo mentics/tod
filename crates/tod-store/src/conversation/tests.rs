@@ -33,7 +33,7 @@ impl Drop for Fx {
 }
 
 fn setup() -> Fx {
-    let dir = std::env::temp_dir().join(format!("tod-conversation-{}", Uuid::new_v4()));
+    let dir = tod_test_util::scratch_dir(format!("tod-conversation-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     let conn = schema::open_writer_connection(&dir.join("tod.db")).unwrap();
     let list = ListRepo::new(&conn).create("t", "T").unwrap().id;
@@ -1647,7 +1647,7 @@ fn turns_range_returns_the_inclusive_seq_range() {
 fn a_user_turn_keeps_its_attached_images() {
     let fx = setup();
     let repo = ConversationRepo::new(&fx.conn);
-    let root = std::env::temp_dir().join(format!("tod-attachments-{}", Uuid::new_v4()));
+    let root = tod_test_util::scratch_dir(format!("tod-attachments-{}", Uuid::new_v4()));
     let image = TurnAttachment::save(&root, fx.conv, "image/png", b"png bytes").unwrap();
     assert!(image.file.starts_with(&format!("conversation-attachments/{}/", fx.conv)));
     assert!(image.file.ends_with(".png"));
@@ -1672,7 +1672,7 @@ fn a_user_turn_keeps_its_attached_images() {
 
 #[test]
 fn the_v33_to_v34_migration_runs_twice_cleanly() {
-    let dir = std::env::temp_dir().join(format!("tod-conversation-mig-{}", Uuid::new_v4()));
+    let dir = tod_test_util::scratch_dir(format!("tod-conversation-mig-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("tod.db");
     for _ in 0..2 {
@@ -1815,7 +1815,7 @@ fn obligation_body(snapshot: &Option<EntitySnapshot>) -> Option<&str> {
 #[test]
 fn direct_obligation_edits_are_recorded_and_ctrl_z_reverses_them() {
     use crate::fleet::store::FleetStore;
-    let root = std::env::temp_dir().join(format!("tod-direct-actions-{}", Uuid::new_v4()));
+    let root = tod_test_util::scratch_dir(format!("tod-direct-actions-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&root).unwrap();
     let store = FleetStore::open(&root).unwrap();
     store

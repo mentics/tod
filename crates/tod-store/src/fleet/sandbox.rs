@@ -1348,7 +1348,7 @@ mod tests {
 
     #[test]
     fn a_creation_that_takes_minutes_does_not_put_back_a_golden_changed_meanwhile() {
-        let root = std::env::temp_dir().join(format!("tod-sbx-race-{}", uuid::Uuid::new_v4()));
+        let root = tod_test_util::scratch_dir(format!("tod-sbx-race-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let mut seed = Sandboxes::load(&root).unwrap();
         seed.config.blaxel = Some(Account::new("w"));
@@ -1374,7 +1374,7 @@ mod tests {
 
     #[test]
     fn a_forgotten_sandbox_leaves_the_config() {
-        let root = std::env::temp_dir().join(format!("tod-sbx-forget-{}", uuid::Uuid::new_v4()));
+        let root = tod_test_util::scratch_dir(format!("tod-sbx-forget-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let mut sandboxes = Sandboxes::load(&root).unwrap();
         for name in ["keep", "node-x"] {
@@ -1395,7 +1395,7 @@ mod tests {
 
     #[test]
     fn command_redirects_round_trip_and_say_when_they_changed() {
-        let root = std::env::temp_dir().join(format!("tod-redirects-{}", std::process::id()));
+        let root = tod_test_util::scratch_dir(format!("tod-redirects-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         // Nothing to clear without an account; a redirect needs one.
         assert!(!set_command_redirects(&root, "").unwrap());
@@ -1413,7 +1413,7 @@ mod tests {
 
     #[test]
     fn account_settings_round_trip() {
-        let root = std::env::temp_dir().join(format!("tod-sbx-acct-{}", std::process::id()));
+        let root = tod_test_util::scratch_dir(format!("tod-sbx-acct-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         assert_eq!(account_settings(&root), (String::new(), config::DEFAULT_IMAGE.to_string()));
         assert!(Sandboxes::load(&root).unwrap().account().is_err());

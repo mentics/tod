@@ -291,7 +291,7 @@ mod tests {
     struct TmpDir(std::path::PathBuf);
     impl TmpDir {
         fn new() -> Self {
-            let p = std::env::temp_dir().join(format!("tod-waits-test-{}", Uuid::new_v4()));
+            let p = tod_test_util::scratch_dir(format!("tod-waits-test-{}", Uuid::new_v4()));
             std::fs::create_dir_all(&p).unwrap();
             Self(p)
         }

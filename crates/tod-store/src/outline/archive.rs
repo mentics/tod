@@ -990,7 +990,7 @@ mod tests {
     use crate::outline::types::OutlineEntry;
 
     fn temp_conn() -> (std::path::PathBuf, Connection) {
-        let dir = std::env::temp_dir().join(format!("tod-archive-{}", Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-archive-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("tod.db");
         let conn = crate::fleet::schema::open_writer_connection(&path).unwrap();

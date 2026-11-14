@@ -168,7 +168,7 @@ mod tests {
     use crate::outline::repos::NodeRepo;
 
     fn setup() -> (std::path::PathBuf, Connection, Uuid) {
-        let dir = std::env::temp_dir().join(format!("tod-node-problems-{}", Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-node-problems-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let conn = schema::open_writer_connection(&dir.join("tod.db")).unwrap();
         let node = Uuid::new_v4();

@@ -4236,7 +4236,7 @@ mod tests {
     use std::fs;
 
     fn temp_db() -> (std::path::PathBuf, Connection) {
-        let dir = std::env::temp_dir().join(format!("tod-fleet-schema-{}", uuid::Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-fleet-schema-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("tod.db");
         let conn = open_writer_connection(&path).unwrap();
@@ -5338,7 +5338,7 @@ mod plan_step_migration_tests {
 
     fn temp_db() -> (std::path::PathBuf, Connection) {
         let dir =
-            std::env::temp_dir().join(format!("tod-plan-step-schema-{}", uuid::Uuid::new_v4()));
+            tod_test_util::scratch_dir(format!("tod-plan-step-schema-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("tod.db");
         let conn = open_writer_connection(&path).unwrap();
@@ -5883,7 +5883,7 @@ mod reclaim_tests {
 
     #[test]
     fn free_space_is_vacuumed_only_past_the_threshold() {
-        let dir = std::env::temp_dir().join(format!("tod-reclaim-{}", uuid::Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-reclaim-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let db = dir.join("t.db");
         let conn = Connection::open(&db).unwrap();
@@ -5914,7 +5914,7 @@ mod node_worked_migration_tests {
 
     #[test]
     fn an_existing_database_gets_node_worked_and_node_branch_starts() {
-        let dir = std::env::temp_dir().join(format!("tod-node-worked-{}", uuid::Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-node-worked-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let conn = open_writer_connection(&dir.join("tod.db")).unwrap();
         conn.execute_batch("DROP TABLE node_worked; DROP TABLE node_branch_starts;").unwrap();

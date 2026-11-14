@@ -114,7 +114,7 @@ mod tests {
 
     #[test]
     fn routes_round_trip_through_their_file() {
-        let dir = std::env::temp_dir().join(format!("tod-routes-{}", uuid::Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-routes-{}", uuid::Uuid::new_v4()));
         assert_eq!(GithubRoutes::load(&dir).unwrap(), GithubRoutes::default());
         let r = routes(&[("acme/*", "gh_acme")]);
         r.save(&dir).unwrap();

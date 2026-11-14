@@ -52,7 +52,7 @@ fn ask(conn: &rusqlite::Connection, node: Uuid, protocol: Option<&str>) -> Uuid 
 
 #[test]
 fn an_answered_stop_question_pokes_its_node() {
-    let base: PathBuf = std::env::temp_dir().join(format!("tod-orch-answers-{}", Uuid::new_v4()));
+    let base: PathBuf = tod_test_util::scratch_dir(format!("tod-orch-answers-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&base).unwrap();
     let app = base.join("app");
     let fleet = FleetStore::open(&app).unwrap();

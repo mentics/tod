@@ -95,7 +95,7 @@ mod tests {
     use crate::fleet::schema;
 
     fn temp_conn() -> (std::path::PathBuf, Connection) {
-        let dir = std::env::temp_dir().join(format!("tod-fleet-explore-{}", uuid::Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-fleet-explore-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("tod.db");
         let conn = schema::open_writer_connection(&path).unwrap();

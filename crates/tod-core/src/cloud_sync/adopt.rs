@@ -495,7 +495,7 @@ mod tests {
 
     /// A node whose Files run in a cloud sandbox and that has no location.
     fn fx() -> Fx {
-        let root = std::env::temp_dir().join(format!("tod-adopt-{}", Uuid::new_v4()));
+        let root = tod_test_util::scratch_dir(format!("tod-adopt-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let fleet = FleetStore::open(&root).unwrap();
         fleet.enqueue_outline(OutlineMutation::CreateList { slug: "t".into(), title: "T".into() }).unwrap();

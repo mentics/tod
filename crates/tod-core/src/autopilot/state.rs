@@ -319,7 +319,7 @@ mod tests {
 
     #[test]
     fn fresh_session_request_is_saved_and_old_files_load() {
-        let dir = std::env::temp_dir().join(format!("tod-fresh-{}", Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-fresh-{}", Uuid::new_v4()));
         let node = Uuid::new_v4();
         assert!(!AutopilotState::load(&dir, node).unwrap().fresh_session);
         AutopilotState::request_fresh_session(&dir, node).unwrap();

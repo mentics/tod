@@ -64,7 +64,7 @@ struct Rig {
 }
 
 fn rig(lifecycle: &str, spec: &str) -> Rig {
-    let base: PathBuf = std::env::temp_dir().join(format!("tod-orch-gate-{}", Uuid::new_v4()));
+    let base: PathBuf = tod_test_util::scratch_dir(format!("tod-orch-gate-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&base).unwrap();
     let app = base.join("app");
     let fleet = FleetStore::open(&app).unwrap();

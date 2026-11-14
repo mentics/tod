@@ -1,0 +1,9 @@
+[package]
+name = "tod-test-util"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Test-only leaf crate (a dev-dependency of the others): no `tod-*` dependencies.
+[dependencies]
+tempfile = "3.10"

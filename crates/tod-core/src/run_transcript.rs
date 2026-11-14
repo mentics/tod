@@ -359,7 +359,7 @@ mod tests {
 
     /// A store with one node, and a Claude config dir holding session `s1`.
     fn setup() -> (std::path::PathBuf, Arc<FleetStore>, String) {
-        let root = std::env::temp_dir().join(format!("tod-run-transcript-{}", uuid::Uuid::new_v4()));
+        let root = tod_test_util::scratch_dir(format!("tod-run-transcript-{}", uuid::Uuid::new_v4()));
         let project = root.join("claude").join("projects").join("C--repo");
         std::fs::create_dir_all(&project).unwrap();
         std::fs::write(

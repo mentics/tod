@@ -1942,7 +1942,7 @@ mod tests {
 
         use crate::paths::{clear_data_root_override, set_data_root};
         let repo = Workdir::container(&container, &dir);
-        let data_root = std::env::temp_dir().join(format!("tod-th-data-{}", uuid::Uuid::new_v4()));
+        let data_root = tod_test_util::scratch_dir(format!("tod-th-data-{}", uuid::Uuid::new_v4()));
         set_data_root(data_root.clone());
         let paths = TodPaths::discover().unwrap();
         clear_data_root_override();
@@ -1981,7 +1981,7 @@ git -c user.name=t -c user.email=t@t commit -q -m 'add sub'"#;
         use crate::paths::{clear_data_root_override, set_data_root};
         let repo = Workdir::container(&container, format!("{dir}/main"));
         assert!(has_gitmodules(&repo));
-        let data_root = std::env::temp_dir().join(format!("tod-th-data-{}", uuid::Uuid::new_v4()));
+        let data_root = tod_test_util::scratch_dir(format!("tod-th-data-{}", uuid::Uuid::new_v4()));
         set_data_root(data_root.clone());
         let paths = TodPaths::discover().unwrap();
         clear_data_root_override();
@@ -2172,7 +2172,7 @@ git -c user.name=t -c user.email=t@t commit -q -m 'add sub'"#;
     /// branch, which every fork of a golden does: it now switches to it.
     #[test]
     fn the_quick_branching_script_handles_a_submodule_that_already_has_the_branch() {
-        let dir = std::env::temp_dir().join(format!("tod-quick-branch-{}", uuid::Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-quick-branch-{}", uuid::Uuid::new_v4()));
         let sub = dir.join("sub");
         fs::create_dir_all(&sub).unwrap();
         let git = |cwd: &std::path::Path, args: &[&str]| {

@@ -931,7 +931,7 @@ missing"),
     fn db_is_mentioned_only_when_databases_are_declared() {
         let media = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("tod").join("media");
         let paths = MediaPaths::from_media_root(media).unwrap();
-        let dir = std::env::temp_dir().join(format!("tod-recipe-db-{}", std::process::id()));
+        let dir = tod_test_util::scratch_dir(format!("tod-recipe-db-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let build = |root: &std::path::Path| {
             let ctx = DynamicContext { data_root: Some(root), ..Default::default() };

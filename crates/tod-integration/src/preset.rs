@@ -107,18 +107,10 @@ fn write_presets(data_root: &Path, presets: &[FilterPreset]) -> Result<(), Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     use std::path::PathBuf;
 
     fn temp_dir() -> PathBuf {
-        use std::time::SystemTime;
-        let nanos = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("tod-preset-test-{}", nanos));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+        tod_test_util::scratch_dir("tod-preset-test-")
     }
 
     #[test]

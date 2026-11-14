@@ -562,7 +562,7 @@ mod tests {
 
     #[test]
     fn tail_starts_at_the_end_then_reads_only_new_whole_lines() {
-        let dir = std::env::temp_dir().join(format!("tod-tail-{}", std::process::id()));
+        let dir = tod_test_util::scratch_dir(format!("tod-tail-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("agentd.log");
         std::fs::write(&path, "t ERROR old: before\n").unwrap();
@@ -633,7 +633,7 @@ mod tests {
 
     #[test]
     fn a_tod_cli_problem_reaches_the_buffer_with_its_source() {
-        let root = std::env::temp_dir().join(format!("tod-cli-problem-{}", std::process::id()));
+        let root = tod_test_util::scratch_dir(format!("tod-cli-problem-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let mut tail = tod_problems::Tail::new(&root);
         drain_problems(&mut tail).unwrap();

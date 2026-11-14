@@ -916,7 +916,7 @@ mod tests {
 
     impl Fs {
         fn new(tag: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!("tod-session-log-{tag}-{}", uuid::Uuid::new_v4()));
+            let dir = tod_test_util::scratch_dir(format!("tod-session-log-{tag}-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&dir).unwrap();
             Self(dir)
         }
@@ -1048,7 +1048,7 @@ mod transfer_tests {
 
     #[test]
     fn a_session_moves_under_the_target_working_directory() {
-        let dir = std::env::temp_dir().join(format!("tod-session-transfer-{}", std::process::id()));
+        let dir = tod_test_util::scratch_dir(format!("tod-session-transfer-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let from = HostRemote::at(dir.join("a"));
         let to = HostRemote::at(dir.join("b"));
@@ -1077,7 +1077,7 @@ mod transfer_tests {
 
     #[test]
     fn keep_session_copies_only_that_session_and_only_whole_lines() {
-        let dir = std::env::temp_dir().join(format!("tod-session-keep-{}", std::process::id()));
+        let dir = tod_test_util::scratch_dir(format!("tod-session-keep-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let host = HostRemote::at(dir.join("claude"));
         let id = "cccccccc-2222-3333-4444-555555555555";
@@ -1102,7 +1102,7 @@ mod transfer_tests {
 
     #[test]
     fn ensure_session_copies_only_what_the_target_lacks() {
-        let dir = std::env::temp_dir().join(format!("tod-session-ensure-{}", std::process::id()));
+        let dir = tod_test_util::scratch_dir(format!("tod-session-ensure-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let from = HostRemote::at(dir.join("a"));
         let to = HostRemote::at(dir.join("b"));
@@ -1165,7 +1165,7 @@ mod transfer_tests {
         if !probe.status.success() {
             return;
         }
-        let dir = std::env::temp_dir().join(format!("tod-session-sh-{}", std::process::id()));
+        let dir = tod_test_util::scratch_dir(format!("tod-session-sh-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let claude = dir.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
@@ -1193,7 +1193,7 @@ mod transfer_tests {
         if !probe.status.success() {
             return;
         }
-        let dir = std::env::temp_dir().join(format!("tod-runner-state-{}", std::process::id()));
+        let dir = tod_test_util::scratch_dir(format!("tod-runner-state-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let (app, sandbox) = (dir.join("app"), dir.join("sandbox"));
         std::fs::create_dir_all(&app).unwrap();
@@ -1235,7 +1235,7 @@ mod transfer_tests {
     /// host → place under the place's own project name, and comes back
     /// unchanged. `place` is the remote under test.
     fn round_trip_through(place: &dyn Remote, tag: &str) {
-        let dir = std::env::temp_dir().join(format!("tod-session-{tag}-{}", std::process::id()));
+        let dir = tod_test_util::scratch_dir(format!("tod-session-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let host = HostRemote::at(&dir);
         let id = format!("cccccccc-{}-3333-4444-555555555555", &format!("{:04x}", std::process::id() & 0xffff));
@@ -1294,7 +1294,7 @@ mod transfer_tests {
     /// the mirror. The session must never lose a turn on any hop, in
     /// particular a return to a place it already visited.
     fn run_move_matrix(host: &dyn Remote, others: &[(&str, &dyn Remote, &str)]) {
-        let dir = std::env::temp_dir().join(format!("tod-session-matrix-{}", uuid::Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-session-matrix-{}", uuid::Uuid::new_v4()));
         let mirror_dir = local_dir(&dir, "node");
         let session = "dddddddd-2222-3333-4444-555555555555";
         let host_project = "-on-host";
@@ -1330,7 +1330,7 @@ mod transfer_tests {
 
     #[test]
     fn a_session_loses_no_turn_moving_between_places_and_back() {
-        let dir = std::env::temp_dir().join(format!("tod-session-matrix-places-{}", uuid::Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-session-matrix-places-{}", uuid::Uuid::new_v4()));
         let host = HostRemote::at(dir.join("host"));
         let a = HostRemote::at(dir.join("a"));
         let b = HostRemote::at(dir.join("b"));
@@ -1349,7 +1349,7 @@ mod transfer_tests {
             return;
         };
         crate::fleet::sandbox::set_data_root(&std::fs::canonicalize(root).unwrap());
-        let dir = std::env::temp_dir().join(format!("tod-session-matrix-real-{}", uuid::Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-session-matrix-real-{}", uuid::Uuid::new_v4()));
         let host = HostRemote::at(&dir);
         let c = ContainerRemote::new(&container).unwrap();
         let s = SandboxRemote::new(&name);
@@ -1387,7 +1387,7 @@ mod transfer_tests {
         run_there: &dyn Fn(&[String]) -> Result<std::process::Output>,
         token: &str,
     ) {
-        let dir = std::env::temp_dir().join(format!("tod-real-claude-{}", uuid::Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-real-claude-{}", uuid::Uuid::new_v4()));
         let work = dir.join("work");
         std::fs::create_dir_all(&work).unwrap();
         let cfg = dir.join("cfg");

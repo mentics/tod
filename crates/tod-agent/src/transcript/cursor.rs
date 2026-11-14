@@ -501,7 +501,7 @@ mod tests {
 
     #[test]
     fn a_session_store_reads_as_turns() {
-        let dir = std::env::temp_dir().join(format!("tod-cursor-transcript-{}", uuid::Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-cursor-transcript-{}", uuid::Uuid::new_v4()));
         let store = Builder::new(&dir.join("acp-sessions").join("s1").join("store.db"));
 
         let call = serde_json::json!({
@@ -576,7 +576,7 @@ mod tests {
 
     #[test]
     fn what_the_reader_does_not_know_is_skipped_and_reported() {
-        let dir = std::env::temp_dir().join(format!("tod-cursor-transcript-{}", uuid::Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-cursor-transcript-{}", uuid::Uuid::new_v4()));
         let store = Builder::new(&dir.join("acp-sessions").join("s1").join("store.db"));
 
         let message = serde_json::json!({
@@ -629,7 +629,7 @@ mod tests {
 
     #[test]
     fn a_session_never_prompted_reads_as_absent() {
-        let dir = std::env::temp_dir().join(format!("tod-cursor-transcript-{}", uuid::Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-cursor-transcript-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(dir.join("acp-sessions").join("s1")).unwrap();
         std::fs::write(dir.join("acp-sessions").join("s1").join("meta.json"), "{}").unwrap();
         assert!(read(&dir, "s1").unwrap().is_none());

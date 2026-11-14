@@ -145,7 +145,7 @@ mod tests {
     use std::process::Command;
 
     fn scratch() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("tod-repos-{}", uuid::Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-repos-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }

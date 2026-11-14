@@ -16,9 +16,7 @@ pub struct ScaleSnapshot {
 
 /// Create a unique ephemeral fleet storage root.
 pub fn temp_fleet_root() -> PathBuf {
-    let root = std::env::temp_dir().join(format!("tod-fleet-verify-{}", Uuid::new_v4()));
-    fs::create_dir_all(&root).unwrap();
-    root
+    tod_test_util::scratch_dir("tod-fleet-verify-")
 }
 
 /// Remove a temp fleet root (best-effort).
@@ -94,32 +92,8 @@ pub fn insert_scale_data(conn: &Connection) -> ScaleSnapshot {
     }
 }
 
-thread_local! {
-    static SCRATCH: std::cell::RefCell<Vec<tempfile::TempDir>> = const { std::cell::RefCell::new(Vec::new()) };
-}
-
 /// A fresh directory under the system temp dir that is removed when the
-/// calling test's thread ends (libtest runs each test on its own thread), so
-/// a test that returns a plain path still leaves nothing behind, even when it
-/// panics.
+/// calling test's thread ends, even when it panics (see `tod_test_util`).
 pub fn scratch_dir(prefix: &str) -> PathBuf {
-    let dir = tempfile::Builder::new().prefix(prefix).tempdir().unwrap();
-    let path = dir.path().to_path_buf();
-    SCRATCH.with(|s| s.borrow_mut().push(dir));
-    path
-}
-
-#[cfg(test)]
-mod scratch_tests {
-    #[test]
-    fn scratch_dir_is_removed_when_the_test_thread_ends() {
-        let path = std::thread::spawn(|| {
-            let p = super::scratch_dir("tod-scratch-check-");
-            assert!(p.is_dir());
-            p
-        })
-        .join()
-        .unwrap();
-        assert!(!path.exists(), "{} was left behind", path.display());
-    }
+    tod_test_util::scratch_dir(prefix)
 }

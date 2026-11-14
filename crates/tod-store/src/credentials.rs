@@ -683,7 +683,7 @@ mod tests {
     impl IsolatedStore {
         fn new() -> Self {
             let id = uuid::Uuid::new_v4();
-            let dir = std::env::temp_dir().join(format!("tod-cred-{id}"));
+            let dir = tod_test_util::scratch_dir(format!("tod-cred-{id}"));
             fs::create_dir_all(&dir).unwrap();
             Self {
                 store: CredentialStore {

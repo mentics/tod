@@ -35,7 +35,7 @@ mod tests {
 
     #[test]
     fn path_is_under_detects_child() {
-        let root = std::env::temp_dir().join(format!("tod-path-under-{}", uuid::Uuid::new_v4()));
+        let root = tod_test_util::scratch_dir(format!("tod-path-under-{}", uuid::Uuid::new_v4()));
         let child = root.join("agent").join("nodes");
         fs::create_dir_all(&child).unwrap();
         assert!(path_is_under(&root, &child));

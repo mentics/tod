@@ -464,7 +464,7 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
-            let root = std::env::temp_dir().join(format!("tod-ckpt-{}", uuid::Uuid::new_v4()));
+            let root = tod_test_util::scratch_dir(format!("tod-ckpt-{}", uuid::Uuid::new_v4()));
             let remote = root.join("remote.git");
             std::fs::create_dir_all(&remote).unwrap();
             run(&remote, &["init", "--bare", "-q", "-b", "main"]);

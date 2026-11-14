@@ -257,7 +257,7 @@ mod tests {
     use tod_store::outline::{Capability, CreatePosition, KIND_REQUIREMENT, OutlineMutation};
 
     fn fixture() -> (PathBuf, FleetStore, Uuid) {
-        let root = std::env::temp_dir().join(format!("tod-journey-changes-test-{}", Uuid::new_v4()));
+        let root = tod_test_util::scratch_dir(format!("tod-journey-changes-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let fleet = FleetStore::open(&root).unwrap();
         fleet

@@ -133,7 +133,7 @@ mod tests {
 
     #[test]
     fn the_hang_limit_is_written_in_minutes() {
-        let dir = std::env::temp_dir().join(format!("tod-hang-limit-{}", std::process::id()));
+        let dir = tod_test_util::scratch_dir(format!("tod-hang-limit-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         write_hang_limit(&dir, Duration::from_secs(45 * 60)).unwrap();
         assert_eq!(std::fs::read_to_string(dir.join(HANG_LIMIT_FILE)).unwrap(), "45");

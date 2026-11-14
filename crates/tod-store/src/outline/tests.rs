@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 #[test]
 fn create_node_requires_title_and_slugs_it() {
-    let root = std::env::temp_dir().join(format!("tod-create-title-{}", Uuid::new_v4()));
+    let root = tod_test_util::scratch_dir(format!("tod-create-title-{}", Uuid::new_v4()));
     fs::create_dir_all(&root).unwrap();
     let store = FleetStore::open(&root).unwrap();
     store
@@ -56,7 +56,7 @@ fn create_node_requires_title_and_slugs_it() {
 fn obligation_text_cannot_reference_files() {
     use crate::outline::KIND_CONSTRAINT;
 
-    let root = std::env::temp_dir().join(format!("tod-obl-files-{}", Uuid::new_v4()));
+    let root = tod_test_util::scratch_dir(format!("tod-obl-files-{}", Uuid::new_v4()));
     fs::create_dir_all(&root).unwrap();
     let store = FleetStore::open(&root).unwrap();
     store
@@ -158,7 +158,7 @@ fn resolve_obligations_for_node_includes_ancestor_and_design_phase() {
     use crate::interview::PHASE_DESIGN;
     use crate::outline::KIND_REQUIREMENT;
 
-    let root = std::env::temp_dir().join(format!("tod-resolve-node-{}", Uuid::new_v4()));
+    let root = tod_test_util::scratch_dir(format!("tod-resolve-node-{}", Uuid::new_v4()));
     fs::create_dir_all(&root).unwrap();
     let store = FleetStore::open(&root).unwrap();
     store
@@ -257,7 +257,7 @@ fn resolve_obligations_for_node_includes_ancestor_and_design_phase() {
 
 #[test]
 fn reparent_and_loop_detection() {
-    let root = std::env::temp_dir().join(format!("tod-outline-loop-{}", Uuid::new_v4()));
+    let root = tod_test_util::scratch_dir(format!("tod-outline-loop-{}", Uuid::new_v4()));
     fs::create_dir_all(&root).unwrap();
     let store = FleetStore::open(&root).unwrap();
     store
@@ -290,7 +290,7 @@ fn reparent_and_loop_detection() {
 fn reorder_sibling_past_subtree() {
     use crate::outline::ReorderDirection;
 
-    let root = std::env::temp_dir().join(format!("tod-outline-reorder-{}", Uuid::new_v4()));
+    let root = tod_test_util::scratch_dir(format!("tod-outline-reorder-{}", Uuid::new_v4()));
     fs::create_dir_all(&root).unwrap();
     let store = FleetStore::open(&root).unwrap();
     store
@@ -386,7 +386,7 @@ fn reorder_sibling_past_subtree() {
 fn reorder_sibling_past_parent_to_next_aunt() {
     use crate::outline::ReorderDirection;
 
-    let root = std::env::temp_dir().join(format!("tod-outline-aunt-{}", Uuid::new_v4()));
+    let root = tod_test_util::scratch_dir(format!("tod-outline-aunt-{}", Uuid::new_v4()));
     fs::create_dir_all(&root).unwrap();
     let store = FleetStore::open(&root).unwrap();
     store
@@ -545,7 +545,7 @@ fn reorder_sibling_past_parent_to_next_aunt() {
 fn obligation_crud_and_counts() {
     use crate::outline::{KIND_CONSTRAINT, KIND_REQUIREMENT, ReorderDirection};
 
-    let root = std::env::temp_dir().join(format!("tod-obl-crud-{}", Uuid::new_v4()));
+    let root = tod_test_util::scratch_dir(format!("tod-obl-crud-{}", Uuid::new_v4()));
     fs::create_dir_all(&root).unwrap();
     let store = FleetStore::open(&root).unwrap();
     store
@@ -752,7 +752,7 @@ fn obligation_crud_and_counts() {
 fn delete_node_blocked_when_agents_present() {
     use crate::fleet::writer::FleetMutation;
 
-    let root = std::env::temp_dir().join(format!("tod-del-blocked-{}", Uuid::new_v4()));
+    let root = tod_test_util::scratch_dir(format!("tod-del-blocked-{}", Uuid::new_v4()));
     fs::create_dir_all(&root).unwrap();
     let store = FleetStore::open(&root).unwrap();
     store
@@ -800,7 +800,7 @@ fn delete_node_blocked_when_agents_present() {
 
 #[test]
 fn delete_node_and_undo_restore() {
-    let root = std::env::temp_dir().join(format!("tod-del-undo-{}", Uuid::new_v4()));
+    let root = tod_test_util::scratch_dir(format!("tod-del-undo-{}", Uuid::new_v4()));
     fs::create_dir_all(&root).unwrap();
     let store = FleetStore::open(&root).unwrap();
     store
@@ -866,7 +866,7 @@ fn gate_criteria_seed_on_migration() {
     use crate::outline::GATE_CRITERIA;
     use crate::outline::repos::GateRepo;
 
-    let root = std::env::temp_dir().join(format!("tod-gate-seed-{}", Uuid::new_v4()));
+    let root = tod_test_util::scratch_dir(format!("tod-gate-seed-{}", Uuid::new_v4()));
     fs::create_dir_all(&root).unwrap();
     let db = root.join("tod.db");
     let _store = FleetStore::open(&root).unwrap();
@@ -956,7 +956,7 @@ fn gate_criteria_seed_on_migration() {
 fn plan_step_dependency_graph_and_obligation_links() {
     use crate::outline::repos::PlanStepRepo;
 
-    let root = std::env::temp_dir().join(format!("tod-plan-step-{}", Uuid::new_v4()));
+    let root = tod_test_util::scratch_dir(format!("tod-plan-step-{}", Uuid::new_v4()));
     fs::create_dir_all(&root).unwrap();
     let store = FleetStore::open(&root).unwrap();
     store
@@ -1152,7 +1152,7 @@ fn plan_step_dependency_graph_and_obligation_links() {
 // ── Generator capability tests ──────────────────────────────────────────
 
 fn setup_store_with_list() -> (FleetStore, PathBuf, Uuid) {
-    let root = std::env::temp_dir().join(format!("tod-gen-{}", Uuid::new_v4()));
+    let root = tod_test_util::scratch_dir(format!("tod-gen-{}", Uuid::new_v4()));
     fs::create_dir_all(&root).unwrap();
     let store = FleetStore::open(&root).unwrap();
     store
@@ -2463,7 +2463,7 @@ fn plan_step_phases_order_dependencies_and_readiness() {
     assert!(due_by("released", "released"));
     assert!(!due_by("released", "merged"));
 
-    let root = std::env::temp_dir().join(format!("tod-plan-phase-{}", Uuid::new_v4()));
+    let root = tod_test_util::scratch_dir(format!("tod-plan-phase-{}", Uuid::new_v4()));
     fs::create_dir_all(&root).unwrap();
     let store = FleetStore::open(&root).unwrap();
     store

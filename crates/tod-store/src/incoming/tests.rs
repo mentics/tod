@@ -20,7 +20,7 @@ impl Drop for Fx {
 }
 
 fn setup() -> Fx {
-    let dir = std::env::temp_dir().join(format!("tod-incoming-{}", Uuid::new_v4()));
+    let dir = tod_test_util::scratch_dir(format!("tod-incoming-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     let conn = schema::open_writer_connection(&dir.join("tod.db")).unwrap();
     let list = ListRepo::new(&conn).create("t", "T").unwrap().id;
@@ -240,7 +240,7 @@ fn net_pending_folds_per_item() {
 #[test]
 fn direct_edits_fan_out_and_ctrl_z_cancels() {
     use crate::fleet::store::FleetStore;
-    let root_dir = std::env::temp_dir().join(format!("tod-incoming-direct-{}", Uuid::new_v4()));
+    let root_dir = tod_test_util::scratch_dir(format!("tod-incoming-direct-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&root_dir).unwrap();
     let store = FleetStore::open(&root_dir).unwrap();
     store

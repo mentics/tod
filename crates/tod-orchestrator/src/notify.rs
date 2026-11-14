@@ -604,7 +604,7 @@ mod tests {
 
     #[test]
     fn topic_is_made_once_and_kept() {
-        let dir = std::env::temp_dir().join(format!("tod-notify-topic-{}", uuid::Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-notify-topic-{}", uuid::Uuid::new_v4()));
         let a = topic(&dir).unwrap();
         assert_eq!(a, topic(&dir).unwrap());
         assert!(a.len() > 40, "{a}");

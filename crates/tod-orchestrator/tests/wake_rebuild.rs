@@ -53,7 +53,7 @@ struct Fixture {
 /// node (for the existing-wake case), `[4]` a live cloud node whose wait is
 /// already past due.
 fn fixture() -> Fixture {
-    let base = std::env::temp_dir().join(format!("tod-orch-rebuild-{}", Uuid::new_v4()));
+    let base = tod_test_util::scratch_dir(format!("tod-orch-rebuild-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&base).unwrap();
     let app = base.join("app");
     let fleet = FleetStore::open(&app).unwrap();

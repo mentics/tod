@@ -302,7 +302,7 @@ mod tests {
     }
 
     fn fx() -> Fx {
-        let root = std::env::temp_dir().join(format!("tod-retire-{}", Uuid::new_v4()));
+        let root = tod_test_util::scratch_dir(format!("tod-retire-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let fleet = FleetStore::open(&root).unwrap();
         fleet.enqueue_outline(OutlineMutation::CreateList { slug: "t".into(), title: "T".into() }).unwrap();

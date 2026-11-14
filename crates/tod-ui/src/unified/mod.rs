@@ -1602,7 +1602,7 @@ mod tests {
         // `TaskListView::new` (column 1) resolves `TodPaths` for its working
         // set. Tests get their own root, separate from the fixture's store.
         let config_root =
-            std::env::temp_dir().join(format!("tod-unified-config-{}", Uuid::new_v4()));
+            tod_test_util::scratch_dir(format!("tod-unified-config-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&config_root).unwrap();
         open_view_in(fixture, &config_root, cx)
     }

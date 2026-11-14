@@ -656,8 +656,8 @@ mod tests {
     }
 
     fn build_and_check(fx: &crate::interview::test_support::Fixture, journeys_dir: &std::path::Path, cutoff: u64, include_transcripts: bool) {
-        let process_dir = std::env::temp_dir().join(format!("tod-bundle-process-{}", Uuid::new_v4()));
-        let media_dir = std::env::temp_dir().join(format!("tod-bundle-media-{}", Uuid::new_v4()));
+        let process_dir = tod_test_util::scratch_dir(format!("tod-bundle-process-{}", Uuid::new_v4()));
+        let media_dir = tod_test_util::scratch_dir(format!("tod-bundle-media-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&process_dir).unwrap();
         std::fs::create_dir_all(&media_dir).unwrap();
         let install = install_paths(&process_dir);

@@ -320,7 +320,7 @@ Connection: close
 {page}", page.len());
             }
         });
-        let profile = std::env::temp_dir().join(format!("tod-cdp-test-{}", std::process::id()));
+        let profile = tod_test_util::scratch_dir(format!("tod-cdp-test-{}", std::process::id()));
         let mut child = std::process::Command::new(chrome)
             .arg(format!("--app=http://127.0.0.1:{port}/"))
             .arg(format!("--user-data-dir={}", profile.display()))

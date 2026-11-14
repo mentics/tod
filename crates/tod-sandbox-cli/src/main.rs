@@ -1306,7 +1306,7 @@ mod sandbox_binary_tests {
     /// shadow the fresh `target/sandbox/<bin>` a build just wrote.
     #[test]
     fn a_fresher_build_further_up_wins_over_a_stale_nearer_copy() {
-        let dir = std::env::temp_dir().join(format!("tod-sbx-bin-{}", std::process::id()));
+        let dir = tod_test_util::scratch_dir(format!("tod-sbx-bin-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         put(&dir.join("target/debug/sandbox/tod-orchestrator"), 3600);
         put(&dir.join("target/sandbox/tod-orchestrator"), 10);
@@ -1317,7 +1317,7 @@ mod sandbox_binary_tests {
 
     #[test]
     fn a_missing_binary_is_an_error_and_a_tie_goes_to_the_nearest() {
-        let dir = std::env::temp_dir().join(format!("tod-sbx-bin2-{}", std::process::id()));
+        let dir = tod_test_util::scratch_dir(format!("tod-sbx-bin2-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let exe = dir.join("target/debug/tod-sandbox");
         assert!(sandbox_binary_from(&exe, "tod-relay").is_err());

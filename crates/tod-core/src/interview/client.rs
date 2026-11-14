@@ -202,7 +202,7 @@ mod tests {
 
     /// A stand-in for a running `tod`: answers one request with `reply`.
     fn fake_instance(reply: &'static str) -> (PathBuf, std::thread::JoinHandle<String>) {
-        let root = std::env::temp_dir().join(format!("tod-client-{}", Uuid::new_v4()));
+        let root = tod_test_util::scratch_dir(format!("tod-client-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -260,7 +260,7 @@ mod tests {
 
     #[test]
     fn a_stale_port_file_falls_back_to_the_store() {
-        let root = std::env::temp_dir().join(format!("tod-client-{}", Uuid::new_v4()));
+        let root = tod_test_util::scratch_dir(format!("tod-client-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         // Nothing listens on this port any more.
         let port = TcpListener::bind("127.0.0.1:0")

@@ -94,7 +94,7 @@ fn state_round_trips_and_defaults_when_missing() {
 }
 
 fn temp_root(tag: &str) -> PathBuf {
-    let root = std::env::temp_dir().join(format!("tod-cloud-sync-{tag}-{}", uuid::Uuid::new_v4()));
+    let root = tod_test_util::scratch_dir(format!("tod-cloud-sync-{tag}-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&root).unwrap();
     root
 }
@@ -558,7 +558,7 @@ fn a_cloud_node_is_working_only_while_its_supervisor_is_beating() {
 #[test]
 fn the_supervisor_gets_the_release_profiles_and_nothing_else() {
     use tod_store::settings::{RepoProfile, RepoProfileSetting};
-    let dir = std::env::temp_dir().join(format!("tod-supervisor-settings-{}", uuid::Uuid::new_v4()));
+    let dir = tod_test_util::scratch_dir(format!("tod-supervisor-settings-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     let mut settings = tod_store::TodSettings::default();
     settings.lifecycle.repo_profiles = vec![RepoProfileSetting { repo: "acme/*".into(), profile: RepoProfile::Merge }];

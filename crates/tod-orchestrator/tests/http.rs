@@ -22,7 +22,7 @@ fn start(name: &str) -> Harness {
 }
 
 fn start_with_sink(name: &str, sink: Box<dyn tod_orchestrator::notify::Sink>) -> Harness {
-    let base = std::env::temp_dir().join(format!("tod-orch-{name}-{}", std::process::id()));
+    let base = tod_test_util::scratch_dir(format!("tod-orch-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(&base).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -276,7 +276,7 @@ fn a_changes_post_is_announced_on_the_users_topic() {
 }
 #[test]
 fn github_routes_are_kept_per_user_and_checked() {
-    let base = std::env::temp_dir().join(format!("tod-orch-routes-{}", uuid::Uuid::new_v4()));
+    let base = tod_test_util::scratch_dir(format!("tod-orch-routes-{}", uuid::Uuid::new_v4()));
     let server = tod_orchestrator::Server::with_sink(
         tod_orchestrator::Config { base: base.clone(), tod_cli: "unused".into(), tod_cli_prefix: Vec::new() },
         Box::new(tod_orchestrator::wakes::RelayPoker::from_env()),

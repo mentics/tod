@@ -106,7 +106,7 @@ mod tests {
     use tod_store::outline::OutlineMutation;
 
     fn test_node() -> (std::path::PathBuf, std::sync::Arc<FleetStore>, Uuid) {
-        let root = std::env::temp_dir().join(format!("tod-route-{}", uuid::Uuid::new_v4()));
+        let root = tod_test_util::scratch_dir(format!("tod-route-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         let fleet = std::sync::Arc::new(FleetStore::open(&root).unwrap());
         fleet

@@ -23,7 +23,7 @@ impl Drop for Root {
 /// A data root with one Spec node and one conversation focused on it. The
 /// store is closed again so `tod-cli` opens it itself, as with no app running.
 fn setup() -> (Root, Uuid, Uuid) {
-    let root = std::env::temp_dir().join(format!("tod-cli-changeset-{}", Uuid::new_v4()));
+    let root = tod_test_util::scratch_dir(format!("tod-cli-changeset-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&root).unwrap();
     let node = Uuid::new_v4();
     {

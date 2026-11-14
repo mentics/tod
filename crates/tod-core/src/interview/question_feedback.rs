@@ -57,7 +57,7 @@ mod tests {
 
     #[test]
     fn append_writes_under_data_root() {
-        let root = std::env::temp_dir().join(format!("tod-qfb-{}", uuid::Uuid::new_v4()));
+        let root = tod_test_util::scratch_dir(format!("tod-qfb-{}", uuid::Uuid::new_v4()));
         set_data_root(root.clone());
         let paths = TodPaths::discover().unwrap();
         append_question_feedback(

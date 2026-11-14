@@ -102,7 +102,7 @@ mod tests {
 
     #[test]
     fn session_crud_on_fleet_db() {
-        let root = std::env::temp_dir().join(format!("tod-sess-{}", uuid::Uuid::new_v4()));
+        let root = tod_test_util::scratch_dir(format!("tod-sess-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         let fleet = std::sync::Arc::new(FleetStore::open(&root).unwrap());
         fleet

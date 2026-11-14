@@ -27,8 +27,8 @@ mod tests {
     use tod_journey::{PresentedAction, Reference};
 
     fn write_bundle(events: Vec<(Actor, Event)>) -> std::path::PathBuf {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("sample.journey");
+        let dir = tod_test_util::scratch_dir("tod-journeys-show-");
+        let path = dir.join("sample.journey");
         let mut w = BundleWriter::new().unwrap();
         for (actor, event) in events {
             w.append(actor, event).unwrap();
@@ -36,9 +36,6 @@ mod tests {
         let compressed = w.finish().unwrap();
         let plain = tod_journey::bundle::decompress(&compressed).unwrap();
         std::fs::write(&path, &plain).unwrap();
-        // Keep tempdir alive by leaking it; the test just needs the file to
-        // exist for the duration of the call.
-        std::mem::forget(dir);
         path
     }
 

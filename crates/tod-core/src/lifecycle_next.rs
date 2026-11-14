@@ -298,7 +298,7 @@ mod tests {
     /// a node ready for its gate into one that needs verifying.
     #[test]
     fn loads_from_the_store_and_follows_a_reopened_verification() {
-        let dir = std::env::temp_dir().join(format!("tod-lifecycle-next-{}", Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-lifecycle-next-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let conn = schema::open_writer_connection(&dir.join("tod.db")).unwrap();
         let node = Uuid::new_v4();

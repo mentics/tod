@@ -814,7 +814,7 @@ mod tests {
     #[test]
     fn the_http_shim_runs_pr_and_secrets_here() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("tod-http-shim-{}", uuid::Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-http-shim-{}", uuid::Uuid::new_v4()));
         let bin = dir.join("bin");
         let root = dir.join("copy");
         std::fs::create_dir_all(&bin).unwrap();
@@ -882,7 +882,7 @@ mod tests {
     #[test]
     fn the_http_shim_sends_pr_through_the_tunnel_when_tod_started_the_agent() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("tod-http-shim-tunnel-{}", uuid::Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-http-shim-tunnel-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let shim = dir.join("tod-cli");
         std::fs::write(&shim, HTTP_SHIM_SCRIPT).unwrap();
@@ -930,7 +930,7 @@ mod tests {
                 drop(stream);
             }
         });
-        let dir = std::env::temp_dir().join(format!("tod-shim-closed-{}", uuid::Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-shim-closed-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let shim = dir.join("tod-cli");
         std::fs::write(&shim, SHIM_SCRIPT).unwrap();
@@ -983,7 +983,7 @@ mod tests {
 
     #[test]
     fn a_container_token_names_its_container_and_others_are_refused() {
-        let root = std::env::temp_dir().join(format!("tod-relay-tok-{}", uuid::Uuid::new_v4()));
+        let root = tod_test_util::scratch_dir(format!("tod-relay-tok-{}", uuid::Uuid::new_v4()));
         let endpoint = endpoint_for_container(&root, "dev-1").unwrap();
         assert_eq!(container_for_token(&endpoint.token).as_deref(), Some("dev-1"));
         assert_eq!(container_for_token("nope"), None);
@@ -1006,7 +1006,7 @@ mod tests {
     fn serve_places_secrets_run_in_the_tokens_container() {
         use std::io::Read;
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("tod-relay-serve-{}", uuid::Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-relay-serve-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let cli = dir.join("fake-cli");
         std::fs::write(&cli, "#!/bin/sh\necho \"c=$TOD_SECRETS_EXEC_CONTAINER cwd=$TOD_SECRETS_EXEC_CWD\"\n").unwrap();
@@ -1078,7 +1078,7 @@ mod tests {
         ) else {
             return;
         };
-        let root = std::env::temp_dir().join(format!("tod-relay-{}", uuid::Uuid::new_v4()));
+        let root = tod_test_util::scratch_dir(format!("tod-relay-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let relay = start(root.clone(), PathBuf::from(cli)).unwrap();
         let shim = format!("{SHIM_DIR}/tod-cli");

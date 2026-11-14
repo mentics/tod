@@ -80,7 +80,7 @@ mod tests {
 
     #[test]
     fn prune_under_tiny_cap() {
-        let dir = std::env::temp_dir().join(format!("tod-prune-{}", uuid::Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-prune-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
 
         write_file(&dir.join("tod.log"), 100);
@@ -98,7 +98,7 @@ mod tests {
 
     #[test]
     fn prune_keeps_active_when_only_file_over_cap() {
-        let dir = std::env::temp_dir().join(format!("tod-prune-{}", uuid::Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-prune-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         write_file(&dir.join("tod.log"), 200);
         prune_log_dir(&dir, 50).unwrap();

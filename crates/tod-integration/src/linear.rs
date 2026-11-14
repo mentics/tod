@@ -1546,7 +1546,7 @@ mod tests {
 
     #[test]
     fn issue_url_uses_metadata_slug_then_cache_then_nothing() {
-        let dir = std::env::temp_dir().join(format!("tod-issue-url-{}", std::process::id()));
+        let dir = tod_test_util::scratch_dir(format!("tod-issue-url-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let meta = serde_json::json!({ "workspace_slug": "mentics" });
         assert_eq!(

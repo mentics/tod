@@ -54,7 +54,7 @@ fn create_node(fleet: &FleetStore, list_id: Uuid, title: &str) -> Uuid {
 
 #[test]
 fn a_wait_changed_in_the_app_pokes_its_cloud_node() {
-    let base: PathBuf = std::env::temp_dir().join(format!("tod-orch-waits-{}", Uuid::new_v4()));
+    let base: PathBuf = tod_test_util::scratch_dir(format!("tod-orch-waits-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&base).unwrap();
     let app = base.join("app");
     let fleet = FleetStore::open(&app).unwrap();

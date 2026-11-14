@@ -33,7 +33,7 @@ impl Side {
 }
 
 fn temp_root(tag: &str) -> std::path::PathBuf {
-    let root = std::env::temp_dir().join(format!("tod-sync-{tag}-{}", Uuid::new_v4()));
+    let root = tod_test_util::scratch_dir(format!("tod-sync-{tag}-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&root).unwrap();
     root
 }

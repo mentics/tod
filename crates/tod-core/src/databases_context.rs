@@ -77,7 +77,7 @@ mod tests {
 
     #[test]
     fn names_round_trip_through_the_file_and_render() {
-        let dir = std::env::temp_dir().join(format!("tod-dbctx-{}", std::process::id()));
+        let dir = tod_test_util::scratch_dir(format!("tod-dbctx-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join(tod_sandbox::config::FILE_NAME),

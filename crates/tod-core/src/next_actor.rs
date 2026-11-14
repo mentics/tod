@@ -1568,7 +1568,7 @@ mod tests {
     }
 
     fn fixture() -> Fixture {
-        let dir = std::env::temp_dir().join(format!("tod-next-actor-{}", Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-next-actor-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let conn = schema::open_writer_connection(&dir.join("tod.db")).unwrap();
         Fixture { dir, conn }
@@ -1646,7 +1646,7 @@ mod tests {
         use tod_store::fleet::FleetStore;
         use tod_store::outline::OutlineMutation;
 
-        let root = std::env::temp_dir().join(format!("tod-next-actor-guard-{}", Uuid::new_v4()));
+        let root = tod_test_util::scratch_dir(format!("tod-next-actor-guard-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let fleet = std::sync::Arc::new(FleetStore::open(&root).unwrap());
         fleet
@@ -1734,7 +1734,7 @@ mod tests {
     #[test]
     fn a_gate_check_holds_a_lease_while_it_runs_and_not_after() {
         use tod_store::fleet::FleetStore;
-        let root = std::env::temp_dir().join(format!("tod-next-actor-lease-{}", Uuid::new_v4()));
+        let root = tod_test_util::scratch_dir(format!("tod-next-actor-lease-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let fleet = FleetStore::open(&root).unwrap();
         // The lease needs a node row; the node need not have Lifecycle.

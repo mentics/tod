@@ -594,7 +594,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("tod-launcher-{nanos}"));
+        let dir = tod_test_util::scratch_dir(format!("tod-launcher-{nanos}"));
         std::fs::create_dir_all(&dir).unwrap();
         let mockup = dir.join("m.html");
         std::fs::write(&mockup, "<html><body>x</body></html>").unwrap();
@@ -741,7 +741,7 @@ mod tests {
     #[test]
     #[ignore]
     fn real_run() {
-        let dir = std::env::temp_dir().join("tod-launcher-real");
+        let dir = tod_test_util::scratch_dir("tod-launcher-real-");
         std::fs::create_dir_all(&dir).unwrap();
         let mockup = dir.join("m.html");
         std::fs::write(&mockup, "<html><body><h1>real run</h1></body></html>").unwrap();

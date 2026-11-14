@@ -725,7 +725,7 @@ mod tests {
     use tod_store::outline::types::Capability;
 
     fn setup() -> (std::path::PathBuf, FleetStore) {
-        let root = std::env::temp_dir().join(format!("tod-gen-core-{}", Uuid::new_v4()));
+        let root = tod_test_util::scratch_dir(format!("tod-gen-core-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         let store = FleetStore::open(&root).unwrap();
         store

@@ -75,7 +75,7 @@ mod tests {
     ) -> (Entity<SettingsPanel>, &'a mut VisualTestContext) {
         cx.update(gpui_component::init);
         let config_root =
-            std::env::temp_dir().join(format!("tod-unified-settings-{}", Uuid::new_v4()));
+            tod_test_util::scratch_dir(format!("tod-unified-settings-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&config_root).unwrap();
         crate::interview::set_data_root(config_root);
         let paths = TodPaths::discover().unwrap();

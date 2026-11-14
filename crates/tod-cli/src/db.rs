@@ -311,7 +311,7 @@ mod tests {
 
     #[test]
     fn the_hosts_file_gets_one_line_per_database_and_nothing_else_changes() {
-        let dir = std::env::temp_dir().join(format!("tod-db-hosts-{}", std::process::id()));
+        let dir = tod_test_util::scratch_dir(format!("tod-db-hosts-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let hosts = dir.join("hosts");
         std::fs::write(&hosts, "127.0.0.1 localhost\n10.0.0.5 other\n").unwrap();

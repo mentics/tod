@@ -72,7 +72,7 @@ mod tests {
 
     #[test]
     fn variables_show_values_and_secrets_never_do() {
-        let dir = std::env::temp_dir().join(format!("tod-envctx-{}", Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-envctx-{}", Uuid::new_v4()));
         let store = CredentialStore::from_data_root(&dir);
         let node = Uuid::new_v4();
         let mut gb = Entry::secret("growthbook");

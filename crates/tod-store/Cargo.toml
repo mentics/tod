@@ -41,4 +41,5 @@ windows = { version = "0.57", features = [
 ] }
 
 [dev-dependencies]
+tod-test-util = { path = "../tod-test-util" }
 tempfile = "3.10"

@@ -411,7 +411,7 @@ mod tests {
     }
 
     fn temp_root(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("tod-prov-{tag}-{}", std::process::id()));
+        let dir = tod_test_util::scratch_dir(format!("tod-prov-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir

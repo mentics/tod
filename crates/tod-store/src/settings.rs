@@ -1307,7 +1307,7 @@ mod tests {
 
     #[test]
     fn sandbox_idle_reads_the_data_roots_settings_and_defaults_what_is_missing() {
-        let dir = std::env::temp_dir().join(format!("tod-sandbox-idle-{}", std::process::id()));
+        let dir = tod_test_util::scratch_dir(format!("tod-sandbox-idle-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         assert_eq!(SandboxIdleSettings::load(&dir), SandboxIdleSettings::default());
 
@@ -1351,7 +1351,7 @@ mod tests {
 
     #[test]
     fn defaults_when_missing() {
-        let dir = std::env::temp_dir().join(format!("tod-settings-{}", uuid::Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-settings-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("tod.yml");
         let settings = TodSettings::load_from_path(&path).unwrap();
@@ -1373,7 +1373,7 @@ mod tests {
     #[test]
     fn resolve_fleet_storage_root_uses_data_root() {
         let sandbox =
-            std::env::temp_dir().join(format!("tod-fleet-sandbox-{}", uuid::Uuid::new_v4()));
+            tod_test_util::scratch_dir(format!("tod-fleet-sandbox-{}", uuid::Uuid::new_v4()));
         set_data_root(sandbox.clone());
         let paths = TodPaths::discover().unwrap();
         let settings = TodSettings::default();
@@ -1390,7 +1390,7 @@ mod tests {
             ..TodSettings::default()
         };
         let sandbox =
-            std::env::temp_dir().join(format!("tod-fleet-sandbox-{}", uuid::Uuid::new_v4()));
+            tod_test_util::scratch_dir(format!("tod-fleet-sandbox-{}", uuid::Uuid::new_v4()));
         set_data_root(sandbox.clone());
         let paths = TodPaths::discover().unwrap();
         let root = settings.resolve_fleet_storage_root(&paths).unwrap();
@@ -1402,7 +1402,7 @@ mod tests {
 
     #[test]
     fn round_trip_yaml() {
-        let dir = std::env::temp_dir().join(format!("tod-settings-{}", uuid::Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-settings-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("tod.yml");
         let settings = TodSettings {
@@ -1509,7 +1509,7 @@ mod tests {
 
     #[test]
     fn migrates_legacy_flat_model_effort_into_active_platform() {
-        let dir = std::env::temp_dir().join(format!("tod-settings-{}", uuid::Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-settings-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("tod.yml");
         fs::write(
@@ -1577,7 +1577,7 @@ mod tests {
 
     #[test]
     fn independent_evaluation_defaults_on_and_round_trips_off() {
-        let dir = std::env::temp_dir().join(format!("tod-settings-{}", uuid::Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-settings-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("tod.yml");
         fs::write(&path, "log_max_size_kb: 1024
@@ -1598,7 +1598,7 @@ mod tests {
 
     #[test]
     fn rejects_out_of_range_max_size_on_load() {
-        let dir = std::env::temp_dir().join(format!("tod-settings-{}", uuid::Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-settings-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("tod.yml");
         fs::write(&path, "log_max_size_kb: 0\n").unwrap();
@@ -1610,7 +1610,7 @@ mod tests {
 
     #[test]
     fn rejects_out_of_range_max_size_on_save() {
-        let dir = std::env::temp_dir().join(format!("tod-settings-{}", uuid::Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-settings-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("tod.yml");
         let settings = TodSettings {

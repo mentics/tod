@@ -176,7 +176,7 @@ mod tests {
 
     #[test]
     fn fingerprint_prefers_the_last_lines_uuid() {
-        let dir = std::env::temp_dir().join(format!("tod-claude-fp-{}", uuid_like()));
+        let dir = tod_test_util::scratch_dir(format!("tod-claude-fp-{}", uuid_like()));
         let project_dir = dir.join("projects").join("some-project");
         std::fs::create_dir_all(&project_dir).unwrap();
         // SAFETY: single-threaded test process section, restored immediately after.

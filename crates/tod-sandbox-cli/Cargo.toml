@@ -22,4 +22,5 @@ tod-store = { path = "../tod-store" }
 tokio = { version = "1", features = ["rt", "macros"] }
 
 [dev-dependencies]
+tod-test-util = { path = "../tod-test-util" }
 tempfile = "3.10"

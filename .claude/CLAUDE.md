@@ -29,6 +29,11 @@ cargo nextest run --workspace --no-fail-fast
 cargo nextest run -p tod-store fleet::tests::some_test_name
 cargo nextest run -p tod-ui some_test_name
 
+# Fail if the tests leave anything in the temp dir (TMPDIR is a fresh empty
+# directory per run; nextest cannot assert on leftovers itself). Takes the usual
+# nextest arguments, default `--workspace`.
+scripts/check-test-leaks.sh -p tod-core -p tod-store
+
 # Release build — excludes the TCP agent-control socket entirely
 cargo build --release -p tod --no-default-features
 
@@ -52,6 +57,7 @@ CI runs `cargo check --workspace --all-targets` on Ubuntu, Windows, and macOS. C
 
 - Always run `cargo check` / `cargo test` / `cargo build` with an explicit ~120s timeout, even when you expect them to be fast. Tests can hang intermittently (a spawned process, a port, a wait on stdin); a timeout is cheap insurance and should be the default, not a special case. If 120s proves too short for a particular command, raise it for that command rather than dropping the policy.
 - Scope test runs to what the change actually touches (`cargo nextest run -p tod-store ...`) rather than defaulting to the whole workspace, which pulls in the full GPUI build. Use `--workspace` when the change is broad or you need the CI-equivalent check.
+- A test that needs a directory under the temp dir takes it from `tod_test_util::scratch_dir(prefix)` (crate `tod-test-util`, a dev-dependency; removed when the test's thread ends, even on failure) or owns a `tempfile::TempDir`; never a bare `std::env::temp_dir().join(..)` with a hand-written `remove_dir_all` (a failing assert skips it, and 82,000 leaked directories once filled the disk). `scripts/check-test-leaks.sh` catches leaks.
 - Piping through `grep`/`head` to cut noise is fine and preferred — don't remove that just to see more output.
 - If you do intentionally background a long-running command (e.g. an ultra review, a release build), don't just sit idle waiting on it — either continue other work, or if there's nothing else to do, poll it periodically (sleep, then check) rather than blocking indefinitely on a single wait.
 

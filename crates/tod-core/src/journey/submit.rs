@@ -149,7 +149,7 @@ mod tests {
     use super::*;
 
     fn tmp_dir(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("tod-submit-test-{name}-{}", Uuid::new_v4()))
+        tod_test_util::scratch_dir(format!("tod-submit-test-{name}-{}", Uuid::new_v4()))
     }
 
     #[test]

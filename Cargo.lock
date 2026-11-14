@@ -7525,6 +7525,7 @@ dependencies = [
  "tod-agentd-client",
  "tod-problems",
  "tod-store",
+ "tod-test-util",
  "tod-ui",
  "uuid",
 ]
@@ -7541,6 +7542,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.20",
+ "tod-test-util",
  "tracing",
  "uuid",
  "windows-sys 0.61.2",
@@ -7561,6 +7563,7 @@ dependencies = [
  "tod-journey",
  "tod-problems",
  "tod-store",
+ "tod-test-util",
  "tokio",
  "tracing",
  "uuid",
@@ -7575,6 +7578,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tod-store",
+ "tod-test-util",
  "tokio",
  "tracing",
  "uuid",
@@ -7595,6 +7599,7 @@ dependencies = [
  "tod-problems",
  "tod-sandbox",
  "tod-store",
+ "tod-test-util",
  "ureq",
  "uuid",
 ]
@@ -7623,6 +7628,7 @@ dependencies = [
  "tod-problems",
  "tod-sandbox",
  "tod-store",
+ "tod-test-util",
  "tokio",
  "toml 0.8.23",
  "tracing",
@@ -7642,6 +7648,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.20",
+ "tod-test-util",
 ]
 
 [[package]]
@@ -7674,6 +7681,7 @@ dependencies = [
  "tempfile",
  "tod-integration",
  "tod-journey",
+ "tod-test-util",
  "toml 0.8.23",
 ]
 
@@ -7692,6 +7700,7 @@ dependencies = [
  "tod-problems",
  "tod-sandbox",
  "tod-store",
+ "tod-test-util",
  "ureq",
  "uuid",
 ]
@@ -7701,6 +7710,7 @@ name = "tod-problems"
 version = "0.1.0"
 dependencies = [
  "serde_json",
+ "tod-test-util",
 ]
 
 [[package]]
@@ -7712,6 +7722,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tod-problems",
+ "tod-test-util",
  "tokio",
  "tokio-tungstenite",
 ]
@@ -7731,6 +7742,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
+ "tod-test-util",
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",
@@ -7752,6 +7764,7 @@ dependencies = [
  "tod-problems",
  "tod-sandbox",
  "tod-store",
+ "tod-test-util",
  "tokio",
 ]
 
@@ -7779,6 +7792,7 @@ dependencies = [
  "tod-agent",
  "tod-journey",
  "tod-sandbox",
+ "tod-test-util",
  "tokio",
  "toml 0.8.23",
  "tracing",
@@ -7803,10 +7817,18 @@ dependencies = [
  "tod-orchestrator",
  "tod-problems",
  "tod-store",
+ "tod-test-util",
  "tracing",
  "tracing-subscriber",
  "ureq",
  "uuid",
+]
+
+[[package]]
+name = "tod-test-util"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
 ]
 
 [[package]]
@@ -7849,6 +7871,7 @@ dependencies = [
  "tod-journey",
  "tod-sandbox",
  "tod-store",
+ "tod-test-util",
  "tokio",
  "tokio-tungstenite",
  "toml 0.8.23",

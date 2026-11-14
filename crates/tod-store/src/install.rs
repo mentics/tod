@@ -121,7 +121,7 @@ mod tests {
     #[test]
     fn round_trip_install_config() {
         let _lock = env_lock();
-        let base = std::env::temp_dir().join(format!("tod-install-{}", uuid::Uuid::new_v4()));
+        let base = tod_test_util::scratch_dir(format!("tod-install-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&base).unwrap();
         // `dirs::config_dir()` ignores XDG_CONFIG_HOME on Windows and macOS, so
         // only the tod-specific override reliably keeps this test off the real file.

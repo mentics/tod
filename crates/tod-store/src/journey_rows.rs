@@ -142,7 +142,7 @@ mod tests {
 
     #[test]
     fn every_triggered_table_has_a_key_mapping() {
-        let root = std::env::temp_dir().join(format!("tod-journey-rows-{}", Uuid::new_v4()));
+        let root = tod_test_util::scratch_dir(format!("tod-journey-rows-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let fleet = FleetStore::open(&root).unwrap();
         let names: Vec<String> = fleet
@@ -165,7 +165,7 @@ mod tests {
 
     #[test]
     fn fetches_live_row_and_none_when_gone() {
-        let root = std::env::temp_dir().join(format!("tod-journey-rows-{}", Uuid::new_v4()));
+        let root = tod_test_util::scratch_dir(format!("tod-journey-rows-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let fleet = FleetStore::open(&root).unwrap();
         fleet

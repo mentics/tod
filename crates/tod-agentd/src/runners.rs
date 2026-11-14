@@ -893,7 +893,7 @@ mod tests {
             // One process per test under nextest; the variable is this test's.
             unsafe { std::env::set_var("TOD_MEDIA_ROOT", "/nonexistent/tod-media") };
         }
-        let root = std::env::temp_dir().join(format!("tod-agentd-runners-{}", Uuid::new_v4()));
+        let root = tod_test_util::scratch_dir(format!("tod-agentd-runners-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let fleet = Arc::new(FleetStore::open(&root).unwrap());
         fleet.enqueue_outline(OutlineMutation::CreateList { slug: "t".into(), title: "T".into() }).unwrap();

@@ -166,7 +166,7 @@ mod tests {
     #[test]
     fn paths_are_flat_under_data_root() {
         let _override = hold_override();
-        let root = std::env::temp_dir().join(format!("tod-paths-{}", uuid::Uuid::new_v4()));
+        let root = tod_test_util::scratch_dir(format!("tod-paths-{}", uuid::Uuid::new_v4()));
         set_data_root(root.clone());
         let paths = TodPaths::discover().unwrap();
         assert_eq!(paths.data_root(), root.as_path());
@@ -180,7 +180,7 @@ mod tests {
     #[test]
     fn discover_honors_data_root_override() {
         let _override = hold_override();
-        let root = std::env::temp_dir().join(format!("tod-paths-{}", uuid::Uuid::new_v4()));
+        let root = tod_test_util::scratch_dir(format!("tod-paths-{}", uuid::Uuid::new_v4()));
         set_data_root(root.clone());
         let paths = TodPaths::discover().unwrap();
         assert_eq!(paths.data_root(), root.as_path());

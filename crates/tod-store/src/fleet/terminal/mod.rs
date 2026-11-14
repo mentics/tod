@@ -1500,7 +1500,7 @@ mod tests {
         use crate::settings::TerminalSettings;
         use reconnect_identity;
 
-        let root = std::env::temp_dir().join(format!("tod-shell-gb-{}", uuid::Uuid::new_v4()));
+        let root = tod_test_util::scratch_dir(format!("tod-shell-gb-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         set_data_root(root.clone());
         let paths = crate::paths::TodPaths::discover().unwrap();
@@ -1546,7 +1546,7 @@ mod tests {
             fn GetConsoleWindow() -> *mut core::ffi::c_void;
         }
 
-        let root = std::env::temp_dir().join(format!("tod-shell-ps-{}", uuid::Uuid::new_v4()));
+        let root = tod_test_util::scratch_dir(format!("tod-shell-ps-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         set_data_root(root.clone());
         let paths = crate::paths::TodPaths::discover().unwrap();

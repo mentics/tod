@@ -1247,7 +1247,7 @@ mod tests {
     #[cfg(unix)]
     fn run_adapter_script(adapter: bool, npm: bool) -> (i32, bool) {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("tod-adapter-{}-{adapter}-{npm}", std::process::id()));
+        let dir = tod_test_util::scratch_dir(format!("tod-adapter-{}-{adapter}-{npm}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let bin = dir.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
@@ -1286,7 +1286,7 @@ mod tests {
     #[cfg(unix)]
     fn run_db_query(tag: &str, args: &[&str], list: &str, psql_row: &str) -> (i32, String, String, String) {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("tod-dbq-{}-{tag}", std::process::id()));
+        let dir = tod_test_util::scratch_dir(format!("tod-dbq-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let bin = dir.join("bin");
         let real = dir.join("workspace-bin");
@@ -1377,7 +1377,7 @@ mod tests {
 
     /// Runs the redirect hook on a Bash `command`; the hook's stdout.
     fn run_redirect_hook(tag: &str, command: &str) -> String {
-        let dir = std::env::temp_dir().join(format!("tod-redirect-{tag}-{}", std::process::id()));
+        let dir = tod_test_util::scratch_dir(format!("tod-redirect-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let hook = dir.join("redirect.sh");
         let redirects = crate::config::CommandRedirect::parse_all(&["db-query=/usr/local/bin/db-query"]).unwrap();
@@ -1430,7 +1430,7 @@ mod tests {
 
     #[test]
     fn the_settings_step_adds_the_hook_once_and_takes_it_out_keeping_the_rest() {
-        let dir = std::env::temp_dir().join(format!("tod-redirect-settings-{}", std::process::id()));
+        let dir = tod_test_util::scratch_dir(format!("tod-redirect-settings-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(".claude")).unwrap();
         std::fs::write(dir.join(".claude/settings.json"), r#"{"model":"x","hooks":{"PreToolUse":[{"matcher":"Edit","hooks":[{"type":"command","command":"keep"}]}]}}"#).unwrap();
@@ -1831,7 +1831,7 @@ mod bundle_archive_tests {
         ];
         let archive = bundle_archive(&bundles).unwrap();
         assert_eq!(archive.len() % 512, 0);
-        let dir = std::env::temp_dir().join(format!("tod-bundle-test-{}", std::process::id()));
+        let dir = tod_test_util::scratch_dir(format!("tod-bundle-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let tar = dir.join("bundles.tar");
         std::fs::write(&tar, &archive).unwrap();

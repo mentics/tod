@@ -103,7 +103,7 @@ mod tests {
 
     #[test]
     fn second_acquire_fails_while_held() {
-        let root = std::env::temp_dir().join(format!("tod-fleet-lock-{}", uuid::Uuid::new_v4()));
+        let root = tod_test_util::scratch_dir(format!("tod-fleet-lock-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
 
         let lock1 = FleetLock::try_acquire(&root).unwrap();
@@ -142,7 +142,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn lock_survives_across_threads_in_same_process() {
-        let root = std::env::temp_dir().join(format!("tod-fleet-lock-t-{}", uuid::Uuid::new_v4()));
+        let root = tod_test_util::scratch_dir(format!("tod-fleet-lock-t-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         let lock = FleetLock::try_acquire(&root).unwrap();
         let root2 = root.clone();

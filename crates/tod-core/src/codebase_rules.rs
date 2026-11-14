@@ -50,7 +50,7 @@ mod tests {
 
     #[test]
     fn rules_follow_the_working_directory() {
-        let root = std::env::temp_dir().join(format!("tod-codebase-{}", uuid::Uuid::new_v4()));
+        let root = tod_test_util::scratch_dir(format!("tod-codebase-{}", uuid::Uuid::new_v4()));
         let plain = root.join("plain");
         std::fs::create_dir_all(&plain).unwrap();
         assert_eq!(with_codebase_rules("ctx".into(), &plain), "ctx");

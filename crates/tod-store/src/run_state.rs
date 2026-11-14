@@ -210,7 +210,7 @@ mod tests {
 
     #[test]
     fn a_state_round_trips_keeps_since_when_repeated_and_travels_in_the_sync_log() {
-        let dir = std::env::temp_dir().join(format!("tod-run-state-{}", Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-run-state-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let conn = schema::open_writer_connection(&dir.join("tod.db")).unwrap();
         let node = Uuid::new_v4();
@@ -242,7 +242,7 @@ mod tests {
 
     #[test]
     fn migration_from_v90_makes_the_table_and_keeps_the_rest() {
-        let dir = std::env::temp_dir().join(format!("tod-run-state-migrate-{}", Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-run-state-migrate-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let db = dir.join("tod.db");
         let node = Uuid::new_v4();

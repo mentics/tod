@@ -102,7 +102,7 @@ mod tests {
     use super::*;
 
     fn root(name: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("tod-orch-problems-{name}-{}", std::process::id()));
+        let d = tod_test_util::scratch_dir(format!("tod-orch-problems-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d

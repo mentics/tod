@@ -124,7 +124,7 @@ mod tests {
     #[test]
     fn resolve_worktrees_parent_none_when_unset() {
         let _guard = test_lock().lock().unwrap();
-        let sandbox = std::env::temp_dir().join(format!("tod-treehouse-{}", uuid::Uuid::new_v4()));
+        let sandbox = tod_test_util::scratch_dir(format!("tod-treehouse-{}", uuid::Uuid::new_v4()));
         set_data_root(sandbox.clone());
         let settings = TodSettings::default();
         assert_eq!(resolve_worktrees_parent(&settings).unwrap(), None);
@@ -135,7 +135,7 @@ mod tests {
     #[test]
     fn sync_writes_config_at_treehouse_home() {
         let _guard = test_lock().lock().unwrap();
-        let sandbox = std::env::temp_dir().join(format!("tod-treehouse-{}", uuid::Uuid::new_v4()));
+        let sandbox = tod_test_util::scratch_dir(format!("tod-treehouse-{}", uuid::Uuid::new_v4()));
         set_data_root(sandbox.clone());
         let paths = TodPaths::discover().unwrap();
         let settings = TodSettings::default();
@@ -152,7 +152,7 @@ mod tests {
     #[test]
     fn invocation_sets_treehouse_home_and_worktrees_env() {
         let _guard = test_lock().lock().unwrap();
-        let sandbox = std::env::temp_dir().join(format!("tod-treehouse-{}", uuid::Uuid::new_v4()));
+        let sandbox = tod_test_util::scratch_dir(format!("tod-treehouse-{}", uuid::Uuid::new_v4()));
         set_data_root(sandbox.clone());
         let paths = TodPaths::discover().unwrap();
         let custom = sandbox.join("custom-worktrees");

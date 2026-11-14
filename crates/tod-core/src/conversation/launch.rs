@@ -162,7 +162,7 @@ mod tests {
     use uuid::Uuid;
 
     fn store_with_node() -> (std::path::PathBuf, FleetStore, Uuid) {
-        let root = std::env::temp_dir().join(format!("tod-launch-{}", Uuid::new_v4()));
+        let root = tod_test_util::scratch_dir(format!("tod-launch-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let store = FleetStore::open(&root).unwrap();
         store

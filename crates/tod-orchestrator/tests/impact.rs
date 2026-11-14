@@ -84,7 +84,7 @@ fn export(app: &Path, after: i64) -> Vec<tod_store::sync::Change> {
 
 #[test]
 fn posted_changes_mark_and_poke_only_the_affected_nodes() {
-    let base: PathBuf = std::env::temp_dir().join(format!("tod-orch-impact-{}", Uuid::new_v4()));
+    let base: PathBuf = tod_test_util::scratch_dir(format!("tod-orch-impact-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&base).unwrap();
     let app = base.join("app");
     let fleet = FleetStore::open(&app).unwrap();
@@ -156,7 +156,7 @@ impl Poker for GonePoker {
 
 #[test]
 fn a_poke_that_finds_the_sandbox_gone_marks_the_node_lost() {
-    let base: PathBuf = std::env::temp_dir().join(format!("tod-orch-lost-{}", Uuid::new_v4()));
+    let base: PathBuf = tod_test_util::scratch_dir(format!("tod-orch-lost-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&base).unwrap();
     let app = base.join("app");
     let fleet = FleetStore::open(&app).unwrap();

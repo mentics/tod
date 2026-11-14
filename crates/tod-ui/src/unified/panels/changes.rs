@@ -389,7 +389,7 @@ mod tests {
         use tod_store::outline::OutlineMutation;
         use tod_store::outline::types::Capability;
 
-        let repo = std::env::temp_dir().join(format!("tod-changes-ui-{}", Uuid::new_v4()));
+        let repo = tod_test_util::scratch_dir(format!("tod-changes-ui-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&repo).unwrap();
         git(&repo, &["init", "-q", "-b", "main"]);
         std::fs::write(repo.join("a.txt"), "a\n").unwrap();

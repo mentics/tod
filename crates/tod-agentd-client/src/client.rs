@@ -432,7 +432,7 @@ impl Detach {
 mod log_tests {
     #[test]
     fn the_last_log_line_says_why_it_exited() {
-        let dir = std::env::temp_dir().join(format!("tod-agentd-log-{}", uuid::Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-agentd-log-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let log = dir.join("agentd.log");
         assert_eq!(super::last_log_line(&log), None);

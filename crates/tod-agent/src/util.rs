@@ -93,7 +93,7 @@ mod path_tests {
 
     #[test]
     fn a_file_not_yet_written_is_under_its_existing_root() {
-        let root = std::env::temp_dir().join(format!("tod-agent-under-{}", std::process::id()));
+        let root = tod_test_util::scratch_dir(format!("tod-agent-under-{}", std::process::id()));
         std::fs::create_dir_all(root.join("scratch")).unwrap();
         assert!(path_is_under(&root, &root.join("scratch").join("new").join("a.md")));
         assert!(!path_is_under(&root, &root.join("scratch").join("..").join("..").join("x")));

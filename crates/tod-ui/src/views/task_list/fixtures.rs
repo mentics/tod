@@ -214,7 +214,7 @@ mod tests {
 
     #[test]
     fn loads_from_outline_tree() {
-        let root = std::env::temp_dir().join(format!("tod-fixtures-{}", Uuid::new_v4()));
+        let root = tod_test_util::scratch_dir(format!("tod-fixtures-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         let store = FleetStore::open(&root).unwrap();
         store
@@ -258,7 +258,7 @@ mod tests {
     /// parent owns, and the child's own shells and live runs.
     #[test]
     fn inherits_agent_and_files_and_reports_shells_and_runs() {
-        let root = std::env::temp_dir().join(format!("tod-fixtures-inherit-{}", Uuid::new_v4()));
+        let root = tod_test_util::scratch_dir(format!("tod-fixtures-inherit-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         let store = FleetStore::open(&root).unwrap();
         store
@@ -349,7 +349,7 @@ mod tests {
 
     #[test]
     fn agent_capability_alone_does_not_invent_proposed_lifecycle() {
-        let root = std::env::temp_dir().join(format!("tod-fixtures-agent-{}", Uuid::new_v4()));
+        let root = tod_test_util::scratch_dir(format!("tod-fixtures-agent-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         let store = FleetStore::open(&root).unwrap();
         store

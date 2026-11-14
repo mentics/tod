@@ -279,7 +279,7 @@ mod tests {
     /// A node `n` in `state` with one requirement, and a second node `m` in
     /// `design` to move it to.
     fn setup(state: &str) -> Fx {
-        let dir = std::env::temp_dir().join(format!("tod-settled-{}", Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-settled-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let conn = schema::open_writer_connection(&dir.join("tod.db")).unwrap();
         let nodes = NodeRepo::new(&conn);

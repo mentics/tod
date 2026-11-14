@@ -254,7 +254,7 @@ mod tests {
 
     #[test]
     fn record_and_get_seq_returns_the_writer_thread_s_assigned_seq() {
-        let dir = std::env::temp_dir().join(format!("tod-journey-recorder-test-{}", uuid::Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-journey-recorder-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let recorder = spawn(dir.clone(), 100);
 

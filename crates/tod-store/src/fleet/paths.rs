@@ -141,7 +141,7 @@ mod tests {
 
     #[test]
     fn path_shapes_under_root() {
-        let root = std::env::temp_dir().join(format!("tod-fleet-paths-{}", uuid::Uuid::new_v4()));
+        let root = tod_test_util::scratch_dir(format!("tod-fleet-paths-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         let paths = FleetPaths::new(&root).unwrap();
 
@@ -165,7 +165,7 @@ mod tests {
 
     #[test]
     fn relative_root_becomes_absolute() {
-        let root = std::env::temp_dir().join(format!("tod-fleet-rel-{}", uuid::Uuid::new_v4()));
+        let root = tod_test_util::scratch_dir(format!("tod-fleet-rel-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         let rel = Path::new(".").join(root.file_name().unwrap());
         // Use parent + relative segment when cwd is temp parent.

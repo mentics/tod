@@ -141,7 +141,7 @@ mod tests {
     #[test]
     fn a_stored_token_missing_from_every_source_is_missing() {
         // An isolated environment: no GITHUB_TOKEN, an empty credentials dir.
-        let dir = std::env::temp_dir().join(format!("tod-ghtok-{}", uuid::Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-ghtok-{}", uuid::Uuid::new_v4()));
         let store = CredentialStore::from_data_root(&dir).with_github_via_proxy(false);
         if std::env::var("GITHUB_TOKEN").is_ok_and(|v| !v.trim().is_empty()) {
             return; // the developer's own environment would answer

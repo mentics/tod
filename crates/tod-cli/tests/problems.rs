@@ -20,7 +20,7 @@ fn lines(root: &std::path::Path) -> Vec<serde_json::Value> {
 
 #[test]
 fn an_error_exit_is_recorded_as_a_problem() {
-    let root = std::env::temp_dir().join(format!("tod-cli-problems-{}", std::process::id()));
+    let root = tod_test_util::scratch_dir(format!("tod-cli-problems-{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
     let out = run(&root, &["no-such-noun"]);
     assert!(!out.status.success());
@@ -36,7 +36,7 @@ fn an_error_exit_is_recorded_as_a_problem() {
 
 #[test]
 fn a_successful_run_records_nothing() {
-    let root = std::env::temp_dir().join(format!("tod-cli-problems-ok-{}", std::process::id()));
+    let root = tod_test_util::scratch_dir(format!("tod-cli-problems-ok-{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
     let out = run(&root, &["--build-stamp"]);
     assert!(out.status.success());

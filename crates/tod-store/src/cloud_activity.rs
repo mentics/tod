@@ -194,7 +194,7 @@ mod tests {
 
     #[test]
     fn a_stop_reason_round_trips_and_the_next_beat_clears_it() {
-        let dir = std::env::temp_dir().join(format!("tod-cloud-activity-{}", Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-cloud-activity-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let conn = schema::open_writer_connection(&dir.join("tod.db")).unwrap();
         let node = Uuid::new_v4();
@@ -223,7 +223,7 @@ mod tests {
 
     #[test]
     fn migration_from_v86_adds_the_stopped_column_and_keeps_its_rows() {
-        let dir = std::env::temp_dir().join(format!("tod-cloud-activity-migrate-{}", Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-cloud-activity-migrate-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let db = dir.join("tod.db");
         let node = Uuid::new_v4();

@@ -955,7 +955,7 @@ mod commit_tests {
 write notes/marker.txt: hello: world
 write : nothing";
         assert_eq!(mock_writes(body), vec![("notes/marker.txt", "hello: world")]);
-        let dir = std::env::temp_dir().join(format!("tod-mock-write-{}", Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-mock-write-{}", Uuid::new_v4()));
         mock_write(Some(&dir), "notes/marker.txt", "hello").unwrap();
         assert_eq!(std::fs::read_to_string(dir.join("notes/marker.txt")).unwrap(), "hello
 ");
@@ -966,7 +966,7 @@ write : nothing";
 
     #[test]
     fn commits_dirty_tree_on_detached_head_and_skips_clean_one() {
-        let dir = std::env::temp_dir().join(format!("tod-commit-{}", Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-commit-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         git(&dir, &["init", "-q"]);
         std::fs::write(dir.join("a.txt"), "a").unwrap();
@@ -992,7 +992,7 @@ write : nothing";
     /// changes the superproject commits only its own files.
     #[test]
     fn a_run_never_commits_a_submodule_pointer() {
-        let root = std::env::temp_dir().join(format!("tod-commit-sub-{}", Uuid::new_v4()));
+        let root = tod_test_util::scratch_dir(format!("tod-commit-sub-{}", Uuid::new_v4()));
         let (lib, top) = (root.join("lib"), root.join("top"));
         for dir in [&lib, &top] {
             std::fs::create_dir_all(dir).unwrap();

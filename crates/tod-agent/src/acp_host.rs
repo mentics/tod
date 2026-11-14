@@ -415,7 +415,7 @@ mod tests {
             return;
         };
 
-        let dir = std::env::temp_dir().join(format!("tod-acp-host-test-{}", std::process::id()));
+        let dir = tod_test_util::scratch_dir(format!("tod-acp-host-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let script = dir.join("claude-agent-acp.cmd");
         std::fs::write(&script, "@echo %CLAUDE_CODE_GIT_BASH_PATH%\r\n").unwrap();

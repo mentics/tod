@@ -120,7 +120,7 @@ mod tests {
     #[ignore]
     fn moves_a_real_chrome_window() {
         let chrome = r"C:\Program Files\Google\Chrome\Application\chrome.exe";
-        let dir = std::env::temp_dir().join(format!("tod-mover-{}", std::process::id()));
+        let dir = tod_test_util::scratch_dir(format!("tod-mover-{}", std::process::id()));
         let page = dir.join("p.html");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(&page, "<html><head><title>tod mover check</title></head><body>x</body></html>").unwrap();

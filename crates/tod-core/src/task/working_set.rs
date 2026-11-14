@@ -150,7 +150,7 @@ mod tests {
     #[test]
     fn generator_sorts_round_trip_across_save_and_load() {
         let dir =
-            std::env::temp_dir().join(format!("tod-working-set-test-{}", uuid::Uuid::new_v4()));
+            tod_test_util::scratch_dir(format!("tod-working-set-test-{}", uuid::Uuid::new_v4()));
         let mut ws = ListWorkingSet::default_sort();
         ws.generator_sorts.insert(
             "gen-1".into(),
@@ -189,7 +189,7 @@ mod tests {
     #[test]
     fn collapsed_groups_round_trip_across_save_and_load() {
         let dir =
-            std::env::temp_dir().join(format!("tod-working-set-test-{}", uuid::Uuid::new_v4()));
+            tod_test_util::scratch_dir(format!("tod-working-set-test-{}", uuid::Uuid::new_v4()));
         let mut ws = ListWorkingSet::default_sort();
         ws.collapsed_groups.insert("group:p:active".into());
         save_working_set(&dir, &ws);
@@ -203,7 +203,7 @@ mod tests {
     #[test]
     fn actor_filter_round_trips_and_an_older_file_without_it_loads() {
         let dir =
-            std::env::temp_dir().join(format!("tod-working-set-test-{}", uuid::Uuid::new_v4()));
+            tod_test_util::scratch_dir(format!("tod-working-set-test-{}", uuid::Uuid::new_v4()));
         let mut ws = ListWorkingSet::default_sort();
         ws.actor_filter = Some(ActorBucket::OnOthers);
         save_working_set(&dir, &ws);

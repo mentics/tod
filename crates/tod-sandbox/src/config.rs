@@ -618,7 +618,7 @@ claude_token_via = \"env\"
 
     #[test]
     fn an_account_wide_golden_is_refused_with_what_to_do() {
-        let dir = std::env::temp_dir().join(format!("tod-sandbox-golden-{}", std::process::id()));
+        let dir = tod_test_util::scratch_dir(format!("tod-sandbox-golden-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(FILE_NAME);
         std::fs::write(&path, "[blaxel]\nworkspace = \"w\"\ngolden = \"wsx-golden-*\"\n").unwrap();
@@ -640,7 +640,7 @@ claude_token_via = \"env\"
 
     #[test]
     fn a_goldens_original_is_kept_beside_it_and_merged_on_save() {
-        let dir = std::env::temp_dir().join(format!("tod-sandbox-src-{}", std::process::id()));
+        let dir = tod_test_util::scratch_dir(format!("tod-sandbox-src-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(FILE_NAME);
         std::fs::write(&path, "[blaxel]\nworkspace = \"w\"\n[blaxel.goldens]\n\"acme/widget\" = \"wsx-golden-*\"\n").unwrap();
@@ -662,7 +662,7 @@ claude_token_via = \"env\"
 
     #[test]
     fn round_trips() {
-        let dir = std::env::temp_dir().join(format!("tod-sandbox-cfg-{}", std::process::id()));
+        let dir = tod_test_util::scratch_dir(format!("tod-sandbox-cfg-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(FILE_NAME);
         assert!(Config::load(&path).unwrap().blaxel.is_none());
@@ -701,7 +701,7 @@ claude_token_via = \"env\"
 
     #[test]
     fn interleaved_writers_each_change_only_their_own_keys() {
-        let dir = std::env::temp_dir().join(format!("tod-sandbox-merge-{}", std::process::id()));
+        let dir = tod_test_util::scratch_dir(format!("tod-sandbox-merge-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(FILE_NAME);
         let mut start = Config::default();
@@ -744,7 +744,7 @@ claude_token_via = \"env\"
 
     #[test]
     fn many_threads_saving_at_once_lose_no_key() {
-        let dir = std::env::temp_dir().join(format!("tod-sandbox-threads-{}", std::process::id()));
+        let dir = tod_test_util::scratch_dir(format!("tod-sandbox-threads-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(FILE_NAME);
         Config::default().save(&path).unwrap();
@@ -802,7 +802,7 @@ claude_token_via = \"env\"
         assert!(c.remove_database("a") && !c.remove_database("a"));
         assert_eq!(c.databases().unwrap().len(), 1);
         // It survives the file.
-        let dir = std::env::temp_dir().join(format!("tod-sandbox-db-{}", std::process::id()));
+        let dir = tod_test_util::scratch_dir(format!("tod-sandbox-db-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(FILE_NAME);
         c.save(&path).unwrap();

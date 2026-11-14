@@ -533,7 +533,7 @@ mod tests {
     use std::time::Instant;
 
     fn tmp() -> PathBuf {
-        let d = std::env::temp_dir().join(format!("tod-design-{}", uuid::Uuid::new_v4()));
+        let d = tod_test_util::scratch_dir(format!("tod-design-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&d).unwrap();
         d
     }

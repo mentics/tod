@@ -397,7 +397,7 @@ mod tests {
     use std::fs;
 
     fn temp_root(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
+        tod_test_util::scratch_dir(format!(
             "tod-fleet-migration-{name}-{}",
             uuid::Uuid::new_v4()
         ))

@@ -78,7 +78,7 @@ mod tests {
     use tod_store::outline::{CreatePosition, OutlineMutation};
 
     fn fleet() -> (FleetStore, std::path::PathBuf) {
-        let root = std::env::temp_dir().join(format!("tod-runner-place-{}", Uuid::new_v4()));
+        let root = tod_test_util::scratch_dir(format!("tod-runner-place-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         (FleetStore::open(&root).unwrap(), root)
     }

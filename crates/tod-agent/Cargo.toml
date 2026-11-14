@@ -37,3 +37,6 @@ windows-sys = { version = "0.61", features = [
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+tod-test-util = { path = "../tod-test-util" }

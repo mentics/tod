@@ -218,7 +218,7 @@ mod tests {
 
     #[test]
     fn lists_branch_and_uncommitted_changes_against_main() {
-        let dir = std::env::temp_dir().join(format!("tod-changes-{}", Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-changes-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let root = dir.as_path();
         git(root, &["init", "-q", "-b", "main"]);

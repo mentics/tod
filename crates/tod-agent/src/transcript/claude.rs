@@ -257,7 +257,7 @@ mod tests {
 
     #[test]
     fn a_session_log_reads_as_turns() {
-        let dir = std::env::temp_dir().join(format!("tod-claude-transcript-{}", uuid::Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-claude-transcript-{}", uuid::Uuid::new_v4()));
         let project = dir.join("projects").join("C--work-repo");
         std::fs::create_dir_all(&project).unwrap();
         let lines = [
@@ -319,7 +319,7 @@ mod tests {
 
     #[test]
     fn what_the_reader_does_not_know_is_skipped_and_reported() {
-        let dir = std::env::temp_dir().join(format!("tod-claude-transcript-{}", uuid::Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-claude-transcript-{}", uuid::Uuid::new_v4()));
         let project = dir.join("projects").join("C--work-repo");
         std::fs::create_dir_all(&project).unwrap();
         let lines = [
@@ -354,7 +354,7 @@ mod tests {
 
     #[test]
     fn usage_counts_each_response_once_with_its_subagents() {
-        let dir = std::env::temp_dir().join(format!("tod-claude-transcript-{}", uuid::Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-claude-transcript-{}", uuid::Uuid::new_v4()));
         let project = dir.join("projects").join("C--work-repo");
         std::fs::create_dir_all(project.join("s1").join("subagents")).unwrap();
         let usage = |input, output, read, write| {
@@ -409,7 +409,7 @@ mod tests {
 
     #[test]
     fn a_session_with_no_log_reads_as_absent() {
-        let dir = std::env::temp_dir().join(format!("tod-claude-transcript-{}", uuid::Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-claude-transcript-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(dir.join("projects").join("p")).unwrap();
         assert!(read(&dir, "missing").unwrap().is_none());
         let _ = std::fs::remove_dir_all(&dir);

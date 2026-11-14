@@ -567,7 +567,7 @@ mod tests {
         }
     }
     fn scratch(name: &str) -> Scratch {
-        let dir = std::env::temp_dir().join(format!("tod-zed-{name}-{}", std::process::id()));
+        let dir = tod_test_util::scratch_dir(format!("tod-zed-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         Scratch(dir)
     }

@@ -4,3 +4,7 @@
 # stdin) are killed after three minutes instead of blocking the run.
 [profile.default]
 slow-timeout = { period = "60s", terminate-after = 3 }
+
+# Nextest has setup scripts but no teardown, so it cannot fail a run that left
+# files in the temp dir. `scripts/check-test-leaks.sh` does: it runs this same
+# command with TMPDIR set to a fresh empty directory and fails on any leftover.

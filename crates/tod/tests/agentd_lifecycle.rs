@@ -20,7 +20,7 @@ impl Drop for Cleanup {
 }
 
 fn root(name: &str) -> (PathBuf, Cleanup) {
-    let dir = std::env::temp_dir().join(format!("tod-agentd-test-{name}-{}", std::process::id()));
+    let dir = tod_test_util::scratch_dir(format!("tod-agentd-test-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     (dir.clone(), Cleanup(dir))

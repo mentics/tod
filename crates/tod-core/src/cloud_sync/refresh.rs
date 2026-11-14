@@ -343,7 +343,7 @@ mod tests {
 
     #[test]
     fn a_record_is_kept_per_node() {
-        let dir = std::env::temp_dir().join(format!("tod-refresh-{}", Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-refresh-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let inst = |stamp: &str| Install { stamp: stamp.into(), parts: BTreeMap::new() };
         record(&dir, "a", &inst("1"), None).unwrap();
@@ -399,7 +399,7 @@ mod tests {
 
     #[test]
     fn the_record_is_written_atomically_with_its_reason_and_reads_the_old_format() {
-        let dir = std::env::temp_dir().join(format!("tod-refresh-{}", Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-refresh-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(STAMPS_FILE), r#"{"old":"abc"}"#).unwrap();
         let a = install_of(b"relay", None, None, &[]);
@@ -415,7 +415,7 @@ mod tests {
 
     #[test]
     fn a_corrupt_record_is_an_error_not_an_empty_one() {
-        let dir = std::env::temp_dir().join(format!("tod-refresh-{}", Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-refresh-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(STAMPS_FILE), "{trunc").unwrap();
         let err = format!("{:#}", load(&dir).unwrap_err());

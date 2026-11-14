@@ -62,7 +62,7 @@ fn events(db: &Path, node: Uuid) -> Vec<String> {
 
 #[test]
 fn deliveries_are_verified_then_routed_by_branch_and_by_wait() {
-    let base: PathBuf = std::env::temp_dir().join(format!("tod-orch-webhooks-{}", Uuid::new_v4()));
+    let base: PathBuf = tod_test_util::scratch_dir(format!("tod-orch-webhooks-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&base).unwrap();
     let app = base.join("app");
     let fleet = FleetStore::open(&app).unwrap();
@@ -144,7 +144,7 @@ fn deliveries_are_verified_then_routed_by_branch_and_by_wait() {
 
 #[test]
 fn a_node_with_linked_pull_requests_hears_only_its_own_repository_and_releases() {
-    let base: PathBuf = std::env::temp_dir().join(format!("tod-orch-webhooks-links-{}", Uuid::new_v4()));
+    let base: PathBuf = tod_test_util::scratch_dir(format!("tod-orch-webhooks-links-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&base).unwrap();
     let app = base.join("app");
     let fleet = FleetStore::open(&app).unwrap();
@@ -250,7 +250,7 @@ fn record_repo(conn: &rusqlite::Connection, node: Uuid, repo: &str) {
 
 #[test]
 fn a_branch_name_in_another_repository_is_ignored() {
-    let base: PathBuf = std::env::temp_dir().join(format!("tod-orch-webhooks-owned-{}", Uuid::new_v4()));
+    let base: PathBuf = tod_test_util::scratch_dir(format!("tod-orch-webhooks-owned-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&base).unwrap();
     let app = base.join("app");
     let fleet = FleetStore::open(&app).unwrap();
@@ -324,7 +324,7 @@ fn a_branch_name_in_another_repository_is_ignored() {
 /// request's repository must reach it, and one for any other repository not.
 #[test]
 fn a_node_hears_the_repository_of_its_pull_request_not_only_its_checkouts() {
-    let base: PathBuf = std::env::temp_dir().join(format!("tod-orch-webhooks-sub-{}", Uuid::new_v4()));
+    let base: PathBuf = tod_test_util::scratch_dir(format!("tod-orch-webhooks-sub-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&base).unwrap();
     let app = base.join("app");
     let fleet = FleetStore::open(&app).unwrap();

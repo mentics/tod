@@ -234,7 +234,7 @@ mod tests {
     use std::fs;
 
     fn temp_root(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("tod-fleet-launch-{name}-{}", uuid::Uuid::new_v4()))
+        tod_test_util::scratch_dir(format!("tod-fleet-launch-{name}-{}", uuid::Uuid::new_v4()))
     }
 
     #[test]
@@ -351,7 +351,7 @@ mod tests {
 
     #[test]
     fn non_directory_root_blocks_launch() {
-        let root = temp_root("file-root");
+        let root = temp_root("file-root").join("root-is-a-file");
         fs::write(&root, b"x").unwrap();
         let paths = FleetPaths::new(&root).unwrap();
         let err = FleetLaunch::prepare(&paths).unwrap_err();

@@ -203,7 +203,7 @@ mod tests {
 
     fn state_root(name: &str) -> std::path::PathBuf {
         let nanos = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
-        let root = std::env::temp_dir().join(format!("tod-relay-{name}-{}-{nanos}", std::process::id()));
+        let root = tod_test_util::scratch_dir(format!("tod-relay-{name}-{}-{nanos}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         root
     }

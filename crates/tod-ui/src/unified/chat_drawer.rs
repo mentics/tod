@@ -932,7 +932,7 @@ mod tests {
     }
 
     fn set_data_root() {
-        let config_root = std::env::temp_dir().join(format!("tod-chat-drawer-{}", Uuid::new_v4()));
+        let config_root = tod_test_util::scratch_dir(format!("tod-chat-drawer-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&config_root).unwrap();
         crate::interview::set_data_root(config_root);
     }

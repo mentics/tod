@@ -35,5 +35,6 @@ uuid = { version = "1.0", features = ["v4"] }
 libc = "0.2"
 
 [dev-dependencies]
+tod-test-util = { path = "../tod-test-util" }
 tod-orchestrator = { path = "../tod-orchestrator" }
 tempfile = "3.10"

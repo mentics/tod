@@ -24,3 +24,4 @@ toml = "0.8"
 
 [dev-dependencies]
 tempfile = "3.10"
+tod-test-util = { path = "../tod-test-util" }

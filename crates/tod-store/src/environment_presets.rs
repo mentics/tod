@@ -203,7 +203,7 @@ mod tests {
 
     #[test]
     fn a_user_preset_replaces_a_bundled_one_and_adds_new_ones() {
-        let dir = std::env::temp_dir().join(format!("tod-presets-{}", uuid::Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-presets-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             user_file(&dir),

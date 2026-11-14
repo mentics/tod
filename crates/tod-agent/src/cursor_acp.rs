@@ -2577,7 +2577,7 @@ mod tests {
     }
 
     fn scratch_dir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("tod-{label}-{}", uuid::Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-{label}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("create scratch dir");
         dir
     }

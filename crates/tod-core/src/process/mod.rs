@@ -176,7 +176,7 @@ mod tests {
 
     fn temp_repo(label: &str) -> PathBuf {
         let root =
-            std::env::temp_dir().join(format!("tod-process-{}-{}", label, uuid::Uuid::new_v4()));
+            tod_test_util::scratch_dir(format!("tod-process-{}-{}", label, uuid::Uuid::new_v4()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         root

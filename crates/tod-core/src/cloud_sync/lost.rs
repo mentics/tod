@@ -1099,7 +1099,7 @@ mod tests {
 
     #[test]
     fn a_sandbox_the_user_deleted_is_remembered_until_the_node_runs_again() {
-        let dir = std::env::temp_dir().join(format!("tod-deleted-by-user-{}", Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-deleted-by-user-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         assert!(!crate::cloud_sync::sandbox_deleted_by_user(&dir, "n"));
         crate::cloud_sync::set_sandbox_deleted_by_user(&dir, "n", true).unwrap();
@@ -1112,7 +1112,7 @@ mod tests {
     #[test]
     fn forgets_entries_blaxel_no_longer_lists() {
         use tod_sandbox::config::Sandbox;
-        let dir = std::env::temp_dir().join(format!("tod-forget-gone-{}", Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-forget-gone-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut sandboxes = tod_store::fleet::sandbox::Sandboxes::load(&dir).unwrap();
         for name in ["live", "failed", "expired"] {
@@ -1187,7 +1187,7 @@ mod tests {
 
     fn fx() -> Fx {
         use tod_store::outline::OutlineMutation;
-        let root = std::env::temp_dir().join(format!("tod-lost-delete-{}", Uuid::new_v4()));
+        let root = tod_test_util::scratch_dir(format!("tod-lost-delete-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let fleet = FleetStore::open(&root).unwrap();
         fleet.enqueue_outline(OutlineMutation::CreateList { slug: "t".into(), title: "T".into() }).unwrap();

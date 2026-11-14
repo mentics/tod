@@ -1070,7 +1070,7 @@ mod tests {
     #[test]
     fn flush_on_quit_commits_debounced_writes() {
         let root =
-            std::env::temp_dir().join(format!("tod-fleet-store-quit-{}", uuid::Uuid::new_v4()));
+            tod_test_util::scratch_dir(format!("tod-fleet-store-quit-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         let store = FleetStore::open(&root).unwrap();
         let id = uuid::Uuid::new_v4().to_string();
@@ -1089,9 +1089,9 @@ mod tests {
     #[test]
     fn enqueue_blocked_during_storage_migration() {
         let source =
-            std::env::temp_dir().join(format!("tod-fleet-mig-block-{}", uuid::Uuid::new_v4()));
+            tod_test_util::scratch_dir(format!("tod-fleet-mig-block-{}", uuid::Uuid::new_v4()));
         let dest =
-            std::env::temp_dir().join(format!("tod-fleet-mig-block-d-{}", uuid::Uuid::new_v4()));
+            tod_test_util::scratch_dir(format!("tod-fleet-mig-block-d-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&source).unwrap();
         fs::create_dir_all(&dest).unwrap();
         let mut store = FleetStore::open(&source).unwrap();
@@ -1113,7 +1113,7 @@ mod tests {
     #[test]
     fn queueing_a_journey_submission_notifies_subscribers() {
         let root =
-            std::env::temp_dir().join(format!("tod-fleet-store-queue-{}", uuid::Uuid::new_v4()));
+            tod_test_util::scratch_dir(format!("tod-fleet-store-queue-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         let store = FleetStore::open(&root).unwrap();
         let mut rx = store.subscribe_changes();
@@ -1128,7 +1128,7 @@ mod tests {
     #[test]
     fn subscribe_and_list_tasks_round_trip() {
         let root =
-            std::env::temp_dir().join(format!("tod-fleet-store-list-{}", uuid::Uuid::new_v4()));
+            tod_test_util::scratch_dir(format!("tod-fleet-store-list-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         let store = FleetStore::open(&root).unwrap();
         let mut rx = store.subscribe_changes();

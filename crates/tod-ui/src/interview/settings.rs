@@ -132,7 +132,7 @@ mod tests {
     #[test]
     fn resolve_fleet_storage_root_uses_data_root() {
         let sandbox =
-            std::env::temp_dir().join(format!("tod-fleet-sandbox-{}", uuid::Uuid::new_v4()));
+            tod_test_util::scratch_dir(format!("tod-fleet-sandbox-{}", uuid::Uuid::new_v4()));
         set_data_root(sandbox.clone());
         let paths = TodPaths::discover().unwrap();
         let settings = TodSettings::default();

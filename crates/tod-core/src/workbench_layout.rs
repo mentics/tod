@@ -62,7 +62,7 @@ mod tests {
     use super::*;
 
     fn scratch_dir() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("tod-workbench-{}", uuid::Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-workbench-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         dir
     }

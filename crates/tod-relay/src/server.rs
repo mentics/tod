@@ -1303,7 +1303,7 @@ mod abandoned_tests {
             supervisor: Mutex::new(None),
             poke_gen: AtomicU64::new(0),
             supervisor_env: vec![],
-            supervisor_root: std::env::temp_dir().join(format!("tod-relay-test-no-supervisors-{}", std::process::id())),
+            supervisor_root: tod_test_util::scratch_dir(format!("tod-relay-test-no-supervisors-{}", std::process::id())),
             supervisor_since: Mutex::new(None),
             adopting: AtomicBool::new(false),
         })
@@ -1349,7 +1349,7 @@ mod abandoned_tests {
 
     /// A relay whose supervisor state root holds a lock naming `pid`.
     fn relay_with_untracked(cmd: &str, pid: u32, tag: &str) -> Arc<Relay> {
-        let root = std::env::temp_dir().join(format!("tod-relay-adopt-{tag}-{}", std::process::id()));
+        let root = tod_test_util::scratch_dir(format!("tod-relay-adopt-{tag}-{}", std::process::id()));
         let node = root.join("node-1");
         std::fs::create_dir_all(&node).unwrap();
         std::fs::write(node.join(liveness::LOCK_FILE), pid.to_string()).unwrap();

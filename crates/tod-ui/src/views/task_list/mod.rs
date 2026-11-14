@@ -3601,7 +3601,7 @@ mod tests {
         cx.update(gpui_component::init);
         // `TaskListView::new` resolves `TodPaths::discover()` for its
         // working-set file; pin it to a scratch dir for the test.
-        let data_root = std::env::temp_dir().join(format!("tod-task-list-{}", uuid::Uuid::new_v4()));
+        let data_root = tod_test_util::scratch_dir(format!("tod-task-list-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&data_root).unwrap();
         tod_store::set_data_root(data_root);
         let slot = std::rc::Rc::new(std::cell::RefCell::new(None));

@@ -2523,7 +2523,7 @@ mod tests {
         use super::{NodePr, NodePrRepo};
         use crate::fleet::FleetStore;
         use crate::outline::{Capability, CreatePosition, OutlineMutation};
-        let root = std::env::temp_dir().join(format!("tod-node-pr-{}", uuid::Uuid::new_v4()));
+        let root = tod_test_util::scratch_dir(format!("tod-node-pr-{}", uuid::Uuid::new_v4()));
         let store = FleetStore::open(&root).unwrap();
         store
             .enqueue_outline(OutlineMutation::CreateList { slug: "t".into(), title: "T".into() })

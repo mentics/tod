@@ -1217,7 +1217,7 @@ mod tests {
     use std::time::Duration;
 
     fn temp_writer(debounce_ms: u64) -> (std::path::PathBuf, FleetWriter) {
-        let dir = std::env::temp_dir().join(format!("tod-fleet-writer-{}", uuid::Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-fleet-writer-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("tod.db");
         let writer = FleetWriter::open_with_debounce(

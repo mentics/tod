@@ -448,7 +448,7 @@ mod tests {
 
     #[test]
     fn the_version_is_found_from_a_shim_beside_node_modules() {
-        let root = std::env::temp_dir().join(format!("tod-adapter-{}", uuid::Uuid::new_v4()));
+        let root = tod_test_util::scratch_dir(format!("tod-adapter-{}", uuid::Uuid::new_v4()));
         // npm's `.cmd` shims and `node_modules/.bin`: the package sits in
         // the `node_modules` beside or above the shim.
         let package: PathBuf = PACKAGE.split('/').collect();
@@ -466,7 +466,7 @@ mod tests {
 
     #[test]
     fn another_packages_manifest_is_not_the_adapters() {
-        let root = std::env::temp_dir().join(format!("tod-adapter-{}", uuid::Uuid::new_v4()));
+        let root = tod_test_util::scratch_dir(format!("tod-adapter-{}", uuid::Uuid::new_v4()));
         write_package(&root, "@zed-industries/claude-code-acp", "0.16.2");
         let shim = root.join("claude-code-acp.cmd");
         std::fs::write(&shim, "@echo off").unwrap();

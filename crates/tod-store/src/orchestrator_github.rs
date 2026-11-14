@@ -173,7 +173,7 @@ mod tests {
 
     #[test]
     fn a_config_checks_saves_and_makes_routes_without_tokens() {
-        let dir = std::env::temp_dir().join(format!("tod-orch-github-{}", uuid::Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-orch-github-{}", uuid::Uuid::new_v4()));
         let config = Config { tokens: vec![entry("acme", &["acme/*", "joel/x"]), entry("joel", &["joel/*"])] };
         config.save(&dir).unwrap();
         assert_eq!(Config::load(&dir).unwrap(), config);

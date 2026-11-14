@@ -380,7 +380,7 @@ pub(crate) mod tests {
     /// A data root holding one Spec node and its interview session. The store
     /// is closed again so `tod-cli` opens it itself, as with no app running.
     pub(crate) fn data_root() -> (PathBuf, Uuid, Uuid) {
-        let root = std::env::temp_dir().join(format!("tod-cli-{}", Uuid::new_v4()));
+        let root = tod_test_util::scratch_dir(format!("tod-cli-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let fleet = Arc::new(FleetStore::open(&root).unwrap());
         fleet

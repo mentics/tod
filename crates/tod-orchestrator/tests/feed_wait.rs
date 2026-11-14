@@ -49,7 +49,7 @@ impl Drop for Setup {
 }
 
 fn setup() -> Setup {
-    let base = std::env::temp_dir().join(format!("tod-orch-feedwait-{}", Uuid::new_v4()));
+    let base = tod_test_util::scratch_dir(format!("tod-orch-feedwait-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&base).unwrap();
     let app = base.join("app");
     drop(FleetStore::open(&app).unwrap());

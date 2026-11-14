@@ -331,7 +331,7 @@ mod tests {
     }
 
     fn setup() -> Fx {
-        let dir = std::env::temp_dir().join(format!("tod-verdicts-{}", Uuid::new_v4()));
+        let dir = tod_test_util::scratch_dir(format!("tod-verdicts-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let conn = schema::open_writer_connection(&dir.join("tod.db")).unwrap();
         let node = Uuid::new_v4();
