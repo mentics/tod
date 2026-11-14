@@ -1266,7 +1266,7 @@ fn restore_obligation_row(
 }
 
 /// See [`OutlineMutation::RestorePlanStep`].
-fn restore_plan_step(
+pub(crate) fn restore_plan_step(
     conn: &Connection,
     id: Uuid,
     snapshot: &crate::conversation::EntitySnapshot,
@@ -1316,6 +1316,13 @@ fn restore_plan_step(
     )?;
     if !matches!(status.as_str(), "pending" | "ready") {
         crate::branch_starts::mark_worked_for_step(conn, &uuid_to_blob(id))?;
+    }
+    // A step restored as handed back, whose question was answered or
+    // withdrawn since, is stale: open it, as that answer did.
+    if crate::outline::repos::plan_steps::needs_user(status)
+        && crate::decisions::DecisionRepo::new(conn).settled_hold(id, *node_id)?
+    {
+        repo.update_status(id, crate::outline::repos::plan_steps::STATUS_READY, None, None)?;
     }
     for dep in depends_on {
         if repo.get(*dep)?.is_some() {

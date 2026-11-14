@@ -141,6 +141,9 @@ pub struct Decision {
     /// them resolves the decision (see [`DecisionRepo::answer`] and
     /// [`DecisionRepo::release_for_step`]).
     pub blocks: Vec<Uuid>,
+    /// What the agent said was new when it asked again after an answer
+    /// (`decisions ask --new-evidence`); shown to the user with the request.
+    pub new_evidence: String,
 }
 
 impl Decision {
@@ -209,6 +212,11 @@ pub struct NewDecision {
     pub new_evidence: String,
 }
 
+/// The actor of an answer the app recorded, not the user or an agent. Such an
+/// answer is never shown to an agent as the user's, and never counts against
+/// asking again.
+pub const SETTLED_BY: &str = "tod";
+
 /// How long an answer stands against the same question being asked again:
 /// 30 minutes, by the clock, whatever the number of turns in between.
 pub const REASK_WINDOW_MS: i64 = 30 * 60 * 1000;
@@ -242,7 +250,7 @@ pub const CREATE_TABLE: &str = "
 ";
 
 const DECISION_COLUMNS: &str =
-    "id, node_id, conversation_id, protocol, question, options, evidence, status, created_at, reason, option_moves, blocks";
+    "id, node_id, conversation_id, protocol, question, options, evidence, status, created_at, reason, option_moves, blocks, new_evidence";
 
 /// `decisions.option_moves` (an option that sends the node back); a no-op
 /// when the column is already there.
@@ -268,6 +276,20 @@ pub fn add_blocks(conn: &Connection) -> Result<()> {
     )?;
     if !has {
         conn.execute_batch("ALTER TABLE decisions ADD COLUMN blocks TEXT NOT NULL DEFAULT '[]';")?;
+    }
+    Ok(())
+}
+
+/// `decisions.new_evidence` (what was new when an answered question was asked
+/// again); a no-op when the column is already there.
+pub fn add_new_evidence(conn: &Connection) -> Result<()> {
+    let has: bool = conn.query_row(
+        "SELECT COUNT(*) > 0 FROM pragma_table_info('decisions') WHERE name = 'new_evidence'",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has {
+        conn.execute_batch("ALTER TABLE decisions ADD COLUMN new_evidence TEXT NOT NULL DEFAULT '';")?;
     }
     Ok(())
 }
@@ -360,14 +382,14 @@ impl<'a> DecisionRepo<'a> {
             blocks.push(*step);
         }
         if decision.guard_reask && decision.new_evidence.trim().is_empty() {
-            self.check_not_reasked(node_id, question, &blocks)?;
+            self.check_not_reasked(node_id, question)?;
         }
         let id = Uuid::new_v4();
         let now = now_ms();
         self.conn.execute(
             "INSERT INTO decisions
-             (id, node_id, conversation_id, protocol, question, options, evidence, status, created_at, reason, option_moves, blocks)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?9, ?10, ?11)",
+             (id, node_id, conversation_id, protocol, question, options, evidence, status, created_at, reason, option_moves, blocks, new_evidence)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?9, ?10, ?11, ?12)",
             params![
                 uuid_to_blob(id),
                 uuid_to_blob(node_id),
@@ -380,6 +402,7 @@ impl<'a> DecisionRepo<'a> {
                 reason,
                 serde_json::to_string(&moves)?,
                 serde_json::to_string(&blocks)?,
+                decision.new_evidence.trim(),
             ],
         )?;
         self.get(id)?.context("decision vanished after insert")
@@ -405,10 +428,12 @@ impl<'a> DecisionRepo<'a> {
     }
 
     /// Refuse a question the user already answered on this node a moment ago
-    /// (the same text, or one that held up a step that answer released):
-    /// asking again makes them answer twice for one cause. The message names
-    /// the answer, and the way through when something really is new.
-    fn check_not_reasked(&self, node_id: Uuid, question: &str, blocks: &[Uuid]) -> Result<()> {
+    /// (the same text, case and spacing aside): asking again makes them
+    /// answer twice for one cause. Only the same question counts: a different
+    /// question that holds up the same step is a different cause. Answers by
+    /// `tod` (not the user's) never count. The message names the answer, and
+    /// the way through when something really is new.
+    fn check_not_reasked(&self, node_id: Uuid, question: &str) -> Result<()> {
         let since = now_ms() - REASK_WINDOW_MS;
         let normal = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
         let wanted = normal(question);
@@ -417,10 +442,12 @@ impl<'a> DecisionRepo<'a> {
                 continue;
             }
             let Some(found) = self.get_with_answers(decision.id)? else { continue };
-            let Some(answer) = found.answers.iter().rev().find(|a| a.answered_at >= since) else { continue };
-            let same_question = normal(&decision.question) == wanted;
-            let same_steps = decision.blocks.iter().any(|b| blocks.contains(b));
-            if !(same_question || same_steps) {
+            let Some(answer) =
+                found.answers.iter().rev().find(|a| a.answered_at >= since && a.actor != SETTLED_BY)
+            else {
+                continue;
+            };
+            if normal(&decision.question) != wanted {
                 continue;
             }
             let given = match (&answer.option, &answer.text) {
@@ -596,19 +623,12 @@ impl<'a> DecisionRepo<'a> {
     /// Hold `steps` up with the pending `decision_id` (`plan update
     /// --decision`): same node, and the decision must still be waiting.
     pub fn link_steps(&self, decision_id: Uuid, steps: &[Uuid]) -> Result<()> {
+        self.check_linkable(decision_id, steps)?;
         let decision = self
             .get(decision_id)?
             .with_context(|| format!("decision {decision_id} not found"))?;
-        if decision.status != DECISION_PENDING {
-            bail!(
-                "decision {} is already {}: a step it no longer holds up cannot be linked to it",
-                crate::interview::short_id(decision_id),
-                decision.status
-            );
-        }
         let mut blocks = decision.blocks.clone();
         for step in steps {
-            self.check_blockable(decision.node_id, *step)?;
             if !blocks.contains(step) {
                 blocks.push(*step);
             }
@@ -620,24 +640,72 @@ impl<'a> DecisionRepo<'a> {
         Ok(())
     }
 
-    /// A step the decision holds up was reopened (the user's Retry, or any
-    /// move off `partial`/`blocked`): the cause is dealt with, so the pending
-    /// decisions holding it up are resolved, and with them every other step
-    /// they hold up. Recorded as an answer by `tod`, so the next turn shows
-    /// the agent what happened.
+    /// A step the decision holds up left `partial`/`blocked` by some route
+    /// other than this decision's own answer (the user's Retry, a rework):
+    /// the cause the decision asked about is gone, so every pending decision
+    /// holding that step is settled, and its other steps open again. They are
+    /// *withdrawn*, never answered: nobody answered them, so no agent is told
+    /// the user did and the re-ask guard does not count them.
     pub fn release_for_step(&self, step: Uuid, node_id: Uuid) -> Result<()> {
-        for decision in self.list_pending_for_node(node_id)? {
-            if decision.blocks.contains(&step) {
-                self.answer(
-                    decision.id,
-                    None,
-                    Some(&format!(
-                        "Resolved without an answer: plan step [{}] was retried, so its steps are open again",
-                        crate::interview::short_id(step)
-                    )),
-                    "tod",
-                )?;
+        let ids: Vec<Uuid> = self
+            .list_pending_for_node(node_id)?
+            .into_iter()
+            .filter(|d| d.blocks.contains(&step))
+            .map(|d| d.id)
+            .collect();
+        self.withdraw_ids(&ids, true)?;
+        Ok(())
+    }
+
+    /// Withdraw the pending `ids`. With `reopen`, the steps each held up that
+    /// are still handed back open again (`ready`): the question that held them
+    /// is gone, so they must not come back as separate requests. A decision
+    /// is withdrawn before its steps are touched, so reopening them does not
+    /// settle it again.
+    fn withdraw_ids(&self, ids: &[Uuid], reopen: bool) -> Result<usize> {
+        let mut changed = 0;
+        for id in ids {
+            let Some(decision) = self.get(*id)? else { continue };
+            if decision.status != DECISION_PENDING {
+                continue;
             }
+            self.conn.execute(
+                "UPDATE decisions SET status = 'withdrawn' WHERE id = ?1 AND status = 'pending'",
+                params![uuid_to_blob(*id)],
+            )?;
+            changed += 1;
+            if reopen {
+                self.reopen_blocked_steps(&decision)?;
+            }
+        }
+        Ok(changed)
+    }
+
+    /// Whether a decision that is no longer pending (answered or withdrawn)
+    /// held `step` up: a step still handed back after that is stale.
+    pub fn settled_hold(&self, step: Uuid, node_id: Uuid) -> Result<bool> {
+        Ok(self
+            .list_for_node(node_id)?
+            .iter()
+            .any(|d| d.status != DECISION_PENDING && d.blocks.contains(&step)))
+    }
+
+    /// Whether `steps` may be held up by `decision_id` (pending, same node);
+    /// what [`Self::link_steps`] checks, so a caller can validate before
+    /// writing anything else.
+    pub fn check_linkable(&self, decision_id: Uuid, steps: &[Uuid]) -> Result<()> {
+        let decision = self
+            .get(decision_id)?
+            .with_context(|| format!("decision {decision_id} not found"))?;
+        if decision.status != DECISION_PENDING {
+            bail!(
+                "decision {} is already {}: a step it no longer holds up cannot be linked to it",
+                crate::interview::short_id(decision_id),
+                decision.status
+            );
+        }
+        for step in steps {
+            self.check_blockable(decision.node_id, *step)?;
         }
         Ok(())
     }
@@ -645,49 +713,47 @@ impl<'a> DecisionRepo<'a> {
     /// Withdraw the node's pending decisions that have an option moving the
     /// node, except `keep`: the node was moved by hand, so "send it back to
     /// X" no longer describes it, and answering it later would redo a move
-    /// the person has already made their own way. Returns how many.
+    /// the person has already made their own way. The steps those decisions
+    /// held up open again: the stay they were handed back in is over.
+    /// Returns how many.
     pub fn withdraw_moving_for_node(&self, node_id: Uuid, keep: Option<Uuid>) -> Result<usize> {
-        let keep = keep.map(uuid_to_blob);
-        Ok(self.conn.execute(
-            "UPDATE decisions SET status = 'withdrawn'
-             WHERE node_id = ?1 AND status = 'pending' AND option_moves <> '[]'
-               AND (?2 IS NULL OR id <> ?2)",
-            params![uuid_to_blob(node_id), keep],
-        )?)
+        let ids: Vec<Uuid> = self
+            .list_pending_for_node(node_id)?
+            .into_iter()
+            .filter(|d| !d.moves.is_empty() && Some(d.id) != keep)
+            .map(|d| d.id)
+            .collect();
+        self.withdraw_ids(&ids, true)
     }
 
     /// Withdraw every pending decision of the node: it is finished, so
-    /// nothing is waiting on an answer (`crate::done_close`). Returns how many.
+    /// nothing is waiting on an answer (`crate::done_close`). The steps they
+    /// held up are left as they are: a finished node's history is not
+    /// rewritten, and nothing runs them again. Returns how many.
     pub fn withdraw_pending_for_node(&self, node_id: Uuid) -> Result<usize> {
-        Ok(self.conn.execute(
-            "UPDATE decisions SET status = 'withdrawn' WHERE node_id = ?1 AND status = 'pending'",
-            params![uuid_to_blob(node_id)],
-        )?)
+        let ids: Vec<Uuid> = self.list_pending_for_node(node_id)?.into_iter().map(|d| d.id).collect();
+        self.withdraw_ids(&ids, false)
     }
 
     /// Withdraw the node's pending decisions asked by an agent of one of
     /// `protocols`, except `keep`: the stay they were asked in is over (the
-    /// node was moved back past it). Returns how many.
+    /// node was moved back past it). The steps they held up open again, for
+    /// the same reason. Returns how many.
     pub fn withdraw_for_protocols(&self, node_id: Uuid, protocols: &[&str], keep: Option<Uuid>) -> Result<usize> {
-        let mut withdrawn = 0;
-        for protocol in protocols {
-            withdrawn += self.conn.execute(
-                "UPDATE decisions SET status = 'withdrawn'
-                 WHERE node_id = ?1 AND status = 'pending' AND protocol = ?2
-                   AND (?3 IS NULL OR id <> ?3)",
-                params![uuid_to_blob(node_id), protocol, keep.map(uuid_to_blob)],
-            )?;
-        }
-        Ok(withdrawn)
+        let ids: Vec<Uuid> = self
+            .list_pending_for_node(node_id)?
+            .into_iter()
+            .filter(|d| d.protocol.as_deref().is_some_and(|p| protocols.contains(&p)) && Some(d.id) != keep)
+            .map(|d| d.id)
+            .collect();
+        self.withdraw_ids(&ids, true)
     }
 
-    /// Withdraw a decision: it no longer needs an answer.
+    /// Withdraw a decision: it no longer needs an answer, because what it
+    /// asked about was settled without the user (the lost-work and bot
+    /// callers). The steps it held up open again: their cause is gone.
     pub fn withdraw(&self, id: Uuid) -> Result<()> {
-        let changed = self.conn.execute(
-            "UPDATE decisions SET status = 'withdrawn' WHERE id = ?1 AND status = 'pending'",
-            params![uuid_to_blob(id)],
-        )?;
-        if changed == 0 {
+        if self.withdraw_ids(&[id], true)? == 0 {
             bail!("decision {id} not found or not pending");
         }
         Ok(())
@@ -754,6 +820,7 @@ fn map_decision(row: &rusqlite::Row<'_>) -> rusqlite::Result<Decision> {
                 rusqlite::Error::FromSqlConversionFailure(11, rusqlite::types::Type::Text, Box::new(err))
             })?
         },
+        new_evidence: row.get(12)?,
     })
 }
 
@@ -1098,12 +1165,106 @@ mod tests {
         crate::outline::repos::PlanStepRepo::new(&fx.conn)
             .update_status(steps[0], "in_progress", None, None)
             .unwrap();
-        assert_eq!(repo.get(d.id).unwrap().unwrap().status, DECISION_ANSWERED);
+        // Nobody answered it: it is withdrawn, with no answer on record to
+        // show an agent or to count against asking again.
+        assert_eq!(repo.get(d.id).unwrap().unwrap().status, "withdrawn");
         assert_eq!(status_of(&fx, steps[1]), "ready");
         assert!(repo.list_pending_for_node(fx.node).unwrap().is_empty());
-        // The retry is on the record, for the agent's next turn.
-        let found = repo.get_with_answers(d.id).unwrap().unwrap();
-        assert_eq!(found.answers[0].actor, "tod");
+        assert!(repo.get_with_answers(d.id).unwrap().unwrap().answers.is_empty());
+        // So the same question may be asked again for a new cause.
+        repo.create(
+            fx.node,
+            None,
+            None,
+            &NewDecision { guard_reask: true, ..decision("Carry on?", &["yes"]) },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn withdrawing_a_decision_reopens_the_steps_it_held_up() {
+        let fx = setup();
+        let steps = blocked_steps(&fx, 2);
+        let repo = DecisionRepo::new(&fx.conn);
+        let held = |q: &str, s: &[Uuid]| {
+            repo.create(fx.node, None, Some("implement"), &NewDecision { blocks: s.to_vec(), ..decision(q, &["a"]) })
+                .unwrap()
+        };
+        let a = held("A?", &steps[..1]);
+        repo.withdraw(a.id).unwrap();
+        assert_eq!(status_of(&fx, steps[0]), "ready");
+        assert_eq!(status_of(&fx, steps[1]), "blocked");
+        // The protocol sweep does the same.
+        held("B?", &steps[1..]);
+        repo.withdraw_for_protocols(fx.node, &["implement"], None).unwrap();
+        assert_eq!(status_of(&fx, steps[1]), "ready");
+    }
+
+    #[test]
+    fn closing_a_done_node_withdraws_without_rewriting_its_steps() {
+        let fx = setup();
+        let steps = blocked_steps(&fx, 1);
+        let repo = DecisionRepo::new(&fx.conn);
+        repo.create(fx.node, None, None, &NewDecision { blocks: steps.clone(), ..decision("A?", &["a"]) }).unwrap();
+        assert_eq!(repo.withdraw_pending_for_node(fx.node).unwrap(), 1);
+        assert_eq!(status_of(&fx, steps[0]), "blocked");
+    }
+
+    #[test]
+    fn restoring_a_handed_back_step_whose_question_was_answered_opens_it() {
+        use crate::conversation::EntitySnapshot;
+        let fx = setup();
+        crate::outline::repos::NodeRepo::new(&fx.conn)
+            .enable_capability(fx.node, crate::outline::Capability::Spec)
+            .unwrap();
+        let steps = blocked_steps(&fx, 1);
+        let repo = DecisionRepo::new(&fx.conn);
+        let d = repo
+            .create(fx.node, None, None, &NewDecision { blocks: steps.clone(), ..decision("Q?", &["a"]) })
+            .unwrap();
+        repo.answer(d.id, Some(1), None, "user").unwrap();
+        // The step is deleted, then restored from a snapshot taken while it was blocked.
+        fx.conn
+            .execute(
+                "DELETE FROM node_plan_steps WHERE id = ?1",
+                params![uuid_to_blob(steps[0])],
+            )
+            .unwrap();
+        let snapshot = EntitySnapshot::PlanStep {
+            node_id: fx.node,
+            ordinal: 0,
+            body: "Step 0".into(),
+            status: "blocked".into(),
+            note: Some("no access".into()),
+            reason: None,
+            depends_on: vec![],
+            satisfies: vec![],
+            phase: "active".into(),
+        };
+        crate::outline::mutations::restore_plan_step(&fx.conn, steps[0], &snapshot).unwrap();
+        assert_eq!(status_of(&fx, steps[0]), "ready");
+    }
+
+    #[test]
+    fn new_evidence_is_kept_on_the_decision() {
+        let fx = setup();
+        let repo = DecisionRepo::new(&fx.conn);
+        let d = repo
+            .create(fx.node, None, None, &NewDecision { new_evidence: " it failed with E1 ".into(), ..decision("Q?", &["a"]) })
+            .unwrap();
+        assert_eq!(d.new_evidence, "it failed with E1");
+        assert_eq!(repo.get(d.id).unwrap().unwrap().new_evidence, "it failed with E1");
+    }
+
+    #[test]
+    fn linking_is_validated_before_anything_is_written() {
+        let fx = setup();
+        let steps = blocked_steps(&fx, 1);
+        let repo = DecisionRepo::new(&fx.conn);
+        let d = repo.create(fx.node, None, None, &decision("Q?", &["a"])).unwrap();
+        repo.check_linkable(d.id, &steps).unwrap();
+        repo.answer(d.id, Some(1), None, "user").unwrap();
+        assert!(repo.check_linkable(d.id, &steps).is_err());
     }
 
     #[test]
@@ -1154,8 +1315,8 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("Carry on without it") && err.contains("--new-evidence"), "{err}");
-        // A different question holding up the step the answer released.
-        assert!(repo.create(fx.node, None, None, &guarded("Different words", vec![steps[0]], "")).is_err());
+        // A different question is a different cause, even for the same step.
+        repo.create(fx.node, None, None, &guarded("Different words", vec![steps[0]], "")).unwrap();
         // An unrelated question is fine.
         repo.create(fx.node, None, None, &guarded("Something else entirely?", vec![], "")).unwrap();
         // New evidence lets the repeat through.

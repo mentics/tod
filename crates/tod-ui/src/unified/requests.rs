@@ -1448,6 +1448,14 @@ impl Requests {
                     cx,
                 ),
             ))
+            .when(!decision.new_evidence.trim().is_empty(), |el| {
+                el.child(style::text_muted(div().text_sm()).child(selectable_markdown(
+                    SharedString::from(format!("unified-decisions-new-evidence-{}", decision.id)),
+                    format!("New since the last answer: {}", decision.new_evidence.trim()),
+                    window,
+                    cx,
+                )))
+            })
             .when(!held_up.is_empty(), |el| {
                 el.child(style::text_muted(div().text_sm()).child(selectable_markdown(
                     SharedString::from(format!("unified-decisions-held-up-{}", decision.id)),
@@ -1771,6 +1779,7 @@ mod tests {
             reason: "intent".into(),
             moves: Vec::new(),
             blocks: Vec::new(),
+            new_evidence: String::new(),
         };
         let answer = DecisionAnswer {
             id: 1,

@@ -202,6 +202,7 @@ mod tests {
                 reason: "access".into(),
                 moves: vec![],
                 blocks: vec![],
+                new_evidence: String::new(),
             },
             answers: vec![DecisionAnswer {
                 id: 1,

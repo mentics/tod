@@ -436,7 +436,14 @@ fn update(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
                 status.is_some_and(needs_user),
                 "--decision links a step handed back (--status partial or blocked) to the question that holds it up"
             );
-            Some(inv.client().read(|conn| tod_store::decisions::DecisionRepo::new(conn).resolve(raw))?)
+            // Validated before anything is written: a bad link must not
+            // leave the step handed back with no question behind it.
+            Some(inv.client().read(|conn| {
+                let repo = tod_store::decisions::DecisionRepo::new(conn);
+                let decision = repo.resolve(raw)?;
+                repo.check_linkable(decision, &[id])?;
+                Ok(decision)
+            })?)
         }
         None => None,
     };

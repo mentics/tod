@@ -470,7 +470,14 @@ pub fn render_recent_answers(conn: &Connection, node_id: Uuid) -> Result<String>
             continue;
         }
         let Some(found) = repo.get_with_answers(decision.id)? else { continue };
-        let Some(answer) = found.answers.iter().rev().find(|a| a.answered_at >= since) else { continue };
+        let Some(answer) = found
+            .answers
+            .iter()
+            .rev()
+            .find(|a| a.answered_at >= since && a.actor != tod_store::decisions::SETTLED_BY)
+        else {
+            continue;
+        };
         let picked = answer
             .option
             .and_then(|o| decision.options.get(usize::try_from(o).ok()?.checked_sub(1)?))
@@ -538,6 +545,42 @@ mod tests {
         assert!(text.contains("Leave PG 18 verification to CI?"), "{text}");
         assert!(text.contains("\"Carry on without it\""), "{text}");
         assert!(text.contains("do not ask them again"), "{text}");
+    }
+
+    /// A question tod settled itself (withdrawn) was not answered by the user: it never reaches the agent as an answer.
+    #[test]
+    fn a_settled_without_the_user_question_is_not_shown_as_answered() {
+        use tod_store::decisions::{DecisionRepo, NewDecision};
+        use tod_store::interview::InterviewCommand;
+        let fx = crate::interview::test_support::fixture();
+        fx.fleet
+            .interview(
+                "user",
+                InterviewCommand::AskDecision {
+                    node_id: fx.node,
+                    conversation_id: None,
+                    protocol: None,
+                    decision: NewDecision {
+                        question: "Settled by the app?".into(),
+                        options: vec!["a".into()],
+                        ..Default::default()
+                    },
+                },
+            )
+            .unwrap();
+        let pending = fx
+            .fleet
+            .read(|conn| Ok(DecisionRepo::new(conn).list_pending_for_node(fx.node)?))
+            .unwrap()
+            .remove(0);
+        fx.fleet
+            .interview(
+                "user",
+                InterviewCommand::WithdrawDecision { decision_id: pending.id },
+            )
+            .unwrap();
+        let text = fx.fleet.read(|conn| render_recent_answers(conn, fx.node)).unwrap();
+        assert_eq!(text, "");
     }
 
     fn obligation(n: u128, kind: &str, section: Option<&str>) -> NodeObligation {
