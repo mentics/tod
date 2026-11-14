@@ -1,14 +1,12 @@
-# Improvement log
+# Improvement log (frozen 2026-11-14)
 
-What went wrong while driving real nodes through the lifecycle, how often, and
-what was done about it. One entry per kind of problem; bump its count and add
-the node when it happens again. Newest kinds first. The point is to see which
-problems recur and fix those at the root (app, prompts, context), not one node
-at a time.
-
-Fields: **Seen** (count, nodes, dates) · **Symptom** (what the user saw) ·
-**Cause** · **Fix** (commit, or "open") · **Measure** (what statistic would
-have shown it sooner).
+History only: nothing is added here. It is what went wrong while driving real
+nodes through the lifecycle up to 2026-11-14, kept for data mining and
+troubleshooting. Its open items (each "Fix: open" or "Open:" below, and every
+statistic in the next section) were moved to the shepherd ledger as open
+gaps, which is where current work lives now: `ledger.py <live root> gap list`
+(`.claude/skills/shepherd-common/ledger.md`). A gap that is closed goes to the
+ledger's `history.jsonl`; why a fix was made is in its commit message.
 
 ## Statistics worth collecting
 
