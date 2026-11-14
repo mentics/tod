@@ -126,7 +126,7 @@ pub fn plan(existing: Option<&SandboxInfo>, has_proxy: bool, volume: Option<&str
 /// Returns the sandbox's URL; the server is at `<url>/port/8090`.
 pub fn provision(bx: &Blaxel, spec: &Spec, progress: &mut dyn FnMut(&str)) -> Result<String> {
     let name = spec.name;
-    let mut existing = bx.get(name)?;
+    let mut existing = bx.get_waiting_not_ready(name, crate::blaxel::NOT_READY_WAIT)?;
     if let Some(info) = &existing
         && is_dead(&info.status)
     {

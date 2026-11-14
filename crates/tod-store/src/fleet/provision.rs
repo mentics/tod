@@ -495,16 +495,18 @@ fn choose_sandbox_within(
     progress: &mut dyn FnMut(&str),
     wait: std::time::Duration,
 ) -> Result<Chosen> {
+    // One deadline for everything below: lookups and the delete wait together.
+    let deadline = std::time::Instant::now() + wait;
+    let left = || deadline.saturating_duration_since(std::time::Instant::now()).max(bx.poll_interval());
     let mut candidate = sandbox_name(slug, node_id)?;
     for name in recorded {
-        if sandbox_exists(bx.get_waiting_not_ready(name, wait)?.as_ref()) {
+        if sandbox_exists(bx.get_waiting_not_ready(name, left())?.as_ref()) {
             candidate = name.clone();
             break;
         }
     }
-    let deadline = std::time::Instant::now() + wait;
     loop {
-        let existing = bx.get_waiting_not_ready(&candidate, wait)?;
+        let existing = bx.get_waiting_not_ready(&candidate, left())?;
         match decide_name(&candidate, node_id, recorded, existing.as_ref()) {
             NameDecision::Make => return Ok(Chosen::Make(candidate)),
             NameDecision::Reuse => return Ok(Chosen::Reuse(candidate)),
@@ -688,10 +690,11 @@ pub fn refresh_sandbox_proxy(
     progress(&format!("deleting {name} to give it the node's credentials…"));
     sandboxes.delete(&bx, &cleared).with_context(|| format!("delete sandbox {name}"))?;
     // Not-ready answers during the deletion are waited out; the location is
-    // cleared either way (the sandbox was deleted and the new one gets another
-    // name), a wait that ran out is said, not dropped.
+    // cleared either way. The next start's name is the same (`sandbox_name` is
+    // deterministic), so it waits up to its bound for this one to go and
+    // errors if it has not; a wait that ran out here is said, not dropped.
     if let Some(why) = bx.wait_until_gone(&name, std::time::Duration::from_secs(120), |found| !sandbox_exists(found))? {
-        progress(&format!("warning: {name} was deleted but is not gone yet ({why}); going on"));
+        progress(&format!("warning: {name} was deleted but is not gone yet ({why}); the next start waits up to two minutes for it to go, and stops with an error if it has not"));
     }
     fleet.enqueue(FleetMutation::DeleteFilesLocation { node_id: node_id.to_string() })?;
     fleet.writer().flush()?;
