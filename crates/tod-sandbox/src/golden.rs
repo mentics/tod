@@ -331,7 +331,26 @@ pub fn retry_from_new_source(source_exists: Option<bool>, already_retried: bool,
 /// Its text is the whole message for the user (the original error first,
 /// then the sandbox's name and what to do about it).
 #[derive(Debug)]
-pub struct LeftBehind(pub String);
+pub struct LeftBehind(pub String, pub Option<String>);
+
+impl LeftBehind {
+    /// A failure that names no one sandbox (several joined, or a record that
+    /// could not be written).
+    pub fn new(text: impl Into<String>) -> Self {
+        Self(text.into(), None)
+    }
+
+    /// A failure of the call that makes `target`: the name the record keeps,
+    /// never parsed back out of the text (the text names the source first).
+    pub fn with_target(text: impl Into<String>, target: &str) -> Self {
+        Self(text.into(), Some(target.to_string()))
+    }
+
+    /// The sandbox this failure may have left, when it is known.
+    pub fn target(&self) -> Option<&str> {
+        self.1.as_deref()
+    }
+}
 
 impl std::fmt::Display for LeftBehind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -546,7 +565,7 @@ mod tests {
         // Kept, or the delete failed: a sandbox is still there.
         assert!(!cleanup_left_nothing(true, &HalfMade::Keep("not tod's".into()), false));
         assert!(!cleanup_left_nothing(true, &HalfMade::Delete, false));
-        let err = anyhow::Error::new(LeftBehind("fork x: 502 Bad Gateway; tod-golden-x may exist".into()));
+        let err = anyhow::Error::new(LeftBehind::new("fork x: 502 Bad Gateway; tod-golden-x may exist"));
         assert!(err.downcast_ref::<LeftBehind>().is_some());
     }
 

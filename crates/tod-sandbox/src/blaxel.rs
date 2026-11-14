@@ -87,6 +87,15 @@ pub fn classify_failure(status: u16, body: &str) -> FailureClass {
     }
 }
 
+/// Whether a 404 with `body` for sandbox `name` means it does not exist:
+/// `Ok`, or an error when the body says the workload is not ready (unknown).
+pub fn not_found_means_gone(name: &str, body: &str) -> Result<()> {
+    match classify_failure(404, body) {
+        FailureClass::Gone => Ok(()),
+        _ => bail!("Blaxel answered 404 for {name} but says it is not ready ({}): whether it exists is unknown", body.trim().chars().take(200).collect::<String>()),
+    }
+}
+
 /// Whether a reply's body, or an error's text, says the workload or resource
 /// is not ready yet, so the same call would work a moment later. The one list
 /// of those phrases: [`classify_failure`] and [`error_is_not_ready`] read it.
@@ -569,6 +578,21 @@ impl Blaxel {
             .context("Blaxel API")?;
         if resp.status().as_u16() == 404 {
             return Ok(None);
+        }
+        check(&mut resp, "get sandbox")?;
+        let v: Value = resp.body_mut().read_json()?;
+        Ok(Some(parse_info(&v)))
+    }
+
+    /// [`Self::get`] for a decision that acts on "it does not exist": a 404
+    /// whose body says the workload is not ready ([`classify_failure`]) is not
+    /// "gone" but unknown, and is an error saying so.
+    pub fn get_strict(&self, name: &str) -> Result<Option<SandboxInfo>> {
+        let mut resp = self.cp(true, || self.auth(self.agent.get(&format!("{API}/sandboxes/{name}"))).call())
+            .context("Blaxel API")?;
+        if resp.status().as_u16() == 404 {
+            let body = resp.body_mut().read_to_string().with_context(|| format!("read Blaxel's 404 for {name}"))?;
+            return not_found_means_gone(name, &body).map(|()| None);
         }
         check(&mut resp, "get sandbox")?;
         let v: Value = resp.body_mut().read_json()?;
@@ -1348,6 +1372,18 @@ pub fn jwt_expiry(token: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// A 404 that says the workload is not ready is unknown, not gone: a
+    /// decision that acts on "it does not exist" must not read it as gone.
+    #[test]
+    fn a_404_saying_not_ready_is_not_gone() {
+        assert!(not_found_means_gone("x", r#"{"error":"sandbox not found"}"#).is_ok());
+        assert!(not_found_means_gone("x", "").is_ok());
+        let err = not_found_means_gone("x", "workload is not ready").unwrap_err();
+        assert!(format!("{err:#}").contains("unknown"), "{err:#}");
+    }
+
     #[test]
     fn a_bare_deadline_error_is_transient() {
         assert!(text_is_transient("fork x from y: Post .../compute/instances?wait=false: context deadline exceeded"));

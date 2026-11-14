@@ -137,7 +137,9 @@ and `refresh_golden` (`golden refresh`, Settings):
 - **Nodes are never blocked while a golden can be forked.** With a record
   standing, or when a refresh fails just now, a node start uses the
   repository's existing golden if Blaxel has it and it is not newer than this
-  build (older and unstamped ones are usable); the failure is logged as an
+  build (older and unstamped ones are usable). This holds for **any** refresh
+  failure, not only a left-behind one (an original golden that is gone, a
+  failed GitHub or Blaxel look); the failure is logged as an
   error and said in the progress. Only a repository with **no** such golden is
   refused, and the message says why.
 - **The record clears itself.** At least ten minutes after the failure
@@ -150,8 +152,12 @@ and `refresh_golden` (`golden refresh`, Settings):
   before the fork. If the fork fails and the source is gone (the workspace
   golden was replaced meanwhile) and the cleanup finds the target name not at
   Blaxel, the fork is made once more from the source the setting names now,
-  under a different name (`golden::retry_from_new_source`). Any other failure is
-  recorded as above.
+  under a different name (`golden::retry_from_new_source`). The first target may
+  still be made later, so it is deleted if it then exists, else recorded beside
+  any other (a record holds every target and clears only when none exists). The
+  target is stored from the failed call's own name, never parsed from the
+  message, and a 404 saying the workload is not ready counts as unknown, not
+  gone (`Blaxel::get_strict`). Any other failure is recorded as above.
 - **The hint matches.** A refusal says what happens ("What to do: nothing needs
   trying again; tod checks again after ..., it clears itself once Blaxel shows
   no sandbox named ...") rather than the panel's "try again in a minute".
