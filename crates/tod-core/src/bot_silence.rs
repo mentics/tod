@@ -189,6 +189,19 @@ pub fn settings_for_node(
     // starts again. Nothing is read for a project with no bots.
     if !settings.bots.is_empty() {
         settings.own_review = own_review_state(conn, node)?;
+        // Every repository tod has pull requests in: where a bot's history
+        // is read from when finding out whether it reviews drafts.
+        let mut repos: Vec<(String, String)> = Vec::new();
+        for prs in tod_store::github::NodePrRepo::new(conn).all()?.into_values() {
+            for pr in prs {
+                let key = (pr.owner.clone(), pr.repo.clone());
+                if !repos.iter().any(|(o, r)| o.eq_ignore_ascii_case(&key.0) && r.eq_ignore_ascii_case(&key.1)) {
+                    repos.push(key);
+                }
+            }
+        }
+        repos.sort();
+        settings.known_repos = repos;
     }
     Ok(settings)
 }

@@ -3661,6 +3661,8 @@ impl BotFeed {
 fn drafts_passed_over() -> Vec<tod_store::github::RecentPr> {
     let ago = |hours: i64| (chrono::Utc::now() - chrono::Duration::hours(hours)).to_rfc3339();
     let pr = |number, draft, hours: i64, bot: bool| tod_store::github::RecentPr {
+        repo: "acme/app".into(),
+        ready_events: Vec::new(),
         number,
         draft,
         created_at: ago(hours),
@@ -3722,7 +3724,11 @@ impl crate::pr_readiness::PrFeed for BotFeed {
         })
     }
 
-    fn recent_prs(&self, _: &tod_store::github::NodePr) -> Result<Vec<tod_store::github::RecentPr>, String> {
+    fn recent_prs(
+        &self,
+        _: &tod_store::github::NodePr,
+        _: &[(String, String)],
+    ) -> Result<Vec<tod_store::github::RecentPr>, String> {
         Ok(self.recent.clone())
     }
 
@@ -3875,6 +3881,21 @@ fn a_bot_that_skips_drafts_is_still_required_once_the_pull_request_is_ready() {
 }
 
 #[test]
+fn names_a_pull_request_by_number_only_at_a_number_boundary() {
+    use super::request_names_pr as names;
+    assert!(names("Check why Greptile is not reviewing flagship pull request #6640, then pick an option.", 6640));
+    assert!(names("Check why Greptile is not reviewing pull request #6680 (Cofactr/flagship), or decide", 6680));
+    assert!(names("Check why the Greptile review bot is not responding on pull request #2885 (Cofactr/kb).", 2885));
+    assert!(names("Trigger Greptile's review of flagship pull request #6679, or tell me", 6679));
+    assert!(names("Fix GitHub so a comment can be posted on pull request #2866 (Cofactr/kb), then pick Fixed.", 2866));
+    assert!(names("greptile has not reviewed Cofactr/flagship#6641 after 0 asks", 6641));
+    assert!(names("see PR 12 and pull/12", 12));
+    assert!(!names("Check why Greptile is not reviewing pull request #6640", 664));
+    assert!(!names("Check why Greptile is not reviewing pull request #6640", 66400));
+    assert!(!names("took 6640 ms", 6640));
+}
+
+#[test]
 fn requests_about_a_bot_that_skips_drafts_are_withdrawn_with_a_note_and_the_run_goes_on() {
     let feed = BotFeed::drafted("2020-01-01T00:00:00Z", None, true, drafts_passed_over());
     let (fx, mut agent) = bot_node(feed.clone(), SILENT_BOT);
@@ -3896,11 +3917,30 @@ fn requests_about_a_bot_that_skips_drafts_are_withdrawn_with_a_note_and_the_run_
             )
             .unwrap();
     };
+    // The live wordings, with this node's pull request (#42).
     ask(
         "pr",
         "broken",
-        "Check why Greptile is not reviewing flagship#6640",
+        "Check why Greptile is not reviewing flagship pull request #42, then pick an option.",
         vec!["Fixed, try again".into(), "Carry on without Greptile".into()],
+    );
+    ask(
+        "pr",
+        "broken",
+        "Check why the Greptile review bot is not responding on pull request #42 (acme/app).",
+        vec!["Fixed, try again".into()],
+    );
+    ask(
+        "pr",
+        "broken",
+        "Trigger Greptile's review of flagship pull request #42, or tell me to proceed without it",
+        vec!["Fixed, try again".into()],
+    );
+    ask(
+        "pr",
+        "broken",
+        "Fix GitHub so a comment can be posted on pull request #42 (acme/app), then pick Fixed.",
+        vec!["Fixed, try again".into()],
     );
     ask(
         crate::bot_silence::PROTOCOL,
@@ -3908,21 +3948,35 @@ fn requests_about_a_bot_that_skips_drafts_are_withdrawn_with_a_note_and_the_run_
         "greptile has not reviewed acme/app#42 after 0 asks for a review",
         crate::bot_silence::options("greptile"),
     );
-    // An unrelated request stays.
-    ask("pr", "broken", "The build is broken", vec!["Fixed, try again".into()]);
-    assert_eq!(pending_requests(&fx).len(), 3);
+    // Stays: no pull request named (a bad token), another pull request's
+    // number (#4 is not #42), a comment failure that is not about a pull
+    // request of the node's, and an unrelated request.
+    ask("pr", "broken", "Greptile rejected the token: replace the credential", vec!["Fixed, try again".into()]);
+    ask("pr", "broken", "Check why Greptile is not reviewing pull request #4", vec!["Fixed, try again".into()]);
+    ask("pr", "broken", "Fix GitHub so a comment can be posted on pull request #7", vec!["Fixed, try again".into()]);
+    ask("pr", "broken", "The build is broken on pull request #42", vec!["Fixed, try again".into()]);
+    assert_eq!(pending_requests(&fx).len(), 9);
 
     let outcome = autopilot(&fx, Budget::default())
         .with_pr_poll_interval(Duration::ZERO)
         .run(&fx.fleet, &mut agent)
         .unwrap();
     let left = pending_requests(&fx);
-    assert_eq!(left.len(), 1, "{left:?}");
-    assert_eq!(left[0].question, "The build is broken");
-    assert_eq!(outcome, Outcome::NeedsHuman { reason: NeedsHuman::Decision { pending: 1 } });
+    let mut left: Vec<&str> = left.iter().map(|d| d.question.as_str()).collect();
+    left.sort_unstable();
+    assert_eq!(
+        left,
+        vec![
+            "Check why Greptile is not reviewing pull request #4",
+            "Fix GitHub so a comment can be posted on pull request #7",
+            "Greptile rejected the token: replace the credential",
+            "The build is broken on pull request #42",
+        ]
+    );
+    assert_eq!(outcome, Outcome::NeedsHuman { reason: NeedsHuman::Decision { pending: 4 } });
     assert!(feed.posted.lock().unwrap().is_empty());
     let notes = fx.fleet.read(|conn| Ok(tod_store::node_timeline::TimelineRepo::new(conn).list(fx.node)?)).unwrap();
-    assert_eq!(notes.iter().filter(|e| e.title.starts_with("Request withdrawn: greptile")).count(), 2, "{notes:?}");
+    assert_eq!(notes.iter().filter(|e| e.title.starts_with("Request withdrawn: ")).count(), 5, "{notes:?}");
 }
 
 #[test]

@@ -490,20 +490,39 @@ its own words. Now:
          reviews_drafts: false   # true: always on drafts; unset: detect
    ```
 
-   Unset, `pr_readiness::reviews_drafts` reads the repository's last 40 pull
-   requests with one GraphQL query (cached 30 minutes; a failed read is the
-   assessment's error, never a guess). Let D be the last time the bot spoke
-   (review or comment) on a pull request that is a draft now. It is taken
-   not to review drafts when **at least 3** drafts opened after D, over 2
-   hours ago and within the last 14 days, got nothing from it, **and** it has
-   spoken on a ready pull request after D (so it is alive and only drafts
-   are skipped). Fewer drafts, a bot silent everywhere, or a draft it
-   reviewed since leave it as reviewing drafts, so a bot is not dropped on
-   thin evidence. A request already pending about such a bot on a draft
-   (protocol `pr` or `bot_silence`, reason `broken`, naming it) is withdrawn
-   by the autopilot with a note on the node's activity
-   (`Autopilot::withdraw_draft_bot_requests`), and the node goes on. No
-   prompt or code names a bot: it comes from the configuration.
+   Unset, `pr_readiness::reviews_drafts` reads recent pull requests (the last
+   40 of a repository, one GraphQL query each, cached 30 minutes; a failed
+   read is the assessment's error, never a guess). A review bot is one GitHub
+   App with one configuration per owner, so the history is **pooled**: the
+   pull request's repository plus every other repository of the same owner
+   that tod has a linked pull request in (`PrReadinessSettings::known_repos`).
+   A low-volume repository therefore borrows the evidence of a busy sibling.
+   Let D be the last time the bot spoke (review or comment) on a pull request
+   **while it was a draft**, judged from the pull request's ready-for-review
+   and convert-to-draft events (a PR that is ready now but was a draft when
+   the bot spoke counts as a draft then; with no such events its state now
+   is used). The bot is taken not to review drafts when **at least 3** pull
+   requests that are drafts now, opened after D within the last 14 days, got
+   nothing from it (and are over 2 hours old, except the pull request being
+   assessed, which also counts once the bot was first asked for a review of
+   it at least 2 hours ago), **and** it has spoken on a ready pull request
+   after D and within the last 14 days (so it is alive and only drafts are
+   skipped). Fewer drafts, a bot silent everywhere or for over 14 days, or a
+   draft it reviewed since leave it as reviewing drafts, so a bot is not
+   dropped on thin evidence. Not handled: a draft that was marked ready
+   before the bot ever got to it is not counted as passed over.
+
+   A request already pending about such a bot (protocol `pr` or `bot_silence`,
+   reason `broken`) is withdrawn by the autopilot with a note on the node's
+   activity (`Autopilot::withdraw_draft_bot_requests`), and the node goes on,
+   only when it **names one of the node's pull requests by number** (`#6680`,
+   `owner/repo#6680`, `pull request 6680`, `PR 6680`; `#66` is not `#6680`)
+   and that pull request is a draft the bot is skipped on, and it is about the
+   bot: it names the bot, or it is a failed attempt to post a comment on that
+   draft (how an ask to the bot fails, read as "comment" with "post" or "add";
+   documented, not a bot-free match otherwise). A request naming the bot
+   alone (a rejected token) or an unrelated request about the draft is never
+   withdrawn. No prompt or code names a bot: it comes from the configuration.
 
 ## What is built where
 

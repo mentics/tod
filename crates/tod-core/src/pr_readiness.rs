@@ -1524,6 +1524,8 @@ Not safe.
     fn recent(number: i64, draft: bool, hours_ago: i64, bot_hours_ago: Option<i64>) -> tod_store::github::RecentPr {
         let t = |h: i64| (now() - chrono::Duration::hours(h)).to_rfc3339();
         tod_store::github::RecentPr {
+            repo: "o/r".into(),
+            ready_events: Vec::new(),
             number,
             draft,
             created_at: t(hours_ago),
@@ -1543,21 +1545,111 @@ Not safe.
             recent(4, true, 10, None),
             recent(5, true, 5, None),
         ];
-        assert!(!reviews_drafts(&blind, bot, now()));
+        assert!(!reviews_drafts(&blind, bot, now(), None));
         // Two drafts are too few.
-        assert!(reviews_drafts(&blind[..4], bot, now()));
+        assert!(reviews_drafts(&blind[..4], bot, now(), None));
         // A bot silent everywhere is silent, not blind to drafts.
         let silent: Vec<_> = (0..6).map(|n| recent(n, n % 2 == 0, 10 + n, None)).collect();
-        assert!(reviews_drafts(&silent, bot, now()));
+        assert!(reviews_drafts(&silent, bot, now(), None));
         // It reviewed a draft after the others were passed over.
         let mut back = blind.clone();
         back.push(recent(6, true, 4, Some(3)));
-        assert!(reviews_drafts(&back, bot, now()));
+        assert!(reviews_drafts(&back, bot, now(), None));
         // Drafts under two hours old may just not have been reached.
         let fresh = vec![recent(1, false, 30, Some(29)), recent(2, true, 1, None), recent(3, true, 1, None), recent(4, true, 1, None)];
-        assert!(reviews_drafts(&fresh, bot, now()));
+        assert!(reviews_drafts(&fresh, bot, now(), None));
         // Nothing known: as before.
-        assert!(reviews_drafts(&[], bot, now()));
+        assert!(reviews_drafts(&[], bot, now(), None));
+    }
+
+    fn in_repo(mut p: tod_store::github::RecentPr, repo: &str) -> tod_store::github::RecentPr {
+        p.repo = repo.into();
+        p
+    }
+
+    #[test]
+    fn a_low_volume_repository_borrows_the_owners_other_repositories() {
+        let bot = &GREPTILE;
+        // kb-like: one draft of its own, passed over. flagship-like: the
+        // bot reviews ready pull requests and passes over drafts.
+        let kb = vec![in_repo(recent(1, true, 30, None), "o/kb")];
+        assert!(reviews_drafts(&kb, bot, now(), None), "one draft is not enough alone");
+        let mut pooled = kb.clone();
+        pooled.extend([
+            in_repo(recent(10, false, 40, Some(39)), "o/flagship"),
+            in_repo(recent(11, true, 20, None), "o/flagship"),
+            in_repo(recent(12, true, 10, None), "o/flagship"),
+        ]);
+        assert!(!reviews_drafts(&pooled, bot, now(), None));
+    }
+
+    #[test]
+    fn the_own_draft_asked_and_unanswered_counts_before_it_is_hours_old() {
+        let bot = &GREPTILE;
+        let history = vec![
+            recent(1, false, 30, Some(29)),
+            recent(2, true, 20, None),
+            recent(3, true, 10, None),
+            recent(4, true, 1, None),
+        ];
+        assert!(reviews_drafts(&history, bot, now(), None), "the newest is too young");
+        let asked = OwnDraft { repo: "o/r".into(), number: 4, asked_at: Some(now() - chrono::Duration::hours(1)) };
+        assert!(reviews_drafts(&history, bot, now(), Some(&asked)), "asked under 2 hours ago is still young");
+        let asked = OwnDraft { asked_at: Some(now() - chrono::Duration::hours(3)), ..asked };
+        // Created an hour ago but asked three hours ago cannot be; the ask
+        // time is what settles it.
+        assert!(!reviews_drafts(&history, bot, now(), Some(&asked)));
+        let other = OwnDraft { number: 9, ..asked };
+        assert!(reviews_drafts(&history, bot, now(), Some(&other)), "only the pull request itself");
+    }
+
+    #[test]
+    fn activity_is_judged_by_the_state_the_pull_request_was_in_then() {
+        let bot = &GREPTILE;
+        let t = |h: i64| (now() - chrono::Duration::hours(h)).to_rfc3339();
+        // A pull request that is ready now but was a draft when the bot
+        // reviewed it (marked ready 5 hours ago): the review was of a draft.
+        let mut was_draft = recent(1, false, 30, Some(20));
+        was_draft.ready_events = vec![(t(5), false)];
+        assert!(draft_at(&was_draft, now() - chrono::Duration::hours(20)));
+        assert!(!draft_at(&was_draft, now() - chrono::Duration::hours(2)));
+        // Converted back to a draft after being ready.
+        let mut back = recent(2, true, 30, None);
+        back.ready_events = vec![(t(20), true)];
+        assert!(!draft_at(&back, now() - chrono::Duration::hours(25)));
+        assert!(draft_at(&back, now() - chrono::Duration::hours(1)));
+        // With that review of a draft at -20h, drafts opened since do not show
+        // blindness: D is -20h, and the bot has spoken on no ready PR since.
+        let history = vec![
+            was_draft,
+            recent(3, true, 15, None),
+            recent(4, true, 12, None),
+            recent(5, true, 10, None),
+            recent(6, false, 8, Some(7)),
+        ];
+        assert!(!reviews_drafts(&history, bot, now(), None), "the ready review after D and three drafts since");
+        // Without the events the first review reads as one of a ready PR, so D
+        // is not set by it, and the drafts before it count too (still blind).
+        let mut plain = history.clone();
+        plain[0].ready_events.clear();
+        assert!(!reviews_drafts(&plain, bot, now(), None));
+        // A review of a draft *after* the others were opened clears it.
+        let mut recent_draft_review = history.clone();
+        recent_draft_review.push(recent(7, true, 9, Some(1)));
+        assert!(reviews_drafts(&recent_draft_review, bot, now(), None));
+    }
+
+    #[test]
+    fn a_ready_review_older_than_the_window_does_not_make_the_bot_alive() {
+        let bot = &GREPTILE;
+        let old = 15 * 24;
+        let history = vec![
+            recent(1, false, old + 10, Some(old)),
+            recent(2, true, 30, None),
+            recent(3, true, 20, None),
+            recent(4, true, 10, None),
+        ];
+        assert!(reviews_drafts(&history, bot, now(), None));
     }
 
     #[test]
@@ -1567,7 +1659,11 @@ Not safe.
             fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<PrSnapshot, String> {
                 unreachable!()
             }
-            fn recent_prs(&self, _: &tod_store::github::NodePr) -> Result<Vec<tod_store::github::RecentPr>, String> {
+            fn recent_prs(
+                &self,
+                _: &tod_store::github::NodePr,
+                _: &[(String, String)],
+            ) -> Result<Vec<tod_store::github::RecentPr>, String> {
                 Err("GitHub is down".into())
             }
         }
@@ -2268,7 +2364,15 @@ pub trait PrFeed: Send + Sync {
     /// The repository's recent pull requests and who spoke on them, for
     /// [`reviews_drafts`]. A feed with no such history says none, which counts
     /// as "no evidence the bot skips drafts".
-    fn recent_prs(&self, _pr: &tod_store::github::NodePr) -> Result<Vec<tod_store::github::RecentPr>, String> {
+    ///
+    /// `pool` is every repository tod has pull requests in: a review bot is one
+    /// GitHub App with one configuration for its owner, so the history of the
+    /// owner's other repositories counts too.
+    fn recent_prs(
+        &self,
+        _pr: &tod_store::github::NodePr,
+        _pool: &[(String, String)],
+    ) -> Result<Vec<tod_store::github::RecentPr>, String> {
         Ok(Vec::new())
     }
     /// Post a top-level comment on the pull request (the ask for a bot's
@@ -2350,22 +2454,49 @@ impl PrFeed for GithubFeed {
         Ok(same)
     }
 
-    fn recent_prs(&self, pr: &tod_store::github::NodePr) -> Result<Vec<tod_store::github::RecentPr>, String> {
+    fn recent_prs(
+        &self,
+        pr: &tod_store::github::NodePr,
+        pool: &[(String, String)],
+    ) -> Result<Vec<tod_store::github::RecentPr>, String> {
         static CACHE: std::sync::Mutex<
             Option<std::collections::HashMap<String, (std::time::Instant, Vec<tod_store::github::RecentPr>)>>,
         > = std::sync::Mutex::new(None);
-        let key = format!("{}/{}", pr.owner, pr.repo);
-        if let Some((at, prs)) = CACHE.lock().unwrap().as_ref().and_then(|m| m.get(&key))
-            && at.elapsed() < RECENT_TTL
-        {
-            return Ok(prs.clone());
+        // This pull request's repository, then the owner's other repositories
+        // tod has pull requests in, each read once per `RECENT_TTL`.
+        let mut repos: Vec<(String, String)> = vec![(pr.owner.clone(), pr.repo.clone())];
+        for (owner, repo) in pool {
+            if owner.eq_ignore_ascii_case(&pr.owner) && !repos.iter().any(|(_, r)| r.eq_ignore_ascii_case(repo)) {
+                repos.push((owner.clone(), repo.clone()));
+            }
         }
-        let prs = self
-            .0
-            .recent_pr_activity(&pr.owner, &pr.repo)
-            .map_err(|err| format!("reading {}/{}'s recent pull requests to see whether a review bot reviews drafts: {err}", pr.owner, pr.repo))?;
-        CACHE.lock().unwrap().get_or_insert_with(Default::default).insert(key, (std::time::Instant::now(), prs.clone()));
-        Ok(prs)
+        let mut all = Vec::new();
+        for (owner, repo) in repos {
+            let key = format!("{owner}/{repo}").to_ascii_lowercase();
+            let cached = CACHE
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|m| m.get(&key))
+                .filter(|(at, _)| at.elapsed() < RECENT_TTL)
+                .map(|(_, prs)| prs.clone());
+            let prs = match cached {
+                Some(prs) => prs,
+                None => {
+                    let prs = self.0.recent_pr_activity(&owner, &repo).map_err(|err| {
+                        format!("reading {owner}/{repo}'s recent pull requests to see whether a review bot reviews drafts: {err}")
+                    })?;
+                    CACHE
+                        .lock()
+                        .unwrap()
+                        .get_or_insert_with(Default::default)
+                        .insert(key, (std::time::Instant::now(), prs.clone()));
+                    prs
+                }
+            };
+            all.extend(prs);
+        }
+        Ok(all)
     }
 
     fn post_comment(&self, pr: &tod_store::github::NodePr, body: &str) -> Result<(), String> {
@@ -2567,10 +2698,22 @@ pub fn assess(
             .filter(|b| b.reviews_drafts.is_none())
             .filter_map(|b| builtin_bot(&b.name).map(|bot| (b, bot)))
             .collect();
-        let history = if open.is_empty() { Vec::new() } else { feed.recent_prs(pr)? };
+        let history = if open.is_empty() { Vec::new() } else { feed.recent_prs(pr, &settings.known_repos)? };
         let mut with_blind = settings.clone();
         for (configured, bot) in open {
-            if !reviews_drafts(&history, bot, now) {
+            // This draft's own asks count as evidence at once: asked and
+            // unanswered, it need not be hours old first.
+            let ask = ask_text(configured).map(|a| a.to_ascii_lowercase());
+            let asked_at = ask.and_then(|ask| {
+                snapshot
+                    .comments
+                    .iter()
+                    .filter(|c| c.body.to_ascii_lowercase().contains(&ask))
+                    .filter_map(|c| parse_time(&c.created_at))
+                    .min()
+            });
+            let own = OwnDraft { repo: format!("{}/{}", pr.owner, pr.repo), number: pr.pr_number, asked_at };
+            if !reviews_drafts(&history, bot, now, Some(&own)) {
                 with_blind.draft_blind.push(configured.name.to_ascii_lowercase());
             }
         }
@@ -2597,30 +2740,70 @@ const DRAFT_MIN_AGE_HOURS: i64 = 2;
 /// does not review them.
 const DRAFT_EVIDENCE: usize = 3;
 
-/// Whether `bot` reviews pull requests that are drafts, from the repository's
-/// recent pull requests (`history`, as [`PrFeed::recent_prs`] reads them).
-/// The rule, in `doc/lifecycle/pr-readiness.md`: let D be the latest time the
-/// bot spoke on a pull request that is a draft now. The bot is taken not to
-/// review drafts when **at least three** drafts opened after D, over two hours
-/// ago, within the last 14 days, got nothing from it, **and** it has spoken
-/// on some pull request that is ready after D (so it is alive, and only drafts
-/// are skipped). Anything less (too few drafts, a bot silent everywhere, a
-/// draft it reviewed since) leaves it as reviewing drafts, so a bot is never
-/// dropped on thin evidence.
-pub fn reviews_drafts(history: &[tod_store::github::RecentPr], bot: &ReviewBot, now: DateTime<Utc>) -> bool {
+/// The pull request being assessed, as evidence for [`reviews_drafts`].
+#[derive(Debug, Clone)]
+pub struct OwnDraft {
+    /// `owner/repo`.
+    pub repo: String,
+    pub number: i64,
+    /// When the bot was first asked for a review of it, if it was.
+    pub asked_at: Option<DateTime<Utc>>,
+}
+
+/// Whether `pr` was a draft at `at`, from its ready/convert-to-draft events
+/// (replayed from the state they imply before the first one), else its state now.
+fn draft_at(pr: &tod_store::github::RecentPr, at: DateTime<Utc>) -> bool {
+    let mut state = match pr.ready_events.first() {
+        Some((_, to_draft)) => !*to_draft,
+        None => return pr.draft,
+    };
+    for (when, to_draft) in &pr.ready_events {
+        if parse_time(when).is_some_and(|t| t <= at) {
+            state = *to_draft;
+        }
+    }
+    state
+}
+
+/// Whether `bot` reviews pull requests that are drafts, from recent pull
+/// requests (`history`, as [`PrFeed::recent_prs`] reads them: the repository's
+/// and the owner's other repositories', since the bot is one app with one
+/// configuration for its owner). The rule, in `doc/lifecycle/pr-readiness.md`:
+/// let D be the latest time the bot spoke on a pull request **while it was a
+/// draft** (from its ready/convert-to-draft events). The bot is taken not to
+/// review drafts when **at least three** pull requests that are drafts now,
+/// opened after D within the last 14 days, got nothing from it (and are over
+/// two hours old, unless `own` is one of them and was asked for a review at
+/// least two hours ago), **and** it has spoken on a ready pull request after D
+/// and within the last 14 days (so it is alive, and only drafts are skipped).
+/// Anything less leaves it as reviewing drafts.
+pub fn reviews_drafts(
+    history: &[tod_store::github::RecentPr],
+    bot: &ReviewBot,
+    now: DateTime<Utc>,
+    own: Option<&OwnDraft>,
+) -> bool {
     let window = now - chrono::Duration::days(DRAFT_HISTORY_DAYS);
     let settled = now - chrono::Duration::hours(DRAFT_MIN_AGE_HOURS);
     let spoke = |p: &tod_store::github::RecentPr| -> Vec<DateTime<Utc>> {
         p.activity.iter().filter(|(who, _)| bot.is_author(who)).filter_map(|(_, at)| parse_time(at)).collect()
     };
-    let last_on_draft = history.iter().filter(|p| p.draft).flat_map(spoke).max();
+    let last_on_draft = history.iter().flat_map(|p| spoke(p).into_iter().filter(|at| draft_at(p, *at))).max();
     let after = |at: DateTime<Utc>| last_on_draft.is_none_or(|d| at > d);
-    let alive = history.iter().filter(|p| !p.draft).flat_map(spoke).any(after);
+    let alive = history
+        .iter()
+        .flat_map(|p| spoke(p).into_iter().filter(|at| !draft_at(p, *at)))
+        .any(|at| after(at) && at >= window);
     let passed_over = history
         .iter()
         .filter(|p| p.draft && spoke(p).is_empty())
-        .filter_map(|p| parse_time(&p.created_at))
-        .filter(|created| *created >= window && *created <= settled && after(*created))
+        .filter(|p| {
+            let Some(created) = parse_time(&p.created_at) else { return false };
+            let is_own = own.is_some_and(|o| o.number == p.number && o.repo.eq_ignore_ascii_case(&p.repo));
+            let old_enough =
+                created <= settled || (is_own && own.and_then(|o| o.asked_at).is_some_and(|a| a <= settled));
+            created >= window && after(created) && old_enough
+        })
         .count();
     !(alive && passed_over >= DRAFT_EVIDENCE)
 }

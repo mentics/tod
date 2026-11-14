@@ -274,6 +274,7 @@ fn check_ready_for_review(fleet: &FleetStore, node: uuid::Uuid, data_root: &std:
         Ok(live) => live,
         Err(err) => return Ok(GithubCheck::Unreadable(err)),
     };
+    super::note_draft_skipped(fleet, node, &live, "pr_draft")?;
     if let crate::pr_readiness::Next::Wait(waits) = crate::pr_readiness::overall(&live)
         && waits.iter().any(|w| !matches!(w, crate::pr_readiness::Wait::HumanReview))
     {

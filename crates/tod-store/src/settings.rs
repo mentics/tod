@@ -419,6 +419,12 @@ pub struct PrReadinessSettings {
     /// `tod_core::pr_readiness::assess`; never saved.
     #[serde(skip)]
     pub draft_blind: Vec<String>,
+    /// `(owner, repo)` of every pull request tod has linked: a review bot is
+    /// one app with one configuration per owner, so its history in the owner's
+    /// other repositories counts when finding out whether it reviews drafts.
+    /// Read by `tod_core::bot_silence::settings_for_node`; never saved.
+    #[serde(skip)]
+    pub known_repos: Vec<(String, String)>,
 }
 
 /// What tod's own review of a node's pull requests says, for the bots' asks
@@ -484,6 +490,7 @@ impl Default for PrReadinessSettings {
             waived_asks: Vec::new(),
             own_review: OwnReviewState::default(),
             draft_blind: Vec::new(),
+            known_repos: Vec::new(),
         }
     }
 }
@@ -1459,6 +1466,7 @@ mod tests {
                 waived_asks: Vec::new(),
                 own_review: OwnReviewState::default(),
                 draft_blind: Vec::new(),
+                known_repos: Vec::new(),
             },
             sandbox_idle: SandboxIdleSettings::default(),
             credentials_file_only: true,

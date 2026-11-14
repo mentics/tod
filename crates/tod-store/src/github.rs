@@ -630,7 +630,7 @@ impl Github {
     /// bot reviews drafts (`tod_core::pr_readiness::reviews_drafts`). One
     /// query; the caller caches it.
     pub fn recent_pr_activity(&self, owner: &str, repo: &str) -> Result<Vec<RecentPr>, GithubError> {
-        const QUERY: &str = "query($owner: String!, $repo: String!) { repository(owner: $owner, name: $repo) { pullRequests(last: 40, orderBy: {field: CREATED_AT, direction: ASC}) { nodes { number isDraft createdAt reviews(last: 20) { nodes { submittedAt author { login } } } comments(last: 20) { nodes { createdAt author { login } } } } } } }";
+        const QUERY: &str = "query($owner: String!, $repo: String!) { repository(owner: $owner, name: $repo) { pullRequests(last: 40, orderBy: {field: CREATED_AT, direction: ASC}) { nodes { number isDraft createdAt timelineItems(itemTypes: [READY_FOR_REVIEW_EVENT, CONVERT_TO_DRAFT_EVENT], first: 20) { nodes { __typename ... on ReadyForReviewEvent { createdAt } ... on ConvertToDraftEvent { createdAt } } } reviews(last: 20) { nodes { submittedAt author { login } } } comments(last: 20) { nodes { createdAt author { login } } } } } } }";
         let data: RecentData =
             self.graphql(QUERY, serde_json::json!({ "owner": owner, "repo": repo }), Some((owner, repo)))?;
         let repository = data.repository.ok_or(GithubError::NotFound)?;
@@ -650,7 +650,20 @@ impl Github {
                         activity.push((a.login, c.created_at));
                     }
                 }
-                RecentPr { number: p.number, draft: p.is_draft, created_at: p.created_at, activity }
+                let ready_events = p
+                    .timeline_items
+                    .nodes
+                    .into_iter()
+                    .filter_map(|e| Some((e.created_at?, e.typename == "ConvertToDraftEvent")))
+                    .collect();
+                RecentPr {
+                    repo: format!("{owner}/{repo}"),
+                    number: p.number,
+                    draft: p.is_draft,
+                    created_at: p.created_at,
+                    ready_events,
+                    activity,
+                }
             })
             .collect())
     }
@@ -1127,10 +1140,16 @@ struct GraphqlError {
 /// ([`Github::recent_pr_activity`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecentPr {
+    /// `owner/repo`.
+    pub repo: String,
     pub number: i64,
     /// Whether it is a draft now.
     pub draft: bool,
     pub created_at: String,
+    /// `(time, to_draft)` for each time it was marked ready (`false`) or
+    /// converted back to a draft (`true`), oldest first: what says whether it
+    /// was a draft when someone spoke on it.
+    pub ready_events: Vec<(String, bool)>,
     /// `(login, time)` of each review and top-level comment on it.
     pub activity: Vec<(String, String)>,
 }
@@ -1158,8 +1177,18 @@ struct RecentPull {
     is_draft: bool,
     #[serde(rename = "createdAt")]
     created_at: String,
+    #[serde(rename = "timelineItems")]
+    timeline_items: RecentNodes<RecentEvent>,
     reviews: RecentNodes<RecentReview>,
     comments: RecentNodes<RecentComment>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RecentEvent {
+    #[serde(rename = "__typename")]
+    typename: String,
+    #[serde(rename = "createdAt")]
+    created_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

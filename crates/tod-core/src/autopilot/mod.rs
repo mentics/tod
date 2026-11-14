@@ -1662,24 +1662,23 @@ impl Autopilot {
         if settings.bots.is_empty() {
             return Ok(None);
         }
-        let candidates: Vec<(tod_store::decisions::Decision, String)> = fleet
+        let links = fleet.read(|conn| tod_store::github::NodePrRepo::new(conn).read(node))?;
+        if links.prs.is_empty() {
+            return Ok(None);
+        }
+        // Only a request that names one of the node's pull requests by number
+        // can be about a draft: a request naming the bot alone (a bad token,
+        // say) is never withdrawn.
+        let candidates: Vec<tod_store::decisions::Decision> = fleet
             .read(|conn| Ok(DecisionRepo::new(conn).list_pending_for_node(node)?))?
             .into_iter()
             .filter(|d| {
                 d.reason == REASON_BROKEN
                     && matches!(d.protocol.as_deref(), Some("pr") | Some(crate::bot_silence::PROTOCOL))
-            })
-            .filter_map(|d| {
-                let question = d.question.to_ascii_lowercase();
-                let bot = settings.bots.iter().find(|b| question.contains(&b.name.to_ascii_lowercase()))?.name.clone();
-                Some((d, bot))
+                    && links.prs.iter().any(|pr| request_names_pr(&d.question, pr.pr_number))
             })
             .collect();
         if candidates.is_empty() {
-            return Ok(None);
-        }
-        let links = fleet.read(|conn| tod_store::github::NodePrRepo::new(conn).read(node))?;
-        if links.prs.is_empty() {
             return Ok(None);
         }
         let Some(feed) = pr_readiness::feed_for(&self.config.data_root) else {
@@ -1689,19 +1688,40 @@ impl Autopilot {
             Ok(live) => live,
             Err(err) => return Ok(Some(github_wait::github_look_failed(fleet, node, false, &err)?)),
         };
-        for (decision, bot) in candidates {
-            let skipped = live.iter().any(|p| p.assessment.draft_skipped.iter().any(|d| d.bot.eq_ignore_ascii_case(&bot)));
-            let still_needed =
-                live.iter().any(|p| p.assessment.bots.iter().any(|r| r.settings.name.eq_ignore_ascii_case(&bot)));
-            if !skipped || still_needed {
+        for decision in candidates {
+            let named: Vec<&crate::pr_readiness::LivePr> =
+                live.iter().filter(|p| request_names_pr(&decision.question, p.pr.pr_number)).collect();
+            let question = decision.question.to_ascii_lowercase();
+            // The bots it is about: those it names, else (a failed post of a
+            // comment on the draft, which is how an ask to the bot fails) the
+            // bots left out of the draft it names.
+            let mut bots: Vec<String> = settings
+                .bots
+                .iter()
+                .filter(|b| question.contains(&b.name.to_ascii_lowercase()))
+                .map(|b| b.name.clone())
+                .collect();
+            if bots.is_empty() && request_is_comment_post_failure(&question) {
+                bots = named
+                    .iter()
+                    .flat_map(|p| p.assessment.draft_skipped.iter().map(|d| d.bot.clone()))
+                    .collect();
+            }
+            if named.is_empty() || bots.is_empty() {
                 continue;
             }
-            let note = live
-                .iter()
-                .flat_map(|p| p.assessment.draft_skipped.iter())
-                .find(|d| d.bot.eq_ignore_ascii_case(&bot))
-                .map(|d| d.note())
-                .unwrap_or_default();
+            let all_draft_and_skipped = named.iter().all(|p| {
+                p.draft
+                    && bots.iter().all(|bot| {
+                        p.assessment.draft_skipped.iter().any(|d| d.bot.eq_ignore_ascii_case(bot))
+                            && !p.assessment.bots.iter().any(|r| r.settings.name.eq_ignore_ascii_case(bot))
+                    })
+            });
+            if !all_draft_and_skipped {
+                continue;
+            }
+            let note = named[0].assessment.draft_skipped.first().map(|d| d.note()).unwrap_or_default();
+            let bot = bots[0].clone();
             tracing::info!(%node, %bot, "withdrawing a request about a bot that does not review drafts");
             fleet
                 .interview("autopilot", InterviewCommand::WithdrawDecision { decision_id: decision.id })
@@ -2444,6 +2464,34 @@ fn short_waits(waits: Vec<crate::pr_readiness::Wait>) -> Vec<crate::pr_readiness
         }
     }
     short
+}
+
+/// Whether `question` names the pull request `number`: `#6680`,
+/// `owner/repo#6680`, `pull request 6680`, `pull/6680` or `PR 6680`, with the
+/// number ending there (`#66` is not `#6680`).
+pub(crate) fn request_names_pr(question: &str, number: i64) -> bool {
+    let q = question.to_ascii_lowercase();
+    let digits = number.to_string();
+    let mut from = 0;
+    while let Some(at) = q[from..].find(&digits) {
+        let start = from + at;
+        let end = start + digits.len();
+        from = start + 1;
+        if q[end..].chars().next().is_some_and(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let before = &q[..start];
+        if ["#", "pull request ", "pull requests ", "pull/", "pr "].iter().any(|m| before.ends_with(m)) {
+            return true;
+        }
+    }
+    false
+}
+
+/// A request about a failed attempt to post a comment on a pull request (how
+/// an ask to a review bot fails), read in lowercase.
+pub(crate) fn request_is_comment_post_failure(question: &str) -> bool {
+    question.contains("comment") && (question.contains("post") || question.contains("add"))
 }
 
 /// Records, once per bot and pull request, that a bot is left out of a
