@@ -388,19 +388,7 @@ impl Sandboxes {
                 image
             }
         };
-        let mut info = bx.wait_deployed(name, Duration::from_secs(300))?;
-        if matches!(source, NewSandboxSource::Fork(_)) {
-            // Blaxel copied the source's labels (a golden's kind and its
-            // keep-when-idle=true); this is neither. Before anything uses it.
-            if let Err(err) = bx.set_labels(name, &provision::plain_fork_labels()) {
-                let removed = match bx.delete_waiting_not_ready(name, tod_sandbox::blaxel::NOT_READY_WAIT) {
-                    Ok(()) => format!("{name} was deleted"),
-                    Err(del) => format!("{name} could not be deleted either ({del:#}); `tod-sandbox delete {name}` removes it"),
-                };
-                return Err(err.context(format!("relabel the fork {name} ({removed})")));
-            }
-            info = bx.wait_deployed(name, Duration::from_secs(300))?;
-        }
+        let info = bx.wait_deployed(name, Duration::from_secs(300))?;
         progress(&format!("{name}: deployed in {:.1}s", started.elapsed().as_secs_f64()));
         self.config.upsert(Sandbox { name: name.to_string(), image, url: info.url, agents });
         self.save()?;
@@ -409,7 +397,17 @@ impl Sandboxes {
             NewSandboxSource::Fork(_) => provision::Mode::Fork,
             NewSandboxSource::Image(_) => provision::Mode::Install,
         };
-        match self.ensure_as(&bx, name, mode, progress) {
+        // Blaxel copied the source's labels (a golden's kind and its
+        // keep-when-idle=true); a plain fork is neither. Before anything uses
+        // it, and under the same cleanup as a failed readying below.
+        let relabelled = match source {
+            NewSandboxSource::Fork(_) => bx
+                .set_labels(name, &provision::plain_fork_labels())
+                .and_then(|()| bx.wait_deployed(name, Duration::from_secs(300)).map(|_| ()))
+                .with_context(|| format!("relabel the fork {name}")),
+            NewSandboxSource::Image(_) => Ok(()),
+        };
+        match relabelled.and_then(|()| self.ensure_as(&bx, name, mode, progress)) {
             Ok(url) => Ok(url),
             Err(err) => {
                 // Nothing has used it yet: leaving it would leak a sandbox
@@ -700,6 +698,8 @@ pub fn list(root: &Path) -> Result<Vec<ListedSandbox>> {
         .list()?
         .into_iter()
         .filter(|info| !matches!(info.status.as_str(), "TERMINATED" | "DELETING"))
+        // A node's sandbox is never a source to fork (`fork_source_refusal`).
+        .filter(|info| !tod_sandbox::provision::is_node_kind(info.label("tod-kind")))
         .map(|info| ListedSandbox {
             status: info.state_or_status().to_string(),
             owner: info.label("tod-owner").map(str::to_string),

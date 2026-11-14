@@ -1004,7 +1004,13 @@ pub fn fork_golden(bx: &Blaxel, source: &str, spec: &NodeSandboxSpec, creds: &No
     // A tod golden holds no routes (a fork keeps none) and does not need any:
     // it is a fork of an original that had them, and only the node's own
     // fork is ever given the node's rules.
-    let tod_golden = current["metadata"]["labels"][crate::golden::LABEL_FROM].as_str().is_some();
+    let source_kind = current["metadata"]["labels"]["tod-kind"].as_str();
+    // Never a node's sandbox: its work and credentials are not for another node.
+    if let Some(why) = crate::provision::fork_source_refusal(source, source_kind) {
+        bail!("{why}");
+    }
+    let tod_golden = source_kind == Some(crate::golden::KIND_GOLDEN)
+        && current["metadata"]["labels"][crate::golden::LABEL_FROM].as_str().is_some();
     if routes == 0 && !tod_golden {
         bail!(
             "{source} was made without a proxy, so a fork of it cannot carry the node's credentials; \
@@ -1020,7 +1026,10 @@ pub fn fork_golden(bx: &Blaxel, source: &str, spec: &NodeSandboxSpec, creds: &No
     let proxy = proxy_spec(&proxy_rules(creds, spec.orchestrator_host, spec.claude_via));
     let env_label = env_fingerprint(&creds.custom);
     let creds_label = node_creds_fingerprint(spec, creds);
+    let [ready, origin] = crate::provision::golden_state_not_inherited();
     let labels = [
+        ready,
+        origin,
         ("tod-kind", "node"),
         ("tod-user", spec.user),
         ("tod-node", spec.node),
@@ -1139,6 +1148,35 @@ pub fn poke_script() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_node_is_never_forked_from_another_nodes_sandbox() {
+        let posts = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = posts.clone();
+        let bx = crate::fake::blaxel(move |method, path| {
+            if method != "GET" {
+                seen.lock().unwrap().push(format!("{method} {path}"));
+            }
+            (200, r#"{"metadata":{"name":"other","labels":{"tod-kind":"node"}},"status":"DEPLOYED","spec":{}}"#.to_string())
+        });
+        let spec = NodeSandboxSpec {
+            name: "tod-new-1",
+            image: "",
+            region: "us",
+            memory_mb: 1024,
+            user: "u",
+            node: "n",
+            orchestrator_host: "h",
+            orchestrator_cli_url: "u",
+            agent: None,
+            claude_via: Default::default(),
+            scheduler: Default::default(),
+            workspace: "ws",
+        };
+        let err = fork_golden(&bx, "other", &spec, &NodeCredentials::default()).unwrap_err();
+        assert!(format!("{err:#}").contains("is a node's sandbox"), "{err:#}");
+        assert!(posts.lock().unwrap().is_empty(), "nothing was forked: {:?}", posts.lock().unwrap());
+    }
 
     fn result(exit_code: i32, logs: &str) -> crate::blaxel::ProcessResult {
         crate::blaxel::ProcessResult { exit_code, logs: Some(logs.to_string()), status: None }

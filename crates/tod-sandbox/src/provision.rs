@@ -277,12 +277,20 @@ pub const KIND_FORK: &str = "fork";
 /// golden refresh's fork, which is meant to keep them, nor a node's
 /// (`node::fork_golden` sets its own).
 pub fn plain_fork_labels() -> Vec<(&'static str, &'static str)> {
-    vec![
+    let mut labels = vec![
         ("tod-kind", KIND_FORK),
         (crate::blaxel::LABEL_KEEP_WHEN_IDLE, crate::blaxel::KEEP_WHEN_IDLE_NO),
-        (crate::golden::LABEL_READY, "false"),
-        (crate::golden::LABEL_ORIGIN, "false"),
-    ]
+    ];
+    labels.extend(golden_state_not_inherited());
+    labels
+}
+
+/// The golden-only state a fork (plain or a node's) must not inherit from its
+/// source: it is not ready-checked, and not an origin. (`tod-from`, `tod-repo`
+/// and the stamp cannot be removed, but every reader of them first requires
+/// `tod-kind=golden`, which a fork never has.)
+pub fn golden_state_not_inherited() -> [(&'static str, &'static str); 2] {
+    [(crate::golden::LABEL_READY, "false"), (crate::golden::LABEL_ORIGIN, "false")]
 }
 
 /// Why a plain fork of `source` is refused: a node's sandbox holds the node's

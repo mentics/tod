@@ -1098,10 +1098,20 @@ fn make_sandbox_once(
     // update (that fork's source was never updated); any other golden's fork
     // gets them uploaded.
     let golden_has_tod_files = match &fork_from {
-        Some(golden) => bx
-            .get(golden)
-            .map_err(before_anything_is_made)?
-            .is_some_and(|info| info.label(tod_sandbox::golden::LABEL_FROM).is_some_and(|v| !v.is_empty())),
+        Some(golden) => {
+            let info = bx.get(golden).map_err(before_anything_is_made)?;
+            // Before anything is made: never fork a node's sandbox into a node.
+            if let Some(why) = info
+                .as_ref()
+                .and_then(|i| tod_sandbox::provision::fork_source_refusal(golden, i.label("tod-kind")))
+            {
+                return Err(before_anything_is_made(anyhow!("{why}")));
+            }
+            info.is_some_and(|info| {
+                info.label("tod-kind") == Some(tod_sandbox::golden::KIND_GOLDEN)
+                    && info.label(tod_sandbox::golden::LABEL_FROM).is_some_and(|v| !v.is_empty())
+            })
+        }
         None => false,
     };
     let image = match &source {
