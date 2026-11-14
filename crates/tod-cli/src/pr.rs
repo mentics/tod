@@ -38,6 +38,8 @@ COMMANDS:
     comment reply <COMMENT_ID> <TEXT> [--node <UUID>] [--pr <LINK>]
     threads                           [--node <UUID>] [--pr <LINK>] [--all]
     threads answer <THREAD_ID>        (--fixed | --rejected) --reply <TEXT> [--node <UUID>] [--pr <LINK>]
+    checks                            [--node <UUID>] [--pr <LINK>]
+    checks unrelated <CHECK>          --reason <TEXT> [--node <UUID>] [--pr <LINK>]
     mergeable                         [--note <TEXT>]
     merged                            [--note <TEXT>]
     blocked                           --why <TEXT>
@@ -71,6 +73,14 @@ the thread, all as the user. --fixed says you changed
 code for it (push first, so the reply can name the commit); --rejected says
 you did not, and why. If you cannot decide a thread, ask the user with
 `decisions ask` instead.
+`checks` lists each linked PR's failing checks by name, with where the user's
+decision stands for any you called unrelated. `checks unrelated` says a failing
+check is not caused by this change: --reason is your evidence (the file or log
+line, and where else the check fails: the base branch, other branches). tod
+then takes that check off your list and asks the user once whether to fix it in
+this pull request or carry on without it; end your turn after it. It refuses a
+check that is not failing, one already asked about, and one the user decided to
+fix in this pull request.
 `mergeable` records that the PR is ready for the `pr → approved` gate to
 check (checks green, reviews satisfied) — it does not itself approve
 anything. `blocked` records that you cannot make further progress without the
@@ -102,6 +112,7 @@ pub fn run(inv: Invocation) -> anyhow::Result<String> {
         }
         "comment" => comment(&inv, &rest),
         "threads" => threads(&inv, &rest),
+        "checks" => checks(&inv, &rest),
         "mergeable" => {
             let args = Args::parse(&rest)?;
             mergeable(&inv, &args)
@@ -410,12 +421,16 @@ fn status(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
             "{} mergeable={:?} mergeable_state={:?} merged={} checks={:?}",
             pr.url, status.mergeable, status.mergeable_state, status.merged, status.checks
         ));
+        if !status.failing_checks.is_empty() {
+            lines.push(format!("  failing checks: {}", status.failing_checks.join(", ")));
+        }
         pulls.push(serde_json::json!({
             "url": pr.url,
             "mergeable": status.mergeable,
             "mergeable_state": status.mergeable_state,
             "merged": status.merged,
             "checks": status.checks,
+            "failing_checks": status.failing_checks,
         }));
     }
     if inv.json {
@@ -650,4 +665,109 @@ fn blocked(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
             body: blocked_report(why),
         })?;
     Ok(format!("ok blocked ({})", short_id(conversation)))
+}
+
+/// `checks` and `checks unrelated <CHECK>`: the failing checks of the node's
+/// pull requests, and the agent's way to say one is not the change's
+/// (`tod_core::check_unrelated`).
+fn checks(inv: &Invocation, rest: &[String]) -> anyhow::Result<String> {
+    use tod_core::check_unrelated as cu;
+    use tod_store::settings::UnrelatedStanding;
+    if rest.first().map(String::as_str) == Some("unrelated") {
+        return checks_unrelated(inv, &rest[1..]);
+    }
+    let args = Args::parse(rest)?;
+    let node = node(&args)?;
+    let all = linked(inv, node)?.prs;
+    let prs = if args.get("--pr").is_some() { vec![pick_pr(all, &args, node)?] } else { all };
+    let standings = inv.client().read(|conn| cu::standings(conn, node))?;
+    let github = github(inv)?;
+    let mut lines = Vec::new();
+    let mut json = Vec::new();
+    for pr in &prs {
+        let label = tod_core::pr_readiness::pr_label(pr);
+        let status = github
+            .get_pr_status(&pr.owner, &pr.repo, pr.pr_number)
+            .map_err(|err| gh_err(inv, &format!("GitHub ({})", pr.url), err))?;
+        lines.push(format!("{label} ({}) checks={:?}", pr.url, status.checks));
+        if status.failing_checks.is_empty() && status.checks.as_deref() == Some("failure") {
+            lines.push("  a check is failing and GitHub named none".to_string());
+        }
+        let mut failing = Vec::new();
+        for check in &status.failing_checks {
+            let standing = tod_store::settings::unrelated_standing(&standings, &label, check);
+            let words = match standing {
+                None => "failing",
+                Some(UnrelatedStanding::Pending) => "failing; you said it is not this change's, the user has been asked",
+                Some(UnrelatedStanding::Waived) => "failing; the user said to carry on without it",
+                Some(UnrelatedStanding::FixHere) => "failing; the user said to fix it in this pull request",
+            };
+            lines.push(format!("  \"{check}\": {words}"));
+            failing.push(serde_json::json!({
+                "check": check,
+                "standing": standing.map(|s| match s {
+                    UnrelatedStanding::Pending => "pending",
+                    UnrelatedStanding::Waived => "waived",
+                    UnrelatedStanding::FixHere => "fix_here",
+                }),
+            }));
+        }
+        json.push(serde_json::json!({ "url": pr.url, "checks": status.checks, "failing": failing }));
+    }
+    if inv.json {
+        return Ok(serde_json::to_string(&serde_json::json!({ "pulls": json }))?);
+    }
+    Ok(lines.join("\n"))
+}
+
+fn checks_unrelated(inv: &Invocation, rest: &[String]) -> anyhow::Result<String> {
+    use tod_core::check_unrelated as cu;
+    use tod_store::settings::UnrelatedStanding;
+    let [check, flags @ ..] = rest else {
+        anyhow::bail!("usage: pr checks unrelated <CHECK> --reason <TEXT> [--node <UUID>] [--pr <LINK>]");
+    };
+    let args = Args::parse(flags)?;
+    let reason = args.require("--reason")?.trim().to_string();
+    if reason.is_empty() {
+        anyhow::bail!("--reason must be your evidence: the file or log line, and where else the check fails");
+    }
+    let node = node(&args)?;
+    let pr = pick_pr(linked(inv, node)?.prs, &args, node)?;
+    let label = tod_core::pr_readiness::pr_label(&pr);
+    let status = github(inv)?
+        .get_pr_status(&pr.owner, &pr.repo, pr.pr_number)
+        .map_err(|err| gh_err(inv, &format!("GitHub ({})", pr.url), err))?;
+    let Some(name) = status.failing_checks.iter().find(|c| c.eq_ignore_ascii_case(check)) else {
+        anyhow::bail!(
+            "`{check}` is not failing on {label}: {} (see `pr checks`)",
+            if status.failing_checks.is_empty() {
+                "no check names are failing".to_string()
+            } else {
+                format!("failing: {}", status.failing_checks.join(", "))
+            }
+        );
+    };
+    match inv.client().read(|conn| cu::standing(conn, node, &label, name))? {
+        Some(UnrelatedStanding::Pending) => {
+            return Ok(format!("ok: the user has already been asked about \"{name}\" on {label}; end your turn"));
+        }
+        Some(UnrelatedStanding::Waived) => {
+            return Ok(format!("ok: the user already said to carry on without \"{name}\" on {label}; nothing more to do for it"));
+        }
+        Some(UnrelatedStanding::FixHere) => anyhow::bail!(
+            "the user decided \"{name}\" on {label} is to be fixed in this pull request: fix it, whoever caused it"
+        ),
+        None => {}
+    }
+    let claim = cu::Claim { pr: label.clone(), pr_url: pr.url.clone(), check: name.clone(), reason };
+    inv.client().interview(InterviewCommand::AskDecision {
+        node_id: node,
+        conversation_id: None,
+        protocol: Some(cu::PROTOCOL.to_string()),
+        decision: cu::new_decision(&claim),
+    })?;
+    Ok(format!(
+        "ok: asked the user whether to fix \"{name}\" on {label} here or carry on without it; \
+         tod no longer sends you back for it. End your turn (do not fix it in this pull request)."
+    ))
 }

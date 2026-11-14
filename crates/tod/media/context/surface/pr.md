@@ -32,6 +32,28 @@ Either way:
 - A review thread (or a finding) that contradicts an obligation is a decision
   for the user (`decisions ask`), never a reason to change the obligation.
 
+## A failing check that is not this change's
+
+A check can fail for a reason this change has nothing to do with. Read its
+log before you touch anything (`pr checks` names each failing check). It is
+**not this change's** when the failure is in code or configuration the change
+does not touch (a lock file or module in an unrelated directory, say), or the
+same check fails on the base branch or on other branches. Then:
+
+- Do not fix it in this pull request, unless the fix is trivial and clearly
+  within what this change set out to do. Unrelated breakage is not yours to
+  repair here, and a fix that enlarges the scope does not belong.
+- Record it: `pr checks unrelated <check> --reason <evidence>`. The evidence
+  is what the user reads: the file or log line that fails, why the change
+  cannot have caused it, and where else it fails (another branch, the base).
+  The app then asks the user once whether to fix it in this pull request or
+  carry on without it, and stops sending you back for that check meanwhile.
+  End your turn after recording it; do not ask the user about it yourself
+  (`decisions ask`), and do not work around it.
+- If the user's answer is to fix it in this pull request, you are told so in
+  your next turn: fix it then, whoever caused it.
+- A check this change did cause is yours to fix as any other feedback.
+
 ## Where the code is
 
 Your working directory, named in the context below, is the only copy of the

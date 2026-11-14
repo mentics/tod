@@ -227,6 +227,7 @@ pub fn settings_for_node(
 ) -> anyhow::Result<PrReadinessSettings> {
     let waived = waived(conn, node)?;
     let mut settings = if waived.is_empty() { settings } else { without_waived(&settings, &waived) };
+    crate::check_unrelated::apply(conn, node, &mut settings)?;
     // Where tod's own review stands: a bot is asked for a head only once it
     // is clean, and a bot's `fallback` relies on it. Per head: the cleared
     // heads are the ones the latest clean review covered, so a later push

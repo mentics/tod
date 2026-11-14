@@ -10,7 +10,7 @@
 
 use chrono::{DateTime, Utc};
 use tod_store::github::{PrSnapshot, ReviewThread};
-use tod_store::settings::{PrReadinessSettings, PrReviewBotSettings};
+use tod_store::settings::{PrReadinessSettings, PrReviewBotSettings, UnrelatedCheck, UnrelatedStanding};
 
 /// A review bot whose comment carries a score. Built in; the project's
 /// settings only choose and tune them.
@@ -293,6 +293,15 @@ pub struct Assessment {
     /// Commits of its base the branch lacks (`PrStatus::behind_by`).
     pub behind_by: Option<u32>,
     pub checks: Option<String>,
+    /// The checks behind a failing `checks` ([`PrStatus::failing_checks`]).
+    pub failing_checks: Vec<String>,
+    /// A check is still running, whatever else failed.
+    pub checks_running: bool,
+    /// Where the user's decision stands for the failing checks the agent said
+    /// are not the change's ([`crate::check_unrelated`]), set by
+    /// [`Self::with_unrelated`]: a pending or waived one is not work, a
+    /// `FixHere` one is work the agent was told to do.
+    pub check_standings: Vec<(String, UnrelatedStanding)>,
     pub open_threads: Vec<OpenThread>,
     pub bots: Vec<BotReport>,
     /// Bots given up on for this head ([`FallbackApplied`]): not in `bots`,
@@ -321,8 +330,9 @@ pub struct Assessment {
 pub enum Work {
     /// Review threads (human or bot) still open.
     Threads(usize),
-    /// A required or reported check failed.
-    FailingChecks,
+    /// A required or reported check failed: the failing checks the user has
+    /// not said to carry on without, by name (empty when GitHub named none).
+    FailingChecks(Vec<String>),
     /// The branch is behind its base: merge the base in.
     Behind,
     /// The branch conflicts with its base.
@@ -354,7 +364,7 @@ impl Work {
     pub fn is_feedback(&self) -> bool {
         match self {
             Work::Threads(_)
-            | Work::FailingChecks
+            | Work::FailingChecks(_)
             | Work::LowScore { .. }
             | Work::ChangesRequested
             | Work::ReviewComments(_) => true,
@@ -533,6 +543,9 @@ impl Assessment {
             mergeable: snapshot.status.mergeable,
             behind_by: snapshot.status.behind_by,
             checks: snapshot.status.checks.clone(),
+            failing_checks: snapshot.status.failing_checks.clone(),
+            checks_running: snapshot.status.checks_running,
+            check_standings: Vec::new(),
             open_threads: snapshot.threads.iter().filter(|t| wants_answer(t)).map(open_thread).collect(),
             bots,
             fallbacks,
@@ -562,6 +575,50 @@ impl Assessment {
     pub fn answered_through(mut self, at: Option<DateTime<Utc>>) -> Self {
         self.answered_at = at;
         self
+    }
+
+    /// This assessment with the node's standings for `pr`'s failing checks
+    /// ([`crate::check_unrelated`]): the ones in `list` for that pull request
+    /// and still failing.
+    pub fn with_unrelated(mut self, pr: &str, list: &[UnrelatedCheck]) -> Self {
+        self.check_standings = self
+            .failing_checks
+            .iter()
+            .filter_map(|c| tod_store::settings::unrelated_standing(list, pr, c).map(|s| (c.clone(), s)))
+            .collect();
+        self
+    }
+
+    /// What the user decided for failing check `check`, when the agent said
+    /// it is not the change's and it still fails.
+    pub fn check_standing(&self, check: &str) -> Option<UnrelatedStanding> {
+        self.check_standings.iter().find(|(c, _)| c.eq_ignore_ascii_case(check)).map(|(_, s)| *s)
+    }
+
+    /// The failing checks that are agent work: those the agent has not said
+    /// are not the change's (pending the user's answer, or carried on
+    /// without).
+    pub fn checks_to_fix(&self) -> Vec<String> {
+        self.failing_checks
+            .iter()
+            .filter(|c| !matches!(self.check_standing(c), Some(UnrelatedStanding::Pending | UnrelatedStanding::Waived)))
+            .cloned()
+            .collect()
+    }
+
+    /// The checks the user said to fix in this pull request.
+    pub fn checks_to_fix_here(&self) -> Vec<String> {
+        self.failing_checks
+            .iter()
+            .filter(|c| self.check_standing(c) == Some(UnrelatedStanding::FixHere))
+            .cloned()
+            .collect()
+    }
+
+    /// Checks fail, and every one of them is excused: the agent has no
+    /// check work, whatever is still running or left to the user.
+    fn only_excused_checks_fail(&self) -> bool {
+        self.checks.as_deref() == Some("failure") && !self.failing_checks.is_empty() && self.checks_to_fix().is_empty()
     }
 
     /// Reviews with text the agent has not yet had a turn on.
@@ -602,8 +659,8 @@ impl Assessment {
         if !self.open_threads.is_empty() {
             work.push(Work::Threads(self.open_threads.len()));
         }
-        if self.checks.as_deref() == Some("failure") {
-            work.push(Work::FailingChecks);
+        if self.checks.as_deref() == Some("failure") && !self.only_excused_checks_fail() {
+            work.push(Work::FailingChecks(self.checks_to_fix()));
         }
         if self.human_review == (HumanReview::ChangesRequested { unaddressed: true }) && self.open_threads.is_empty() {
             work.push(Work::ChangesRequested);
@@ -735,7 +792,9 @@ impl Assessment {
                 });
             }
         }
-        if self.checks.as_deref() == Some("pending") {
+        // `failure` hides a check still running: with only excused ones
+        // failing, that one is still waited for.
+        if self.checks.as_deref() == Some("pending") || (self.only_excused_checks_fail() && self.checks_running) {
             waits.push(Wait::ChecksRunning);
         }
         if self.mergeable_state.is_none() {
@@ -1067,7 +1126,7 @@ pub fn render_work(url: &str, assessment: &Assessment) -> String {
             Work::Conflict => "- it conflicts with its base branch: merge the base in and resolve\n".to_string(),
             Work::Behind => "- it is behind its base branch: merge the base in\n".to_string(),
             Work::Threads(n) => format!("- {n} review thread(s) are open: `tod-cli pr threads`\n"),
-            Work::FailingChecks => "- a check is failing: `tod-cli pr status`\n".to_string(),
+            Work::FailingChecks(names) => failing_checks_line(assessment, &names),
             Work::ChangesRequested => "- a reviewer asked for changes in a review: read it with `tod-cli pr status`\n".to_string(),
             Work::ReviewComments(_) => {
                 let mut text = String::new();
@@ -1092,6 +1151,81 @@ pub fn render_work(url: &str, assessment: &Assessment) -> String {
         });
     }
     out
+}
+
+/// What the agent is told about the failing checks `names`: read the log
+/// (`tod-cli pr checks` names each), fix what this change caused, and say so
+/// when it did not (`tod-cli pr checks unrelated`) instead of fixing
+/// unrelated breakage here. A check the user said to fix in this pull request
+/// is to be fixed.
+fn failing_checks_line(assessment: &Assessment, names: &[String]) -> String {
+    let (here, rest): (Vec<&String>, Vec<&String>) =
+        names.iter().partition(|n| assessment.check_standing(n) == Some(UnrelatedStanding::FixHere));
+    let mut out = String::new();
+    if names.is_empty() {
+        out.push_str("- a check is failing (GitHub named none): `tod-cli pr checks`, read its log\n");
+    }
+    if !rest.is_empty() {
+        out.push_str(&format!(
+            "- {} failing: {}. `tod-cli pr checks` lists them; read each one's log. Fix what this change caused. \
+             If a failure is in code or configuration this change does not touch, or the same check fails on the base branch or on other branches, it is not this change's: \
+             do not fix it here (unless the fix is trivial and clearly within this change's scope), and record it with \
+             `tod-cli pr checks unrelated <check> --reason <evidence>`, naming the file or log line and where else it fails. That asks the user once and takes the check off your list meanwhile.\n",
+            if rest.len() == 1 { "a check is" } else { "checks are" },
+            rest.iter().map(|n| format!("\"{n}\"")).collect::<Vec<_>>().join(", "),
+        ));
+    }
+    if !here.is_empty() {
+        out.push_str(&format!(
+            "- the user decided {} to be fixed in this pull request: fix {}, whoever caused it (do not say again that {} not this change's)\n",
+            here.iter().map(|n| format!("\"{n}\"")).collect::<Vec<_>>().join(", "),
+            if here.len() == 1 { "it" } else { "them" },
+            if here.len() == 1 { "it is" } else { "they are" },
+        ));
+    }
+    out
+}
+
+/// What is left to do on `live`, in words, one entry per pull request with
+/// work: `owner/repo#n: failing check "x"; 2 open review threads`. For the
+/// stop that says the agent is not getting it through.
+pub fn outstanding(live: &[LivePr]) -> String {
+    let mut entries = Vec::new();
+    for p in live {
+        let mut parts: Vec<String> = Vec::new();
+        for work in p.assessment.work() {
+            parts.push(match work {
+                Work::FailingChecks(names) if names.is_empty() => "a failing check (GitHub named none)".to_string(),
+                Work::FailingChecks(names) => format!(
+                    "failing check{} {}",
+                    if names.len() == 1 { "" } else { "s" },
+                    names.iter().map(|n| format!("\"{n}\"")).collect::<Vec<_>>().join(", ")
+                ),
+                Work::Threads(n) => format!("{n} open review thread{}", if n == 1 { "" } else { "s" }),
+                Work::Behind => "behind its base".to_string(),
+                Work::Conflict => "conflicts with its base".to_string(),
+                Work::LowScore { bot, score, min } => format!("{bot} scored it {score}/5 (needs {min}/5)"),
+                Work::BotReviewMissing { bot, .. } => format!("no {bot} review of the current head"),
+                Work::ChangesRequested => "a reviewer asked for changes".to_string(),
+                Work::ReviewComments(n) => format!("{n} review{} with comments to answer", if n == 1 { "" } else { "s" }),
+            });
+        }
+        if !parts.is_empty() {
+            entries.push(format!("{} ({}): {}", pr_label(&p.pr), p.pr.url, parts.join("; ")));
+        }
+    }
+    entries.join(" | ")
+}
+
+/// The guidance that goes with [`outstanding`] when a failing check is part
+/// of it: what the user can decide.
+pub fn stuck_advice(live: &[LivePr]) -> &'static str {
+    if live.iter().any(|p| p.assessment.work().iter().any(|w| matches!(w, Work::FailingChecks(_)))) {
+        "Open the failing check's log. If this change did not cause it, tell the agent so (it records that with \
+         `tod-cli pr checks unrelated`, which asks you once) or re-run the check; if it did, tell the agent what to change"
+    } else {
+        "Look at the pull request and say what the agent should do"
+    }
 }
 
 /// The comments on the pull request since the head commit that ask `bot`
@@ -2311,9 +2445,77 @@ Not safe.
     fn failing_checks_are_work_and_running_ones_a_wait() {
         let none = PrReadinessSettings::default();
         let failing = Assessment::of(&snap(status("unstable", "failure"), vec![], vec![]), &none, now());
-        assert_eq!(failing.work(), vec![Work::FailingChecks]);
+        assert_eq!(failing.work(), vec![Work::FailingChecks(vec![])]);
         let running = Assessment::of(&snap(status("blocked", "pending"), vec![], vec![]), &none, now());
         assert_eq!(running.next(), Next::Wait(vec![Wait::ChecksRunning]));
+    }
+
+
+    fn failing(names: &[&str], state: &str, checks: &str) -> Assessment {
+        let mut st = status(state, checks);
+        st.failing_checks = names.iter().map(|n| n.to_string()).collect();
+        st.checks_running = checks == "pending";
+        Assessment::of(&snap(st, vec![], vec![]), &PrReadinessSettings::default(), now())
+    }
+
+    fn standing_of(check: &str, standing: UnrelatedStanding) -> Vec<UnrelatedCheck> {
+        vec![UnrelatedCheck { pr: "acme/app#42".into(), check: check.into(), standing }]
+    }
+
+    #[test]
+    fn a_failing_check_is_named_in_the_work() {
+        let a = failing(&["terraform", "lint"], "unstable", "failure");
+        assert_eq!(a.work(), vec![Work::FailingChecks(vec!["terraform".into(), "lint".into()])]);
+    }
+
+    #[test]
+    fn a_check_the_agent_called_unrelated_is_no_work_while_asked_or_waived() {
+        for standing in [UnrelatedStanding::Pending, UnrelatedStanding::Waived] {
+            let a = failing(&["terraform"], "unstable", "failure")
+                .with_unrelated("acme/app#42", &standing_of("terraform", standing));
+            assert!(a.work().is_empty(), "{standing:?}: {:?}", a.work());
+        }
+        // Only that check: another failing one is still work, by name.
+        let a = failing(&["terraform", "lint"], "unstable", "failure")
+            .with_unrelated("acme/app#42", &standing_of("terraform", UnrelatedStanding::Waived));
+        assert_eq!(a.work(), vec![Work::FailingChecks(vec!["lint".into()])]);
+        // Another pull request's answer does not count.
+        let a = failing(&["terraform"], "unstable", "failure")
+            .with_unrelated("acme/app#7", &standing_of("terraform", UnrelatedStanding::Waived));
+        assert_eq!(a.work(), vec![Work::FailingChecks(vec!["terraform".into()])]);
+    }
+
+    #[test]
+    fn a_check_the_user_said_to_fix_here_is_work_again() {
+        let a = failing(&["terraform"], "unstable", "failure")
+            .with_unrelated("acme/app#42", &standing_of("terraform", UnrelatedStanding::FixHere));
+        assert_eq!(a.work(), vec![Work::FailingChecks(vec!["terraform".into()])]);
+        let text = render_work("https://github.com/acme/app/pull/42", &a);
+        assert!(text.contains("terraform"), "{text}");
+    }
+
+    #[test]
+    fn running_checks_are_still_waited_on_when_only_an_excused_one_fails() {
+        let a = failing(&["terraform"], "blocked", "pending")
+            .with_unrelated("acme/app#42", &standing_of("terraform", UnrelatedStanding::Waived));
+        assert!(a.work().is_empty());
+        assert_eq!(a.next(), Next::Wait(vec![Wait::ChecksRunning]));
+    }
+
+    #[test]
+    fn what_is_outstanding_names_the_failing_check_for_the_stop() {
+        let live = vec![LivePr {
+            pr: tod_store::github::NodePr::new("acme", "app", 42),
+            draft: false,
+            assessment: failing(&["terraform"], "unstable", "failure"),
+            fingerprint: String::new(),
+            head_sha: None,
+            threads: vec![],
+            base_ref: None,
+        }];
+        let text = outstanding(&live);
+        assert!(text.contains("\"terraform\""), "{text}");
+        assert!(stuck_advice(&live).contains("tod-cli pr checks unrelated"));
     }
 
     #[test]
@@ -2824,6 +3026,7 @@ pub fn assess(
         })?;
         feed.same_change(pr, base, reviewed, head).map_err(|err| format!("{}: {err}", pr.url))
     })
+    .map(|assessment| assessment.with_unrelated(&pr_label(pr), &settings.unrelated_checks))
 }
 
 /// How long a repository's recent pull requests are reused.

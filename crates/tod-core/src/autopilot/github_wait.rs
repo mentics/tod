@@ -413,7 +413,8 @@ fn work_description(work: &[crate::pr_readiness::Work]) -> String {
     work.iter()
         .map(|w| match w {
             Work::Threads(n) => format!("{n} open review thread{}", if *n == 1 { "" } else { "s" }),
-            Work::FailingChecks => "failing checks".to_string(),
+            Work::FailingChecks(names) if names.is_empty() => "failing checks".to_string(),
+            Work::FailingChecks(names) => format!("failing checks: {}", names.join(", ")),
             Work::Behind => "behind its base".to_string(),
             Work::Conflict => "conflicts with its base".to_string(),
             Work::LowScore { bot, score, min } => format!("{bot} scored it {score} (needs {min})"),

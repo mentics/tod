@@ -425,6 +425,41 @@ pub struct PrReadinessSettings {
     /// Read by `tod_core::bot_silence::settings_for_node`; never saved.
     #[serde(skip)]
     pub known_repos: Vec<(String, String)>,
+    /// Failing checks the pull request agent said are not its change's, and
+    /// where the user's answer stands (`tod_core::check_unrelated`). Read by
+    /// `tod_core::bot_silence::settings_for_node`; never saved.
+    #[serde(skip)]
+    pub unrelated_checks: Vec<UnrelatedCheck>,
+}
+
+/// Where a failing check stands with the user, when the pull request agent
+/// said it is not caused by the change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnrelatedStanding {
+    /// The user has been asked and has not answered: not agent work meanwhile.
+    Pending,
+    /// The user said to carry on without it: not work, not a failure.
+    Waived,
+    /// The user said to fix it in this pull request: work, and the agent may
+    /// not say again that it is not the change's.
+    FixHere,
+}
+
+/// One failing check of one pull request the node has a standing for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnrelatedCheck {
+    /// `owner/repo#number`.
+    pub pr: String,
+    pub check: String,
+    pub standing: UnrelatedStanding,
+}
+
+/// Whether a list of [`UnrelatedCheck`] holds `check` of `pr` (names and
+/// repositories compare without case).
+pub fn unrelated_standing(list: &[UnrelatedCheck], pr: &str, check: &str) -> Option<UnrelatedStanding> {
+    list.iter()
+        .find(|u| u.pr.eq_ignore_ascii_case(pr) && u.check.eq_ignore_ascii_case(check))
+        .map(|u| u.standing)
 }
 
 /// What tod's own review of a node's pull requests says, for the bots' asks
@@ -491,6 +526,7 @@ impl Default for PrReadinessSettings {
             own_review: OwnReviewState::default(),
             draft_blind: Vec::new(),
             known_repos: Vec::new(),
+            unrelated_checks: Vec::new(),
         }
     }
 }
@@ -1470,6 +1506,7 @@ mod tests {
                 own_review: OwnReviewState::default(),
                 draft_blind: Vec::new(),
                 known_repos: Vec::new(),
+                unrelated_checks: Vec::new(),
             },
             sandbox_idle: SandboxIdleSettings::default(),
             credentials_file_only: true,

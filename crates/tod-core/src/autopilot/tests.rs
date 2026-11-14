@@ -2334,6 +2334,8 @@ fn a_pr_draft_wake_leaves_running_checks_to_the_babysitter() {
         behind_by: Some(0),
         merged: false,
         checks: Some("pending".into()),
+        failing_checks: Vec::new(),
+        checks_running: false,
         head_sha: None,
         head_committed_at: None,
         draft: true,
@@ -2375,6 +2377,8 @@ fn check_now_in_pr_draft_waits_for_the_draft_to_be_ready_and_reviewed() {
         behind_by: Some(0),
         merged: false,
         checks: None,
+        failing_checks: Vec::new(),
+        checks_running: false,
         head_sha: None,
         head_committed_at: None,
         draft: true,
@@ -2494,6 +2498,8 @@ fn check_now_in_pr_draft_sends_new_changes_requested_to_the_agent_even_on_a_draf
         behind_by: Some(0),
         merged: false,
         checks: None,
+        failing_checks: Vec::new(),
+        checks_running: false,
         head_sha: None,
         head_committed_at: Some("2026-01-01T09:00:00Z".into()),
         draft: true,
@@ -2538,6 +2544,8 @@ fn check_now_in_pr_draft_clears_a_leftover_review_wait_and_ignores_a_bot_reviewe
         behind_by: Some(0),
         merged: false,
         checks: None,
+        failing_checks: Vec::new(),
+        checks_running: false,
         head_sha: None,
         head_committed_at: None,
         draft: false,
@@ -4335,4 +4343,187 @@ fn a_silent_bot_with_a_fallback_is_given_up_on_visibly_without_asking_the_user()
     .unwrap();
     let err = crate::pr_readiness::settings_for_node(&fx.fleet, fx.node, &fx.root).unwrap_err().to_string();
     assert!(err.contains("silent_after_minutes needs a fallback"), "{err}");
+}
+
+// ---- A failing check the agent says is not the change's ----
+
+/// A pull request whose only problem is the failing check `terraform`, until
+/// `fixed` is set.
+struct FailingCheckFeed {
+    fixed: std::sync::atomic::AtomicBool,
+}
+
+impl crate::pr_readiness::PrFeed for FailingCheckFeed {
+    fn merge(&self, _: &tod_store::github::NodePr) -> Result<tod_store::github::PrMerge, String> {
+        Ok(tod_store::github::PrMerge { title: "t".into(), merged: false, merged_at: None })
+    }
+
+    fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
+        use tod_store::github::{PrSnapshot, PrStatus};
+        let fixed = self.fixed.load(std::sync::atomic::Ordering::SeqCst);
+        Ok(PrSnapshot {
+            status: PrStatus {
+                mergeable: Some(true),
+                mergeable_state: Some(if fixed { "blocked" } else { "unstable" }.into()),
+                behind_by: Some(0),
+                checks: Some(if fixed { "success" } else { "failure" }.into()),
+                failing_checks: if fixed { Vec::new() } else { vec!["terraform".into()] },
+                head_sha: Some("abc1234".into()),
+                head_committed_at: Some("2020-01-01T00:00:00Z".into()),
+                open: true,
+                reviewers: vec!["maria".into()],
+                base_ref: Some("main".into()),
+                ..Default::default()
+            },
+            threads: Vec::new(),
+            comments: Vec::new(),
+            reviews: vec![],
+        })
+    }
+}
+
+fn unrelated_decisions(fx: &Fixture) -> Vec<tod_store::decisions::Decision> {
+    fx.fleet
+        .read(|conn| Ok(DecisionRepo::new(conn).list_for_node(fx.node)?))
+        .unwrap()
+        .into_iter()
+        .filter(|d| d.protocol.as_deref() == Some(crate::check_unrelated::PROTOCOL))
+        .collect()
+}
+
+/// A node in `pr_review` on a pull request whose `terraform` check fails. When
+/// `says_unrelated`, the agent's first turn records that the check is not the
+/// change's (what `tod-cli pr checks unrelated` does). Every prompt sent is
+/// kept.
+fn failing_check_node(says_unrelated: bool) -> (Fixture, Arc<FailingCheckFeed>, FakeAgent, Arc<std::sync::Mutex<Vec<String>>>) {
+    let fx = bare();
+    retire_outside_criteria(&fx);
+    std::fs::write(fx.root.join("tod.yml"), "pr_readiness:\n  max_rounds: 2\n").unwrap();
+    let feed = Arc::new(FailingCheckFeed { fixed: std::sync::atomic::AtomicBool::new(false) });
+    crate::pr_readiness::set_feed_override(Some(feed.clone()));
+    linked_to_prs(&fx, "pr_review", &["https://github.com/acme/app/pull/42"]);
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let sent = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let (fleet, node, log) = (fx.fleet.clone(), fx.node, sent.clone());
+    agent.pr_hook = Some(Arc::new(move |prompt: &str| {
+        let first = {
+            let mut log = log.lock().unwrap();
+            log.push(prompt.to_string());
+            log.len() == 1
+        };
+        if says_unrelated && first {
+            let claim = crate::check_unrelated::Claim {
+                pr: "acme/app#42".into(),
+                pr_url: "https://github.com/acme/app/pull/42".into(),
+                check: "terraform".into(),
+                reason: "the lock file in infra/ fails the same way on main".into(),
+            };
+            fleet
+                .interview(
+                    ACTOR_USER,
+                    InterviewCommand::AskDecision {
+                        node_id: node,
+                        conversation_id: None,
+                        protocol: Some(crate::check_unrelated::PROTOCOL.to_string()),
+                        decision: crate::check_unrelated::new_decision(&claim),
+                    },
+                )
+                .unwrap();
+        }
+    }));
+    (fx, feed, agent, sent)
+}
+
+fn run_babysitter(fx: &Fixture, agent: &mut FakeAgent) -> Outcome {
+    autopilot(fx, Budget::default()).with_pr_poll_interval(Duration::ZERO).run(&fx.fleet, agent).unwrap()
+}
+
+#[test]
+fn a_check_the_agent_says_is_unrelated_is_asked_once_and_costs_no_more_turns() {
+    let (fx, _, mut agent, sent) = failing_check_node(true);
+    let outcome = run_babysitter(&fx, &mut agent);
+    assert!(
+        matches!(&outcome, Outcome::NeedsHuman { reason: NeedsHuman::Decision { pending: 1 } }),
+        "{outcome:?}"
+    );
+    // The prompt named the failing check.
+    assert!(sent.lock().unwrap()[0].contains("terraform"), "{}", sent.lock().unwrap()[0]);
+    assert_eq!(agent.turns, 1);
+    let decisions = unrelated_decisions(&fx);
+    assert_eq!(decisions.len(), 1);
+    let d = &decisions[0];
+    assert_eq!(d.reason, "broken");
+    assert!(d.question.contains("acme/app#42") && d.question.contains("terraform"), "{}", d.question);
+    assert!(d.question.contains("the lock file in infra/ fails the same way on main"), "{}", d.question);
+    assert_eq!(d.options.len(), 2);
+    assert_eq!(d.options[1], "Fix it in this pull request");
+    // Again and again: still one question, no further turns.
+    for _ in 0..3 {
+        let outcome = run_babysitter(&fx, &mut agent);
+        assert!(matches!(&outcome, Outcome::NeedsHuman { reason: NeedsHuman::Decision { pending: 1 } }), "{outcome:?}");
+    }
+    assert_eq!(agent.turns, 1);
+    assert_eq!(unrelated_decisions(&fx).len(), 1);
+}
+
+#[test]
+fn carrying_on_without_the_check_leaves_the_pull_request_to_its_person() {
+    let (fx, _, mut agent, _) = failing_check_node(true);
+    run_babysitter(&fx, &mut agent);
+    let d = unrelated_decisions(&fx).remove(0);
+    fx.fleet
+        .interview(ACTOR_USER, InterviewCommand::AnswerDecision { decision_id: d.id, option: Some(1), text: None })
+        .unwrap();
+    let outcome = run_babysitter(&fx, &mut agent);
+    assert!(matches!(outcome, Outcome::Waiting { .. }), "{outcome:?}");
+    assert_eq!(agent.turns, 1, "no turn for a waived check");
+    // The gate accepts GitHub's `unstable` for a waived check, so the node moves on.
+    assert_eq!(lifecycle::current_state(&fx.fleet, fx.node).unwrap(), "approved");
+    assert_eq!(unrelated_decisions(&fx).len(), 1, "never asked again");
+    let settings = crate::pr_readiness::settings_for_node(&fx.fleet, fx.node, &fx.root).unwrap();
+    assert!(
+        crate::check_unrelated::all_waived(&settings, "acme/app#42", &["terraform".to_string()]),
+        "{settings:?}"
+    );
+}
+
+#[test]
+fn fixing_the_check_in_this_pull_request_makes_it_work_again() {
+    let (fx, _, mut agent, sent) = failing_check_node(true);
+    run_babysitter(&fx, &mut agent);
+    let d = unrelated_decisions(&fx).remove(0);
+    fx.fleet
+        .interview(ACTOR_USER, InterviewCommand::AnswerDecision { decision_id: d.id, option: Some(2), text: None })
+        .unwrap();
+    let outcome = run_babysitter(&fx, &mut agent);
+    assert!(agent.turns >= 2, "the agent was sent back for the check: {outcome:?}");
+    let sent = sent.lock().unwrap();
+    assert!(sent[1].contains("terraform"), "{}", sent[1]);
+    assert_eq!(unrelated_decisions(&fx).len(), 1, "the agent may not ask again");
+}
+
+#[test]
+fn a_question_for_a_check_that_passes_again_is_withdrawn() {
+    let (fx, feed, mut agent, _) = failing_check_node(true);
+    run_babysitter(&fx, &mut agent);
+    assert_eq!(pending_requests(&fx).len(), 1);
+    feed.fixed.store(true, std::sync::atomic::Ordering::SeqCst);
+    let outcome = run_babysitter(&fx, &mut agent);
+    assert!(matches!(outcome, Outcome::Waiting { .. }), "{outcome:?}");
+    assert!(pending_requests(&fx).is_empty());
+    let notes = fx.fleet.read(|conn| Ok(tod_store::node_timeline::TimelineRepo::new(conn).list(fx.node)?)).unwrap();
+    assert!(notes.iter().any(|e| e.title.starts_with("Request withdrawn: ")), "{notes:?}");
+}
+
+#[test]
+fn two_quiet_turns_on_a_failing_check_stop_naming_the_check() {
+    let (fx, _, mut agent, _) = failing_check_node(false);
+    let outcome = run_babysitter(&fx, &mut agent);
+    match &outcome {
+        Outcome::NeedsHuman { reason: NeedsHuman::PrStuck { why } } => {
+            assert!(why.contains("terraform"), "{why}");
+            assert!(why.contains("unrelated"), "{why}");
+        }
+        other => panic!("{other:?}"),
+    }
 }

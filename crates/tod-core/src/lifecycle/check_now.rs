@@ -136,6 +136,8 @@ mod tests {
                     behind_by: Some(0),
                     merged: false,
                     checks: None,
+                    failing_checks: Vec::new(),
+                    checks_running: false,
                     head_sha: None,
                     head_committed_at: None,
                     draft: true,
