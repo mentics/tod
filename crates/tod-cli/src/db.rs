@@ -334,8 +334,29 @@ mod tests {
         std::thread::spawn(move || {
             for (status, body) in answers {
                 let Ok((mut conn, _)) = listener.accept() else { return };
+                // Read the whole request (headers and the JSON body) before
+                // answering: closing with request bytes unread makes the OS
+                // reset the connection, and the client sees "Connection reset
+                // by peer" instead of the answer.
+                let mut got = Vec::new();
                 let mut buf = [0u8; 8192];
-                let _ = conn.read(&mut buf);
+                loop {
+                    let Ok(n) = conn.read(&mut buf) else { break };
+                    if n == 0 {
+                        break;
+                    }
+                    got.extend_from_slice(&buf[..n]);
+                    let Some(end) = got.windows(4).position(|w| w == b"\r\n\r\n") else { continue };
+                    let head = String::from_utf8_lossy(&got[..end]).to_ascii_lowercase();
+                    let len = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if got.len() >= end + 4 + len {
+                        break;
+                    }
+                }
                 let _ = write!(
                     conn,
                     "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
