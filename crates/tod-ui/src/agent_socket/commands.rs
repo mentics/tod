@@ -69,6 +69,15 @@ pub enum Command {
     Close,
     Transcripts(TranscriptsCommand),
     AgentPlatform(AgentPlatformSocketCommand),
+    /// Reply `ok driven|user|idle` (`agent_socket::mode`).
+    Mode,
+    /// Reply `ok W H`: the window's content size in logical pixels.
+    Size,
+    /// Set the window's content size; part of the agent's saved view.
+    Resize {
+        w: f32,
+        h: f32,
+    },
 }
 
 /// Parse one protocol line into a command.
@@ -253,6 +262,30 @@ pub fn parse_line(line: &str) -> Result<Command, String> {
                 )),
             }
         }
+        "mode" => {
+            if parts.next().is_some() {
+                return Err("mode takes no arguments".into());
+            }
+            Ok(Command::Mode)
+        }
+        "size" => {
+            if parts.next().is_some() {
+                return Err("size takes no arguments".into());
+            }
+            Ok(Command::Size)
+        }
+        "resize" => {
+            let w = parts.next().ok_or_else(|| "resize requires W H".to_string())?;
+            let h = parts.next().ok_or_else(|| "resize requires W H".to_string())?;
+            if parts.next().is_some() {
+                return Err("resize takes exactly two numbers".into());
+            }
+            let (w, h) = (parse_coord(w, "W")?, parse_coord(h, "H")?);
+            if !(w.is_finite() && h.is_finite() && w >= 1.0 && h >= 1.0) {
+                return Err("resize needs a positive W and H".into());
+            }
+            Ok(Command::Resize { w, h })
+        }
         other => Err(format!("unknown command `{other}`")),
     }
 }
@@ -265,6 +298,19 @@ fn parse_coord(raw: &str, name: &str) -> Result<f32, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_mode_size_and_resize() {
+        assert!(matches!(parse_line("mode").unwrap(), Command::Mode));
+        assert!(matches!(parse_line("size").unwrap(), Command::Size));
+        match parse_line("resize 1280 800").unwrap() {
+            Command::Resize { w, h } => assert_eq!((w, h), (1280.0, 800.0)),
+            other => panic!("{other:?}"),
+        }
+        assert!(parse_line("resize 1280").is_err());
+        assert!(parse_line("resize 0 10").is_err());
+        assert!(parse_line("mode now").is_err());
+    }
 
     #[test]
     fn parses_close() {

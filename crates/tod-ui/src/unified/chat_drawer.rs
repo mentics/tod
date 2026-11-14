@@ -195,7 +195,7 @@ impl ChatDrawer {
         drawer
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "agent-socket"))]
     pub fn expanded(&self) -> bool {
         self.expanded
     }

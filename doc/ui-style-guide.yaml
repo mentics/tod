@@ -487,6 +487,16 @@ styles:
     color: linked-source-text
   scrim:
     background: scrim
+  title-bar-shepherd-driving:
+    # The window's title bar while the UI shepherd agent drives the app
+    # through the dev control socket (driven mode,
+    # crates/tod-ui/src/agent_socket/mode.rs): a color nothing else uses,
+    # with the words "Shepherd driving" in it, so the person at the keyboard
+    # knows the app is not theirs right now. The title bar is plain otherwise.
+    color: shepherd-driving-text
+    background: shepherd-driving-fill
+    text-case: sentence
+    text-end: no-period
 
 states:
   hover-control:
@@ -600,6 +610,9 @@ tokens:
     # Waiting on others (and a deferral): a cool gray.
     node-others-text: "#94a3b8"
     node-failed-text: "#f87171"
+    # The title bar in driven mode: violet, which no other state uses.
+    shepherd-driving-fill: "#7c3aed"
+    shepherd-driving-text: "#ffffff"
     node-retrying-text: "#fbbf24"
     node-pr-open-text: "#f59e0b"
     node-pr-draft-text: "#a3a3a3"

@@ -799,12 +799,29 @@ impl Shell {
     }
 
     fn render_title_bar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        TitleBar::new().child(
+        // Driven mode (dev agent socket): the shepherd agent has the app.
+        #[cfg(feature = "agent-socket")]
+        let driving = crate::agent_socket::driving();
+        #[cfg(not(feature = "agent-socket"))]
+        let driving = false;
+        let bar = TitleBar::new();
+        #[cfg(feature = "agent-socket")]
+        let bar = if driving {
+            crate::ui::style::title_bar_shepherd_driving(bar)
+        } else {
+            bar
+        };
+        bar.child(
             h_flex()
                 .w_full()
                 .items_center()
                 .justify_between()
-                .child("tod")
+                .child(
+                    h_flex()
+                        .gap(crate::ui::style::space::RELATED)
+                        .child("tod")
+                        .when(driving, |row| row.child("Shepherd driving")),
+                )
                 .child(
                     h_flex()
                         .ml(crate::ui::style::space::INLINE)
@@ -916,6 +933,9 @@ impl Render for Shell {
             .v_flex()
             .size_full()
             .relative()
+            // First child, so its capture-phase mouse listeners run first
+            // (dev agent socket: real vs synthetic input).
+            .map(input_watch_layer)
             .on_action(cx.listener(Self::on_open_agent_chat))
             .on_action(cx.listener(|this, _: &NavigateBack, window, cx| {
                 this.navigate(true, window, cx);
@@ -980,6 +1000,66 @@ impl Render for Shell {
             .when_some(notification_overlay(window, cx), |el, layer| {
                 el.child(layer)
             })
+    }
+}
+
+#[cfg(feature = "agent-socket")]
+fn input_watch_layer(root: gpui::Div) -> gpui::Div {
+    root.child(crate::agent_socket::input_watch())
+}
+
+#[cfg(not(feature = "agent-socket"))]
+fn input_watch_layer(root: gpui::Div) -> gpui::Div {
+    root
+}
+
+/// Where the shell is, for the dev agent socket's driven/user mode
+/// (`agent_socket::snapshot`): the active view and the workbench's state.
+#[cfg(feature = "agent-socket")]
+#[derive(Clone)]
+pub(crate) struct ShellViewState {
+    view: ShellView,
+    pub(crate) unified: crate::unified::view_state::UnifiedViewState,
+}
+
+#[cfg(feature = "agent-socket")]
+impl Shell {
+    pub(crate) fn shepherd_view_state(&self, cx: &App) -> ShellViewState {
+        ShellViewState {
+            view: self.active_view,
+            unified: self.unified.read(cx).view_state(cx),
+        }
+    }
+
+    /// Put the shell back as `state` says. View state only: no data is touched.
+    pub(crate) fn shepherd_restore(
+        &mut self,
+        state: &ShellViewState,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Also closes the app menus, which cannot be restored.
+        self.select_view(state.view, window, cx);
+        if state.view == ShellView::Unified {
+            self.unified
+                .update(cx, |unified, cx| unified.restore_view_state(&state.unified, window, cx));
+        }
+    }
+
+    pub(crate) fn shepherd_node_facts(
+        &self,
+        id: uuid::Uuid,
+        cx: &App,
+    ) -> crate::unified::view_state::NodeFacts {
+        self.unified.read(cx).node_facts(id)
+    }
+
+    pub(crate) fn shepherd_panel_facts(
+        &self,
+        panel: crate::unified::PanelKind,
+        cx: &App,
+    ) -> crate::unified::view_state::PanelFacts {
+        self.unified.read(cx).panel_facts(panel)
     }
 }
 
@@ -1285,6 +1365,8 @@ fn transcript_format_message(notice: &run_transcript::FormatNotice) -> String {
 pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
     #[cfg(feature = "agent-socket")]
     let socket_addr = opts.agent_socket;
+    #[cfg(feature = "agent-socket")]
+    let driven_idle_ms = opts.driven_idle_ms;
     let width = opts.width;
     let height = opts.height;
     let no_focus = opts.no_focus;
@@ -1714,6 +1796,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                     addr,
                     width,
                     height,
+                    driven_idle_ms,
                     transcript_for_socket,
                     shell_weak,
                 );

@@ -183,6 +183,7 @@ cargo run -p tod -- --data-root .local/test/my-sandbox --agent mock --no-focus
 | `--agent cursor` | Real Cursor Agent CLI over ACP (rare protocol smoke only; still use `--data-root`) |
 | `--no-focus` | No window (main or secondary) takes OS keyboard focus; implied by `--agent-socket`/`--agent-socket-port` |
 | `--agent-socket HOST:PORT` | Enable control socket on a specific address (dev builds only) |
+| `--driven-idle-ms MS` | How long the user may sit idle in user mode before the agent gets the app back (default 5000) |
 | `--agent-socket-port PORT` | Shorthand for `127.0.0.1:PORT` — use a different port per parallel test instance |
 
 Line-oriented protocol (one command per line; reply `ok` or `err …`):
@@ -199,10 +200,44 @@ If the chosen port is already in use, startup fails immediately with a bind erro
 | `drag <x1> <y1> <x2> <y2>` | Press at the first coords, move to the second, release (drags a list row to a new place) |
 | `press` / `moveto` / `release` `<x> <y>` | The same gesture one step at a time, so a `shot` can catch what only exists mid-drag (a list's landing line) |
 | `sync` | Wait one UI frame |
+| `mode` | Reply `ok driven`, `ok user` or `ok idle`: who has the app (see below). Runs at once in any mode |
+| `size` | Reply `ok W H`: the window's content size in logical pixels. Runs at once in any mode |
+| `resize W H` | Set the window's content size. It is part of the agent's saved view (see below) |
 | `close` | Ask the window to close as the user would: the close guard runs (replies `ok blocked` while its toast is up). `click` also works on macOS. |
 | `quit` | Close every window, so the app quits as if the user closed it |
 | `shot <path>` | PNG screenshot of the window (Windows and macOS; on macOS the app reads its own window back from the window server, so no Screen Recording permission, and it works while the window is covered or unfocused) |
 | `shot2 <path> [x0 y0 x1 y1]` | Like `shot`, but forces a fresh draw and renders the scene offscreen through gpui (`Window::render_to_image`, so it needs no window-server readback and is current while the window is covered or minimized). macOS-tested; dev builds only, since it turns on gpui's `test-support` |
+
+### Sharing the app with the user: driven mode and user mode
+
+The socket drives the same instance the user may be using, so the app tells
+the two apart. The socket marks its own injected events; any other input is
+the user's (`agent_socket/driver.rs`).
+
+- **driven**: a socket client is driving, from its first input command until no
+  command for 2 minutes (then `idle`: no indicator, no snapshots). The title bar
+  is violet and says "Shepherd driving".
+- **user**: the user pressed a key or a mouse button, scrolled, or moved the
+  pointer. Focus gained, or the pointer merely over the window, does not count
+  (swiping through the macOS Space the window is on must not interrupt driven
+  work). A key or click that switches is consumed, so it never lands in a field
+  the agent focused. The agent's view state is saved and the user's own last
+  view restored; the reverse when driven mode resumes. Only view state (window
+  size, active view, tree selection, columns, pins, focused column, chat drawer,
+  the text of the input being edited) is saved and restored, never data; menus
+  are closed on a switch. Scroll offsets are not captured.
+- Back to **driven** when the window loses key focus or the pointer leaves it
+  for 300 ms, or after `--driven-idle-ms` (default 5000) without interaction.
+
+An input command (`key`, `text`, `click`, `rclick`, `scroll`, `drag`,
+`press`/`moveto`/`release`, `resize`) that arrives in user mode **waits**. Once
+driven mode resumes and the agent's view is restored: if the data it depended on
+is unchanged (the selected node still exists, its lifecycle state, who is next,
+its pending request ids, and each open panel still applying) it runs and replies
+`ok`; otherwise it replies `err user-conflict: request 3f2a answered; ENG-2925
+pr_draft→approved` (what changed) without running. After 60 s it replies `err
+user-mode` and the agent resends. `shot`/`shot2` in user mode reply `err
+user-mode: …` since the screen shows the user's view.
 
 See `.local/agent/ui-smoke/BATCH.md` for the full smoke workflow.
 
