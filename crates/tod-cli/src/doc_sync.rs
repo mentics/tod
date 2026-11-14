@@ -12,6 +12,7 @@
 
 /// Every noun, as `(noun, usage text)`. The fragment is
 /// `media/context/cli/<noun>.md`. `help` searches these too.
+#[cfg(test)]
 pub(crate) fn nouns() -> &'static [(&'static str, &'static str)] {
     crate::NOUNS
 }

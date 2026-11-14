@@ -43,12 +43,12 @@ use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::scroll::Scrollbar;
 use tod_core::conversation::ConversationStatus;
 use tod_core::runner_status::{LiveTurn, format_tokens};
-use tod_core::next_actor::{NextActor, NodeStanding, YouReason};
+use tod_core::next_actor::{NextActor, NodeStanding};
 use crate::unified::panels::runner_menu::{
-    self, EndedHow, Place, RunState, RunnerAction, RunnerActions, RunnerInputs,
+    self, Place, RunFacts, RunState, RunnerAction, RunnerActions, RunnerInputs,
+    derive_run_state, describe_check, load_runner,
 };
 use crate::views::task_list::standing::{self, PartTone};
-use tod_core::autopilot::Outcome;
 use tod_core::cloud_sync::CloudNode;
 use gpui_component::button::DropdownButton;
 use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
@@ -256,187 +256,6 @@ impl Prompt {
             Prompt::DeleteRunning { .. } => vec!["Stop and delete", "Cancel"],
         }
     }
-}
-
-/// What `load_runner` reads: the store half of [`RunnerLine`].
-#[derive(Debug, Default, Clone)]
-struct RunnerFacts {
-    lifecycle: String,
-    cloud: Option<CloudNode>,
-    cloud_sandbox: Option<String>,
-    adoptable: bool,
-    place: Option<Place>,
-    supervised: bool,
-    has_checkout: bool,
-    has_children: bool,
-    locations: Vec<tod_store::fleet::FilesPlace>,
-    current_location: Option<String>,
-    place_text: String,
-    problems: Vec<tod_store::node_problems::NodeProblem>,
-    error: Option<String>,
-}
-
-/// Everything the runner menu needs from the store: the node's lifecycle
-/// state, its cloud row, where its files are (and whether a sandbox exists),
-/// where its runner runs, whether it has a checkout of its own and children,
-/// and the global locations. Reads only, but not for the UI thread. A read
-/// that fails is said, never taken for "no".
-fn load_runner(fleet: &FleetStore, node_id: Uuid) -> RunnerFacts {
-    let mut facts = RunnerFacts::default();
-    let id = node_id.to_string();
-    facts.lifecycle = fleet
-        .get_node(&id)
-        .ok()
-        .flatten()
-        .map(|n| n.lifecycle)
-        .unwrap_or_default();
-    facts.cloud = tod_core::cloud_sync::cloud_node(fleet, &id);
-    match tod_core::node_problems::for_node(fleet, node_id) {
-        Ok(problems) => facts.problems = problems,
-        Err(err) => {
-            tracing::error!("could not read the problems of node {node_id}: {err:#}");
-            facts.error = Some(format!("Could not read this node's problems: {err:#}"));
-        }
-    }
-    match load_place(fleet, node_id, &mut facts) {
-        Ok(()) => {}
-        Err(err) => {
-            tracing::error!("could not read where node {node_id} runs: {err:#}");
-            facts.error = Some(format!("Could not read where this node runs: {err:#}"));
-        }
-    }
-    facts
-}
-
-fn load_place(fleet: &FleetStore, node_id: Uuid, facts: &mut RunnerFacts) -> anyhow::Result<()> {
-    use anyhow::Context as _;
-    let id = node_id.to_string();
-    let files = fleet.resolve_files_for_node(&id).context("read the node's Files")?;
-    let location = tod_store::fleet::provision::node_location(fleet, &id).context("read the node's location")?;
-    facts.supervised = tod_core::runner_place::RunnerPlace::of(fleet, node_id)? == tod_core::runner_place::RunnerPlace::Supervisor;
-    facts.has_checkout = location.is_some();
-    facts.has_children = fleet.node_has_children(node_id).context("look for the node's children")?;
-    facts.locations = tod_store::fleet::places::list(fleet).context("list the locations")?;
-    facts.current_location = files.as_ref().and_then(|f| f.place_id.clone());
-    let sandbox_made = location.as_ref().and_then(|l| l.sandbox().map(str::to_string));
-    facts.cloud_sandbox = sandbox_made.clone();
-    facts.adoptable = tod_core::cloud_sync::adopt::adoptable(fleet, fleet.paths().root(), &id)
-        .context("look for an old sandbox record to adopt")?;
-    let (place, text) = match files.as_ref().and_then(|files| files.dev_container.as_ref()) {
-        Some(dev) if dev.sandbox => {
-            // The sandbox is made when something first needs the node's
-            // files, so it can exist before the runner is started.
-            // Only the node's Files location says which sandbox it has.
-            let exists = sandbox_made.is_some();
-            let text = match &sandbox_made {
-                Some(name) => format!("sandbox {name}"),
-                None => "cloud sandbox, not made yet".to_string(),
-            };
-            (Place::Sandbox { exists }, text)
-        }
-        Some(dev) => match dev.container.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
-            Some(container) => (Place::DevContainer, format!("this machine, dev container {container}")),
-            None => (Place::DevContainer, "this machine, a dev container".to_string()),
-        },
-        None => (Place::Host, "this machine".to_string()),
-    };
-    facts.place = Some(place);
-    facts.place_text = text;
-    Ok(())
-}
-
-/// What `run_state` reads.
-struct RunFacts<'a> {
-    done: bool,
-    supervised: bool,
-    /// The daemon (or this process) is running the node's autopilot.
-    runner_running: bool,
-    pausing: bool,
-    /// A conversation the user started by hand is running.
-    hand_turn: bool,
-    /// How the last local run ended.
-    outcome: Option<&'a Outcome>,
-    actor: Option<&'a NextActor>,
-    /// Pause was asked of a supervisor that has not stopped yet.
-    pause_asked: bool,
-}
-
-/// Where the node's run stands (`doc/runner-menu/design.md`, "The runner's
-/// state, wherever it runs"): locally from the runner's own state, else, and
-/// for a supervised node, from who is next (`tod_core::next_actor`).
-fn derive_run_state(f: &RunFacts) -> RunState {
-    if f.done {
-        return RunState::Done;
-    }
-    if f.runner_running {
-        return RunState::Active { pausing: f.pausing };
-    }
-    if f.hand_turn {
-        return RunState::HandTurn;
-    }
-    if f.supervised && matches!(f.actor, Some(NextActor::Working { .. })) {
-        return RunState::Active { pausing: f.pause_asked };
-    }
-    // The last local run's own word, when it has one.
-    match f.outcome {
-        Some(Outcome::BudgetExhausted { .. }) => return RunState::Ended(EndedHow::Budget),
-        Some(Outcome::Stopped { .. }) => return RunState::Ended(EndedHow::Stopped),
-        Some(Outcome::NeedsHuman { .. }) => return RunState::Ended(EndedHow::Request),
-        Some(Outcome::Waiting { .. }) => return RunState::Ended(EndedHow::Waiting),
-        Some(Outcome::Done) | None => {}
-    }
-    match f.actor {
-        Some(NextActor::You { why, .. }) => match why {
-            YouReason::Paused => RunState::Ended(EndedHow::Paused),
-            YouReason::Stopped { reason } if reason.to_lowercase().contains("budget") => {
-                RunState::Ended(EndedHow::Budget)
-            }
-            YouReason::Stopped { .. } => RunState::Ended(EndedHow::Stopped),
-            YouReason::Failed { .. } => RunState::Ended(EndedHow::Failed),
-            YouReason::Request { .. } | YouReason::Permission { .. } => RunState::Ended(EndedHow::Request),
-            YouReason::NotStarted => RunState::NeverRun,
-        },
-        // Waiting on something else, or worked by a process this one has not
-        // heard from: there is nothing to start or resume.
-        Some(NextActor::Others { .. }) | Some(NextActor::Working { .. }) => RunState::Ended(EndedHow::Waiting),
-        Some(NextActor::Done) => RunState::Done,
-        None => RunState::NeverRun,
-    }
-}
-
-/// What a check found, in words for the runner line, and whether it is a
-/// failure (red): the gate's verdict and where it went, then what reading
-/// GitHub found, an unreadable GitHub included.
-fn describe_check(found: &tod_core::lifecycle::CheckNow) -> (String, bool) {
-    use tod_core::autopilot::GithubCheck;
-    let mut failed = false;
-    let mut text = if let Some(state) = found.advanced {
-        format!("Checked: the gate is clear; moved to {state}")
-    } else if found.gate.to.is_none() {
-        format!("Checked: {} has no gate", found.gate.from)
-    } else if found.gate.clear() {
-        match &found.held {
-            Some(why) => format!("Checked: the gate is clear, but the node was not moved on: {why}"),
-            None => "Checked: the gate is clear".to_string(),
-        }
-    } else {
-        let failing: Vec<String> = found.gate.failing().map(|c| format!("{} ({})", c.criterion.label, c.detail)).collect();
-        format!("Checked: the gate is not clear: {}", failing.join("; "))
-    };
-    match &found.github {
-        Some(GithubCheck::Waiting { what, .. }) => text.push_str(&format!(". GitHub: waiting for {what}")),
-        Some(GithubCheck::Feedback { what }) => text.push_str(&format!(". GitHub: {what}")),
-        Some(GithubCheck::Clear) => text.push_str(". GitHub: nothing left to wait for"),
-        Some(GithubCheck::Unreadable(why)) => {
-            failed = true;
-            text.push_str(&format!(". GitHub could not be read: {why}"));
-        }
-        Some(GithubCheck::NothingToWaitOn) | None => {}
-    }
-    if found.needs_agent {
-        text.push_str(". Starting the agent to do what is left");
-    }
-    (text, failed)
 }
 
 /// A runner-line text longer than this many lines is held to it, under a
@@ -2071,6 +1890,9 @@ mod face_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::unified::panels::runner_menu::EndedHow;
+    use tod_core::autopilot::Outcome;
+    use tod_core::next_actor::YouReason;
 
     /// Seen live: a Blaxel failure stack in the stopped reason pushed the
     /// runner buttons 3000px down. A long text is clamped; a short one is not.

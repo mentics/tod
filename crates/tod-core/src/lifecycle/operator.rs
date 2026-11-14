@@ -52,12 +52,19 @@ pub fn user_move_answering(node: Uuid, state: &str, reason: Option<&str>, decisi
 /// session. Nothing sets a lifecycle state except the lifecycle process, so a
 /// node's agent must not move its own node.
 pub fn refuse_agent_session(env: impl Fn(&str) -> Option<String>) -> Result<()> {
+    refuse_agent_session_for(
+        "changing a node's lifecycle state",
+        " Do the node's work; the lifecycle moves it on.",
+        env,
+    )
+}
+
+/// [`refuse_agent_session`] for any operator-only act: `what` is the act, and
+/// `then` is what the agent does instead (empty, or starting with a space).
+pub fn refuse_agent_session_for(what: &str, then: &str, env: impl Fn(&str) -> Option<String>) -> Result<()> {
     for name in AGENT_ENV {
         if env(name).is_some_and(|v| !v.trim().is_empty()) {
-            bail!(
-                "changing a node's lifecycle state is for the operator only; it is refused in an agent \
-                 session ({name} is set). Do the node's work; the lifecycle moves it on."
-            );
+            bail!("{what} is for the operator only; it is refused in an agent session ({name} is set).{then}");
         }
     }
     Ok(())

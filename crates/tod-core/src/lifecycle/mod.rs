@@ -12,6 +12,7 @@
 //! Which step comes next is [`crate::lifecycle_next`]; whether the current
 //! state still holds is [`crate::lifecycle_validity`].
 
+pub mod answer;
 mod check_now;
 pub mod operator;
 pub use check_now::{CheckNow, check_now};

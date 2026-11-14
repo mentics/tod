@@ -3,8 +3,8 @@
 
 /// `help` alone is the top-level usage, `help <NOUN>` that noun's, and
 /// anything else a search.
-pub fn run(words: &[String], top: &str) -> String {
-    let nouns = crate::doc_sync::nouns();
+pub fn run(words: &[String], top: &str, operator: bool) -> String {
+    let nouns = crate::operator::nouns(operator);
     if words.is_empty() {
         return top.trim_end().to_string();
     }
@@ -17,6 +17,7 @@ pub fn run(words: &[String], top: &str) -> String {
     let mut out = Vec::new();
     for (noun, usage) in nouns {
         let text = format!("{noun}\n{usage}").to_lowercase();
+        let usage = usage.as_str();
         if !words.iter().all(|w| text.contains(w.as_str())) {
             continue;
         }
@@ -59,12 +60,12 @@ mod tests {
 
     #[test]
     fn a_search_for_lifecycle_finds_how_to_enable_it() {
-        let found = run(&["enable".into(), "lifecycle".into()], "");
+        let found = run(&["enable".into(), "lifecycle".into()], "", false);
         assert!(found.contains("tod-cli capabilities enable"), "{found}");
     }
 
     #[test]
     fn a_noun_name_shows_its_usage() {
-        assert_eq!(run(&["plan".into()], ""), crate::plan::USAGE.trim_end());
+        assert_eq!(run(&["plan".into()], "", false), crate::plan::USAGE.trim_end());
     }
 }
