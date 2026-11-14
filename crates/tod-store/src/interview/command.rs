@@ -457,6 +457,9 @@ pub fn execute(
     let author = agent
         .as_ref()
         .map(|a| a.role.as_str())
+        // A shepherd (`TOD_ACTOR=shepherd:<id>`) answering for the user is
+        // recorded as itself, not as the user.
+        .or_else(|| actor.starts_with(SHEPHERD_ACTOR_PREFIX).then_some(actor))
         .unwrap_or(AUTHOR_USER);
     let now = now_ms();
 

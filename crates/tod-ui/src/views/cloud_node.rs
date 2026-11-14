@@ -2,9 +2,14 @@
 //! as the task panel's runner menu offers it: Start, Resume, Pause, Stop now,
 //! Reset environment, Delete sandbox and Sync now go to the background
 //! executor, and their progress comes back as [`CloudUpdate`]s.
+//!
+//! The jobs themselves are `tod_core::cloud_jobs`, which `tod-cli runner`
+//! runs too; this only moves them off the UI thread and turns their results
+//! into updates.
 
 use gpui::Context;
 use std::sync::Arc;
+use tod_core::cloud_jobs::{self, JobResult};
 use tod_core::cloud_sync::{self, CloudNode};
 use tod_store::fleet::FleetStore;
 
@@ -25,32 +30,12 @@ impl CloudUpdate {
         tracing::error!("cloud: {msg}");
         CloudUpdate::Failed(msg)
     }
-}
 
-/// A failure as the panel shows it: the title on the first line, then each
-/// cause of the error on a line of its own, and always what to do next. A
-/// cause that already says ("What to do: ...", as the sandbox maker's do) is
-/// left to; otherwise a temporary failure (the network, Blaxel not ready) says
-/// to try again, and any other says where to look.
-fn describe(title: &str, err: &anyhow::Error) -> String {
-    let mut out = title.to_string();
-    for cause in err.chain() {
-        out.push('\n');
-        out.push_str(&cause.to_string());
-    }
-    if !out.contains(tod_sandbox::health::WHAT_TO_DO) {
-        out.push('\n');
-        out.push_str(&next_step(tod_sandbox::blaxel::error_is_transient(err)));
-    }
-    out
-}
-
-/// What the user does next after a failure nothing more specific explained.
-fn next_step(transient: bool) -> String {
-    if transient {
-        "What to do: this looks temporary (the network or Blaxel). Try again in a minute.".to_string()
-    } else {
-        "What to do: try again. If it fails the same way, the log panel has the full detail; send it to whoever maintains tod.".to_string()
+    fn of(result: JobResult) -> Self {
+        match result {
+            Ok(msg) => CloudUpdate::Synced(msg),
+            Err(msg) => CloudUpdate::failed(msg),
+        }
     }
 }
 
@@ -64,10 +49,7 @@ pub fn delete_sandbox<T: 'static>(
 ) {
     spawn(cx, on_update, move |tx| {
         let _ = tx.send_blocking(CloudUpdate::Progress("Deleting the sandbox…".into()));
-        let _ = tx.send_blocking(match cloud_sync::lost::delete_node_sandbox(&fleet, &node_id) {
-            Ok(msg) => CloudUpdate::Synced(msg),
-            Err(err) => CloudUpdate::failed(describe("Delete sandbox failed", &err)),
-        });
+        let _ = tx.send_blocking(CloudUpdate::of(cloud_jobs::delete_sandbox(&fleet, &node_id)));
     });
 }
 
@@ -82,13 +64,9 @@ pub fn adopt_sandbox<T: 'static>(
 ) {
     spawn(cx, on_update, move |tx| {
         let mut progress = |msg: &str| {
-            cloud_sync::log_progress(&format!("adopting the sandbox of {node_id}"), msg);
             let _ = tx.send_blocking(CloudUpdate::Progress(msg.to_string()));
         };
-        let _ = tx.send_blocking(match cloud_sync::adopt::adopt_node_sandbox(&fleet, &node_id, &mut progress) {
-            Ok(msg) => CloudUpdate::Synced(msg),
-            Err(err) => CloudUpdate::failed(describe("Adopt existing sandbox failed", &err)),
-        });
+        let _ = tx.send_blocking(CloudUpdate::of(cloud_jobs::adopt_sandbox(&fleet, &node_id, &mut progress)));
     });
 }
 
@@ -103,10 +81,7 @@ pub fn delete_sandbox_anyway<T: 'static>(
 ) {
     spawn(cx, on_update, move |tx| {
         let _ = tx.send_blocking(CloudUpdate::Progress("Deleting the sandbox without a checkpoint…".into()));
-        let _ = tx.send_blocking(match cloud_sync::lost::delete_node_sandbox_anyway(&fleet, &node_id) {
-            Ok(msg) => CloudUpdate::Synced(msg),
-            Err(err) => CloudUpdate::failed(describe("Delete sandbox failed", &err)),
-        });
+        let _ = tx.send_blocking(CloudUpdate::of(cloud_jobs::delete_sandbox_anyway(&fleet, &node_id)));
     });
 }
 
@@ -124,14 +99,11 @@ pub fn stop_and_delete_sandbox<T: 'static>(
     spawn(cx, on_update, move |tx| {
         let _ = tx.send_blocking(CloudUpdate::Progress("Stopping, then deleting the sandbox…".into()));
         let mut progress = |msg: &str| {
-            cloud_sync::log_progress(&format!("stop and delete {node_id}"), msg);
             let _ = tx.send_blocking(CloudUpdate::Progress(msg.to_string()));
         };
-        let result = cloud_sync::lost::stop_and_delete_node_sandbox(&fleet, &node_id, checkpoint, &mut progress);
-        let _ = tx.send_blocking(match result {
-            Ok(msg) => CloudUpdate::Synced(msg),
-            Err(err) => CloudUpdate::failed(describe("Stop and delete failed", &err)),
-        });
+        let _ = tx.send_blocking(CloudUpdate::of(cloud_jobs::stop_and_delete_sandbox(
+            &fleet, &node_id, checkpoint, &mut progress,
+        )));
     });
 }
 
@@ -146,37 +118,16 @@ pub fn run_in_cloud<T: 'static>(
     spawn(cx, on_update, move |tx| {
         let root = fleet.paths().root().to_path_buf();
         let mut progress = |msg: &str| {
-            cloud_sync::log_progress(&format!("starting {node_id}"), msg);
             let _ = tx.send_blocking(CloudUpdate::Progress(msg.to_string()));
         };
-        let result = cloud_sync::start_in_cloud(&fleet, &root, &node_id, &mut progress);
-        let _ = tx.send_blocking(match result {
-            Ok(started) if started.heard => CloudUpdate::Accepted(started.node),
-            Ok(started) => {
-                // Accepted, but nothing has come back: said, not left to look
-                // like it is working.
-                let _ = tx.send_blocking(CloudUpdate::Accepted(started.node));
-                CloudUpdate::failed(format!(
-                    "The node's sandbox accepted it, but its supervisor has not reported in after {} seconds.\n\
-                     Sync now looks again. If it stays silent, check the log panel for the cloud's problems, \
-                     or use Reset environment.",
-                    cloud_sync::SUPERVISOR_REPORTS_WITHIN.as_secs()
-                ))
-            }
-            Err(err) => CloudUpdate::failed(describe("Start failed", &err)),
-        });
+        let started = cloud_jobs::run_in_cloud(&fleet, &root, &node_id, &mut progress);
+        if let Some(node) = started.accepted {
+            let _ = tx.send_blocking(CloudUpdate::Accepted(node));
+        }
+        if let Err(msg) = started.result {
+            let _ = tx.send_blocking(CloudUpdate::failed(msg));
+        }
     });
-}
-
-/// What the user asked of a supervisor, in words, for the line: what was
-/// asked for, and the menu entry's name for a failure's title.
-fn request_words(kind: &str) -> (&'static str, &'static str) {
-    match kind {
-        cloud_sync::REQUEST_FRESH_SESSION => ("a new session", "Run with a new session"),
-        cloud_sync::REQUEST_FRESH_BUDGET => ("a fresh budget", "Resume with a fresh budget"),
-        cloud_sync::REQUEST_KEEP_GOING => ("it to go on", "Resume"),
-        _ => ("this", "The request"),
-    }
 }
 
 /// Record the user's request of `kind` for `node_id`'s supervisor (a new
@@ -190,25 +141,14 @@ pub fn request<T: 'static>(
     cx: &mut Context<T>,
     on_update: impl Fn(&mut T, CloudUpdate, &mut Context<T>) + 'static,
 ) {
-    let (what, action) = request_words(kind);
+    let (what, _) = cloud_jobs::request_words(kind);
     spawn(cx, on_update, move |tx| {
         let root = fleet.paths().root().to_path_buf();
+        let _ = tx.send_blocking(CloudUpdate::Progress(format!("Asking the supervisor for {what}…")));
         let mut progress = |msg: &str| {
-            cloud_sync::log_progress(&format!("{kind} for {node_id}"), msg);
             let _ = tx.send_blocking(CloudUpdate::Progress(msg.to_string()));
         };
-        let _ = tx.send_blocking(CloudUpdate::Progress(format!("Asking the supervisor for {what}…")));
-        let result = cloud_sync::wake_node_tracked_requesting(&fleet, &root, &node_id, kind, &mut progress);
-        let _ = tx.send_blocking(match result {
-            Ok((said, true)) => CloudUpdate::Synced(format!("Asked for {what}: {said}.")),
-            Ok((said, false)) => CloudUpdate::failed(format!(
-                "Asked for {what} ({said}), but its supervisor has not reported in after {} seconds.\n\
-                 Sync now looks again. If it stays silent, check the log panel for the cloud's problems, \
-                 or use Reset environment.",
-                cloud_sync::SUPERVISOR_REPORTS_WITHIN.as_secs()
-            )),
-            Err(err) => CloudUpdate::failed(describe(&format!("{action} failed"), &err)),
-        });
+        let _ = tx.send_blocking(CloudUpdate::of(cloud_jobs::request(&fleet, &root, &node_id, kind, &mut progress)));
     });
 }
 
@@ -232,9 +172,6 @@ pub fn stop_now<T: 'static>(
     stop_request(fleet, node_id, cloud_sync::REQUEST_STOP_NOW, "Stop now", cx, on_update)
 }
 
-/// A `pause` or `stop_now`: recorded, synced and poked, and the click is
-/// answered at once (`cloud_sync::wake_node_requesting`), not when the
-/// supervisor reports back; the standing shows it stop.
 fn stop_request<T: 'static>(
     fleet: Arc<FleetStore>,
     node_id: String,
@@ -246,10 +183,7 @@ fn stop_request<T: 'static>(
     spawn(cx, on_update, move |tx| {
         let root = fleet.paths().root().to_path_buf();
         let _ = tx.send_blocking(CloudUpdate::Progress(format!("Asking the supervisor: {}…", action.to_lowercase())));
-        let _ = tx.send_blocking(match cloud_sync::wake_node_requesting(&fleet, &root, &node_id, kind) {
-            Ok(said) => CloudUpdate::Synced(format!("{action} asked of the supervisor: {said}.")),
-            Err(err) => CloudUpdate::failed(describe(&format!("{action} failed"), &err)),
-        });
+        let _ = tx.send_blocking(CloudUpdate::of(cloud_jobs::stop_request(&fleet, &root, &node_id, kind, action)));
     });
 }
 
@@ -262,16 +196,11 @@ pub fn reset_environment<T: 'static>(
     on_update: impl Fn(&mut T, CloudUpdate, &mut Context<T>) + 'static,
 ) {
     spawn(cx, on_update, move |tx| {
+        let _ = tx.send_blocking(CloudUpdate::Progress("Setting the environment up again…".into()));
         let mut progress = |msg: &str| {
-            cloud_sync::log_progress(&format!("reset environment of {node}"), msg);
             let _ = tx.send_blocking(CloudUpdate::Progress(msg.to_string()));
         };
-        let _ = tx.send_blocking(CloudUpdate::Progress("Setting the environment up again…".into()));
-        let result = tod_core::environment_reset::reset(&fleet, node, &mut progress);
-        let _ = tx.send_blocking(match result {
-            Ok(()) => CloudUpdate::Synced("The environment was set up again.".into()),
-            Err(err) => CloudUpdate::failed(describe("Reset environment failed", &err)),
-        });
+        let _ = tx.send_blocking(CloudUpdate::of(cloud_jobs::reset_environment(&fleet, node, &mut progress)));
     });
 }
 
@@ -287,42 +216,7 @@ pub fn sync_now<T: 'static>(
 ) {
     spawn(cx, on_update, move |tx| {
         let root = fleet.paths().root().to_path_buf();
-        let _ = tx.send_blocking(match cloud_sync::sync_now(&fleet, &root) {
-            Ok(report) => {
-                let mut msg = report.summary();
-                let mut return_failed: Option<CloudUpdate> = None;
-                if let Some(node) = node
-                    && let Some(status) =
-                        cloud_sync::cloud_status(&fleet, node, tod_store::outline::uuid_blob::now_ms())
-                {
-                    msg.push_str(". ");
-                    if status == cloud_sync::CloudStatus::Lost && cloud_sync::lost::any_marked(&fleet) {
-                        // Sync now is the "next sync": replace it now, and
-                        // say what happened, not only that it was started.
-                        match cloud_sync::lost::check_marked_now(&fleet) {
-                            Ok(Some(done)) if done.replaced > 0 => {
-                                msg.push_str("Its sandbox was gone; a new one was made.")
-                            }
-                            Ok(Some(_)) => {
-                                let why = cloud_sync::lost::note(&node.to_string())
-                                    .unwrap_or_else(|| "nothing was replaced".into());
-                                return_failed = Some(CloudUpdate::failed(describe("Replacing its sandbox failed", &anyhow::anyhow!(why))));
-                            }
-                            Ok(None) => msg.push_str(
-                                "Its sandbox is gone; another check is already making a new one.",
-                            ),
-                            Err(err) => {
-                                return_failed = Some(CloudUpdate::failed(describe("Replacing its sandbox failed", &err)));
-                            }
-                        }
-                    } else {
-                        msg.push_str(&status.describe());
-                    }
-                }
-                return_failed.unwrap_or(CloudUpdate::Synced(msg))
-            }
-            Err(err) => CloudUpdate::failed(describe("Sync failed", &err)),
-        });
+        let _ = tx.send_blocking(CloudUpdate::of(cloud_jobs::sync_now(&fleet, &root, node)));
     });
 }
 
@@ -341,70 +235,4 @@ fn spawn<T: 'static>(
         }
     })
     .detach();
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn failure(check: tod_sandbox::health::Check, detail: &str, setup: tod_sandbox::health::Setup) -> tod_sandbox::health::HealthFailure {
-        tod_sandbox::health::HealthFailure { check, detail: detail.into(), plain: false, setup }
-    }
-
-    /// An existing sandbox's health failure carries its own "What to do:", so
-    /// the panel adds no second, conflicting step.
-    #[test]
-    fn an_existing_sandboxes_health_failure_keeps_its_own_next_step() {
-        use tod_sandbox::health::{Check, Setup};
-        let text = describe("Start failed", &anyhow::Error::new(failure(Check::Relay, "the relay does not answer", Setup::Existing)));
-        assert_eq!(text.matches("What to do:").count(), 1, "{text}");
-        assert!(text.contains("use Reset environment in the task panel's runner menu"), "{text}");
-        assert!(text.contains("Technical detail: sandbox health check \"relay up\" failed"), "{text}");
-    }
-
-    /// A temporary failure while Start makes a sandbox (one that did not
-    /// wake): the health text has no step, and the maker's (it deleted the
-    /// sandbox), which `discard_failed_sandbox` adds, is the only one.
-    #[test]
-    fn a_new_sandboxes_temporary_health_failure_has_exactly_the_makers_step() {
-        use tod_sandbox::health::{Check, Setup};
-        let make = || failure(Check::Reachable, "node-x: did not wake", Setup::New);
-        assert!(tod_sandbox::blaxel::error_is_transient(&anyhow::Error::new(make())));
-        let err = anyhow::Error::new(make()).context(format!(
-            "node-x was deleted. This looks temporary (the network or Blaxel). {} start the node again, which makes a fresh sandbox",
-            tod_sandbox::health::WHAT_TO_DO
-        ));
-        let text = describe("Start failed", &err);
-        assert_eq!(text.matches("What to do:").count(), 1, "{text}");
-        assert!(text.contains("What to do: start the node again, which makes a fresh sandbox"), "{text}");
-        assert!(!text.contains("next Start deletes"), "{text}");
-        assert!(text.contains("Technical detail: sandbox health check \"reachable\" failed"), "{text}");
-    }
-
-    /// "Asked for {what}" and "Asking the supervisor for {what}" must read as
-    /// sentences for every request.
-    #[test]
-    fn request_words_read_in_the_asked_for_sentence() {
-        for kind in [cloud_sync::REQUEST_FRESH_SESSION, cloud_sync::REQUEST_FRESH_BUDGET, cloud_sync::REQUEST_KEEP_GOING] {
-            let (what, _) = request_words(kind);
-            assert!(!what.starts_with("to "), "{kind}: Asked for {what}");
-        }
-    }
-
-    #[test]
-    fn every_failure_says_what_to_do_next() {
-        let temporary = anyhow::anyhow!("sandbox API timeout: connect").context("upload /x");
-        let text = describe("Start failed", &temporary);
-        assert!(text.starts_with("Start failed\nupload /x\n"), "{text}");
-        assert!(text.contains("What to do: this looks temporary"), "{text}");
-
-        let unknown = anyhow::anyhow!("the checkout has no branch");
-        let text = describe("Start failed", &unknown);
-        assert!(text.contains("What to do: try again. If it fails the same way"), "{text}");
-
-        // A cause that already says what to do is not given a second line.
-        let said = anyhow::anyhow!("x was kept. What to do: open it with `tod-sandbox shell x`");
-        let text = describe("Start failed", &said);
-        assert_eq!(text.matches("What to do:").count(), 1, "{text}");
-    }
 }

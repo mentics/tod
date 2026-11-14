@@ -8,6 +8,8 @@ use uuid::Uuid;
 pub const ACTOR_ENV: &str = "TOD_INTERVIEW_ACTOR";
 /// Actor for writes made by the person using the app.
 pub const ACTOR_USER: &str = "user";
+/// The prefix of the actor a shepherd (`tod-cli` run with `TOD_ACTOR=shepherd:<id>`) acts as.
+pub const SHEPHERD_ACTOR_PREFIX: &str = "shepherd:";
 /// Actor for writes from an agent that has no interview session of its own
 /// (a chat agent, or `tod-cli` run without `TOD_INTERVIEW_ACTOR`).
 pub const ACTOR_AGENT: &str = "agent";

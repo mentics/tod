@@ -23,7 +23,7 @@ use std::sync::Arc;
 use tod_core::conversation::implement::{HandoffAnswer, handoff_answer_message};
 use tod_core::conversation::{ConversationConfig, ConversationDriver, ConversationStatus, SharedAgentAccess};
 use tod_store::conversation::{Conversation, ConversationRepo, Focus, ProtocolKind};
-use tod_store::decisions::{Decision, DecisionRepo};
+use tod_store::decisions::DecisionRepo;
 use tod_store::fleet::FleetStore;
 use tod_store::interview::{ACTOR_USER, InterviewCommand};
 use tod_store::outline::OutlineMutation;
@@ -639,119 +639,6 @@ impl AgentRuns {
         .map_err(|e| anyhow::anyhow!(e))
     }
 
-    /// "option 2 (\"per invoice\")", "\"do it Tuesday\"", or "option 1" when
-    /// there is no free text and the option's own label is empty.
-    fn describe_answer(decision: &Decision, option: Option<i64>, text: Option<&str>) -> String {
-        let picked = option.and_then(|o| {
-            usize::try_from(o)
-                .ok()
-                .and_then(|ix| decision.options.get(ix.checked_sub(1)?))
-        });
-        match (picked, text) {
-            (Some(label), Some(text)) if !text.is_empty() => format!("\"{label}\" ({text})"),
-            (Some(label), _) => format!("\"{label}\""),
-            (None, Some(text)) if !text.is_empty() => format!("\"{text}\""),
-            _ => "(no answer recorded)".to_string(),
-        }
-    }
-
-    /// Records the user's answer to `decision_id` and says what to tell the
-    /// asking conversation: its id and the message, or `None` when nothing
-    /// is to be delivered (a permission, or a decision with no
-    /// conversation). Blocks on the store: run it off the UI thread.
-    pub fn record_decision_answer(
-        fleet: &FleetStore,
-        decision_id: Uuid,
-        option: Option<usize>,
-        text: Option<String>,
-    ) -> anyhow::Result<Option<(Uuid, String)>> {
-        let before = fleet
-            .read(|conn| DecisionRepo::new(conn).get_with_answers(decision_id))?
-            .with_context(|| format!("decision {decision_id} not found"))?;
-        let option_index = option.map(|o| o as i64);
-
-        // An option that sends the node back moves it first (and fails the
-        // answer, recording nothing, when it cannot): `tod_core::lifecycle::send_back`.
-        let answered = tod_core::lifecycle::send_back::answer_decision(
-            fleet,
-            decision_id,
-            option_index,
-            text.clone(),
-        )?;
-
-        let after = fleet
-            .read(|conn| DecisionRepo::new(conn).get_with_answers(decision_id))?
-            .with_context(|| format!("decision {decision_id} vanished after answering"))?;
-
-        // A permission is a standing grant, not a message: the runner that
-        // stopped for it reopens the step once nothing is waiting, and the
-        // agent's next ask is answered from the saved answer
-        // (`tod_core::permission`).
-        if after.decision.protocol.as_deref() == Some(tod_core::permission::PROTOCOL) {
-            return Ok(None);
-        }
-        let Some(conversation_id) = after.decision.conversation_id else {
-            return Ok(None);
-        };
-
-        let chosen = Self::describe_answer(&after.decision, option_index, text.as_deref());
-        // A credential request: the agent is told whether it is now set,
-        // never anything of its value (`tod_core::environment_request`).
-        let credential = tod_core::environment_request::is_request(&after.decision)
-            .then(|| tod_core::environment_request::parse_question(&after.decision.question))
-            .flatten()
-            .map(|(name, _)| {
-                tod_core::environment_request::answer_message(
-                    &name,
-                    tod_core::environment_request::was_provided(&after.decision, option_index),
-                )
-            });
-        let moved = answered.moved_to.as_ref().map(|to| {
-            format!(
-                "\n\nThe app has already moved the task back to `{to}` and reopened its \
-                 implementation steps, as the user chose. Do nothing more in this session."
-            )
-        });
-        let message = match credential {
-            Some(message) => message,
-            None => match before.answers.last() {
-            Some(prev) => {
-                let previous =
-                    Self::describe_answer(&after.decision, prev.option, prev.text.as_deref());
-                format!(
-                    "Decision answered: {}\n\nThe user answered {chosen}.\n\nThe user changed \
-                     their answer from {previous} to {chosen}: review what you did based on \
-                     {previous} and adjust.",
-                    after.decision.question
-                )
-            }
-            None => format!(
-                "Decision answered: {}\n\nThe user answered {chosen}.",
-                after.decision.question
-            ),
-            },
-        };
-
-        // The plan steps this answer opened again, so the agent takes them up
-        // with the answer rather than waiting for a retry.
-        let released = if after.decision.blocks.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "\n\nThis answer also opened the plan steps it held up ([{}]) again: they are ready, carry on \
-                 with them using this answer. Do not ask this again.",
-                after
-                    .decision
-                    .blocks
-                    .iter()
-                    .map(|id| tod_store::interview::short_id(*id))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        };
-        Ok(Some((conversation_id, format!("{message}{released}{}", moved.unwrap_or_default()))))
-    }
-
     /// Records the user's answer to `decision_id` (append-only: a change of
     /// mind is a new `decision_answers` row, never an update — see
     /// `tod_store::decisions`), then delivers a turn to the asking
@@ -773,7 +660,7 @@ impl AgentRuns {
         cx: &mut Context<Self>,
     ) -> anyhow::Result<()> {
         if let Some((conversation_id, message)) =
-            Self::record_decision_answer(&self.fleet, decision_id, option, text)?
+            tod_core::lifecycle::answer::record_decision_answer(&self.fleet, decision_id, option, text)?
         {
             self.deliver_answer(conversation_id, &message, cx)?;
         }
@@ -818,7 +705,7 @@ impl AgentRuns {
         cx.spawn(async move |this, cx| {
             let recorded = cx
                 .background_executor()
-                .spawn(async move { Self::record_decision_answer(&fleet, decision_id, option, text) })
+                .spawn(async move { tod_core::lifecycle::answer::record_decision_answer(&fleet, decision_id, option, text) })
                 .await;
             if recorded.is_ok() {
                 this.update(cx, |this, cx| this.wake_cloud_node(decision_id, cx)).ok();

@@ -8,7 +8,7 @@ pub mod obligations;
 pub mod on_others;
 pub mod plan;
 pub mod pr_controls;
-pub mod runner_menu;
+pub use tod_core::runner_menu;
 pub mod settings;
 pub mod task;
 pub mod activity_timeline;

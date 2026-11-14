@@ -98,8 +98,19 @@ pub fn answer_decision(
     option: Option<i64>,
     text: Option<String>,
 ) -> Result<Answered> {
-    let answered = answer_with(fleet, decision_id, option, text, |command| {
-        fleet.interview(ACTOR_USER, command).map(|_| ()).map_err(anyhow::Error::from)
+    answer_decision_as(fleet, decision_id, option, text, ACTOR_USER)
+}
+
+/// [`answer_decision`] recorded as `actor` (`user`, or `shepherd:<id>`).
+pub fn answer_decision_as(
+    fleet: &FleetStore,
+    decision_id: Uuid,
+    option: Option<i64>,
+    text: Option<String>,
+    actor: &str,
+) -> Result<Answered> {
+    let answered = answer_with_actor(fleet, decision_id, option, text, actor, |command| {
+        fleet.interview(actor, command).map(|_| ()).map_err(anyhow::Error::from)
     })?;
     // An answer about a silent review bot wakes the run parked on it.
     crate::bot_silence::release_parked_wait(fleet, decision_id)?;
@@ -115,8 +126,19 @@ fn answer_with(
     text: Option<String>,
     record: impl FnOnce(InterviewCommand) -> Result<()>,
 ) -> Result<Answered> {
+    answer_with_actor(fleet, decision_id, option, text, ACTOR_USER, record)
+}
+
+fn answer_with_actor(
+    fleet: &FleetStore,
+    decision_id: Uuid,
+    option: Option<i64>,
+    text: Option<String>,
+    actor: &str,
+    record: impl FnOnce(InterviewCommand) -> Result<()>,
+) -> Result<Answered> {
     answer_with_reopen(fleet, decision_id, option, text, record, |command| {
-        fleet.interview(ACTOR_USER, command).map(|_| ()).map_err(anyhow::Error::from)
+        fleet.interview(actor, command).map(|_| ()).map_err(anyhow::Error::from)
     })
 }
 
