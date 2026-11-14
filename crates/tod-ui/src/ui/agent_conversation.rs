@@ -989,6 +989,7 @@ impl AgentConversationPanel {
                     div().absolute().top_0().right_0().child(
                         Button::new(("agent-conversation-image-remove", ix))
                             .icon(IconName::Close)
+                            .accessibility_label("Remove attached image")
                             .ghost()
                             .xsmall()
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -1173,6 +1174,7 @@ impl Render for AgentConversationPanel {
                     .disabled(tool.disabled)
                     .selected(self.active && self.highlight == PanelStop::Tool(ix))
                     .tooltip(tool.tooltip.clone())
+                    .accessibility_label(tool.tooltip.clone())
                     .on_click(cx.listener(move |_, _, _, cx| {
                         cx.emit(AgentConversationEvent::Activated);
                         cx.emit(AgentConversationEvent::Action(

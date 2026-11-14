@@ -907,6 +907,7 @@ impl TranscriptList {
                         .ghost()
                         .compact()
                         .icon(IconName::ChevronUp)
+                        .accessibility_label("Previous match")
                         .on_click(cx.listener(|this, _, _, cx| this.find_step(false, cx))),
                 )
                 .child(
@@ -914,6 +915,7 @@ impl TranscriptList {
                         .ghost()
                         .compact()
                         .icon(IconName::ChevronDown)
+                        .accessibility_label("Next match")
                         .on_click(cx.listener(|this, _, _, cx| this.find_step(true, cx))),
                 )
                 .child(
@@ -921,6 +923,7 @@ impl TranscriptList {
                         .ghost()
                         .compact()
                         .icon(IconName::Close)
+                        .accessibility_label("Close find")
                         .on_click(cx.listener(|this, _, window, cx| this.close_find(window, cx))),
                 )
                 .into_any_element(),

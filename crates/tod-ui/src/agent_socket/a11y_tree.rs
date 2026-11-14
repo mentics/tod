@@ -259,6 +259,39 @@ fn read(window: &Window) -> (Vec<Node>, Vec<(f32, f32)>) {
             }
         }
     }
+    // A scroll wrapper around text (`#text-view-scroll-N`) has no name of its own:
+    // the text is the `label` node beside it, so the wrapper is noise. Drop it and
+    // hand its children to its parent.
+    let dropped: Vec<bool> = order
+        .iter()
+        .map(|&(i, _)| is_empty_wrapper(&snapshot[i]))
+        .collect();
+    let mut keep_as: Vec<Option<usize>> = vec![None; order.len()];
+    let mut kept = 0usize;
+    for (pos, _) in order.iter().enumerate() {
+        if !dropped[pos] {
+            keep_as[pos] = Some(kept);
+            kept += 1;
+        }
+    }
+    let mut parent_of: Vec<Option<usize>> = order.iter().map(|&(_, p)| p).collect();
+    for pos in 0..order.len() {
+        let mut p = parent_of[pos];
+        while let Some(q) = p {
+            if dropped[q] {
+                p = parent_of[q];
+            } else {
+                break;
+            }
+        }
+        parent_of[pos] = p;
+    }
+    let order: Vec<(usize, Option<usize>)> = order
+        .iter()
+        .enumerate()
+        .filter(|&(pos, _)| !dropped[pos])
+        .map(|(pos, &(i, _))| (i, parent_of[pos].and_then(|q| keep_as[q])))
+        .collect();
     let nodes = order
         .into_iter()
         .map(|(snap_index, parent)| {
@@ -280,7 +313,7 @@ fn read(window: &Window) -> (Vec<Node>, Vec<(f32, f32)>) {
                     .map(selector::compact_path)
                     .filter(|p| !p.is_empty()),
                 role: format!("{:?}", s.node.role()),
-                label: s.node.label().unwrap_or("").to_string(),
+                label: label_of(s),
                 value: s.node.value().unwrap_or("").to_string(),
                 bounds: s.node.bounds().map(|r| {
                     [
@@ -297,6 +330,53 @@ fn read(window: &Window) -> (Vec<Node>, Vec<(f32, f32)>) {
         })
         .collect();
     (nodes, viewport)
+}
+
+/// An empty-named, non-clickable group whose element id is a text view's scroll
+/// wrapper: it only holds the text that is listed as its own `label` node.
+fn is_empty_wrapper(s: &gpui::A11yNodeSnapshot) -> bool {
+    s.node.role() == gpui::accesskit::Role::Group
+        && s.node.label().is_none_or(str::is_empty)
+        && s.node.value().is_none_or(str::is_empty)
+        && !s.node.supports_action(Action::Click)
+        && s.path
+            .as_deref()
+            .and_then(|p| p.rsplit('/').find(|seg| !seg.is_empty()))
+            .is_some_and(|seg| seg.starts_with("text-view-scroll"))
+}
+
+/// The node's name. A clickable element that no text or `aria_label` names (a
+/// widget from a library, such as a notification's close button) is named from
+/// its element id (`close` -> "Close"), so it can still be targeted as
+/// `role:label`; tod's own icon buttons are labelled where they are built.
+fn label_of(s: &gpui::A11yNodeSnapshot) -> String {
+    let label = s.node.label().unwrap_or("");
+    if !label.trim().is_empty() {
+        return label.to_string();
+    }
+    let clickable = s.node.supports_action(Action::Click)
+        || matches!(
+            s.node.role(),
+            gpui::accesskit::Role::Button | gpui::accesskit::Role::DefaultButton
+        );
+    if !clickable {
+        return label.to_string();
+    }
+    let Some(path) = s.path.as_deref() else {
+        return String::new();
+    };
+    let Some(seg) = path
+        .rsplit('/')
+        .find(|seg| !seg.is_empty() && !seg.chars().all(|c| c.is_ascii_digit()))
+    else {
+        return String::new();
+    };
+    let words = seg.replace(['-', '_'], " ");
+    let mut chars = words.trim().chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
 }
 
 fn one_line(text: &str) -> String {
@@ -903,5 +983,156 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(json.lines().nth(1).unwrap()).unwrap();
         assert_eq!(value["role"], "label");
         assert!(value["bounds"].is_array());
+    }
+
+    /// Every clickable node of the last frame whose own name (before any id
+    /// fallback) is empty.
+    fn unnamed_clickables(window: &Window) -> Vec<String> {
+        window
+            .a11y_snapshot()
+            .iter()
+            .filter(|s| {
+                s.node.supports_action(Action::Click)
+                    && s.node.label().is_none_or(|l| l.trim().is_empty())
+            })
+            .map(|s| s.path.clone().unwrap_or_default())
+            .collect()
+    }
+
+    struct IconProbe;
+
+    impl Render for IconProbe {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .id("icon-probe")
+                .size_full()
+                .flex()
+                .child(
+                    Button::new("named-icon")
+                        .icon(gpui_component::IconName::Close)
+                        .accessibility_label("Close the thing")
+                        .on_click(|_, _, _| {}),
+                )
+                .child(
+                    Button::new("bare-icon")
+                        .icon(gpui_component::IconName::Copy)
+                        .on_click(|_, _, _| {}),
+                )
+                .child(div().id("text-view-scroll-7").focusable().child("Some text"))
+        }
+    }
+
+    #[gpui::test]
+    fn a_labelled_icon_button_is_named_and_a_bare_one_is_found_and_still_targetable(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|_| IconProbe);
+            Root::new(view, window, cx)
+        });
+        let tree = cx.update(|window, cx| run_tree(window, cx, &TreeQuery::default())).unwrap();
+        assert_eq!(cx.update(|w, cx| count(w, cx, "button:Close the thing")).unwrap(), 1, "{tree}");
+        // The raw snapshot shows the one nobody labelled: this is what the
+        // source scan below prevents in tod's own views.
+        let unnamed = cx.update(|window, _| unnamed_clickables(window));
+        assert_eq!(unnamed.len(), 1, "{unnamed:?}");
+        assert!(unnamed[0].contains("bare-icon"), "{unnamed:?}");
+        // The listing still names it, from its id, so `role:label` reaches it.
+        assert!(tree.contains("\tbutton\tBare icon\t"), "{tree}");
+        // The scroll wrapper around text is not listed; the text is.
+        assert!(!tree.contains("text-view-scroll"), "{tree}");
+        assert!(tree.contains("\tlabel\tSome text\t"), "{tree}");
+    }
+
+    /// Every `Button::new(..)` in tod's own views that shows an icon must also be
+    /// given a name (`.label(..)` or `.accessibility_label(..)`): an icon-only
+    /// button has nothing a screen reader or the control socket can read. This
+    /// scans the sources because the views cannot all be rendered in a test.
+    #[test]
+    fn every_icon_button_in_the_views_is_named() {
+        fn skip_balanced(b: &[u8], mut i: usize) -> usize {
+            let mut depth = 0i32;
+            let mut in_str = false;
+            while i < b.len() {
+                let c = b[i];
+                if in_str {
+                    if c == b'\\' {
+                        i += 1;
+                    } else if c == b'"' {
+                        in_str = false;
+                    }
+                } else if c == b'"' {
+                    in_str = true;
+                } else if c == b'(' || c == b'{' || c == b'[' {
+                    depth += 1;
+                } else if c == b')' || c == b'}' || c == b']' {
+                    depth -= 1;
+                    if depth == 0 {
+                        return i + 1;
+                    }
+                }
+                i += 1;
+            }
+            b.len()
+        }
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        walk(&root, &mut files);
+        let mut bad = Vec::new();
+        for file in files {
+            // This file's own probe has a deliberately bare icon button.
+            if file.ends_with("agent_socket/a11y_tree.rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&file).unwrap();
+            let b = text.as_bytes();
+            let mut from = 0;
+            while let Some(at) = text[from..].find("Button::new(") {
+                let start = from + at;
+                from = start + "Button::new(".len();
+                let mut i = skip_balanced(b, start + "Button::new".len());
+                let (mut icon, mut named) = (false, false);
+                loop {
+                    let mut j = i;
+                    while j < b.len() && b[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    if j >= b.len() || b[j] != b'.' {
+                        break;
+                    }
+                    let name_start = j + 1;
+                    let mut k = name_start;
+                    while k < b.len() && (b[k].is_ascii_alphanumeric() || b[k] == b'_') {
+                        k += 1;
+                    }
+                    match &text[name_start..k] {
+                        "icon" => icon = true,
+                        "label" | "accessibility_label" => named = true,
+                        _ => {}
+                    }
+                    i = if k < b.len() && b[k] == b'(' { skip_balanced(b, k) } else { k };
+                }
+                if icon && !named {
+                    let line = text[..start].matches('\n').count() + 1;
+                    bad.push(format!("{}:{line}", file.strip_prefix(&root).unwrap().display()));
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "icon buttons with no `.label(..)` or `.accessibility_label(..)`:\n{}",
+            bad.join("\n")
+        );
     }
 }

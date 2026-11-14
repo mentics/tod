@@ -1270,6 +1270,7 @@ impl Requests {
                 .xsmall()
                 .disabled(running)
                 .tooltip(tooltip)
+                .accessibility_label("Continue in a terminal")
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.continue_in_terminal(&item, conversation, Source::Click, window, cx);
                 }))

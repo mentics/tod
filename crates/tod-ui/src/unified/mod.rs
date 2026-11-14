@@ -1301,6 +1301,7 @@ impl UnifiedView {
                             .icon(IconName::Copy)
                             .small()
                             .tooltip("Copy what this panel shows, as Markdown")
+                            .accessibility_label("Copy panel as Markdown")
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.copy_column_markdown(index, window, cx);
                             })),
@@ -1318,6 +1319,7 @@ impl UnifiedView {
                     .child(
                         Button::new(("unified-col-close", index))
                             .icon(IconName::Close)
+                            .accessibility_label("Close panel")
                             .small()
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.close_column(index, cx);

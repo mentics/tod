@@ -200,6 +200,7 @@ impl Render for EditableSecretList {
                                     .ghost()
                                     .compact()
                                     .tooltip(self.labels.remove_tooltip.clone())
+                                    .accessibility_label(self.labels.remove_tooltip.clone())
                                     .on_click(cx.listener(move |this, _, _, cx| this.remove(uid, cx))),
                             ),
                     )

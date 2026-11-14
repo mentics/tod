@@ -832,6 +832,7 @@ impl Shell {
                                 .compact()
                                 .disabled(!self.history.can_go_back())
                                 .tooltip("Back (Alt+Left)")
+                                .accessibility_label("Back")
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.navigate(true, window, cx);
                                 })),
@@ -843,6 +844,7 @@ impl Shell {
                                 .compact()
                                 .disabled(!self.history.can_go_forward())
                                 .tooltip("Forward (Alt+Right)")
+                                .accessibility_label("Forward")
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.navigate(false, window, cx);
                                 })),
@@ -908,6 +910,11 @@ impl Shell {
                                 IconName::StarOff
                             })
                             .tooltip(if self.always_on_top {
+                                "Unpin window"
+                            } else {
+                                "Always on top"
+                            })
+                            .accessibility_label(if self.always_on_top {
                                 "Unpin window"
                             } else {
                                 "Always on top"

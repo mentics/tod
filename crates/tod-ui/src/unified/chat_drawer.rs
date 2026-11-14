@@ -792,6 +792,11 @@ impl Render for ChatDrawer {
                             } else {
                                 "Show past sessions"
                             })
+                            .accessibility_label(if self.sessions_open {
+                                "Hide past sessions"
+                            } else {
+                                "Show past sessions"
+                            })
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_sessions(cx))),
                     )
                     .child(
@@ -800,6 +805,7 @@ impl Render for ChatDrawer {
                             .ghost()
                             .xsmall()
                             .tooltip("New session (Ctrl+N)")
+                            .accessibility_label("New session")
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.new_conversation(window, cx)
                             })),

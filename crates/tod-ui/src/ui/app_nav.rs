@@ -359,6 +359,7 @@ pub trait HasAppNav {
 
         let trigger = Button::new("app-nav-trigger")
             .icon(IconName::Menu)
+            .accessibility_label("Open the app menu")
             .compact()
             .selected(menu_open || menu_focused)
             .on_click(cx.listener(|this, _, window, cx| {

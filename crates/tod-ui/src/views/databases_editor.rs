@@ -481,6 +481,7 @@ impl Render for DatabasesEditor {
                                 .ghost()
                                 .compact()
                                 .tooltip("Remove this database (it takes effect on Save)")
+                                .accessibility_label("Remove this database")
                                 .on_click(cx.listener(move |this, _, _, cx| this.remove(uid, cx))),
                         ),
                 );

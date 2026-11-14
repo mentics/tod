@@ -630,6 +630,7 @@ impl PrControls {
                     .ghost()
                     .icon(IconName::Redo2)
                     .tooltip("Check GitHub again")
+                    .accessibility_label("Check GitHub again")
                     .disabled(row.busy.is_some())
                     .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
             )
