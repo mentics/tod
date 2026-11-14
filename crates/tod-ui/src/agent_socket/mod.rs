@@ -20,8 +20,10 @@
 //! `SendMessage` to this process's HWND — synchronous, no focus steal, no sleep.
 //! The UI drain loop wakes on each command (no polling).
 
+mod a11y_tree;
 mod capture;
 pub mod commands;
+pub mod selector;
 
 use crate::app::transcript_window::{TranscriptWindowControl, TranscriptWindowStatus};
 use commands::{AgentPlatformSocketCommand, Command, TranscriptsCommand, parse_line};
@@ -71,6 +73,13 @@ enum UiRequest {
     Scroll { x: f32, y: f32, dx: f32, dy: f32 },
     Transcripts(TranscriptsCommand),
     AgentPlatform(AgentPlatformSocketCommand),
+    A11yTree(a11y_tree::TreeQuery),
+    A11yAct {
+        selector: String,
+        action: a11y_tree::ActAction,
+    },
+    /// How many nodes a selector matches now (what `wait-for` polls).
+    A11yCount(String),
 }
 
 struct Pending {
@@ -194,6 +203,13 @@ fn handle_client(
             Ok(Command::AgentPlatform(action)) => {
                 dispatch_ui(&tx, UiRequest::AgentPlatform(action))
             }
+            Ok(Command::Tree(query)) => dispatch_ui(&tx, UiRequest::A11yTree(query)),
+            Ok(Command::Act { selector, action }) => {
+                dispatch_ui(&tx, UiRequest::A11yAct { selector, action })
+            }
+            Ok(Command::WaitFor { selector, gone, timeout_ms }) => {
+                wait_for(&tx, &selector, gone, timeout_ms)
+            }
             Err(e) => Err(e),
         };
 
@@ -204,6 +220,37 @@ fn handle_client(
         if writer.write_all(msg.as_bytes()).is_err() || writer.flush().is_err() {
             break;
         }
+    }
+}
+
+/// Poll the tree until the selector matches (or stops matching). Runs on the
+/// client's own thread, so the UI is free between polls.
+fn wait_for(
+    tx: &async_channel::Sender<Pending>,
+    selector: &str,
+    gone: bool,
+    timeout_ms: u64,
+) -> Result<String, String> {
+    let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        let count: usize = dispatch_ui(tx, UiRequest::A11yCount(selector.to_string()))?
+            .parse()
+            .map_err(|_| "agent UI returned a bad count".to_string())?;
+        if (count > 0) != gone {
+            return Ok(if gone {
+                "ok gone".to_string()
+            } else {
+                format!("ok {count} matches")
+            });
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(if gone {
+                format!("timeout {selector} still matches ({count})")
+            } else {
+                format!("timeout {selector} never matched")
+            });
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -339,11 +386,56 @@ fn handle_ui_request(
                 "ok".to_string()
             })
             .map_err(|e| format!("scroll failed: {e}")),
+        UiRequest::A11yTree(query) => {
+            let reply = window
+                .update(cx, |_root, window, cx| a11y_tree::run_tree(window, cx, &query))
+                .map_err(|e| format!("window update failed: {e}"))?;
+            watch_a11y_idle(cx, window);
+            reply
+        }
+        UiRequest::A11yAct { selector, action } => {
+            let reply = window
+                .update(cx, |_root, window, cx| {
+                    a11y_tree::run_act(window, cx, &selector, &action)
+                })
+                .map_err(|e| format!("window update failed: {e}"))?;
+            watch_a11y_idle(cx, window);
+            reply
+        }
+        UiRequest::A11yCount(selector) => {
+            let count = window
+                .update(cx, |_root, window, cx| a11y_tree::count(window, cx, &selector))
+                .map_err(|e| format!("window update failed: {e}"))?;
+            watch_a11y_idle(cx, window);
+            count.map(|n| n.to_string())
+        }
         UiRequest::Key(keystroke) => apply_key(cx, window, keystroke).map(|()| "ok".into()),
         UiRequest::Text(text) => apply_text(cx, window, text).map(|()| "ok".into()),
         UiRequest::Transcripts(action) => apply_transcripts(cx, transcript_window, action),
         UiRequest::AgentPlatform(action) => apply_agent_platform(cx, shell, action),
     }
+}
+
+static A11Y_WATCHING: AtomicBool = AtomicBool::new(false);
+
+/// The accessibility tree is only built while commands use it: after
+/// [`a11y_tree::IDLE_OFF`] without one, switch it off again.
+fn watch_a11y_idle(cx: &mut AsyncApp, window: AnyWindowHandle) {
+    if A11Y_WATCHING.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    cx.spawn(async move |cx| {
+        loop {
+            cx.background_executor().timer(Duration::from_secs(5)).await;
+            if a11y_tree::idle_for() < a11y_tree::IDLE_OFF {
+                continue;
+            }
+            let _ = window.update(cx, |_root, window, _cx| a11y_tree::release(window));
+            A11Y_WATCHING.store(false, Ordering::Relaxed);
+            break;
+        }
+    })
+    .detach();
 }
 
 fn apply_agent_platform(

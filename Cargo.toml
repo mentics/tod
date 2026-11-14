@@ -75,3 +75,7 @@ opt-level = 0
 debug = 1
 codegen-units = 256
 
+
+# Dev-only accessibility hooks for the agent control socket: see vendor/gpui-pre/README.md.
+[patch.crates-io]
+gpui-pre = { path = "vendor/gpui-pre" }
