@@ -39,24 +39,28 @@ For each node you hold:
 4. **Act**, if an action of yours can move it: `T runner menu <node>` lists
    what the runner offers now; then `T runner <verb> <node>`, `T decisions
    answer …`, or a move back with `T lifecycle set <node> <state> --reason …`.
-   Right before every action, run `L check <node> --owner <owner>`: on
-   anything but `ok` (the node changed, the user acted, your lease is gone),
-   survey it again and re-decide. An action counts only once the survey shows
-   it took (the state moved, the request is gone, the run is working).
+   Right before every action, run `L check <node> --owner <owner>
+   --fingerprint <fp>` with the fingerprint from `next` or your last survey:
+   exit 3 (the node changed, the user acted, your lease is gone; its JSON says
+   what changed) means survey it again and re-decide. After you act, `L ack
+   <node> --owner <owner>`, so `wait` doesn't report your own change back to
+   you. An action counts only once the survey shows it took (the state moved,
+   the request is gone, the run is working).
 5. **Report a gap** for whatever tod should have done itself
    ([gap reports](../shepherd-common/gap-report.md)). A GUI action you needed
    with no `T` verb is a `cli-parity` gap. Don't wait for the fix.
-6. **Record its verdict**: `L verdict <node> --owner <owner> <verdict>
-   --reason "…" [--gap <id>] [--recheck <minutes>] [--action "…"]`.
-   `--action` says what you did this visit; leave it out when you did nothing,
-   which the ledger counts as an empty visit. Pick `--recheck` by what the
-   node waits on: an agent working, about 10 minutes; CI or a bot, 20–30;
-   a webhook-backed wait, about an hour.
+6. **Record its verdict**: `L verdict <node> --owner <owner> --verdict <v>
+   --reason "…" (--acted | --no-action) [--gap <id>] [--recheck-minutes <n>]`.
+   This releases your lease. `--no-action` counts as an empty visit.
+   `in_motion` needs `--recheck-minutes`, chosen by what the node waits on: an
+   agent working, about 10; CI or a bot, 20–30; a webhook-backed wait, about
+   60. `blocked_on_gap` needs `--gap`.
 
-Between actions, run `L gate --owner <owner>`:
+Between actions, run `L gate --owner <owner>` (it prints the word; exit 0, 10,
+11):
 - `ok`: go on.
 - `pause`: a deploy is coming. Finish nothing more; go straight to `L wait`,
-  which acknowledges the pause and returns when it is over.
+  which acknowledges the pause and blocks until `resume` or `retire`.
 - `retire`: record verdicts for what you hold, then retire.
 
 ## Waiting and pulling more work
@@ -64,30 +68,29 @@ Between actions, run `L gate --owner <owner>`:
 When every node you hold has a verdict and none is due:
 
 ```bash
-L wait --owner <owner> --batch <nodes_per_shepherd> --linger <linger_minutes> --max 540
+L wait --owner <owner> --batch <nodes_per_shepherd> --max-seconds 540
 ```
 
-One call blocks up to 9 minutes and costs almost nothing. It returns:
-- `due <nodes>`: a node you hold came due or changed. Visit it.
-- `new <nodes>`: unassigned nodes were due, and it claimed them for you up to
-  your batch size. Visit them.
-- `deployed <gap> <nodes>`: a fix you were blocked on is live. Retry those.
-- `pause` / `resume`: a deploy drained and finished. Carry on after `resume`.
-- `retire`: the manager wants you gone.
-- `idle`: nothing you hold is due within `linger_minutes` and nothing is
-  queued. Retire.
-- `timeout`: call `wait` again.
-
-You can also pull work yourself with `L next --owner <owner> --n <k>` when you
-hold fewer than your batch size.
+One call blocks up to 9 minutes and costs almost nothing. Its JSON `reason`:
+- `held_changed` / `held_recheck`: a node you hold changed or came due. Visit
+  it.
+- `due_available`: a node no one holds is due (including nodes whose gap was
+  just deployed). Claim it with `L next --owner <owner> --n
+  <nodes_per_shepherd>` (`n` caps what you hold in total) and visit it.
+- `signal`: run `L gate --owner <owner>` and do what it says.
+- `timeout`: if you have now waited `linger_minutes` in a row with nothing to
+  do, retire; otherwise call `wait` again. A timeout with `paused: true` is
+  still inside a deploy: call `wait` again.
 
 Never `sleep`, and never poll the survey in a loop: `wait` is how you wait.
 
 ## Retiring
 
-Retire when `wait` says `retire` or `idle`, or after `max_visits` node visits
-(your context is the limit, not the clock). To retire: every node you hold has
-a verdict, then `L release --owner <owner>`, then reply.
+Retire when `gate` says `retire`, when you have lingered `linger_minutes` with
+nothing to do, or after `max_visits` node visits (your context is the limit,
+not the clock). To retire: give every node you hold a verdict (which releases
+it; `L release <node>… --owner <owner>` for any you could not judge), then
+reply.
 
 Your reply is all the manager reads. Keep it short and structured:
 - owner id and why you retired;

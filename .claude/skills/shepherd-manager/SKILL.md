@@ -65,8 +65,9 @@ shepherds' to start.
 
 After every sync:
 
-1. `L queue` lists due nodes no one holds; `L owners` lists running
-   shepherds, how many nodes each holds, and whether it is paused.
+1. `L status` counts due nodes and leases; `L owners` lists running
+   shepherds, how many nodes each holds, their visits and empty visits, and
+   their signal and acknowledgement.
 2. Running shepherds with room absorb due nodes themselves (their `wait`
    claims them). Start a new shepherd only for what they can't absorb, and
    only when at least `min_batch` such nodes are due or one has waited
@@ -90,8 +91,9 @@ settings are wrong for this load: raise `linger_minutes` or `min_batch`, and
 note it for the next review.
 
 When a shepherd returns:
-- confirm it released its nodes (`L owners`); release a dead one's with
-  `L release --owner <id>`;
+- confirm it holds no nodes (`L owners`); release any it left with
+  `L release <node>… --owner <id>` (an abandoned lease also expires on its
+  own after 20 minutes);
 - a node it marked `parked` on a request only the user can answer: make a
   brief with the `node-request-brief` skill and give the user its link
   (once per request);
@@ -106,7 +108,7 @@ shepherd that reported it.
 
 - **One fixer per gap**, however many nodes reported it: a subagent (config
   `fixer`, Sonnet medium by default) with `isolation: "worktree"`, then
-  `L gap set <id> fixing`. Several run in parallel, one per independent gap.
+  `L gap set <id> --status fixing`. Several run in parallel, one per independent gap.
   The brief gives:
   - the symptom, with every node, ids and evidence from the gap's reports;
   - what the shepherds already ruled out;
@@ -122,11 +124,11 @@ shepherd that reported it.
   element an id and a role.
 - You don't verify fixes yourself and never report a fixer's test results as
   checked. When a fixer reports, confirm its commit is on `origin/main`
-  (`L gap set <id> fixed --commit <sha>`) and start its verifier at once: a
+  (`L gap set <id> --status fixing --commit <sha> --note "verifying"`) and start its verifier at once: a
   subagent (config `verifier`, Haiku medium by default) given the symptom,
   not the fixer's conclusion. It checks the diff addresses the cause and
   covers every path, and runs the regression test and scoped tests on
-  `origin/main`. It passes (`L gap set <id> verified`) or goes back to a
+  `origin/main`. It passes (`L gap set <id> --status verified`) or goes back to a
   fixer.
 - A change to another repository goes on a branch and waits for the user's
   OK to push and open a PR.
@@ -140,10 +142,10 @@ or the oldest verified fix has waited 30. Deploy only verified commits; if
 you must deploy one without a pass, say so in your report.
 
 1. **Drain**: `L signal pause --all`. Each shepherd stops at its next action
-   boundary and acknowledges; `L owners` shows them paused. Wait for every
-   one (a shepherd that never acknowledges within ~10 minutes is dead:
-   release its nodes).
-2. Save a survey: `survey.py <root> $(L scope items) --save <state dir>/pre-deploy.json`.
+   boundary and acknowledges; wait until `L signal status` reports
+   `all_paused` (`awaiting_pause` names who hasn't) (a shepherd that never acknowledges within ~10 minutes is dead:
+   release its nodes and `L signal retire --owner <id>`).
+2. Save a survey: `survey.py <root> <the items in L scope list> --save <state dir>/pre-deploy.json`.
 3. From a checkout current with `origin/main`:
    1. `scripts/build.sh --data-root <root>`: builds the host binaries
       (dev-fast) and the Linux sandbox binaries, each only if stale, and
@@ -173,11 +175,12 @@ you must deploy one without a pass, say so in your report.
       or at once with `tod-sandbox --data-root <root> golden refresh <repo>`.
       Start refuses a golden made by a newer build: if another session's
       build refreshed it, rebuild from main and refresh it again.
-4. `L gap set <id> deployed` for each gap in the batch: its nodes come due
-   for the shepherds holding them, with the gap named.
-5. **Resume**: `L signal resume`.
+4. `L gap set <id> --status deployed` for each gap in the batch: its
+   `blocked_on_gap` nodes come due, with the gap named, and running
+   shepherds claim them from `wait`.
+5. **Resume**: `L signal resume --all`.
 6. **Check the deploy** a few minutes later:
-   `survey.py <root> $(L scope items) --compare <state dir>/pre-deploy.json`.
+   `survey.py <root> <the items in L scope list> --compare <state dir>/pre-deploy.json`.
    Every node it lists as worse is a regression: fix it before anything else.
 
 Running shepherds carry on after a deploy; their context is still good, since
@@ -236,4 +239,4 @@ When the user asks, and at the end:
 - what was fixed and deployed (the orchestrator included);
 - each node's state and verdict (`L status`);
 - open gaps and what is still open;
-- churn: shepherds started, visits, empty visits (`L owners --history`).
+- churn: shepherds started, visits, empty visits (`L owners`).

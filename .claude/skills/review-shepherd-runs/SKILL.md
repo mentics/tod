@@ -90,11 +90,13 @@ Then read the shepherd ledger's churn counts (read-only; the ledger is
 `<root>/shepherd/ledger.db`, `<root>` the `data_root` in `install.toml`):
 
 ```bash
-python3 -I .claude/skills/shepherd-common/scripts/ledger.py <root> owners --history
+python3 -I .claude/skills/shepherd-common/scripts/ledger.py <root> owners
 ```
 
-Per shepherd: when it started and retired, why it retired, node visits,
-empty visits (a visit where it did nothing), and the gaps it reported.
+Per shepherd (owners are kept after they retire): heartbeat age, nodes held,
+node visits, empty visits (a visit where it did nothing), signal and
+acknowledgement. Why each retired, and the gaps it reported, are in its final
+reply in the manager's transcript and in `ledger.py <root> gap list`.
 
 The tool results themselves (command output, screenshots) are only in the raw
 transcript. When a moment matters, read those records directly (find them by

@@ -54,11 +54,10 @@ Every node you hold ends each visit with one verdict in the ledger:
 
 | Verdict | When | Comes back |
 |---|---|---|
-| `in_motion` | tod is working, or waiting on CI, a bot, a webhook | at `--recheck`, or when its fingerprint changes |
+| `in_motion` | tod is working, or waiting on CI, a bot, a webhook | at `--recheck-minutes`, or when its fingerprint changes |
 | `parked` | one of the parked cases above | when its fingerprint changes (a person acted) |
 | `blocked_on_gap` | stuck on a tod gap you reported | when the gap is deployed |
 | `ceiling` | stuck, and no gap or action of yours can move it | when the shepherd changes, or it is cleared |
-| `done` | reached `done` | never |
 
 `ceiling` is rare: almost every stuck node is a gap to report. Use it when the
 cause is outside tod (a broken upstream service, a repo that needs a person's

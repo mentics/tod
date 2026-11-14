@@ -77,16 +77,17 @@ For each node you hold:
    budget", Check now, Rerun this phase, Run with a new session, Reset
    environment, Delete sandbox), answering a request (focus its field, `key
    enter`, `text …`, `key ctrl-enter`), the state chip for a move back. Right
-   before every action, `L check <node> --owner <owner>`; on anything but
-   `ok`, survey again and re-decide. Then confirm in the survey that it took.
+   before every action, `L check <node> --owner <owner> --fingerprint <fp>`;
+   on exit 3, survey again and re-decide. After acting, `L ack <node> --owner
+   <owner>`, then confirm in the survey that it took.
    If the GUI path is broken, report the gap first; you may then use the
    shepherd `tod-cli` verbs ([operator-cli](../shepherd-common/operator-cli.md))
    so the node is not held up by it.
 6. **Report gaps** ([gap reports](../shepherd-common/gap-report.md)), UI ones
    included, with the selector and the reply or screenshot as evidence.
-7. **Record its verdict**: `L verdict <node> --owner <owner> <verdict>
-   --reason "…" [--gap <id>] [--recheck <minutes>] [--action "…"]`, as the
-   CLI shepherds do (`--action` empty means an empty visit).
+7. **Record its verdict**: `L verdict <node> --owner <owner> --verdict <v>
+   --reason "…" (--acted | --no-action) [--gap <id>] [--recheck-minutes <n>]`,
+   as the CLI shepherds do.
 
 Between actions, `L gate --owner <owner>`: `ok` go on; `pause` go straight to
 `L wait` (a deploy will restart the app; your socket will drop until it is
@@ -97,13 +98,15 @@ back); `retire` record verdicts and retire.
 The same as a CLI shepherd:
 
 ```bash
-L wait --owner <owner> --batch <nodes_per_shepherd> --linger <linger_minutes> --max 540
+L wait --owner <owner> --batch <nodes_per_shepherd> --max-seconds 540
 ```
 
-Visit what it returns (`due`, `new`, `deployed`); after `pause`, wait for
-`resume`, then run `mode` and `tree` before anything else, since the app was
-restarted. Retire on `retire`, `idle`, or after `max_visits` visits: verdicts
-for every node you hold, `L release --owner <owner>`, then reply. Never
+Handle its `reason` as a CLI shepherd does (`held_changed`, `held_recheck`,
+`due_available` → `L next`, `signal` → `L gate`, `timeout`). After a deploy's
+pause ends, run `mode` and `tree` before anything else, since the app was
+restarted. Retire on `retire`, after lingering `linger_minutes` with nothing to
+do, or after `max_visits` visits: a verdict for every node you hold (`L release
+<node>… --owner <owner>` for any you could not judge), then reply. Never
 `sleep`.
 
 Your reply: owner id and why you retired; one line per node visited (verdict,
