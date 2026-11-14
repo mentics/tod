@@ -231,6 +231,20 @@ pub const WAKE_ERRORS_FILE: &str = "wake-errors";
 /// File counting consecutive failed agent runs, across wakes.
 pub const AGENT_FAILURES_FILE: &str = "agent-failures";
 
+/// File holding the number of finished steps at the last failed agent run,
+/// across wakes: failures with no step finished between them are in a row.
+/// (Kept only in memory it started at 0 on every wake, so the first failure
+/// after each backoff looked like progress and the count never passed 1.)
+pub const STEPS_AT_FAILURE_FILE: &str = "agent-failure-steps";
+
+/// The consecutive-failure count after one more failed run, given the count
+/// so far, the steps finished at the previous failure and the steps finished
+/// now: a step finished in between means the failures were not in a row.
+pub fn count_failure(failures: u32, steps_at_failure: usize, steps_now: usize) -> u32 {
+    let before = if steps_now > steps_at_failure { 0 } else { failures };
+    before + 1
+}
+
 pub fn load_count(state_dir: &Path, file: &str) -> u32 {
     std::fs::read_to_string(state_dir.join(file)).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0)
 }
@@ -287,6 +301,28 @@ pub fn cancel_scheduled(scheduler: &dyn Scheduler, state_dir: &Path) -> Result<(
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[test]
+    fn consecutive_failures_accumulate_across_wakes() {
+        let dir = TmpDir::new();
+        // First failure with 3 finished steps (a restart: nothing in memory).
+        let mut failures = load_count(dir.path(), AGENT_FAILURES_FILE);
+        let mut at = load_count(dir.path(), STEPS_AT_FAILURE_FILE) as usize;
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            failures = count_failure(failures, at, 3);
+            at = 3;
+            save_count(dir.path(), AGENT_FAILURES_FILE, failures).unwrap();
+            save_count(dir.path(), STEPS_AT_FAILURE_FILE, at as u32).unwrap();
+            seen.push(failures);
+            // The next wake is a new process: reload from disk.
+            failures = load_count(dir.path(), AGENT_FAILURES_FILE);
+            at = load_count(dir.path(), STEPS_AT_FAILURE_FILE) as usize;
+        }
+        assert_eq!(seen, vec![1, 2, 3, 4]);
+        // A step finished in between resets the run.
+        assert_eq!(count_failure(4, 3, 4), 1);
+    }
 
     struct TmpDir(std::path::PathBuf);
     impl TmpDir {

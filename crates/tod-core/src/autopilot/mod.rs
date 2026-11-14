@@ -228,6 +228,13 @@ pub enum NeedsHuman {
 }
 
 impl NeedsHuman {
+    /// The one place [`NeedsHuman::ReviewNotConverging`] is made: a review
+    /// that fails to converge has something standing, so nothing standing is
+    /// `None` (the caller reviews again) and never a stop with an empty list.
+    pub fn review_not_converging(rounds: u32, standing: Vec<String>) -> Option<Self> {
+        (!standing.is_empty()).then_some(Self::ReviewNotConverging { rounds, standing })
+    }
+
     /// Whether this is one of the node's requests (`crate::attention`): the
     /// user answers it where requests are answered, and once none is left
     /// the run can simply continue.
@@ -788,15 +795,12 @@ impl Autopilot {
                             .map(|f| format!("[{}] {} ({})", tod_store::interview::short_id(f.id), f.summary, f.status))
                             .collect::<Vec<_>>())
                     })?;
-                    return self.finish(Outcome::NeedsHuman {
-                        reason: NeedsHuman::ReviewNotConverging {
-                            rounds: self.state.loops.review_rounds,
-                            standing,
-                        },
-                    });
+                    // Nothing standing is not non-convergence (the failed
+                    // attempts that filled the count recorded nothing): review again.
+                    if let Some(reason) = NeedsHuman::review_not_converging(self.state.loops.review_rounds, standing) {
+                        return self.finish(Outcome::NeedsHuman { reason });
+                    }
                 }
-                self.state.loops.review_rounds += 1;
-                self.save()?;
             }
             let stopped = match step {
                 NextStep::Implement => self.converse(fleet, agent, hook, ProtocolKind::Implementation, None)?,
@@ -825,6 +829,12 @@ impl Autopilot {
                 }
                 NextStep::GateCheck => self.gate(fleet, agent, hook, &lifecycle)?,
             };
+            // A round is a review that completed (recorded done): an agent
+            // that failed or was killed part-way is not one, and is run again.
+            if step == NextStep::Review && stopped.is_none() {
+                self.state.loops.review_rounds += 1;
+                self.save()?;
+            }
             if stopped.is_none() {
                 let owed = match step {
                     NextStep::Implement => Some((ProtocolKind::Implementation, "implement")),
@@ -2082,10 +2092,8 @@ impl Autopilot {
                     if !resuming && rounds >= round_limit {
                         let standing = fleet.read(|conn| pr_draft_review::change_standing(conn, node, made_at))?;
                         // Nothing standing is not non-convergence: review again.
-                        if !standing.is_empty() {
-                            return Ok(Some(Outcome::NeedsHuman {
-                                reason: NeedsHuman::ReviewNotConverging { rounds, standing },
-                            }));
+                        if let Some(reason) = NeedsHuman::review_not_converging(rounds, standing) {
+                            return Ok(Some(Outcome::NeedsHuman { reason }));
                         }
                     }
                     self.state.loops.review_rounds = rounds + u32::from(!resuming);
@@ -2169,10 +2177,8 @@ impl Autopilot {
                     // Nothing standing is not a review that fails to converge:
                     // the head is simply reviewed.
                     let standing = fleet.read(|conn| pr_draft_review::stay_standing(conn, node))?;
-                    if !standing.is_empty() {
-                        return Ok(OwnReview::Stop(Outcome::NeedsHuman {
-                            reason: NeedsHuman::ReviewNotConverging { rounds, standing },
-                        }));
+                    if let Some(reason) = NeedsHuman::review_not_converging(rounds, standing) {
+                        return Ok(OwnReview::Stop(Outcome::NeedsHuman { reason }));
                     }
                 }
                 let heads = pr_draft_review::current_heads(live);

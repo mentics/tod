@@ -41,6 +41,8 @@ struct FakeAgent {
     /// Every review turn records a new finding and finishes: a reviewer that
     /// never comes back clean.
     review_never_clean: bool,
+    /// The next this-many review turns fail (the agent died) before doing anything.
+    review_fails: std::sync::atomic::AtomicUsize,
     /// Every fix turn first writes this file (its path and content): the
     /// change that makes a configured check pass.
     fix_writes: Option<(PathBuf, String)>,
@@ -67,6 +69,7 @@ impl FakeAgent {
             verify_rounds: std::sync::atomic::AtomicUsize::new(0),
             phase_churn: false,
             review_never_clean: false,
+            review_fails: std::sync::atomic::AtomicUsize::new(0),
             fix_writes: None,
             log: Default::default(),
             pr_hook: None,
@@ -162,6 +165,17 @@ impl FakeAgent {
                 if protocol == Some(tod_store::conversation::ProtocolKind::Verification) {
                     self.scripted_verify(script, node.parse()?, conversation.parse()?)?;
                     return Ok(String::new());
+                }
+            }
+            if self.review_fails.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                let protocol = self.fleet.read(|conn| {
+                    Ok(tod_store::conversation::ConversationRepo::new(conn)
+                        .get(conversation.parse()?)?
+                        .map(|c| c.protocol))
+                })?;
+                if protocol == Some(tod_store::conversation::ProtocolKind::Review) {
+                    self.review_fails.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    anyhow::bail!("ACP error -32603: Internal error: The Claude Agent process exited unexpectedly");
                 }
             }
             if self.review_never_clean {
@@ -528,6 +542,43 @@ fn takes_a_node_from_proposed_to_done() {
     assert_eq!(saved.current, None);
     // Every finished step's session was ended, not left holding an agent.
     assert!(agent.sessions.is_empty(), "{:?}", agent.sessions.keys().collect::<Vec<_>>());
+}
+
+#[test]
+fn review_not_converging_is_never_raised_with_nothing_standing() {
+    assert_eq!(NeedsHuman::review_not_converging(5, vec![]), None);
+    assert!(matches!(
+        NeedsHuman::review_not_converging(5, vec!["[ab12] x (fixed)".into()]),
+        Some(NeedsHuman::ReviewNotConverging { rounds: 5, .. })
+    ));
+}
+
+#[test]
+fn review_attempts_the_agent_died_in_are_not_rounds() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    let mut agent = FakeAgent::new(&fx.fleet);
+    agent.review_never_clean = true;
+    // Twice the limit of killed reviews, each a fresh run as after a backoff.
+    agent.review_fails = std::sync::atomic::AtomicUsize::new(2 * REVIEW_ROUND_LIMIT as usize);
+    for n in 0..2 * REVIEW_ROUND_LIMIT {
+        let outcome = autopilot(&fx, Budget::default()).run(&fx.fleet, &mut agent).unwrap();
+        assert!(matches!(&outcome, Outcome::NeedsHuman { reason: NeedsHuman::AgentFailed { .. } }), "{n}: {outcome:?}");
+        let saved = AutopilotState::load(&fx.root, fx.node).unwrap();
+        assert_eq!(saved.loops.review_rounds, 0, "failed attempt {n} was counted as a round");
+    }
+    // Now the reviews complete: the whole limit of rounds is still there.
+    let mut pilot = autopilot(&fx, Budget::default());
+    let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
+    match &outcome {
+        Outcome::NeedsHuman { reason: NeedsHuman::ReviewNotConverging { rounds, standing } } => {
+            assert_eq!(*rounds, REVIEW_ROUND_LIMIT);
+            assert!(!standing.is_empty());
+        }
+        other => panic!("{other:?}"),
+    }
+    let reviews = pilot.state().steps.iter().filter(|s| s.step == "review").count();
+    assert_eq!(reviews, REVIEW_ROUND_LIMIT as usize);
 }
 
 #[test]

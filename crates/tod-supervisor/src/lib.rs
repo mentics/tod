@@ -774,7 +774,7 @@ pub fn wake(config: Config) -> Result<Woke> {
     // Persisted: the backoff is a wait the node sleeps through, so the next
     // wake carries on counting.
     let mut failures = waits::load_count(&config.state_dir, waits::AGENT_FAILURES_FILE);
-    let mut steps_at_failure = 0usize;
+    let mut steps_at_failure = waits::load_count(&config.state_dir, waits::STEPS_AT_FAILURE_FILE) as usize;
     let mut backing_off = false;
     let mut hook = Hook {
         replica: &replica,
@@ -865,11 +865,9 @@ pub fn wake(config: Config) -> Result<Woke> {
                             )?;
                             break Ok(outcome);
                         }
-                        if done > steps_at_failure {
-                            failures = 0;
-                        }
-                        failures += 1;
+                        failures = waits::count_failure(failures, steps_at_failure, done);
                         steps_at_failure = done;
+                        waits::save_count(&config.state_dir, waits::STEPS_AT_FAILURE_FILE, done as u32)?;
                         waits::save_count(&config.state_dir, waits::AGENT_FAILURES_FILE, failures)?;
                         match guard::on_failure(error, failures, &config.guards, waits_now_ms()) {
                             OnFailure::UsageLimit(limit) => {
@@ -960,6 +958,7 @@ pub fn wake(config: Config) -> Result<Woke> {
     record_user_stop(&config.state_dir, &outcome)?;
     if !backing_off {
         waits::save_count(&config.state_dir, waits::AGENT_FAILURES_FILE, 0)?;
+        waits::save_count(&config.state_dir, waits::STEPS_AT_FAILURE_FILE, 0)?;
     }
     if matches!(outcome, Outcome::Stopped { .. } | Outcome::Waiting { .. }) {
         schedule(&store, &config)?;
