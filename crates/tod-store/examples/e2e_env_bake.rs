@@ -17,7 +17,7 @@ fn main() -> anyhow::Result<()> {
     let repo = "RUN git config --global user.email e2e@example.invalid && git config --global user.name e2e \\n && git init -q --bare /root/origin.git && git init -q -b main /root/app && cd /root/app \\n && echo hi > README && git add . && git commit -qm init && git remote add origin /root/origin.git && git push -q origin main\n";
     let df = tod_sandbox::provision::bake_dockerfile("ubuntu:24.04", &pl).replace("ENTRYPOINT", &format!("{repo}ENTRYPOINT"));
     std::fs::write(dir.join("Dockerfile"), df)?;
-    std::fs::write(dir.join("bootstrap.sh"), tod_store::fleet::sandbox::BOOTSTRAP)?;
+    std::fs::write(dir.join("bootstrap.sh"), tod_store::fleet::sandbox::bootstrap())?;
     std::fs::write(dir.join("tod-relay"), &relay)?;
     std::fs::write(dir.join("tod-cli"), pl.tod_cli)?;
     std::fs::write(dir.join("blaxel.toml"), tod_sandbox::provision::blaxel_toml(&name, acct.memory_mb))?;

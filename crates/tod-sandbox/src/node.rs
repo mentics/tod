@@ -656,8 +656,9 @@ pub fn checkout_script(repo_url: &str, branch: &str, identity: &GitIdentity, all
 /// gets only this.
 pub fn install(bx: &Blaxel, url: &str, payload: &NodePayload, progress: &mut dyn FnMut(&str)) -> Result<()> {
     upload_tod_files(bx, url, payload, progress)?;
-    ensure_curl(bx, url, progress)?;
+    // Before any package manager runs (ensure_curl uses apt), the proxy CA is trusted.
     trust_proxy_ca(bx, url, progress)?;
+    ensure_curl(bx, url, progress)?;
     ensure_claude_adapter(bx, url, progress)?;
     install_bundles(bx, url, payload, progress)
 }

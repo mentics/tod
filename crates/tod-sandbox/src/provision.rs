@@ -38,6 +38,24 @@ pub fn relay_command() -> String {
     format!("exec {RELAY_PATH} --port {}", crate::blaxel::RELAY_PORT)
 }
 
+/// Marker line in `assets/sandbox/bootstrap.sh` where the proxy-CA script goes.
+const TRUST_MARKER: &str = "#@trust-proxy-ca@";
+
+/// `bootstrap.sh` with `trust-proxy-ca.sh` inlined (in a subshell) ahead of its
+/// first package-manager call, so every bootstrap path (first connect,
+/// `ensure --install`, golden and image creation, a baked image) trusts the
+/// proxy's CA before any `apt-get`. One source for the bytes everyone uploads.
+pub fn bootstrap_script() -> &'static [u8] {
+    static SCRIPT: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    SCRIPT.get_or_init(|| compose_bootstrap(include_str!("../../../assets/sandbox/bootstrap.sh"), crate::node::TRUST_PROXY_CA_SCRIPT)).as_slice()
+}
+
+fn compose_bootstrap(bootstrap: &str, trust: &str) -> Vec<u8> {
+    assert!(bootstrap.contains(TRUST_MARKER), "assets/sandbox/bootstrap.sh lost its {TRUST_MARKER} line");
+    let body: String = trust.lines().filter(|l| !l.starts_with("#!")).collect::<Vec<_>>().join("\n");
+    bootstrap.replacen(TRUST_MARKER, &format!("(\n{body}\n)"), 1).into_bytes()
+}
+
 /// What gets installed into a sandbox.
 pub struct Payload<'a> {
     pub bootstrap: &'a [u8],

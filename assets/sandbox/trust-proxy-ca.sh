@@ -71,6 +71,13 @@ mv -f "$root/etc/profile.d/tod-ca.sh.tmp" "$root/etc/profile.d/tod-ca.sh"
 if [ ! -f "$root/etc/pip.conf" ]; then
     printf '[global]\ncert = %s\n' "$bundle" > "$root/etc/pip.conf"
 elif ! grep -q '^[[:space:]]*cert[[:space:]]*=' "$root/etc/pip.conf"; then
-    echo "trust-proxy-ca: $root/etc/pip.conf exists without a cert; leaving it (PIP_CERT is exported by /etc/profile.d/tod-ca.sh)"
+    # Add the cert to the existing [global] section (or add the section).
+    if grep -q '^[[:space:]]*\[global\][[:space:]]*$' "$root/etc/pip.conf"; then
+        awk -v c="cert = $bundle" '{ print } /^[[:space:]]*\[global\][[:space:]]*$/ && !done { print c; done = 1 }' \
+            "$root/etc/pip.conf" > "$root/etc/pip.conf.tmp"
+    else
+        { cat "$root/etc/pip.conf"; printf '\n[global]\ncert = %s\n' "$bundle"; } > "$root/etc/pip.conf.tmp"
+    fi
+    mv -f "$root/etc/pip.conf.tmp" "$root/etc/pip.conf"
 fi
 echo "trust-proxy-ca: ready"

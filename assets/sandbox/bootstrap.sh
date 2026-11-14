@@ -22,6 +22,11 @@ for arg in "$@"; do
     esac
 done
 
+# Before any package manager runs: the sandbox proxy's CA is trusted
+# system-wide (assets/sandbox/trust-proxy-ca.sh, inlined here at build time by
+# `provision::bootstrap_script`).
+#@trust-proxy-ca@
+
 mkdir -p "$TOD/bin" "$TOD/logs"
 
 have() { command -v "$1" >/dev/null 2>&1; }

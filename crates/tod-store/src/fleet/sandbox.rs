@@ -29,7 +29,9 @@ pub use tod_sandbox::config::{AuthMode, DEFAULT_IMAGE};
 pub use tod_sandbox::provision::{BakeRepo, TOD_CLI_PATH, TUNNEL_PORT, parse_bake_repos};
 
 /// Installs what tod needs in any image (see `assets/sandbox/`).
-pub const BOOTSTRAP: &[u8] = include_bytes!("../../../../assets/sandbox/bootstrap.sh");
+pub fn bootstrap() -> &'static [u8] {
+    tod_sandbox::provision::bootstrap_script()
+}
 
 /// The file that caches a `bl login` token.
 const TOKEN_CACHE: &str = "sandbox-token.json";
@@ -491,7 +493,7 @@ impl Sandboxes {
         let payload = payload(&relay_bin, agents);
         let dir = build_dir(name)?;
         std::fs::write(dir.join("Dockerfile"), provision::bake_dockerfile_with_repos(base_image, &payload, repos))?;
-        std::fs::write(dir.join("bootstrap.sh"), BOOTSTRAP)?;
+        std::fs::write(dir.join("bootstrap.sh"), bootstrap())?;
         std::fs::write(dir.join("tod-relay"), &relay_bin)?;
         std::fs::write(dir.join("tod-cli"), payload.tod_cli)?;
         std::fs::write(dir.join("blaxel.toml"), provision::blaxel_toml(name, acct.memory_mb))?;
@@ -894,7 +896,7 @@ pub fn suggested_name(node_slug: &str) -> String {
 /// What gets installed into a sandbox.
 pub fn payload(relay_bin: &[u8], agents: bool) -> Payload<'_> {
     Payload {
-        bootstrap: BOOTSTRAP,
+        bootstrap: bootstrap(),
         relay: relay_bin,
         tod_cli: crate::fleet::cli_relay::SHIM_SCRIPT.as_bytes(),
         agents,
