@@ -10,6 +10,10 @@
 //! @<n>                   one node by its raw tree id, for the frame it was listed in
 //! <selector> >> <selector>   the right one, inside a node the left one matched
 //! ```
+//!
+//! Double quotes protect spaces, `>>` and action words: `role:"Item title"`,
+//! `"textinput:Item title"`, `"#a >> button:Go now"`. Inside quotes a backslash
+//! escapes a quote or a backslash. Unquoted forms work as before.
 
 use std::collections::HashMap;
 
@@ -66,12 +70,81 @@ impl Selector {
         if source.is_empty() {
             return Err("empty selector".into());
         }
+        // The whole selector in quotes: `"textinput:Item title"`.
+        if let Some(inner) = unquote_whole(source) {
+            return Selector::parse(&inner);
+        }
         let mut parts = Vec::new();
-        for raw in source.split(">>") {
-            parts.push(parse_part(raw.trim())?);
+        for raw in split_chain(source) {
+            let raw = raw.trim();
+            match unquote_whole(raw) {
+                Some(inner) => parts.push(parse_part(inner.trim())?),
+                None => parts.push(parse_part(raw)?),
+            }
         }
         Ok(Selector { parts })
     }
+}
+
+/// `s` is exactly one double-quoted string: its contents, unescaped.
+pub fn unquote_whole(s: &str) -> Option<String> {
+    let rest = s.strip_prefix('"')?;
+    let mut out = String::new();
+    let mut chars = rest.char_indices();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '\\' => match chars.next() {
+                Some((_, e @ ('"' | '\\'))) => out.push(e),
+                Some((_, e)) => {
+                    out.push('\\');
+                    out.push(e);
+                }
+                None => return None,
+            },
+            '"' => {
+                return if rest[i + 1..].is_empty() {
+                    Some(out)
+                } else {
+                    None
+                };
+            }
+            c => out.push(c),
+        }
+    }
+    None
+}
+
+/// Quote `s` for use as a selector label when it needs it.
+pub fn quote_if_needed(s: &str) -> String {
+    if s.chars()
+        .any(|c| c.is_whitespace() || matches!(c, '"' | '>' | '\\'))
+    {
+        format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    } else {
+        s.to_string()
+    }
+}
+
+/// Split at `>>` outside double quotes.
+fn split_chain(src: &str) -> Vec<&str> {
+    let bytes = src.as_bytes();
+    let mut parts = Vec::new();
+    let (mut start, mut i, mut quoted) = (0, 0, false);
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' if quoted => i += 1,
+            b'"' => quoted = !quoted,
+            b'>' if !quoted && bytes.get(i + 1) == Some(&b'>') => {
+                parts.push(&src[start..i]);
+                i += 1;
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    parts.push(&src[start..]);
+    parts
 }
 
 fn parse_part(raw: &str) -> Result<Part, String> {
@@ -94,6 +167,8 @@ fn parse_part(raw: &str) -> Result<Part, String> {
     if let Some((role, label)) = raw.split_once(':') {
         let role = normalize_role(role);
         if !role.is_empty() && role.chars().all(|c| c.is_ascii_alphanumeric()) {
+            let label = label.trim();
+            let label = unquote_whole(label).unwrap_or_else(|| label.to_string());
             return Ok(Part::RoleLabel {
                 role,
                 label: label.trim().to_lowercase(),
@@ -124,6 +199,12 @@ pub fn compact_path(raw: &str) -> String {
         .join("/")
 }
 
+/// A node's role is the selector's. `textinput` also names a multi-line one.
+pub fn role_matches(node_role: &str, role: &str) -> bool {
+    let node_role = normalize_role(node_role);
+    node_role == role || (role == "textinput" && node_role == "multilinetextinput")
+}
+
 fn part_matches(node: &Node, part: &Part) -> bool {
     match part {
         Part::Path(suffix) => match &node.path {
@@ -136,7 +217,7 @@ fn part_matches(node: &Node, part: &Part) -> bool {
             None => false,
         },
         Part::RoleLabel { role, label } => {
-            normalize_role(&node.role) == *role
+            role_matches(&node.role, role)
                 && (label.is_empty()
                     || node.label.to_lowercase().contains(label)
                     || node.value.to_lowercase().contains(label))
@@ -239,8 +320,66 @@ pub fn within(nodes: &[Node], selector: &Selector) -> Option<Vec<usize>> {
     )
 }
 
+/// A selector part that names `node` by role and label if that is unique among
+/// `nodes` (a long label is cut to a unique prefix), else `None`.
+fn role_label_selector(nodes: &[Node], node: &Node) -> Option<String> {
+    let label = one_line_label(&node.label);
+    if label.is_empty() || node.role.is_empty() {
+        return None;
+    }
+    let role = normalize_role(&node.role);
+    let chars: Vec<char> = label.chars().collect();
+    let mut lengths = vec![chars.len().min(48)];
+    if chars.len() > 48 {
+        lengths.push(chars.len());
+    }
+    for len in lengths {
+        let shown: String = chars[..len].iter().collect::<String>().trim().to_string();
+        let wanted = shown.to_lowercase();
+        let count = nodes
+            .iter()
+            .filter(|n| {
+                role_matches(&n.role, &role)
+                    && (n.label.to_lowercase().contains(&wanted)
+                        || n.value.to_lowercase().contains(&wanted))
+            })
+            .count();
+        if count == 1 {
+            return Some(format!("{}:{}", role, quote_if_needed(&shown)));
+        }
+    }
+    None
+}
+
+fn one_line_label(label: &str) -> String {
+    label
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// Ids made of a long run of digits change between runs (`input-4294967389`).
+fn is_unstable(selector: &str) -> bool {
+    let mut run = 0;
+    for c in selector.chars() {
+        if c.is_ascii_digit() {
+            run += 1;
+            if run >= 6 {
+                return true;
+            }
+        } else {
+            run = 0;
+        }
+    }
+    false
+}
+
 /// For each node, a selector that finds it: the shortest `#` suffix of its path
-/// that no other node shares, else the full path, else `@id`.
+/// that no other node shares, else the full path, else `@id`. A node whose
+/// selector would be a raw number or hold an unstable id (a long run of
+/// digits) gets a unique `role:label` instead when it has a label; so does a text node.
 pub fn selectors_for(nodes: &[Node]) -> Vec<String> {
     let mut counts: HashMap<String, usize> = HashMap::new();
     let suffixes: Vec<Vec<String>> = nodes
@@ -265,15 +404,24 @@ pub fn selectors_for(nodes: &[Node]) -> Vec<String> {
         .iter()
         .zip(&suffixes)
         .map(|(node, list)| {
-            for suffix in list {
-                if counts.get(suffix) == Some(&1) {
-                    return format!("#{suffix}");
-                }
-            }
-            match &node.path {
+            let by_path = list
+                .iter()
+                .find(|suffix| counts.get(*suffix) == Some(&1))
+                .map(|suffix| format!("#{suffix}"))
                 // Not unique even in full (a duplicated path): the raw id still is.
-                Some(_) | None => format!("@{}", node.id),
+                .unwrap_or_else(|| format!("@{}", node.id));
+            // A text node's path (`…/~#1`) says nothing: its text does.
+            let anonymous = node.role == "Label" || by_path.contains("/~") || by_path.starts_with("#~");
+            let spaced = by_path.contains(char::is_whitespace);
+            if (by_path.starts_with('@') || is_unstable(&by_path) || anonymous || spaced)
+                && let Some(by_label) = role_label_selector(nodes, node)
+            {
+                return by_label;
             }
+            if spaced {
+                return quote_if_needed(&by_path);
+            }
+            by_path
         })
         .collect()
 }
@@ -337,6 +485,47 @@ mod tests {
         assert!(Selector::parse("#").is_err());
         assert!(Selector::parse("@x").is_err());
         assert!(Selector::parse("#a >> ").is_err());
+    }
+
+    #[test]
+    fn quotes_protect_spaces_chains_and_escapes() {
+        let label = |text: &str| match Selector::parse(text).unwrap().parts.as_slice() {
+            [Part::RoleLabel { label, .. }] => label.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(label(r#"button:"Run >> now""#), "run >> now");
+        assert_eq!(label(r#""button:Run now""#), "run now");
+        assert_eq!(label(r#"button:"say \"hi\"""#), r#"say "hi""#);
+        let chain = Selector::parse(r##""#a" >> button:"x >> y" >> "textinput:Item title""##).unwrap();
+        assert_eq!(chain.parts.len(), 3);
+        assert_eq!(
+            Selector::parse(r##""#a >> button:Go""##).unwrap(),
+            Selector::parse("#a >> button:Go").unwrap()
+        );
+        // Unbalanced quotes are not a quoted label.
+        assert!(Selector::parse(r#""button:Run"#).is_err());
+        assert_eq!(unquote_whole(r#""a" b"#), None);
+        assert_eq!(quote_if_needed("plain"), "plain");
+        assert_eq!(quote_if_needed("two words"), r#""two words""#);
+        let round = quote_if_needed(r#"a "b" \ c"#);
+        assert_eq!(unquote_whole(&round).as_deref(), Some(r#"a "b" \ c"#));
+    }
+
+    #[test]
+    fn unstable_ids_get_a_role_label_selector() {
+        let mut nodes = sample();
+        nodes.push(node(7, Some(0), Some("input-4294967389"), "TextInput", "Item title"));
+        nodes.push(node(8, Some(0), None, "Label", "Which database should the cache use?"));
+        let listed = selectors_for(&nodes);
+        assert_eq!(listed[6], r#"textinput:"Item title""#);
+        assert_eq!(listed[7], r#"label:"Which database should the cache use?""#);
+        for (i, text) in listed.iter().enumerate() {
+            assert_eq!(find(&nodes, &Selector::parse(text).unwrap()), vec![i], "{text}");
+        }
+        // Not unique by label: the numbered path stays.
+        nodes.push(node(9, Some(0), Some("input-4294967390"), "TextInput", "Item title"));
+        let listed = selectors_for(&nodes);
+        assert_eq!(listed[6], "#input-4294967389");
     }
 
     #[test]
@@ -416,8 +605,8 @@ mod tests {
         // `runner-menu` is now shared, so the parent segment is added.
         assert_eq!(listed[2], "#task-panel/runner-menu");
         assert_eq!(listed[6], "#other/runner-menu");
-        // The window has no path.
-        assert_eq!(listed[0], "@0");
+        // The window has no path: its label names it.
+        assert_eq!(listed[0], "window:tod");
         for (i, text) in listed.iter().enumerate() {
             let found = find(&nodes, &Selector::parse(text).unwrap());
             assert_eq!(found, vec![i], "{text}");

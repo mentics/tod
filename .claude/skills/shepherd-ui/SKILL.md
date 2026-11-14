@@ -37,8 +37,11 @@ Find and act on elements through the app's accessibility tree, never by
 coordinates:
 - `tree [--role R] [--label S] [--within SEL] [--json]`: the elements on
   screen, one line each: selector, role, label, value, bounds, actions,
-  focused/disabled. Start every screen with it, narrowed with `--within` or
-  `--role`.
+  focused/disabled. Start every screen with it, narrowed with `--within`,
+  `--role` or `--label`. Every visible string is there: read content (a
+  request's question, the status line, captions) from `label` rows, or from
+  the label of the button, list item or heading that shows it; `tree --label
+  retention` finds the text.
 - `act <selector> [click|focus|set-value <text>|scroll-into-view]` (default
   click): acts through the element's own handler. A reply saying it fell back
   to a synthetic click is fine.
@@ -48,6 +51,11 @@ coordinates:
   (`button:Resume`, `menuitem:Check now`; a case-insensitive substring of the
   label or value), and `a >> b` (b inside a). Prefer `role:label` for
   elements whose selector is `#~file.rs:LINE`: those move when the code does.
+  Quote what has spaces, in any command that takes a selector: `act "textinput:Item title" set-value Cov node`,
+  `act button:"Run now" click`, `wait-for "listitem:Cov node"`; `tree` prints
+  selectors already quoted. A request's free-text field is
+  `textinput:"Answer: <question start>"`: `set-value` fills it (and opens it
+  for editing), `key ctrl-enter` submits it.
 - `text …`, `key enter`, `key ctrl-enter` type into the focused field.
 - `shot2 <png>` only to check how something looks (`shot` can come back
   blank); read every screenshot you take. Read content from `tree`, never

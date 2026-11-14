@@ -40,11 +40,47 @@ pub enum ActAction {
     ScrollIntoView,
 }
 
+/// Whitespace-separated tokens of `text` with their byte ranges; a double-quoted
+/// run (`"a b"`, with `\"` inside) is part of one token, quotes kept.
+fn tokens(text: &str) -> Vec<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let (mut i, mut quoted, mut start) = (0, false, None);
+    while i < bytes.len() {
+        let b = bytes[i];
+        if quoted && b == b'\\' {
+            i += 2;
+            continue;
+        }
+        if b == b'"' {
+            quoted = !quoted;
+            start.get_or_insert(i);
+        } else if b.is_ascii_whitespace() && !quoted {
+            if let Some(s) = start.take() {
+                out.push((s, i));
+            }
+        } else {
+            start.get_or_insert(i);
+        }
+        i += 1;
+    }
+    if let Some(s) = start {
+        out.push((s, text.len()));
+    }
+    out
+}
+
+/// A flag value or action argument: the text, unquoted when it is one quoted string.
+fn unquoted(text: &str) -> String {
+    selector::unquote_whole(text.trim()).unwrap_or_else(|| text.trim().to_string())
+}
+
 /// `tree [--role R] [--label S] [--within SEL] [--json]`. A flag's value runs to
-/// the next `--flag`, so none of them needs quoting.
+/// the next `--flag`, so none of them needs quoting (quote one to hold a `--`).
 pub fn parse_tree(rest: &str) -> Result<TreeQuery, String> {
     let mut query = TreeQuery::default();
-    let mut tokens = rest.split_whitespace().peekable();
+    let ranges = tokens(rest);
+    let mut tokens = ranges.iter().map(|&(a, b)| &rest[a..b]).peekable();
     while let Some(token) = tokens.next() {
         let mut value = || {
             let mut words = Vec::new();
@@ -62,8 +98,9 @@ pub fn parse_tree(rest: &str) -> Result<TreeQuery, String> {
         };
         match token {
             "--json" => query.json = true,
-            "--role" => query.role = Some(value()?),
-            "--label" => query.label = Some(value()?),
+            "--role" => query.role = Some(unquoted(&value()?)),
+            "--label" => query.label = Some(unquoted(&value()?)),
+            // A selector keeps its quotes: `Selector::parse` reads them.
             "--within" => query.within = Some(value()?),
             other => return Err(format!("unknown tree option `{other}`")),
         }
@@ -74,12 +111,45 @@ pub fn parse_tree(rest: &str) -> Result<TreeQuery, String> {
     Ok(query)
 }
 
+const ACTION_WORDS: [&str; 4] = ["click", "focus", "set-value", "scroll-into-view"];
+
 /// `act <selector> [click|focus|set-value <text>|scroll-into-view]`; the action
-/// is the end of the line, the selector everything before it.
+/// is the end of the line, the selector everything before it. When the line has
+/// a double quote anywhere (`act "textinput:Item title" set-value Cov node`,
+/// `act button:"Run now" click`) the selector ends at the first unquoted action
+/// word instead, so a quoted label may contain one.
 pub fn parse_act(rest: &str) -> Result<(String, ActAction), String> {
     let rest = rest.trim();
     if rest.is_empty() {
         return Err("act requires a selector".into());
+    }
+    if rest.contains('"') {
+        let split = tokens(rest)
+            .into_iter()
+            .skip(1)
+            .find(|&(a, b)| ACTION_WORDS.contains(&&rest[a..b]));
+        let (selector, action) = match split {
+            None => (rest, ActAction::Click),
+            Some((a, b)) => {
+                let after = rest[b..].trim();
+                let action = match &rest[a..b] {
+                    "set-value" => ActAction::SetValue(unquoted(after)),
+                    word => {
+                        if !after.is_empty() {
+                            return Err(format!("unexpected text after `{word}`: {after}"));
+                        }
+                        match word {
+                            "click" => ActAction::Click,
+                            "focus" => ActAction::Focus,
+                            _ => ActAction::ScrollIntoView,
+                        }
+                    }
+                };
+                (rest[..a].trim(), action)
+            }
+        };
+        Selector::parse(selector)?;
+        return Ok((selector.to_string(), action));
     }
     let (selector, action) = if let Some((sel, text)) = rest.split_once(" set-value ") {
         (sel, ActAction::SetValue(text.trim().to_string()))
@@ -98,17 +168,18 @@ pub fn parse_act(rest: &str) -> Result<(String, ActAction), String> {
     Ok((selector.trim().to_string(), action))
 }
 
-/// `wait-for <selector> [--gone] [--timeout-ms N]`.
+/// `wait-for <selector> [--gone] [--timeout-ms N]`; the selector may be quoted.
 pub fn parse_wait_for(rest: &str) -> Result<(String, bool, u64), String> {
     let mut gone = false;
     let mut timeout_ms = 5000u64;
     let mut selector = Vec::new();
-    let mut tokens = rest.split_whitespace();
-    while let Some(token) = tokens.next() {
+    let ranges = tokens(rest);
+    let mut words = ranges.iter().map(|&(a, b)| &rest[a..b]);
+    while let Some(token) = words.next() {
         match token {
             "--gone" => gone = true,
             "--timeout-ms" => {
-                let value = tokens.next().ok_or("--timeout-ms needs a number")?;
+                let value = words.next().ok_or("--timeout-ms needs a number")?;
                 timeout_ms = value
                     .parse()
                     .map_err(|_| format!("invalid --timeout-ms `{value}`"))?;
@@ -267,7 +338,7 @@ pub fn run_tree(window: &mut Window, cx: &mut App, query: &TreeQuery) -> Result<
         .filter(|&i| {
             let node = &nodes[i];
             role.as_ref()
-                .is_none_or(|r| selector::normalize_role(&node.role) == *r)
+                .is_none_or(|r| selector::role_matches(&node.role, r))
                 && label.as_ref().is_none_or(|l| {
                     node.label.to_lowercase().contains(l.as_str())
                         || node.value.to_lowercase().contains(l.as_str())
@@ -604,6 +675,46 @@ mod tests {
         assert!(parse_wait_for("#a --timeout-ms x").is_err());
     }
 
+    #[test]
+    fn quoted_selectors_in_act_tree_and_wait_for() {
+        assert_eq!(
+            parse_act(r#""textinput:Item title" set-value Cov node"#).unwrap(),
+            (
+                r#""textinput:Item title""#.into(),
+                ActAction::SetValue("Cov node".into())
+            )
+        );
+        assert_eq!(
+            parse_act(r#"textinput:"Item title" set-value "quoted value""#).unwrap(),
+            (
+                r#"textinput:"Item title""#.into(),
+                ActAction::SetValue("quoted value".into())
+            )
+        );
+        // A quoted label may hold an action word.
+        assert_eq!(
+            parse_act(r#"button:"Click here to focus" focus"#).unwrap(),
+            (r#"button:"Click here to focus""#.into(), ActAction::Focus)
+        );
+        assert_eq!(
+            parse_act(r##""#a >> button:Go now""##).unwrap(),
+            (r##""#a >> button:Go now""##.into(), ActAction::Click)
+        );
+        assert_eq!(
+            parse_act(r#"button:"Run now" click"#).unwrap(),
+            (r#"button:"Run now""#.into(), ActAction::Click)
+        );
+        assert!(parse_act(r#"button:"Run now" click extra"#).is_err());
+        let q = parse_tree(r##"--label "two  words" --within "#a >> button:Go now" --role button"##).unwrap();
+        assert_eq!(q.label.as_deref(), Some("two  words"));
+        assert_eq!(q.within.as_deref(), Some(r##""#a >> button:Go now""##));
+        assert_eq!(q.role.as_deref(), Some("button"));
+        assert_eq!(
+            parse_wait_for(r#"textinput:"Item  title" --gone --timeout-ms 9"#).unwrap(),
+            (r#"textinput:"Item  title""#.into(), true, 9)
+        );
+    }
+
     // ---- GPUI: a rendered view, found and clicked by selector ----
 
     use gpui::{
@@ -732,5 +843,65 @@ mod tests {
         assert_eq!(value["role"], "button");
         assert_eq!(value["label"], "Pause run");
         assert!(value["actions"].as_array().unwrap().iter().any(|a| a == "Click"));
+    }
+
+    struct TextProbe;
+
+    impl Render for TextProbe {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .id("text-probe")
+                .size_full()
+                .flex()
+                .flex_col()
+                .child(div().id("heading").child("Needs your input").child("Asked 09:44"))
+                .child(
+                    // A clickable bar holding a clickable child: the bar is not
+                    // named by the child's text.
+                    div()
+                        .id("bar")
+                        .flex()
+                        .on_click(|_, _, _| {})
+                        .child("tod")
+                        .child(div().id("talk").on_click(|_, _, _| {}).child("Talk about the selection")),
+                )
+                .child(
+                    div()
+                        .id("row")
+                        .role(gpui::accesskit::Role::ListItem)
+                        .child(div().id("row-title").on_click(|_, _, _| {}).child("Cov node"))
+                        .child("proposed"),
+                )
+        }
+    }
+
+    #[gpui::test]
+    fn text_is_readable_and_labels_exclude_interactive_descendants(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|_| TextProbe);
+            Root::new(view, window, cx)
+        });
+        let tree = cx.update(|window, cx| run_tree(window, cx, &TreeQuery::default())).unwrap();
+        // Plain text is a `label` node, findable by role:label.
+        assert!(tree.contains("\tlabel\tNeeds your input\t"), "{tree}");
+        assert!(tree.contains("\tlabel\tAsked 09:44\t"), "{tree}");
+        assert_eq!(cx.update(|w, cx| count(w, cx, r#"label:"Asked 09""#)).unwrap(), 1);
+        // Text a button names is not repeated as a node.
+        assert!(!tree.contains("\tlabel\ttod\t"), "{tree}");
+        assert!(!tree.contains("\tlabel\tTalk about the selection\t"), "{tree}");
+        // The bar is named by its own text; `Talk about the selection` is one button.
+        assert!(tree.contains("\tbutton\ttod\t"), "{tree}");
+        assert_eq!(cx.update(|w, cx| count(w, cx, "button:Talk about the selection")).unwrap(), 1);
+        // A list item is also named by the button inside it.
+        assert!(tree.contains("\tlistitem\tCov node proposed\t"), "{tree}");
+        assert_eq!(cx.update(|w, cx| count(w, cx, r#""listitem:Cov node""#)).unwrap(), 1);
+        // A label found by text is placed in tree order and has bounds.
+        let json = cx
+            .update(|w, cx| run_tree(w, cx, &TreeQuery { label: Some("asked".into()), json: true, ..Default::default() }))
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(json.lines().nth(1).unwrap()).unwrap();
+        assert_eq!(value["role"], "label");
+        assert!(value["bounds"].is_array());
     }
 }

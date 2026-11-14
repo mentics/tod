@@ -51,7 +51,10 @@
 //! view.
 //!
 //! - `tree [--role R] [--label S] [--within SEL] [--json]` — the UI by identity
-//!   (selector, role, label, value, bounds, actions); see `a11y_tree` and `selector`
+//!   (selector, role, label, value, bounds, actions); see `a11y_tree` and `selector`.
+//!   Text is in it: a `label` node per string no interactive node names, else that
+//!   node's label (a button's label excludes the text of buttons inside it).
+//!   Selectors and `act`'s selector accept double quotes (`"textinput:Item title"`)
 //! - `act <selector> [click|focus|set-value <text>|scroll-into-view]` — act on one
 //!   element through the accessibility action path (synthetic click if it has none)
 //! - `wait-for <selector> [--gone] [--timeout-ms N]` — poll until it matches

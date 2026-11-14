@@ -100,6 +100,13 @@ use crate::views::lifecycle_control::LifecycleController;
 pub const REQUESTS_CONTEXT: &str = "UnifiedRequests";
 /// Key-context tag for whichever freeform answer field is in edit mode, so
 /// Escape only fires for that one field (`key_context::including_tag`).
+/// The accessible name of a request's free-text answer field.
+fn freeform_name(question: &str) -> String {
+    let line = question.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+    let line: String = line.chars().take(80).collect();
+    format!("Answer: {line}")
+}
+
 const FREEFORM_TAG: &str = "RequestsFreeform";
 /// Height of the free-text answer area while it is being edited (a textarea
 /// has no height of its own).
@@ -1379,31 +1386,71 @@ impl Requests {
 
     /// The free-text answer field. `only` marks a question asked with no
     /// options, where typing an answer is the only way to answer it.
-    fn render_freeform(&self, decision_id: Uuid, only: bool, cx: &mut Context<Self>) -> impl IntoElement {
+    ///
+    /// Not editing, the field is a text input in the accessibility tree named
+    /// "Answer: <question>" (`textinput:"Answer: <question>"`): clicking or
+    /// focusing it enters edit mode, and `set-value` puts the text in the draft
+    /// and enters edit mode, ready for Ctrl+Enter. Editing, the textarea carries
+    /// the same name.
+    fn render_freeform(&self, decision_id: Uuid, question: &str, only: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        use gpui::{Window as GpuiWindow, accesskit};
         let editing = self.freeform_editing == Some(decision_id);
         key_context::set_input_tab_stop(&self.freeform_input, editing, cx);
-        div()
+        let name = freeform_name(question);
+        let this = cx.entity().downgrade();
+        let begin = {
+            let this = this.clone();
+            move |_: Option<&accesskit::ActionData>, window: &mut GpuiWindow, cx: &mut App| {
+                this.update(cx, |this, cx| this.begin_freeform_edit(decision_id, window, cx)).ok();
+            }
+        };
+        let set_value = move |data: Option<&accesskit::ActionData>, window: &mut GpuiWindow, cx: &mut App| {
+            let Some(accesskit::ActionData::Value(text)) = data else { return };
+            let text = text.to_string();
+            this.update(cx, |this, cx| {
+                FreeformDrafts::set(decision_id, text, cx);
+                // Make the input load the draft even if it held this decision's.
+                this.freeform_draft_for = None;
+                this.begin_freeform_edit(decision_id, window, cx);
+            })
+            .ok();
+        };
+        let base = div()
             .id(SharedString::from(format!("unified-decisions-freeform-{decision_id}")))
             .key_context(FREEFORM_TAG)
             .cursor_text()
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, window, cx| this.begin_freeform_edit(decision_id, window, cx)),
-            )
-            .child(if editing {
-                Textarea::new(&self.freeform_input).disabled(false).w_full().h(gpui::px(FREEFORM_HEIGHT)).into_any_element()
-            } else {
-                let draft = Some(FreeformDrafts::get(decision_id, cx)).filter(|text| !text.trim().is_empty());
-                match draft {
-                    Some(draft) => div().text_xs().child(draft.clone()).record_text(draft).into_any_element(),
-                    None => div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(if only { "Enter to type your answer…" } else { "Enter to answer freely…" })
-                        .record_text(if only { "Enter to type your answer…" } else { "Enter to answer freely…" })
-                        .into_any_element(),
-                }
+            );
+        if editing {
+            return base
+                .child(
+                    Textarea::new(&self.freeform_input)
+                        .aria_label(name)
+                        .disabled(false)
+                        .w_full()
+                        .h(gpui::px(FREEFORM_HEIGHT)),
+                )
+                .into_any_element();
+        }
+        let draft = Some(FreeformDrafts::get(decision_id, cx)).filter(|text| !text.trim().is_empty());
+        base.role(accesskit::Role::MultilineTextInput)
+            .aria_label(name)
+            .aria_value(draft.clone().unwrap_or_default())
+            .on_a11y_action(accesskit::Action::Click, begin.clone())
+            .on_a11y_action(accesskit::Action::Focus, begin)
+            .on_a11y_action(accesskit::Action::SetValue, set_value)
+            .child(match draft {
+                Some(draft) => div().text_xs().child(draft.clone()).record_text(draft).into_any_element(),
+                None => div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(if only { "Enter to type your answer…" } else { "Enter to answer freely…" })
+                    .record_text(if only { "Enter to type your answer…" } else { "Enter to answer freely…" })
+                    .into_any_element(),
             })
+            .into_any_element()
     }
 
     fn card(&self, id: String, cx: &App) -> Stateful<gpui::Div> {
@@ -1472,7 +1519,7 @@ impl Requests {
                 |el| el.child(self.render_options(&decision, cx)),
             )
             .when(!tod_core::environment_request::is_request(&decision), |el| {
-                el.child(self.render_freeform(decision.id, decision.options.is_empty(), cx))
+                el.child(self.render_freeform(decision.id, &decision.question, decision.options.is_empty(), cx))
             })
             .child(footer)
             .into_any_element()
@@ -1659,7 +1706,7 @@ impl Requests {
             .when(changing, |el| {
                 el.child(self.render_options(&decision, cx))
                     .child(div().flex().flex_wrap().gap_2().children(evidence))
-                    .child(self.render_freeform(decision_id, decision.options.is_empty(), cx))
+                    .child(self.render_freeform(decision_id, &decision.question, decision.options.is_empty(), cx))
             })
             .into_any_element()
     }

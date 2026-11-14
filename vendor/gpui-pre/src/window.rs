@@ -6709,6 +6709,28 @@ impl Window {
             .collect()
     }
 
+    /// TOD PATCH: text drawn at `bounds` in this frame's accessibility tree: the
+    /// label of the interactive node around it, or a `Label` node of its own.
+    /// Called by every text element; public for elements that draw text some
+    /// other way (a canvas), so their text is readable too. Does nothing while
+    /// the tree is off.
+    pub fn a11y_note_text(&mut self, text: &SharedString, bounds: Bounds<Pixels>) {
+        if !crate::window::a11y::TOD_A11Y || !self.a11y.is_active() {
+            return;
+        }
+        let visible = bounds.intersect(&self.content_mask().bounds);
+        let bounds = if visible.is_empty() { bounds } else { visible };
+        let scale = self.scale_factor();
+        let rect = accesskit::Rect {
+            x0: (bounds.origin.x.0 * scale) as f64,
+            y0: (bounds.origin.y.0 * scale) as f64,
+            x1: ((bounds.origin.x.0 + bounds.size.width.0) * scale) as f64,
+            y1: ((bounds.origin.y.0 + bounds.size.height.0) * scale) as f64,
+        };
+        let (id, path) = self.a11y.synthetic_node(&self.element_id_stack, None);
+        self.a11y.nodes.note_text(text, rect, id, path);
+    }
+
     /// TOD PATCH: how many clickable elements the last frame had and how many
     /// of them are exposed in the tree.
     #[cfg(feature = "tod-a11y")]

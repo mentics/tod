@@ -285,7 +285,7 @@ impl Element for &'static str {
         _cx: &mut App,
     ) {
         if window.a11y.is_active() {
-            window.a11y.nodes.note_text(&SharedString::from(*self));
+            window.a11y_note_text(&SharedString::from(*self), bounds);
         }
         text_layout.prepaint(bounds, self)
     }
@@ -362,7 +362,7 @@ impl Element for SharedString {
         _cx: &mut App,
     ) {
         if window.a11y.is_active() {
-            window.a11y.nodes.note_text(self);
+            window.a11y_note_text(self, bounds);
         }
         text_layout.prepaint(bounds, self.as_ref())
     }
@@ -591,7 +591,7 @@ impl Element for StyledText {
         _cx: &mut App,
     ) {
         if window.a11y.is_active() {
-            window.a11y.nodes.note_text(&self.text);
+            window.a11y_note_text(&self.text, bounds);
         }
         self.layout.prepaint(bounds, &self.text)
     }

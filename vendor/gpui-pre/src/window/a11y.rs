@@ -343,6 +343,9 @@ impl A11y {
     /// Finalize the tree and produce a [`TreeUpdate`] for the platform adapter.
     pub(crate) fn end_frame(&mut self, frame: debug::FrameDebugInfo) -> TreeUpdate {
         let update = self.nodes.finalize();
+        for (id, path) in std::mem::take(&mut self.nodes.text_paths) {
+            self.node_paths.insert(id, path);
+        }
         self.debug.capture(
             &update,
             self.nodes.focus,
@@ -463,6 +466,13 @@ impl<'a> A11ySubtreeBuilder<'a> {
     }
 }
 
+/// TOD PATCH: the container roles named by all the text inside them, the text
+/// of interactive descendants included.
+fn takes_all_descendant_text(role: accesskit::Role) -> bool {
+    use accesskit::Role::*;
+    matches!(role, ListItem | ListBoxOption | TreeItem | Row | Cell)
+}
+
 /// TOD PATCH: the roles whose accessible name is the text inside them.
 fn takes_text_label(role: accesskit::Role) -> bool {
     use accesskit::Role::*;
@@ -489,12 +499,29 @@ fn takes_text_label(role: accesskit::Role) -> bool {
     )
 }
 
+/// TOD PATCH: one piece of text drawn this frame.
+struct TextNote {
+    text: SharedString,
+    rect: accesskit::Rect,
+    id: NodeId,
+    path: String,
+    parent: NodeId,
+    /// How many children the parent had when this was drawn.
+    position: usize,
+}
+
 pub(crate) struct A11yNodeBuilder {
     ids_stack: SmallVec<[NodeId; 16]>,
     nodes_stack: SmallVec<[accesskit::Node; 16]>,
-    /// TOD PATCH: text drawn under each node on the stack, so a node without a
-    /// label can take its descendants' text as one.
-    texts_stack: SmallVec<[Vec<SharedString>; 16]>,
+    /// TOD PATCH: text drawn this frame, each filed under the node it was drawn
+    /// in. `finalize` gives it to the nearest enclosing interactive node as its
+    /// label, or, with none, makes a `Label` node of it.
+    texts: Vec<TextNote>,
+    /// TOD PATCH: the parent of each node pushed this frame.
+    parents: FxHashMap<NodeId, NodeId>,
+    /// TOD PATCH: id paths of the text nodes `finalize` made (drained by
+    /// `A11y::end_frame`).
+    pub(crate) text_paths: Vec<(NodeId, String)>,
     /// This is the exact type required by accesskit, so we can't just make it a
     /// `HashMap<NodeId, Node>` to remove the need for `seen_ids`
     all_nodes: Vec<(NodeId, accesskit::Node)>,
@@ -516,7 +543,9 @@ impl A11yNodeBuilder {
         Self {
             ids_stack: SmallVec::new(),
             nodes_stack: SmallVec::new(),
-            texts_stack: SmallVec::new(),
+            texts: Vec::new(),
+            parents: FxHashMap::default(),
+            text_paths: Vec::new(),
             all_nodes: Vec::new(),
             seen_ids: FxHashSet::default(),
             focus: None,
@@ -559,59 +588,147 @@ impl A11yNodeBuilder {
         if let Some(parent) = self.nodes_stack.last_mut() {
             parent.push_child(id);
         }
+        if let Some(parent) = self.ids_stack.last() {
+            self.parents.insert(id, *parent);
+        }
         self.ids_stack.push(id);
         self.nodes_stack.push(node);
-        self.texts_stack.push(Vec::new());
         true
     }
 
     /// TOD PATCH: note text drawn under the node on top of the stack.
-    pub(crate) fn note_text(&mut self, text: &SharedString) {
-        if !TOD_A11Y {
+    pub(crate) fn note_text(
+        &mut self,
+        text: &SharedString,
+        rect: accesskit::Rect,
+        id: NodeId,
+        path: String,
+    ) {
+        if !TOD_A11Y || text.trim().is_empty() || !self.seen_ids.insert(id) {
             return;
         }
-        if let Some(top) = self.texts_stack.last_mut() {
-            if !text.is_empty() {
-                top.push(text.clone());
-            }
+        let (Some(parent), Some(top)) = (self.ids_stack.last(), self.nodes_stack.last()) else {
+            return;
+        };
+        self.texts.push(TextNote {
+            text: text.clone(),
+            rect,
+            id,
+            path,
+            parent: *parent,
+            position: top.children().len(),
+        });
+    }
+
+    fn pop_top(&mut self) {
+        if let (Some(id), Some(node)) = (self.ids_stack.pop(), self.nodes_stack.pop()) {
+            self.all_nodes.push((id, node));
         }
     }
 
-    /// TOD PATCH: pop the top node, naming it from its text when it has no
-    /// label and is something the user acts on.
-    fn pop_top(&mut self) {
-        if let (Some(id), Some(mut node)) = (self.ids_stack.pop(), self.nodes_stack.pop()) {
-            let texts = self.texts_stack.pop().unwrap_or_default();
-            if TOD_A11Y
-                && node.label().is_none()
-                && !texts.is_empty()
-                && takes_text_label(node.role())
-            {
-                let mut label = String::new();
-                for text in &texts {
-                    if !label.is_empty() {
-                        label.push(' ');
-                    }
-                    label.push_str(text.trim());
-                    if label.len() > 120 {
+    /// TOD PATCH: turn the frame's drawn text into labels and `Label` nodes.
+    /// Text belongs to its nearest enclosing node that takes its name from
+    /// text (a button, a list item, a heading ...): it becomes that node's
+    /// label, and is not repeated as a node of its own, nor does it leak into
+    /// an outer interactive node's label. Text with no such node around it
+    /// becomes a `Label` child of the node it was drawn in, in drawing order.
+    fn resolve_texts(&mut self) {
+        let texts = std::mem::take(&mut self.texts);
+        if texts.is_empty() {
+            return;
+        }
+        let index: FxHashMap<NodeId, usize> = self
+            .all_nodes
+            .iter()
+            .enumerate()
+            .map(|(i, (id, _))| (*id, i))
+            .collect();
+        let mut owned: FxHashMap<usize, Vec<SharedString>> = FxHashMap::default();
+        let mut inserts: FxHashMap<usize, Vec<(usize, NodeId)>> = FxHashMap::default();
+        let mut made: Vec<(NodeId, accesskit::Node)> = Vec::new();
+        for note in texts {
+            let mut at = Some(note.parent);
+            let mut owner = None;
+            while let Some(a) = at {
+                if let Some(&i) = index.get(&a) {
+                    if takes_text_label(self.all_nodes[i].1.role()) {
+                        owner = Some(i);
                         break;
                     }
                 }
-                if label.len() > 120 {
-                    let mut end = 120;
-                    while !label.is_char_boundary(end) {
-                        end -= 1;
+                at = self.parents.get(&a).copied();
+            }
+            match (owner, index.get(&note.parent)) {
+                (Some(i), _) => {
+                    // A list item, row or cell is also named by the text of the
+                    // buttons inside it (a tree row's title), which a button
+                    // outside such a container does not take.
+                    if !takes_all_descendant_text(self.all_nodes[i].1.role()) {
+                        let mut at = self.parents.get(&self.all_nodes[i].0).copied();
+                        while let Some(a) = at {
+                            if let Some(&c) = index.get(&a)
+                                && takes_all_descendant_text(self.all_nodes[c].1.role())
+                            {
+                                owned.entry(c).or_default().push(note.text.clone());
+                                break;
+                            }
+                            at = self.parents.get(&a).copied();
+                        }
                     }
-                    label.truncate(end);
-                    label.push('…');
+                    owned.entry(i).or_default().push(note.text)
                 }
-                node.set_label(label);
+                (None, Some(&parent)) => {
+                    let mut node = accesskit::Node::new(accesskit::Role::Label);
+                    node.set_label(note.text.trim().to_string());
+                    node.set_bounds(note.rect);
+                    inserts.entry(parent).or_default().push((note.position, note.id));
+                    self.text_paths.push((note.id, note.path));
+                    made.push((note.id, node));
+                }
+                (None, None) => {}
             }
-            if let Some(parent) = self.texts_stack.last_mut() {
-                parent.extend(texts);
-            }
-            self.all_nodes.push((id, node));
         }
+        for (i, texts) in owned {
+            let node = &mut self.all_nodes[i].1;
+            if node.label().is_some() {
+                continue;
+            }
+            let mut label = String::new();
+            for text in &texts {
+                if !label.is_empty() {
+                    label.push(' ');
+                }
+                label.push_str(text.trim());
+                if label.len() > 120 {
+                    break;
+                }
+            }
+            if label.len() > 120 {
+                let mut end = 120;
+                while !label.is_char_boundary(end) {
+                    end -= 1;
+                }
+                label.truncate(end);
+                label.push('…');
+            }
+            node.set_label(label);
+        }
+        for (parent, list) in inserts {
+            let node = &mut self.all_nodes[parent].1;
+            let old: Vec<NodeId> = node.children().to_vec();
+            let mut merged = Vec::with_capacity(old.len() + list.len());
+            let mut next = 0;
+            for (k, child) in old.iter().enumerate() {
+                while next < list.len() && list[next].0 <= k {
+                    merged.push(list[next].1);
+                    next += 1;
+                }
+                merged.push(*child);
+            }
+            merged.extend(list[next..].iter().map(|(_, id)| *id));
+            node.set_children(merged);
+        }
+        self.all_nodes.extend(made);
     }
 
     /// Add a leaf node as a child of the current top-of-stack node, without
@@ -648,7 +765,9 @@ impl A11yNodeBuilder {
         self.all_nodes.clear();
         self.ids_stack.clear();
         self.nodes_stack.clear();
-        self.texts_stack.clear();
+        self.texts.clear();
+        self.parents.clear();
+        self.text_paths.clear();
         self.seen_ids.clear();
         #[cfg(debug_assertions)]
         self.node_info.clear();
@@ -659,7 +778,6 @@ impl A11yNodeBuilder {
 
         self.ids_stack.push(ROOT_NODE_ID);
         self.nodes_stack.push(root_node);
-        self.texts_stack.push(Vec::new());
         self.focus = None;
         self.active_descendant = None;
     }
@@ -733,6 +851,7 @@ impl A11yNodeBuilder {
         while !self.ids_stack.is_empty() {
             self.pop_top();
         }
+        self.resolve_texts();
 
         let focus = match self.active_descendant {
             Some(id) if self.has_node(id) => id,

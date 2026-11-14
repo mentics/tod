@@ -38,8 +38,8 @@ code paths run only inside `if window.a11y.is_active()`.
 - Per-frame bookkeeping: `node_paths` (the element-id path of each node, for
   `#id` selectors), `coverage` (`A11yCoverage`: clickable, exposed, explicit,
   missing), `synthetic_node` (a stable node id and path for a clickable element
-  with no element id: its ancestors' ids plus where it was built), `texts_stack`
-  and `note_text` (text drawn inside a node, used as its label when it has none),
+  with no element id: its ancestors' ids plus where it was built), `texts` (text drawn this frame, resolved at its end)
+  and `note_text`,
   `A11yNodeSnapshot` and `last_tree()`.
 
 `src/window/a11y/debug.rs`
@@ -63,7 +63,13 @@ code paths run only inside `if window.a11y.is_active()`.
   own listeners.
 
 `src/elements/text.rs`
-- Text prepaint calls `note_text` so labels can be inferred.
+- Text prepaint calls `Window::a11y_note_text` (public, so an element that draws
+  text some other way can report it too). At the end of the frame `A11yNodeBuilder::resolve_texts`
+  gives each text to its nearest enclosing node that is named by its text (button,
+  link, tab, list item, heading ...) as that node's label, text of a nested such
+  node excluded (a list item, row or cell also takes the text of the buttons inside
+  it); text with no such node around it becomes a `Label` node, with an id path
+  ending in `~`, in drawing order among its siblings.
 
 Search for `TOD PATCH` to find each change.
 
