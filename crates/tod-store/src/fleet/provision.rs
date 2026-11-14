@@ -449,15 +449,17 @@ fn sandbox_exists(info: Option<&tod_sandbox::blaxel::SandboxInfo>) -> bool {
 }
 
 /// Waits (up to two minutes) for `name` to leave Blaxel's list.
+/// Blaxel's not-ready 404 during the deletion is waited out, not taken for
+/// gone or for a failure, until the bound.
 fn wait_gone(bx: &Blaxel, name: &str) -> Result<()> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-    while sandbox_exists(bx.get(name)?.as_ref()) {
-        if std::time::Instant::now() > deadline {
-            bail!("sandbox {name} is still being deleted after two minutes");
-        }
-        std::thread::sleep(std::time::Duration::from_secs(2));
+    wait_gone_within(bx, name, std::time::Duration::from_secs(120))
+}
+
+fn wait_gone_within(bx: &Blaxel, name: &str, bound: std::time::Duration) -> Result<()> {
+    match bx.wait_until_gone(name, bound, |found| !sandbox_exists(found))? {
+        None => Ok(()),
+        Some(why) => bail!("sandbox {name} is still being deleted after {}s ({why})", bound.as_secs()),
     }
-    Ok(())
 }
 
 /// What [`choose_sandbox`] settled.
@@ -479,16 +481,30 @@ fn choose_sandbox(
     node_id: &str,
     progress: &mut dyn FnMut(&str),
 ) -> Result<Chosen> {
+    choose_sandbox_within(bx, recorded, slug, node_id, progress, std::time::Duration::from_secs(120))
+}
+
+/// [`choose_sandbox`] with the bound of its waits given. Blaxel's not-ready
+/// 404 is waited out within it (never taken for gone, which would make a
+/// sandbox under a name that is taken), and an error after.
+fn choose_sandbox_within(
+    bx: &Blaxel,
+    recorded: &[String],
+    slug: &str,
+    node_id: &str,
+    progress: &mut dyn FnMut(&str),
+    wait: std::time::Duration,
+) -> Result<Chosen> {
     let mut candidate = sandbox_name(slug, node_id)?;
     for name in recorded {
-        if sandbox_exists(bx.get(name)?.as_ref()) {
+        if sandbox_exists(bx.get_waiting_not_ready(name, wait)?.as_ref()) {
             candidate = name.clone();
             break;
         }
     }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let deadline = std::time::Instant::now() + wait;
     loop {
-        let existing = bx.get(&candidate)?;
+        let existing = bx.get_waiting_not_ready(&candidate, wait)?;
         match decide_name(&candidate, node_id, recorded, existing.as_ref()) {
             NameDecision::Make => return Ok(Chosen::Make(candidate)),
             NameDecision::Reuse => return Ok(Chosen::Reuse(candidate)),
@@ -512,7 +528,7 @@ fn choose_sandbox(
                     let status = existing.map(|i| i.status).unwrap_or_default();
                     return Err(lost_track_error(&candidate, slug, node_id, &status));
                 }
-                std::thread::sleep(std::time::Duration::from_secs(2));
+                std::thread::sleep(bx.poll_interval());
             }
             NameDecision::Lost => {
                 let status = existing.map(|i| i.status).unwrap_or_default();
@@ -596,7 +612,7 @@ pub fn refresh_sandbox_proxy(
     };
     let mut sandboxes = Sandboxes::load(fleet.paths().root())?;
     let bx = sandboxes.blaxel()?;
-    let Some(info) = bx.get(&name)? else {
+    let Some(info) = bx.get_waiting_not_ready(&name, tod_sandbox::blaxel::NOT_READY_WAIT)? else {
         return Ok(SandboxRefresh::NotNeeded);
     };
     if matches!(info.status.to_ascii_uppercase().as_str(), "FAILED" | "TERMINATED" | "DELETING" | "DELETED") {
@@ -671,9 +687,11 @@ pub fn refresh_sandbox_proxy(
     }
     progress(&format!("deleting {name} to give it the node's credentials…"));
     sandboxes.delete(&bx, &cleared).with_context(|| format!("delete sandbox {name}"))?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-    while bx.get(&name)?.is_some() && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_secs(2));
+    // Not-ready answers during the deletion are waited out; the location is
+    // cleared either way (the sandbox was deleted and the new one gets another
+    // name), a wait that ran out is said, not dropped.
+    if let Some(why) = bx.wait_until_gone(&name, std::time::Duration::from_secs(120), |found| !sandbox_exists(found))? {
+        progress(&format!("warning: {name} was deleted but is not gone yet ({why}); going on"));
     }
     fleet.enqueue(FleetMutation::DeleteFilesLocation { node_id: node_id.to_string() })?;
     fleet.writer().flush()?;
@@ -1480,7 +1498,9 @@ pub fn retire_unusable_sandbox(fleet: &FleetStore, node_id: &str, progress: &mut
         }
         sandboxes.forget(&name)
     };
-    let info = bx.get(&name)?.filter(|i| !i.status.eq_ignore_ascii_case("TERMINATED"));
+    let info = bx
+        .get_waiting_not_ready(&name, tod_sandbox::blaxel::NOT_READY_WAIT)?
+        .filter(|i| !i.status.eq_ignore_ascii_case("TERMINATED"));
     let Some(info) = info else {
         forget_location(&mut sandboxes)?;
         return Ok(Retired::Replaced(name));
@@ -1969,7 +1989,7 @@ pub fn remove_location(
             if let Some(name) = location.sandbox() {
                 // Every commit, in every repository and branch, or nothing goes.
                 let sandboxes = Sandboxes::load(fleet.paths().root())?;
-                let info = sandboxes.blaxel()?.get(name)?;
+                let info = sandboxes.blaxel()?.get_waiting_not_ready(name, tod_sandbox::blaxel::NOT_READY_WAIT)?;
                 cleared = Some(
                     secure_sandbox_commits(info.as_ref(), name, Some(&location))
                         .with_context(|| format!("{} was kept", location.describe()))?,
@@ -2097,6 +2117,72 @@ pub fn stale_locations(fleet: &FleetStore) -> Result<Vec<AffectedLocation>> {
 
 #[cfg(test)]
 mod tests {
+
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tod_sandbox::fake::{blaxel as fake_blaxel, sandbox_json, NOT_FOUND_BODY, NOT_READY_BODY};
+
+    /// A fake Blaxel answering the n-th GET of the sandbox with `script(n)`.
+    fn scripted(script: impl Fn(usize) -> (u16, String) + Send + Sync + 'static) -> (Blaxel, Arc<Mutex<usize>>) {
+        let n = Arc::new(Mutex::new(0usize));
+        let count = n.clone();
+        let bx = fake_blaxel(move |_, _| {
+            let mut c = count.lock().unwrap();
+            *c += 1;
+            script(*c)
+        });
+        (bx, n)
+    }
+
+    #[test]
+    fn wait_gone_waits_out_not_ready_while_a_sandbox_is_being_deleted() {
+        let (bx, n) = scripted(|n| match n {
+            1 | 2 => (404, NOT_READY_BODY.into()),
+            3 => (200, sandbox_json("sbx", "DELETING")),
+            _ => (404, NOT_FOUND_BODY.into()),
+        });
+        super::wait_gone_within(&bx, "sbx", Duration::from_secs(5)).unwrap();
+        assert_eq!(*n.lock().unwrap(), 4);
+    }
+
+    #[test]
+    fn wait_gone_that_only_ever_hears_not_ready_is_an_error_naming_it() {
+        let (bx, _) = scripted(|_| (404, NOT_READY_BODY.into()));
+        let err = super::wait_gone_within(&bx, "sbx", Duration::from_millis(60)).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("sbx") && text.contains("not ready"), "{text}");
+    }
+
+    #[test]
+    fn choose_sandbox_waits_out_not_ready_then_makes_when_gone() {
+        let node = "0123456789ab-node";
+        let (bx, n) = scripted(|n| if n < 4 { (404, NOT_READY_BODY.into()) } else { (404, NOT_FOUND_BODY.into()) });
+        let chosen =
+            super::choose_sandbox_within(&bx, &[], "slug", node, &mut |_| {}, Duration::from_secs(5)).unwrap();
+        assert!(matches!(chosen, super::Chosen::Make(_)));
+        assert_eq!(*n.lock().unwrap(), 4);
+    }
+
+    #[test]
+    fn choose_sandbox_never_takes_not_ready_for_gone() {
+        let (bx, _) = scripted(|_| (404, NOT_READY_BODY.into()));
+        let err = super::choose_sandbox_within(&bx, &[], "slug", "0123456789ab", &mut |_| {}, Duration::from_millis(60))
+            .err()
+            .expect("an error, not Make");
+        assert!(format!("{err:#}").contains("kept answering"), "{err:#}");
+    }
+
+    #[test]
+    fn choose_sandbox_keeps_waiting_for_a_deleting_sandbox_through_not_ready() {
+        let (bx, _) = scripted(|n| match n {
+            1 | 2 => (200, sandbox_json("x", "DELETING")),
+            3 | 4 => (404, NOT_READY_BODY.into()),
+            _ => (404, NOT_FOUND_BODY.into()),
+        });
+        let chosen =
+            super::choose_sandbox_within(&bx, &[], "slug", "0123456789ab", &mut |_| {}, Duration::from_secs(5)).unwrap();
+        assert!(matches!(chosen, super::Chosen::Make(_)));
+    }
     #[test]
     fn a_temporary_failure_that_cleaned_up_is_retried_then_stops_with_the_error() {
         use std::cell::{Cell, RefCell};
@@ -2482,14 +2568,14 @@ mod tests {
 
     /// The rule, as a structure: this layer deletes a node sandbox only with
     /// the guard's proof ([`sandbox::Cleared`]); the one exception is a
-    /// sandbox this call just made. A new `bx.delete(` here fails this test.
+    /// sandbox this call just made. A new `bx.delete(` or `bx.delete_waiting_not_ready(` here fails this test.
     #[test]
     fn no_node_sandbox_is_deleted_without_the_guard() {
         for (file, source) in [("provision.rs", include_str!("provision.rs")), ("sandbox.rs", include_str!("sandbox.rs"))] {
             let production = source.split("#[cfg(test)]").next().unwrap();
             let calls: Vec<&str> = production
                 .lines()
-                .filter(|l| !l.trim_start().starts_with("//") && (l.contains("bx.delete(") || l.contains("self.delete(")))
+                .filter(|l| !l.trim_start().starts_with("//") && (l.contains("bx.delete(") || l.contains("bx.delete_waiting_not_ready(") || l.contains("self.delete(")))
                 .collect();
             let allowed = if file == "sandbox.rs" { 2 } else { 0 };
             assert_eq!(calls.len(), allowed, "{file}: {calls:?}");

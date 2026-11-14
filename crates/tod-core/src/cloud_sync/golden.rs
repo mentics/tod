@@ -109,7 +109,9 @@ fn usable_golden(sandboxes: &Sandboxes, bx: &Blaxel, repo: &str) -> Result<Optio
         return Ok(None);
     }
     let name = sandboxes.resolve_golden(bx, repo)?;
-    let info = bx.get(&name)?;
+    // Not ready is not gone: waited out (bounded), and an error naming it after,
+    // so a start is refused only when no usable golden exists.
+    let info = bx.get_waiting_not_ready(&name, tod_sandbox::blaxel::NOT_READY_WAIT)?;
     let mine = my_stamp(&install_files(&sandboxes.root)?)?;
     Ok(usable_in(&name, info.as_ref(), &mine)?.then_some(name))
 }

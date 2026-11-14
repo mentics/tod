@@ -106,6 +106,67 @@ pub fn says_not_ready(text: &str) -> bool {
         .any(|marker| lower.contains(marker))
 }
 
+/// How long a lookup waits out Blaxel's not-ready 404 by default: it lasts up
+/// to ~30s after a wake, and longer in an outage; two minutes before it is an
+/// error naming the sandbox.
+pub const NOT_READY_WAIT: Duration = Duration::from_secs(120);
+
+/// Runs `look` until it stops failing with Blaxel's not-ready answer
+/// ([`error_is_not_ready`]), sleeping `poll` between tries, for at most
+/// `bound`. Any other error, and any success, is returned as it is. After the
+/// bound the error names the sandbox and says Blaxel kept answering not-ready
+/// (with the last answer, so [`error_is_not_ready`] still reads it): a
+/// not-ready sandbox is neither present nor gone, so this never returns `None`
+/// for it.
+pub fn wait_out_not_ready<T>(
+    name: &str,
+    bound: Duration,
+    poll: Duration,
+    mut look: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    let start = Instant::now();
+    loop {
+        match look() {
+            Err(err) if error_is_not_ready(&err) => {
+                if start.elapsed() + poll > bound {
+                    return Err(err.context(format!(
+                        "sandbox {name}: Blaxel kept answering that its workload is not ready for {}s, so whether it exists is unknown",
+                        start.elapsed().as_secs()
+                    )));
+                }
+                std::thread::sleep(poll);
+            }
+            other => return other,
+        }
+    }
+}
+
+/// Looks (with `look`) until `is_gone` says what it found is gone, for at most
+/// `bound`. `Ok(None)`: it is gone. `Ok(Some(why))`: the bound passed and it
+/// still exists, or Blaxel kept answering not-ready (a sandbox in the middle of
+/// its deletion often does; that is not "gone" and not an error until the
+/// bound). Any other error is returned at once.
+pub fn wait_until_gone_with(
+    bound: Duration,
+    poll: Duration,
+    mut look: impl FnMut() -> Result<Option<SandboxInfo>>,
+    is_gone: impl Fn(Option<&SandboxInfo>) -> bool,
+) -> Result<Option<String>> {
+    let start = Instant::now();
+    loop {
+        let why = match look() {
+            Ok(found) if is_gone(found.as_ref()) => return Ok(None),
+            Ok(found) => format!("it still exists ({})", found.map(|i| i.status).unwrap_or_default()),
+            Err(err) if error_is_not_ready(&err) => format!("Blaxel kept answering that its workload is not ready ({err:#})"),
+            Err(err) => return Err(err),
+        };
+        if start.elapsed() + poll > bound {
+            return Ok(Some(why));
+        }
+        std::thread::sleep(poll);
+    }
+}
+
 /// [`says_not_ready`] for an error that went through the API's error text
 /// (it keeps the code and message), or a wait that gave up on one.
 pub fn error_is_not_ready(err: &anyhow::Error) -> bool {
@@ -650,11 +711,12 @@ impl Blaxel {
         check(&mut resp, "create sandbox")
     }
 
-    /// `GET {API}{path}`, for calls this type has no method for; `None` on a 404.
+    /// `GET {API}{path}`, for calls this type has no method for; `None` on a true 404; the not-ready 404 is an error, as for [`Self::get`].
     pub fn get_path(&self, path: &str, what: &str) -> Result<Option<Value>> {
         let mut resp = self.cp(true, || self.auth(self.agent.get(&format!("{API}{path}"))).call()).context("Blaxel API")?;
         if resp.status().as_u16() == 404 {
-            return Ok(None);
+            let body = resp.body_mut().read_to_string().with_context(|| format!("read Blaxel's 404 for {path}"))?;
+            return not_found_means_gone(path, &body).map(|()| None);
         }
         check(&mut resp, what)?;
         Ok(Some(resp.body_mut().read_json()?))
@@ -788,7 +850,8 @@ impl Blaxel {
     pub fn get_volume(&self, name: &str) -> Result<Option<Value>> {
         let mut resp = self.cp(true, || self.auth(self.agent.get(&format!("{API}/volumes/{name}"))).call()).context("Blaxel API")?;
         if resp.status().as_u16() == 404 {
-            return Ok(None);
+            let body = resp.body_mut().read_to_string().with_context(|| format!("read Blaxel's 404 for volume {name}"))?;
+            return not_found_means_gone(name, &body).map(|()| None);
         }
         check(&mut resp, "get volume")?;
         Ok(Some(resp.body_mut().read_json()?))
@@ -866,6 +929,36 @@ impl Blaxel {
             return not_found_means_gone(name, &body);
         }
         check(&mut resp, "delete sandbox")
+    }
+
+    /// [`Self::get`], waiting out Blaxel's "workload is not ready" 404 (which
+    /// it gives for a while after a wake, a redeploy or a delete began) for up
+    /// to `bound`. The one wait every loop that used to see `None` for it
+    /// shares; see [`wait_out_not_ready`]. `None` is still only a true 404.
+    pub fn get_waiting_not_ready(&self, name: &str, bound: Duration) -> Result<Option<SandboxInfo>> {
+        wait_out_not_ready(name, bound, self.retry.poll, || self.get(name))
+    }
+
+    /// [`Self::delete`], waiting out the not-ready 404 for up to `bound`.
+    pub fn delete_waiting_not_ready(&self, name: &str, bound: Duration) -> Result<()> {
+        wait_out_not_ready(name, bound, self.retry.poll, || self.delete(name))
+    }
+
+    /// How often the loops that wait on Blaxel look again.
+    pub fn poll_interval(&self) -> Duration {
+        self.retry.poll
+    }
+
+    /// Waits up to `bound` for `name` to be gone ([`wait_until_gone_with`]):
+    /// `None` when it is, else why it still is. A not-ready answer during a
+    /// deletion counts as still there, never as gone.
+    pub fn wait_until_gone(
+        &self,
+        name: &str,
+        bound: Duration,
+        is_gone: impl Fn(Option<&SandboxInfo>) -> bool,
+    ) -> Result<Option<String>> {
+        wait_until_gone_with(bound, self.retry.poll, || self.get(name), is_gone)
     }
 
     pub fn wait_deployed(&self, name: &str, timeout: Duration) -> Result<SandboxInfo> {
@@ -1648,6 +1741,88 @@ mod http_tests {
         assert!(error_is_not_ready(&anyhow::anyhow!("set labels: 409\nResource 'sbx-x' is currently not available")));
         assert!(error_is_not_ready(&anyhow::anyhow!("run command: the sandbox was still not ready after 90s; last answer: 404 (WORKLOAD_UNAVAILABLE)")));
         assert!(!error_is_not_ready(&anyhow::anyhow!("making /opt/tod failed: no space left")));
+    }
+
+    #[test]
+    fn wait_out_not_ready_waits_then_returns_the_answer() {
+        let mut n = 0;
+        let got = wait_out_not_ready("sbx", Duration::from_secs(5), Duration::from_millis(1), || {
+            n += 1;
+            if n < 4 { Err(not_found_means_gone("sbx", NOT_READY).unwrap_err()) } else { Ok(None::<u8>) }
+        })
+        .unwrap();
+        assert_eq!((got, n), (None, 4));
+    }
+
+    #[test]
+    fn wait_out_not_ready_names_the_sandbox_after_the_bound() {
+        let err = wait_out_not_ready::<()>("sbx-x", Duration::from_millis(30), Duration::from_millis(5), || {
+            Err(not_found_means_gone("sbx-x", NOT_READY).unwrap_err())
+        })
+        .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("sbx-x") && text.contains("kept answering"), "{text}");
+        assert!(error_is_not_ready(&err));
+    }
+
+    #[test]
+    fn wait_out_not_ready_does_not_wait_for_other_errors() {
+        let mut n = 0;
+        let err = wait_out_not_ready::<()>("sbx", Duration::from_secs(5), Duration::from_millis(1), || {
+            n += 1;
+            Err(anyhow::anyhow!("401 unauthorized"))
+        })
+        .unwrap_err();
+        assert_eq!(n, 1);
+        assert!(format!("{err:#}").contains("401"));
+    }
+
+    #[test]
+    fn get_and_delete_waiting_not_ready_through_the_fake() {
+        let n = Arc::new(Mutex::new(0));
+        let bx = crate::fake::blaxel(move |_, _| {
+            let mut c = n.lock().unwrap();
+            *c += 1;
+            if *c < 3 { (404, NOT_READY.to_string()) } else { (404, r#"{"error":{"code":"NOT_FOUND"}}"#.to_string()) }
+        });
+        assert!(bx.get_waiting_not_ready("sbx", Duration::from_secs(5)).unwrap().is_none());
+        let bx = crate::fake::blaxel(|_, _| (404, NOT_READY.to_string()));
+        let err = bx.get_waiting_not_ready("sbx", Duration::from_millis(50)).unwrap_err();
+        assert!(format!("{err:#}").contains("kept answering"), "{err:#}");
+        assert!(bx.delete_waiting_not_ready("sbx", Duration::from_millis(50)).is_err());
+    }
+
+    #[test]
+    fn wait_until_gone_waits_out_not_ready_then_sees_gone() {
+        let mut n = 0;
+        let got = wait_until_gone_with(
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+            || {
+                n += 1;
+                match n {
+                    1 | 2 => Err(not_found_means_gone("sbx", NOT_READY).unwrap_err()),
+                    3 => Ok(Some(parse_info(&serde_json::json!({"metadata":{"name":"sbx"},"status":"DELETING"})))),
+                    _ => Ok(None),
+                }
+            },
+            |f| f.is_none(),
+        )
+        .unwrap();
+        assert_eq!((got, n), (None, 4));
+    }
+
+    #[test]
+    fn wait_until_gone_reports_not_ready_forever_as_not_gone() {
+        let why = wait_until_gone_with(
+            Duration::from_millis(30),
+            Duration::from_millis(5),
+            || Err(not_found_means_gone("sbx", NOT_READY).unwrap_err()),
+            |f| f.is_none(),
+        )
+        .unwrap()
+        .expect("not gone");
+        assert!(why.contains("not ready"), "{why}");
     }
 
     #[test]

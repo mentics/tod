@@ -273,15 +273,13 @@ fn remove(bx: &Blaxel, name: &str) -> Result<()> {
 }
 
 fn remove_within(bx: &Blaxel, name: &str, wait: Duration) -> Result<()> {
-    bx.delete(name)?;
-    let deadline = Instant::now() + wait;
-    while bx.get(name)?.is_some() {
-        if Instant::now() > deadline {
-            bail!("{name} is still being removed; try again in a few minutes");
-        }
-        std::thread::sleep(Duration::from_secs(3));
+    // Blaxel answers "workload is not ready" for a sandbox being deleted:
+    // waited out (for the same bound), never taken for gone.
+    bx.delete_waiting_not_ready(name, wait)?;
+    match bx.wait_until_gone(name, wait, |found| found.is_none())? {
+        None => Ok(()),
+        Some(why) => bail!("{name} is still being removed ({why}); try again in a few minutes"),
     }
-    Ok(())
 }
 
 /// Creates the volume if it is missing and waits until Blaxel has it ready.

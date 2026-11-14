@@ -17,6 +17,8 @@ pub mod blaxel;
 pub mod config;
 pub mod drive;
 pub mod edge;
+#[doc(hidden)]
+pub mod fake;
 pub mod golden;
 pub mod node;
 #[cfg(test)]

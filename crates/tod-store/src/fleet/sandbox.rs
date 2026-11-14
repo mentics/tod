@@ -123,7 +123,7 @@ impl Sandboxes {
     /// and the guard (which needs the relay the failure may be about) would
     /// only keep a useless sandbox. Never for a sandbox that existed before.
     pub(super) fn delete_just_made(&mut self, bx: &Blaxel, name: &str) -> Result<()> {
-        bx.delete(name)?;
+        bx.delete_waiting_not_ready(name, tod_sandbox::blaxel::NOT_READY_WAIT)?;
         self.forget(name)
     }
 
@@ -604,7 +604,7 @@ impl Cleared {
 
 /// Deletes the node sandbox the guard cleared, in Blaxel only.
 pub fn delete_cleared(bx: &Blaxel, cleared: &Cleared) -> Result<()> {
-    bx.delete(cleared.name())?;
+    bx.delete_waiting_not_ready(cleared.name(), tod_sandbox::blaxel::NOT_READY_WAIT)?;
     Ok(())
 }
 

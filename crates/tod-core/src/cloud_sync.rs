@@ -2184,11 +2184,12 @@ fn wake_node_requesting_inner(fleet: &FleetStore, root: &Path, node_id: &str, ki
     let bx = sandboxes.blaxel()?;
     // A sandbox that is gone (deleted or reclaimed since the last look) is
     // replaced the way the lost-sandbox check does, then woken.
-    let found = bx.get(&sandbox)?;
+    let found = bx.get_waiting_not_ready(&sandbox, tod_sandbox::blaxel::NOT_READY_WAIT)
+        .with_context(|| format!("wake {sandbox}"))?;
     // A sandbox in standby answers 502/503/504 and Blaxel's own 404 "workload
     // is not ready" for up to ~30s after waking, and WORKLOAD_UNAVAILABLE for
-    // longer in an outage. That is waited out below, bounded, and an error
-    // when it lasts: only Blaxel having no such sandbox, or reporting it
+    // longer in an outage. That is waited out above
+    // (`get_waiting_not_ready`, bounded), and an error when it lasts: only Blaxel having no such sandbox, or reporting it
     // terminal, replaces it (`wake_verdict`).
     let made_for = found.as_ref().and_then(|info| info.env("TOD_USER")).unwrap_or(&row.user);
     let verdict = wake_verdict(&sandbox, found.as_ref(), sandbox_user_reason(&sandbox, made_for, &user));
