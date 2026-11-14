@@ -2,6 +2,9 @@
 target/
 **/*.rs.bk
 *.pdb
+*.pyc
+
+__pycache__
 
 # Local reference material (not part of the repo)
 /refs/
