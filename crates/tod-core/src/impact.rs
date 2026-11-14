@@ -34,6 +34,7 @@ pub const IGNORED_TABLES: &[&str] = &[
     "decisions",
     "decision_answers",
     "conversations",
+    "conversation_openings",
     "conversation_turns",
     "conversation_actions",
     "conversation_flags",

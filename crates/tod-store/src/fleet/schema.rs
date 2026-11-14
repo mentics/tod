@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 96;
+pub const CURRENT_USER_VERSION: i32 = 97;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -641,6 +641,13 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         // What an agent said was new when it asked an answered question again.
         crate::decisions::add_new_evidence(conn)?;
         conn.pragma_update(None, "user_version", 96)?;
+    }
+    if version < 97 {
+        // The opening context moves to `conversation_openings`, written
+        // once, so an update to a conversation row no longer copies it into
+        // the sync log and feed.
+        migrate_v96_to_v97(conn)?;
+        conn.pragma_update(None, "user_version", 97)?;
     }
     // Other branches (the task panel) numbered their own steps 66–67 at the
     // same time as 66–70 above, so a store may be past a version without
@@ -1956,6 +1963,41 @@ fn migrate_v44_to_v45(conn: &Connection) -> Result<()> {
         .exists([])?;
     if !present {
         conn.execute_batch("ALTER TABLE conversations ADD COLUMN opening_context TEXT;")?;
+    }
+    Ok(())
+}
+
+/// The context a conversation's first turn sent, in a table of its own.
+///
+/// It was `conversations.opening_context` (v45), up to ~50 KB on a row that
+/// changes all the time: every later update copied it into the sync log
+/// (`old_row`) and sent it again in the feed. A row here is written once.
+pub const CONVERSATION_OPENINGS: &str = "
+    CREATE TABLE IF NOT EXISTS conversation_openings (
+        conversation_id BLOB PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+        context         TEXT NOT NULL
+    );";
+
+/// `conversations.opening_context` becomes `conversation_openings`. The copy
+/// is not logged (that table's sync triggers come later, from
+/// `crate::sync::install`): every store makes the same rows from its own
+/// conversations, and logging them would send each context once more.
+fn migrate_v96_to_v97(conn: &Connection) -> Result<()> {
+    conn.execute_batch(CONVERSATION_OPENINGS)?;
+    let present = conn
+        .prepare("SELECT 1 FROM pragma_table_info('conversations') WHERE name = 'opening_context'")?
+        .exists([])?;
+    if present {
+        // The sync triggers name every column, and `DROP COLUMN` refuses
+        // while any trigger does; `crate::sync::install` recreates them.
+        conn.execute_batch(
+            "INSERT OR IGNORE INTO conversation_openings (conversation_id, context)
+                 SELECT id, opening_context FROM conversations WHERE opening_context IS NOT NULL;
+             DROP TRIGGER IF EXISTS trg_sync_conversations_insert;
+             DROP TRIGGER IF EXISTS trg_sync_conversations_update;
+             DROP TRIGGER IF EXISTS trg_sync_conversations_delete;
+             ALTER TABLE conversations DROP COLUMN opening_context;",
+        )?;
     }
     Ok(())
 }
@@ -4995,6 +5037,69 @@ mod tests {
             .exists([])
             .unwrap();
         assert!(!table, "node_pr is dropped");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// The opening context moves to `conversation_openings` without being
+    /// logged, the column goes, and a later update of the conversation no
+    /// longer copies the context into the sync log.
+    #[test]
+    fn migrate_v96_to_v97_moves_the_opening_context_out_of_conversations() {
+        use crate::conversation::{ConversationRepo, Focus, ProtocolKind};
+        let (dir, conn) = temp_db();
+        apply_migrations(&conn).unwrap();
+        let node = insert_node(&conn, "talked");
+        let repo = ConversationRepo::new(&conn);
+        let opened = repo.create(Focus::Node(node), ProtocolKind::Outline, None, None, None).unwrap().id;
+        let unopened = repo.create(Focus::Node(node), ProtocolKind::Outline, None, None, None).unwrap().id;
+        let context = "the opening context ".repeat(500);
+        // A v96 store: the column, and no `conversation_openings` (nor its
+        // sync triggers).
+        conn.execute_batch(
+            "DROP TABLE conversation_openings;
+             ALTER TABLE conversations ADD COLUMN opening_context TEXT;",
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE conversations SET opening_context = ?1 WHERE id = ?2",
+            params![context, opened.as_bytes().as_slice()],
+        )
+        .unwrap();
+        conn.execute_batch("DELETE FROM sync_changes;").unwrap();
+        conn.pragma_update(None, "user_version", 96).unwrap();
+        apply_migrations(&conn).unwrap();
+
+        let repo = ConversationRepo::new(&conn);
+        assert_eq!(repo.opening_context(opened).unwrap().as_deref(), Some(context.as_str()));
+        assert!(repo.has_opening_context(opened).unwrap());
+        assert_eq!(repo.opening_context(unopened).unwrap(), None);
+        let column: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('conversations') WHERE name = 'opening_context'")
+            .unwrap()
+            .exists([])
+            .unwrap();
+        assert!(!column, "the column is dropped");
+        let logged: i64 = conn.query_row("SELECT COUNT(*) FROM sync_changes", [], |r| r.get(0)).unwrap();
+        assert_eq!(logged, 0, "the copy is not logged");
+
+        repo.set_agent_session(opened, Some("session"), None).unwrap();
+        let old_row: String = conn
+            .query_row(
+                "SELECT old_row FROM sync_changes WHERE tbl = 'conversations' AND op = 'update'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!old_row.contains("the opening context"), "{old_row}");
+        // Recording it again with the same text writes nothing.
+        repo.set_opening_context(opened, &context).unwrap();
+        let openings: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sync_changes WHERE tbl = 'conversation_openings'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(openings, 0);
+        repo.set_opening_context(unopened, "first").unwrap();
+        assert_eq!(repo.opening_context(unopened).unwrap().as_deref(), Some("first"));
+        assert!(repo.set_opening_context(uuid::Uuid::new_v4(), "nobody").is_err());
         let _ = fs::remove_dir_all(dir);
     }
 

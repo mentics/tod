@@ -461,10 +461,18 @@ impl<'a> ConversationRepo<'a> {
     /// Record the context the conversation's first turn sent.
     pub fn set_opening_context(&self, conversation_id: Uuid, context: &str) -> Result<()> {
         let n = self.conn.execute(
-            "UPDATE conversations SET opening_context = ?1 WHERE id = ?2",
+            // Written once; a first turn sent again (its start failed)
+            // replaces it, which is the only update this row gets.
+            "INSERT INTO conversation_openings (conversation_id, context)
+                 SELECT id, ?1 FROM conversations WHERE id = ?2
+             ON CONFLICT (conversation_id) DO UPDATE SET context = excluded.context
+                 WHERE context IS NOT excluded.context",
             params![context, uuid_to_blob(conversation_id)],
         )?;
-        anyhow::ensure!(n == 1, "conversation {conversation_id} not found");
+        anyhow::ensure!(
+            n == 1 || self.has_opening_context(conversation_id)?,
+            "conversation {conversation_id} not found"
+        );
         Ok(())
     }
 
@@ -474,20 +482,18 @@ impl<'a> ConversationRepo<'a> {
         Ok(self
             .conn
             .query_row(
-                "SELECT opening_context FROM conversations WHERE id = ?1",
+                "SELECT context FROM conversation_openings WHERE conversation_id = ?1",
                 params![uuid_to_blob(conversation_id)],
-                |row| row.get::<_, Option<String>>(0),
+                |row| row.get::<_, String>(0),
             )
-            .optional()?
-            .flatten())
+            .optional()?)
     }
 
     /// Whether the conversation's first turn recorded its context, without
     /// reading it.
     pub fn has_opening_context(&self, conversation_id: Uuid) -> Result<bool> {
         Ok(self.conn.query_row(
-            "SELECT EXISTS (SELECT 1 FROM conversations
-                            WHERE id = ?1 AND opening_context IS NOT NULL)",
+            "SELECT EXISTS (SELECT 1 FROM conversation_openings WHERE conversation_id = ?1)",
             params![uuid_to_blob(conversation_id)],
             |row| row.get(0),
         )?)

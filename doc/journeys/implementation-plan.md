@@ -47,7 +47,7 @@ which works on all three CI platforms; check that CI still passes after step 1.
 ## Step 0: Store the per-turn context sent to the agent
 
 The spec requires every prompt to be stored (§3.2). The opening context is
-(`conversations.opening_context`), but the per-turn delta is not.
+(`conversation_openings`), but the per-turn delta is not.
 
 - `crates/tod-core/src/conversation/driver.rs`, `ConversationDriver::send`
   (~L216–280): `changes` is computed with `protocol_delta` and sent as

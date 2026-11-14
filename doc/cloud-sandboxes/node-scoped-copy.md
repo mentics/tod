@@ -1,7 +1,7 @@
 # A node's copy holds only that node
 
-Status: implemented (`tod_store::sync::slice`); not yet deployed to the
-development orchestrator.
+Status: implemented (`tod_store::sync::slice`), deployed, and verified live
+(a node's copy is about 7 MB, against ~70 MB for the whole database).
 
 ## The problem
 

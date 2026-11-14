@@ -123,6 +123,7 @@ pub const SYNCED_TABLES: &[&str] = &[
     "learn_drafts",
     "learn_outputs",
     "conversations",
+    "conversation_openings",
     "conversation_turns",
     "conversation_actions",
     "conversation_flags",
@@ -348,7 +349,7 @@ pub(crate) fn owner_expr(table: &str, columns: &[String], prefix: &str, schema: 
             col("focus_id"),
             col("focus_node_id")
         ),
-        "conversation_turns" | "conversation_flags" | "conversation_reports" => conversation_owner(&col("conversation_id")),
+        "conversation_openings" | "conversation_turns" | "conversation_flags" | "conversation_reports" => conversation_owner(&col("conversation_id")),
         // An action outside any conversation (a direct edit, an undo) is the
         // touched node's.
         "conversation_actions" => format!(
@@ -502,6 +503,16 @@ fn node_from_value(v: Value) -> Option<Uuid> {
 /// Whether two versions of a row hold the same content. `updated_at` is left
 /// out: a write that only touched the row (a renumber, a save with no edit)
 /// is not an edit the other side could have lost.
+/// `row` without the columns this side's table does not have.
+fn only_columns(row: &Option<Row>, info: &TableInfo) -> Option<Row> {
+    row.as_ref().map(|row| {
+        row.iter()
+            .filter(|(c, _)| info.columns.contains(c))
+            .map(|(c, v)| (c.clone(), v.clone()))
+            .collect()
+    })
+}
+
 fn same_content(a: &Option<Row>, b: &Option<Row>) -> bool {
     match (a, b) {
         (Some(a), Some(b)) => {
@@ -717,7 +728,11 @@ fn apply_one(
         return Ok(());
     }
     let was_parked = parked.iter().any(|(t, k)| *t == change.table && *k == change.key);
-    if !was_parked && !same_content(&found, &change.before) && !same_content(&found, &change.after) {
+    // Compared on this side's columns: a change logged before a column was
+    // dropped here (`conversations.opening_context`, v97) still names it.
+    let before = only_columns(&change.before, info);
+    let after = only_columns(&change.after, info);
+    if !was_parked && !same_content(&found, &before) && !same_content(&found, &after) {
         report.conflicts.push(Conflict {
             node_id: change.node_id,
             table: change.table.clone(),
@@ -726,7 +741,7 @@ fn apply_one(
             found: found.clone(),
         });
     }
-    if found == change.after {
+    if found == after {
         return Ok(());
     }
     let (clause, key_values) = key_clause(&change.key)?;

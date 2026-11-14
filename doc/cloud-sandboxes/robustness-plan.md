@@ -151,16 +151,16 @@ exhaustively. Removes: the "not started" lie, the 150 s silence (the
 `starting` row arrives before seeding), false "working", and the need for
 Sync now / Check now to learn anything.
 
-### 3.2 Node-scoped replicas (provisioning 6, orchestrator 5, supervisor D5)
+### 3.2 Node-scoped replicas (provisioning 6, orchestrator 5, supervisor D5) — landed
 
-The uncommitted `sync/slice.rs` work (Oct 30) cuts a supervisor's copy to
-its node, its ancestors' inherited rows and the foreign-key closure, with
-`scope_node_id` on the feed and a confined push. With 2.2 the full copy is
-~70 MB; the slice would be a few MB, seedable in under a second, and an
-agent sandbox would hold only its own node's data. Resurrect it from
-worktree `tod-cli-vm-connection-ee97d5` against current `main`, deploy the
-orchestrator first. Also move `conversations.opening_context` into a
-write-once table so an update does not copy 50 KB into the log.
+Done: a supervisor's copy is its node, its ancestors' inherited rows and the
+foreign-key closure (`tod_store::sync::slice`, `?slice=1`), with
+`scope_node_id` on the feed and a confined push; verified live at 7 MB
+against ~70 MB for the whole database (`node-scoped-copy.md`). The opening
+context is in a write-once table, `conversation_openings` (schema v97), so an
+update to a conversation no longer copies up to 50 KB into the log and feed;
+a change logged before the column was dropped is compared on the receiver's
+columns.
 
 ### 3.3 Waits owned by lifecycle stays (autopilot D2) — landed
 

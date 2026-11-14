@@ -101,7 +101,7 @@ This keeps journey files small, and it means a bundle never needs the database
 itself: the exporter resolves the references a journey actually makes (§5.3).
 
 Full transcripts, including every prompt exactly as sent, must be stored in
-the database. Today the opening context is (`conversations.opening_context`)
+the database. Today the opening context is (`conversation_openings`)
 but the per-turn context (the delta of changes prepended to each user message)
 is computed at send time and not kept. That is a bug, and storing it is part
 of this work.
