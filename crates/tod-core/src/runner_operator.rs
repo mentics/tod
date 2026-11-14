@@ -248,6 +248,11 @@ pub struct Session {
 
 impl Session {
     pub fn open(root: &Path) -> Result<Self> {
+        // The app pins its data root at start. A verb that makes the node's
+        // files (`start` on a node with none yet) reads `TodPaths::discover()`,
+        // which fails with "data root is not configured" in `tod-cli` unless it
+        // is pinned here.
+        tod_store::paths::set_data_root(root.to_path_buf());
         let running = daemon_client::connect(&DaemonPaths::new(root)).is_some();
         let fleet = if running {
             tod_agentd_client::remote::open_store(root, None)

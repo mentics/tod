@@ -336,3 +336,15 @@ fn an_invalid_answer_is_an_error_and_noted_as_failed() {
     assert!(answer_actors(&fx, id).is_empty());
     assert!(notes(&fx).iter().any(|n| n.failed), "{:?}", notes(&fx));
 }
+
+#[test]
+fn opening_a_session_pins_the_data_root_for_verbs_that_discover_paths() {
+    // `start` on a node with no files yet calls `TodPaths::discover()`, which
+    // `tod-cli` never pinned: "data root is not configured".
+    let dir = tod_test_util::scratch_dir("operator-session-root");
+    tod_store::paths::clear_data_root_override();
+    let _session = Session::open(&dir).expect("open a session");
+    let paths = tod_store::TodPaths::discover().expect("the root is pinned by opening a session");
+    assert_eq!(paths.data_root(), dir.as_path());
+    tod_store::paths::clear_data_root_override();
+}
