@@ -69,7 +69,7 @@ impl GoldenStamp {
             self.install.chars().take(12).collect::<String>(),
             self.schema,
             self.wire,
-            built_text(self.built)
+            time_text(self.built)
         )
     }
 
@@ -131,7 +131,7 @@ pub fn info_repo(info: &SandboxInfo) -> Result<Option<String>> {
     info.label(LABEL_REPO).filter(|v| !v.is_empty()).map(repo_from_label).transpose()
 }
 
-fn built_text(secs: u64) -> String {
+pub fn time_text(secs: u64) -> String {
     use std::time::{Duration, UNIX_EPOCH};
     let t = UNIX_EPOCH + Duration::from_secs(secs);
     // No date library here: seconds since the epoch, civil from days.
@@ -314,6 +314,16 @@ pub fn cleanup_left_nothing(exists: bool, action: &HalfMade, deleted: bool) -> b
     !exists || (matches!(action, HalfMade::Delete) && deleted)
 }
 
+/// Whether a failed fork is made again, once, from the repository's current
+/// original: only when a look at Blaxel found the **source gone**
+/// (`source_exists == Some(false)`; a failed look is `None` and never retries),
+/// it has not been retried yet, and the cleanup after the failure found the
+/// target name not at Blaxel (`target_left_nothing`). Anything else keeps the
+/// "never make a second golden" rule.
+pub fn retry_from_new_source(source_exists: Option<bool>, already_retried: bool, target_left_nothing: bool) -> bool {
+    source_exists == Some(false) && !already_retried && target_left_nothing
+}
+
 /// Carried in the error chain (`err.downcast_ref::<LeftBehind>()`) of a failed
 /// golden step that left a half-made sandbox at Blaxel. Whoever would try the
 /// step again must not: another attempt makes another golden, with another
@@ -429,6 +439,19 @@ pub fn build_body(name: &str, image: &str, region: &str, memory_mb: u32, proxy: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Seen live: the workspace golden was replaced during the fork and the fork
+    /// timed out. Only a source verified gone, a target verified not there and
+    /// no earlier retry make tod fork again; everything else keeps "never make
+    /// a second golden".
+    #[test]
+    fn a_fork_is_made_again_only_from_a_gone_source_with_no_target_and_once() {
+        assert!(retry_from_new_source(Some(false), false, true));
+        assert!(!retry_from_new_source(Some(true), false, true), "the source is still there");
+        assert!(!retry_from_new_source(None, false, true), "the look at the source failed");
+        assert!(!retry_from_new_source(Some(false), false, false), "the target may exist");
+        assert!(!retry_from_new_source(Some(false), true, true), "only once");
+    }
 
     fn info_named(name: &str, labels: &[(&str, &str)]) -> SandboxInfo {
         SandboxInfo {
@@ -631,8 +654,8 @@ mod tests {
 
     #[test]
     fn built_is_shown_as_a_date() {
-        assert_eq!(built_text(0), "1970-01-01 00:00 UTC");
-        assert_eq!(built_text(1_762_000_000), "2025-11-01 12:26 UTC");
+        assert_eq!(time_text(0), "1970-01-01 00:00 UTC");
+        assert_eq!(time_text(1_762_000_000), "2025-11-01 12:26 UTC");
     }
 
     #[test]

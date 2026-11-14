@@ -127,6 +127,38 @@ every ten minutes in the background (`tod-agentd`'s golden check,
 refreshes each repository's golden after a deploy. A golden with no `tod-install` label (made by hand) counts as
 older than any build.
 
+**A refresh that failed (the left-behind record).** A fork or create is a POST
+Blaxel may finish after it failed, so a failed one is recorded durably
+(`<root>/golden-left-behind/<owner>__<name>.txt`: the target name, the time,
+the error) and nothing makes a second golden beside it. The rules, all decided
+in `ensure_golden_current` (every node start, the app, and the daemon's check)
+and `refresh_golden` (`golden refresh`, Settings):
+
+- **Nodes are never blocked while a golden can be forked.** With a record
+  standing, or when a refresh fails just now, a node start uses the
+  repository's existing golden if Blaxel has it and it is not newer than this
+  build (older and unstamped ones are usable); the failure is logged as an
+  error and said in the progress. Only a repository with **no** such golden is
+  refused, and the message says why.
+- **The record clears itself.** At least ten minutes after the failure
+  (`SELF_CLEAR_AFTER`), the next look (a node start or the daemon's tick)
+  asks Blaxel for the target; "not found" removes the record. A target that
+  exists, an unreadable look (said, record kept), or an older record whose
+  text names no `tod-golden-` sandbox keeps it for a person
+  (`tod-sandbox golden clear <owner/name>`).
+- **A stale source is not a left-behind target.** The source is resolved right
+  before the fork. If the fork fails and the source is gone (the workspace
+  golden was replaced meanwhile) and the cleanup finds the target name not at
+  Blaxel, the fork is made once more from the source the setting names now,
+  under a different name (`golden::retry_from_new_source`). Any other failure is
+  recorded as above.
+- **The hint matches.** A refusal says what happens ("What to do: nothing needs
+  trying again; tod checks again after ..., it clears itself once Blaxel shows
+  no sandbox named ...") rather than the panel's "try again in a minute".
+
+In the task panel a long stopped reason or failure is held to six lines under a
+"Show more" so the runner buttons stay in view.
+
 **Older build meets newer golden.** The install stamp is a hash, so the
 golden also carries an order: the sync contract (`schema`, then `wire`) and
 the build's commit time (`tod_sandbox::golden::plan`).

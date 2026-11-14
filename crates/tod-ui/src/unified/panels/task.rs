@@ -439,6 +439,17 @@ fn describe_check(found: &tod_core::lifecycle::CheckNow) -> (String, bool) {
     (text, failed)
 }
 
+/// A runner-line text longer than this many lines is held to it, under a
+/// "Show more" ([`TaskPanel::clamped_reason`]).
+const REASON_CLAMP_LINES: usize = 6;
+/// Characters per line the panel's width is assumed to hold, to count wrapping.
+const REASON_WRAP_COLUMNS: usize = 60;
+
+/// How many lines `text` takes, wrapping included, as far as is known without
+/// laying it out.
+fn reason_lines(text: &str) -> usize {
+    text.lines().map(|line| line.chars().count().div_ceil(REASON_WRAP_COLUMNS).max(1)).sum()
+}
 
 pub struct TaskPanel {
     node_id: Uuid,
@@ -468,6 +479,11 @@ pub struct TaskPanel {
     _requests_subs: Vec<Subscription>,
     /// T5: whether the Answered drawer is open; kept for the session only.
     pub(crate) answered_open: bool,
+    /// Long runner-line texts (a stopped reason, a failure's causes) opened in
+    /// full by their "Show more" (keyed by the text's element id); every other
+    /// one is held to [`REASON_CLAMP_LINES`] lines so the runner buttons stay
+    /// in view. Kept for the session only.
+    reason_in_full: std::collections::HashSet<SharedString>,
     /// Scroll state of the header (its runner line can carry a long error), of
     /// the requests, and of the Answered list; each shows a scrollbar only
     /// when its content overflows.
@@ -576,6 +592,7 @@ impl TaskPanel {
             pr_controls,
             _requests_subs,
             answered_open: false,
+            reason_in_full: std::collections::HashSet::new(),
             header_scroll: ScrollHandle::new(),
             requests_scroll: ScrollHandle::new(),
             answered_scroll: ScrollHandle::new(),
@@ -1593,6 +1610,37 @@ impl TaskPanel {
         Some(recorded(split, label).into_any_element())
     }
 
+    /// `body` (the rendering of `source`), held to [`REASON_CLAMP_LINES`] lines
+    /// when `source` is longer: its end fades under a "Show more" that opens it
+    /// in full, "Show less" puts it back (`styles.chunk-fade`). Seen live: a
+    /// Blaxel failure of dozens of lines pushed the runner buttons 3000px down.
+    fn clamped_reason(&self, key: SharedString, source: &str, body: AnyElement, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        use gpui_component::{h_flex, v_flex};
+        if reason_lines(source) <= REASON_CLAMP_LINES {
+            return body;
+        }
+        let toggle = |label: &'static str, key: SharedString| {
+            let id = SharedString::from(format!("unified-task-reason-toggle-{key}"));
+            Button::new(id).ghost().compact().label(label).on_click(cx.listener(move |this, _, _, cx| {
+                if !this.reason_in_full.remove(&key) {
+                    this.reason_in_full.insert(key.clone());
+                }
+                cx.notify();
+            }))
+        };
+        if self.reason_in_full.contains(&key) {
+            return v_flex().w_full().child(body).child(h_flex().child(toggle("Show less", key))).into_any_element();
+        }
+        div()
+            .relative()
+            .w_full()
+            .max_h(window.line_height() * REASON_CLAMP_LINES as f32)
+            .overflow_hidden()
+            .child(body)
+            .child(style::chunk_fade(div(), style::color::surface()).child(toggle("Show more", key)))
+            .into_any_element()
+    }
+
     /// The runner line's question and its buttons ([`Prompt`]).
     fn render_prompt(&self, prompt: &Prompt, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let buttons = prompt.buttons().into_iter().enumerate().map(|(ix, label)| {
@@ -1670,13 +1718,10 @@ impl TaskPanel {
                     PartTone::Muted => (style::text_muted(el), style::color::text_muted()),
                     PartTone::Error => (style::text_error(el), style::color::danger()),
                 };
-                line = line.child(sep()).child(el.child(selectable_text_colored(
-                    SharedString::from(format!("unified-task-runner-part-{ix}")),
-                    part.text,
-                    color,
-                    window,
-                    cx,
-                )));
+                let key = SharedString::from(format!("unified-task-runner-part-{ix}"));
+                let source = part.text.clone();
+                let text = selectable_text_colored(key.clone(), part.text, color, window, cx);
+                line = line.child(sep()).child(el.child(self.clamped_reason(key, &source, text.into_any_element(), window, cx)));
             }
         }
         // What a live turn is doing right now, beside "working".
@@ -1724,11 +1769,13 @@ impl TaskPanel {
                     };
                     block = block.child(row.child(selectable_text(id, text.to_string(), window, cx)));
                 }
-                extra_note = Some(block.into_any_element());
+                extra_note = Some(self.clamped_reason(SharedString::from("unified-task-runner-note-block"), &note, block.into_any_element(), window, cx));
             } else {
                 let el = div().flex_auto().min_w(gpui::px(160.));
                 let el = if failed { style::text_error(el) } else { style::text_muted(el) };
-                line = line.child(sep()).child(el.child(selectable_text("unified-task-runner-note", note, window, cx)));
+                let text = selectable_text("unified-task-runner-note", note.clone(), window, cx);
+                let text = self.clamped_reason(SharedString::from("unified-task-runner-note"), &note, text.into_any_element(), window, cx);
+                line = line.child(sep()).child(el.child(text));
             }
         }
         let problems = self.render_problems(window, cx);
@@ -1782,12 +1829,9 @@ impl TaskPanel {
             let status = problem_status(problem);
             let message = div().w_full();
             let message = if problem.transient { style::text_muted(message) } else { style::text_error(message) };
-            block = block.child(message.child(selectable_text(
-                SharedString::from(format!("unified-task-problem-{ix}")),
-                problem.message.clone(),
-                window,
-                cx,
-            )));
+            let key = SharedString::from(format!("unified-task-problem-{ix}"));
+            let text = selectable_text(key.clone(), problem.message.clone(), window, cx);
+            block = block.child(message.child(self.clamped_reason(key, &problem.message, text.into_any_element(), window, cx)));
             if let Some(status) = status {
                 block = block.child(style::text_muted(div().w_full().pl(gpui::px(12.))).child(selectable_text(
                     SharedString::from(format!("unified-task-problem-status-{ix}")),
@@ -2027,6 +2071,17 @@ mod face_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Seen live: a Blaxel failure stack in the stopped reason pushed the
+    /// runner buttons 3000px down. A long text is clamped; a short one is not.
+    #[test]
+    fn a_long_stopped_reason_is_clamped_and_a_short_one_is_not() {
+        assert!(reason_lines("an agent is stuck") <= REASON_CLAMP_LINES);
+        let stack = (0..40).map(|i| format!("cause {i}")).collect::<Vec<_>>().join("\n");
+        assert!(reason_lines(&stack) > REASON_CLAMP_LINES);
+        // One very long line wraps onto many.
+        assert!(reason_lines(&"x".repeat(REASON_WRAP_COLUMNS * 10)) > REASON_CLAMP_LINES);
+    }
 
     #[test]
     fn labels_show_failed_only_when_any() {
