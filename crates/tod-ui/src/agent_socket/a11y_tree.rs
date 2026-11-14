@@ -329,6 +329,51 @@ pub fn run_tree(window: &mut Window, cx: &mut App, query: &TreeQuery) -> Result<
     Ok(reply)
 }
 
+/// `coverage`: `ok <clickable> clickable <exposed> exposed <explicit> explicit
+/// <missing> missing`, then one line per clickable element with no node.
+/// Average milliseconds per forced full draw, `n` draws.
+fn time_draws(window: &mut Window, cx: &mut App, n: usize) -> f64 {
+    let start = std::time::Instant::now();
+    for _ in 0..n {
+        window.refresh();
+        let _ = window.draw(cx);
+    }
+    start.elapsed().as_secs_f64() * 1000.0 / n as f64
+}
+
+pub fn run_coverage(window: &mut Window, cx: &mut App, frames: usize) -> Result<String, String> {
+    let timing = if frames > 0 {
+        let was = release(window);
+        let off = time_draws(window, cx, frames);
+        window.set_a11y_forced_active(true);
+        FORCED.store(true, Ordering::Relaxed);
+        let on = time_draws(window, cx, frames);
+        if !was {
+            release(window);
+        }
+        Some(format!("frame-ms: tree off {off:.3}, tree on {on:.3} ({frames} draws each)"))
+    } else {
+        None
+    };
+    let _ = fresh(window, cx);
+    let c = window.a11y_coverage();
+    let mut reply = format!(
+        "ok {} clickable {} exposed {} explicit {} missing",
+        c.clickable,
+        c.exposed,
+        c.explicit,
+        c.missing.len()
+    );
+    if let Some(timing) = timing {
+        reply = reply.replacen("ok ", &format!("ok {timing}; "), 1);
+    }
+    for line in &c.missing {
+        reply.push('\n');
+        reply.push_str(line);
+    }
+    Ok(reply)
+}
+
 /// How many nodes the selector matches in a fresh frame (for `wait-for`).
 pub fn count(window: &mut Window, cx: &mut App, selector_text: &str) -> Result<usize, String> {
     let selector = Selector::parse(selector_text)?;

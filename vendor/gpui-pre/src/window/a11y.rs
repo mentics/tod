@@ -158,6 +158,8 @@ pub(crate) struct A11y {
     pub(crate) node_paths: FxHashMap<NodeId, String>,
     /// TOD PATCH: clickable elements seen this frame, and which of them have a node.
     pub(crate) coverage: A11yCoverage,
+    /// TOD PATCH: how many synthetic nodes each place has made this frame.
+    synth_counts: FxHashMap<String, u32>,
     pub(crate) action_listeners: FxHashMap<NodeId, Vec<(Action, A11yActionListener)>>,
     /// The window's title, used to label the root node so assistive
     /// technology can tell windows apart.
@@ -189,6 +191,7 @@ impl A11y {
             node_bounds: FxHashMap::default(),
             node_paths: FxHashMap::default(),
             coverage: A11yCoverage::default(),
+            synth_counts: FxHashMap::default(),
             action_listeners: FxHashMap::default(),
             window_title,
             last_focus_without_node: None,
@@ -229,6 +232,43 @@ impl A11y {
 
     pub(crate) fn set_forced_active(&mut self, forced: bool) {
         self.forced_active = forced;
+    }
+
+    /// TOD PATCH: a node id and path for a clickable element that has no
+    /// element id: its ancestors' ids, where it was built, and which of the
+    /// same place in the same parent it is this frame.
+    pub(crate) fn synthetic_node(
+        &mut self,
+        stack: &[crate::ElementId],
+        location: Option<&'static core::panic::Location<'static>>,
+    ) -> (NodeId, String) {
+        use std::fmt::Write as _;
+        let mut path = String::new();
+        for (i, id) in stack.iter().enumerate() {
+            if i > 0 {
+                path.push('/');
+            }
+            let _ = write!(path, "{id}");
+        }
+        if !path.is_empty() {
+            path.push('/');
+        }
+        match location {
+            Some(l) => {
+                let file = l.file().rsplit(['/', '\\']).next().unwrap_or("");
+                let _ = write!(path, "~{file}:{}", l.line());
+            }
+            None => path.push('~'),
+        }
+        let seen = self.synth_counts.entry(path.clone()).or_insert(0);
+        let n = *seen;
+        *seen += 1;
+        if n > 0 {
+            let _ = write!(path, "#{n}");
+        }
+        let mut hasher = std::hash::DefaultHasher::default();
+        ("tod-synthetic", &path).hash(&mut hasher);
+        (NodeId(hasher.finish()), path)
     }
 
     pub(crate) fn node_path(&self, id: NodeId) -> Option<&str> {
@@ -295,6 +335,7 @@ impl A11y {
         self.node_bounds.clear();
         self.node_paths.clear();
         self.coverage = A11yCoverage::default();
+        self.synth_counts.clear();
         self.action_listeners.clear();
         self.nodes.begin_frame(self.window_title.as_ref());
     }
@@ -332,6 +373,9 @@ pub struct A11yCoverage {
     pub clickable: usize,
     /// Of those, the ones with an accessibility node.
     pub exposed: usize,
+    /// Of those, the ones whose author gave them a role (what gpui exposed
+    /// before the default roles).
+    pub explicit: usize,
     /// Descriptions of the clickable elements without a node (capped at 200).
     pub missing: Vec<String>,
 }

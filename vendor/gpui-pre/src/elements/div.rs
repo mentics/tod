@@ -1911,6 +1911,14 @@ impl Element for Div {
         }
     }
 
+    fn a11y_click_info(&self) -> Option<bool> {
+        self.interactivity.a11y_clickable().then(|| {
+            self.interactivity
+                .override_role
+                .is_some_and(|r| r != accesskit::Role::GenericContainer)
+        })
+    }
+
     fn write_a11y_info(&self, node: &mut accesskit::Node) {
         self.interactivity.write_a11y_info(node);
     }
@@ -2567,33 +2575,6 @@ impl Interactivity {
                                         // Click action runs them directly.
                                         let mut a11y_click: Option<Vec<ClickListener>> = None;
                                         if crate::window::a11y::TOD_A11Y && window.a11y.is_active() {
-                                            let clickable = !self.click_listeners.is_empty()
-                                                || !self.aux_click_listeners.is_empty()
-                                                || !self.mouse_down_listeners.is_empty();
-                                            if clickable {
-                                                let exposed = global_id.is_some_and(|id| {
-                                                    window
-                                                        .a11y
-                                                        .nodes
-                                                        .has_node(id.accesskit_node_id())
-                                                });
-                                                window.a11y.coverage.clickable += 1;
-                                                if exposed {
-                                                    window.a11y.coverage.exposed += 1;
-                                                } else if window.a11y.coverage.missing.len() < 200 {
-                                                    let why = if global_id.is_none() {
-                                                        "no id"
-                                                    } else {
-                                                        "id but no role"
-                                                    };
-                                                    window.a11y.coverage.missing.push(format!(
-                                                        "{why} at {}",
-                                                        self.source_location()
-                                                            .map(|l| l.to_string())
-                                                            .unwrap_or_default()
-                                                    ));
-                                                }
-                                            }
                                             if !self.click_listeners.is_empty() {
                                                 a11y_click = Some(self.click_listeners.clone());
                                             }
@@ -3591,13 +3572,22 @@ impl Interactivity {
     pub(crate) fn default_a11y_role(&self) -> Option<accesskit::Role> {
         if !crate::window::a11y::TOD_A11Y {
             None
-        } else if !self.click_listeners.is_empty() {
+        } else if self.a11y_clickable() {
             Some(accesskit::Role::Button)
         } else if self.tracked_focus_handle.is_some() || self.focusable {
             Some(accesskit::Role::Group)
         } else {
             None
         }
+    }
+
+    /// TOD PATCH: a click handler, or a mouse-down handler on something that
+    /// shows a pointer cursor (a link built from `on_mouse_down`).
+    fn a11y_clickable(&self) -> bool {
+        !self.click_listeners.is_empty()
+            || !self.aux_click_listeners.is_empty()
+            || (!self.mouse_down_listeners.is_empty()
+                && self.base_style.mouse_cursor == Some(crate::CursorStyle::PointingHand))
     }
 
     pub(crate) fn write_a11y_info(&self, node: &mut accesskit::Node) {
@@ -3664,7 +3654,11 @@ impl Interactivity {
         if let Some(count) = self.aria.column_count {
             node.set_column_count(count);
         }
-        if !self.click_listeners.is_empty() {
+        if !self.click_listeners.is_empty()
+            || (crate::window::a11y::TOD_A11Y && self.a11y_clickable())
+        {
+            // TOD PATCH: a mouse-down handler is a click too (the tree's Click
+            // then falls back to a click at the node's centre).
             node.add_action(accesskit::Action::Click);
         }
         if self.tracked_focus_handle.is_some() || self.focusable {
@@ -4183,6 +4177,10 @@ where
 
     fn a11y_role(&self) -> Option<accesskit::Role> {
         self.element.a11y_role()
+    }
+
+    fn a11y_click_info(&self) -> Option<bool> {
+        self.element.a11y_click_info()
     }
 
     fn write_a11y_info(&self, node: &mut accesskit::Node) {

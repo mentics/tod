@@ -78,6 +78,10 @@ pub enum Command {
         selector: String,
         action: ActAction,
     },
+    /// How many clickable elements the current frame has and how many the tree
+    /// exposes; the ones it does not.
+    /// `coverage [frames N]`: clickable-versus-exposed counts; with `frames`, also times N draws with the tree off and on.
+    Coverage { frames: usize },
     /// Block until a selector matches (or, with `gone`, stops matching).
     WaitFor {
         selector: String,
@@ -267,6 +271,16 @@ pub fn parse_line(line: &str) -> Result<Command, String> {
                     "unknown agent-platform action `{other}` (expected get|cycle|set)"
                 )),
             }
+        }
+        "coverage" => {
+            let frames = match (parts.next(), parts.next(), parts.next()) {
+                (None, _, _) => 0,
+                (Some("frames"), Some(n), None) => n
+                    .parse::<usize>()
+                    .map_err(|_| format!("`{n}` is not a frame count"))?,
+                _ => return Err("usage: coverage [frames N]".into()),
+            };
+            Ok(Command::Coverage { frames })
         }
         "tree" => Ok(Command::Tree(a11y_tree::parse_tree(line["tree".len()..].trim())?)),
         "act" => {

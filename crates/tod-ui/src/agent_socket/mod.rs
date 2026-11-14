@@ -16,6 +16,18 @@
 //! - `agent-platform cycle` — cycle platform and reply with new value
 //! - `agent-platform set cursor|claude` — set platform and reply with new value
 //!
+//! - `tree [--role R] [--label S] [--within SEL] [--json]` — the UI by identity
+//!   (selector, role, label, value, bounds, actions); see `a11y_tree` and `selector`
+//! - `act <selector> [click|focus|set-value <text>|scroll-into-view]` — act on one
+//!   element through the accessibility action path (synthetic click if it has none)
+//! - `wait-for <selector> [--gone] [--timeout-ms N]` — poll until it matches
+//! - `coverage [frames N]` — clickable versus exposed elements, optional frame timing
+//!
+//! `tree`/`act`/`wait-for`/`coverage` read GPUI's AccessKit tree, which the vendored
+//! `gpui-pre` (`vendor/README.md`, feature `tod-a11y`, on with `agent-socket`) lets us
+//! switch on in-process. The first such command forces it on; `watch_a11y_idle` turns
+//! it off after 30 s without one, so an idle socket adds no per-frame work.
+//!
 //! Keys use GPUI `dispatch_keystroke` (same path as typed input). Clicks use
 //! `SendMessage` to this process's HWND — synchronous, no focus steal, no sleep.
 //! The UI drain loop wakes on each command (no polling).
@@ -74,6 +86,7 @@ enum UiRequest {
     Transcripts(TranscriptsCommand),
     AgentPlatform(AgentPlatformSocketCommand),
     A11yTree(a11y_tree::TreeQuery),
+    A11yCoverage { frames: usize },
     A11yAct {
         selector: String,
         action: a11y_tree::ActAction,
@@ -203,6 +216,7 @@ fn handle_client(
             Ok(Command::AgentPlatform(action)) => {
                 dispatch_ui(&tx, UiRequest::AgentPlatform(action))
             }
+            Ok(Command::Coverage { frames }) => dispatch_ui(&tx, UiRequest::A11yCoverage { frames }),
             Ok(Command::Tree(query)) => dispatch_ui(&tx, UiRequest::A11yTree(query)),
             Ok(Command::Act { selector, action }) => {
                 dispatch_ui(&tx, UiRequest::A11yAct { selector, action })
@@ -389,6 +403,13 @@ fn handle_ui_request(
         UiRequest::A11yTree(query) => {
             let reply = window
                 .update(cx, |_root, window, cx| a11y_tree::run_tree(window, cx, &query))
+                .map_err(|e| format!("window update failed: {e}"))?;
+            watch_a11y_idle(cx, window);
+            reply
+        }
+        UiRequest::A11yCoverage { frames } => {
+            let reply = window
+                .update(cx, |_root, window, cx| a11y_tree::run_coverage(window, cx, frames))
                 .map_err(|e| format!("window update failed: {e}"))?;
             watch_a11y_idle(cx, window);
             reply

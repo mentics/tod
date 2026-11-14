@@ -113,6 +113,13 @@ pub trait Element: 'static + IntoElement {
         None
     }
 
+    /// TOD PATCH: `Some` when the user can click this element (a click handler,
+    /// or a mouse-down handler under a pointer cursor); the value says whether
+    /// its author named a role for it. Counted by `Window::a11y_coverage`.
+    fn a11y_click_info(&self) -> Option<bool> {
+        None
+    }
+
     /// Write accessibility properties to the given node.
     /// Called only when `a11y_role()` returns `Some`.
     ///
@@ -364,23 +371,22 @@ impl<E: Element> Drawable<E> {
                 let bounds = window.layout_bounds(layout_id);
                 let mut pushed_a11y_node = false;
                 if window.a11y.is_active() {
-                    if let Some(global_id) = global_id.as_ref() {
-                        if let Some(role) = self.element.a11y_role() {
-                            let node_id = global_id.accesskit_node_id();
-                            let mut node = accesskit::Node::new(role);
-                            let scale = window.scale_factor();
-                            node.set_bounds(accesskit::Rect {
-                                x0: (bounds.origin.x.0 * scale) as f64,
-                                y0: (bounds.origin.y.0 * scale) as f64,
-                                x1: ((bounds.origin.x.0 + bounds.size.width.0) * scale) as f64,
-                                y1: ((bounds.origin.y.0 + bounds.size.height.0) * scale) as f64,
-                            });
-                            self.element.write_a11y_info(&mut node);
-                            window.a11y.node_bounds.insert(node_id, bounds);
-                            pushed_a11y_node = window.a11y.nodes.push(node_id, node);
-                            if pushed_a11y_node && crate::window::a11y::TOD_A11Y {
-                                // TOD PATCH: the path, for selectors.
-                                let mut path = String::new();
+                    // TOD PATCH: count what the user can click, and give a
+                    // clickable element with no id a node of its own (named
+                    // by where it was built and what it sits in).
+                    let click_info = if crate::window::a11y::TOD_A11Y {
+                        self.element.a11y_click_info()
+                    } else {
+                        None
+                    };
+                    if click_info.is_some() {
+                        window.a11y.coverage.clickable += 1;
+                    }
+                    let role = self.element.a11y_role();
+                    let target: Option<(accesskit::NodeId, String)> = match (global_id.as_ref(), role) {
+                        (Some(global_id), Some(_)) => {
+                            let mut path = String::new();
+                            if crate::window::a11y::TOD_A11Y {
                                 for (i, id) in global_id.0.iter().enumerate() {
                                     if i > 0 {
                                         path.push('/');
@@ -388,26 +394,78 @@ impl<E: Element> Drawable<E> {
                                     use std::fmt::Write as _;
                                     let _ = write!(path, "{id}");
                                 }
-                                window.a11y.node_paths.insert(node_id, path);
                             }
-                            #[cfg(debug_assertions)]
-                            if pushed_a11y_node {
-                                let view = window
-                                    .a11y
-                                    .view_type_names
-                                    .get(&window.current_view())
-                                    .copied();
-                                let source_location = self.element.source_location();
-                                window.a11y.nodes.record_node_info(
-                                    node_id,
-                                    crate::window::a11y::debug::NodeDebugInfo {
-                                        synthetic: false,
-                                        view,
-                                        element_id: global_id.0.last().map(|id| format!("{id:?}")),
-                                        source_location,
-                                    },
-                                );
+                            Some((global_id.accesskit_node_id(), path))
+                        }
+                        (None, Some(_)) if crate::window::a11y::TOD_A11Y && click_info.is_some() => {
+                            let location = self.element.source_location();
+                            Some(window.a11y.synthetic_node(&window.element_id_stack, location))
+                        }
+                        _ => None,
+                    };
+                    if let (Some((node_id, path)), Some(role)) = (target, role) {
+                        // TOD PATCH: report only the part a scroll container or
+                        // clip leaves visible, so a click at its centre lands.
+                        let bounds = if crate::window::a11y::TOD_A11Y {
+                            let visible = bounds.intersect(&window.content_mask().bounds);
+                            if visible.is_empty() { bounds } else { visible }
+                        } else {
+                            bounds
+                        };
+                        let mut node = accesskit::Node::new(role);
+                        let scale = window.scale_factor();
+                        node.set_bounds(accesskit::Rect {
+                            x0: (bounds.origin.x.0 * scale) as f64,
+                            y0: (bounds.origin.y.0 * scale) as f64,
+                            x1: ((bounds.origin.x.0 + bounds.size.width.0) * scale) as f64,
+                            y1: ((bounds.origin.y.0 + bounds.size.height.0) * scale) as f64,
+                        });
+                        self.element.write_a11y_info(&mut node);
+                        window.a11y.node_bounds.insert(node_id, bounds);
+                        pushed_a11y_node = window.a11y.nodes.push(node_id, node);
+                        if pushed_a11y_node && crate::window::a11y::TOD_A11Y {
+                            window.a11y.node_paths.insert(node_id, path);
+                        }
+                        #[cfg(debug_assertions)]
+                        if pushed_a11y_node {
+                            let view = window
+                                .a11y
+                                .view_type_names
+                                .get(&window.current_view())
+                                .copied();
+                            let source_location = self.element.source_location();
+                            window.a11y.nodes.record_node_info(
+                                node_id,
+                                crate::window::a11y::debug::NodeDebugInfo {
+                                    synthetic: false,
+                                    view,
+                                    element_id: global_id
+                                        .as_ref()
+                                        .and_then(|g| g.0.last().map(|id| format!("{id:?}"))),
+                                    source_location,
+                                },
+                            );
+                        }
+                    }
+                    if let Some(explicit) = click_info {
+                        if pushed_a11y_node {
+                            window.a11y.coverage.exposed += 1;
+                            if explicit {
+                                window.a11y.coverage.explicit += 1;
                             }
+                        } else if window.a11y.coverage.missing.len() < 200 {
+                            let why = if global_id.is_none() {
+                                "no id"
+                            } else {
+                                "id but no role"
+                            };
+                            window.a11y.coverage.missing.push(format!(
+                                "{why} at {}",
+                                self.element
+                                    .source_location()
+                                    .map(|l| l.to_string())
+                                    .unwrap_or_default()
+                            ));
                         }
                     }
                 }
