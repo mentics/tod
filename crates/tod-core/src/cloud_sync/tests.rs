@@ -2,6 +2,29 @@ use super::*;
 use std::net::TcpListener;
 use tod_store::outline::OutlineMutation;
 
+/// Each path that readies a node's sandbox trusts the proxy CA (the install
+/// does it inside `install` / `install_into_fork`). These paths reach the
+/// network, so this pins the wiring in their source: ensure_supervisor (before
+/// its Current / Install / BrokenNew split, which Start, reinstall and Reset
+/// environment all take), the fork-with-files path of `make_sandbox`, and adoption.
+#[test]
+fn every_path_that_readies_a_node_sandbox_trusts_the_proxy_ca() {
+    let ensure = include_str!("../cloud_sync.rs");
+    let trust = ensure.find("node::trust_proxy_ca(&bx").expect("ensure_supervisor trusts the CA");
+    let split = ensure.find("match supervisor_state(made_now").unwrap();
+    assert!(trust < split, "trust must come before the Current/Install split");
+    let provision = include_str!("../../../tod-store/src/fleet/provision.rs");
+    let fork = provision.find("} else if golden_has_tod_files {").unwrap();
+    let relay = fork + provision[fork..].find("node::start_relay").unwrap();
+    assert!(provision[fork..relay].contains("node::trust_proxy_ca"), "the golden-has-files fork path trusts the CA");
+    assert!(include_str!("adopt.rs").contains("node::trust_proxy_ca"), "adoption trusts the CA");
+    let node = include_str!("../../../tod-sandbox/src/node.rs");
+    for f in ["pub fn install(", "pub fn install_into_fork("] {
+        let at = node.find(f).unwrap();
+        assert!(node[at..at + 600].contains("trust_proxy_ca"), "{f} trusts the CA");
+    }
+}
+
 #[test]
 fn user_names_are_what_the_orchestrator_accepts() {
     assert_eq!(user_name("Joel Shellman").as_deref(), Some("joel-shellman"));

@@ -3,8 +3,10 @@
 # that use the system trust store and ignore SSL_CERT_FILE (apt's gnutls, pip,
 # Java, git built with gnutls) verify the certificates the proxy presents.
 #
-# Does nothing when no proxy is configured (HTTPS_PROXY / https_proxy unset).
-# With a proxy set, a missing CA file or a failed install is an error.
+# Keyed on the CA file, not the environment: a sandbox that has the proxy CA
+# gets it trusted whether or not the proxy variables are visible to this
+# process. With neither the file nor a proxy there is nothing to do; a proxy
+# set with no CA file, or a failed install, is an error.
 # Idempotent. Run as root, on every install and every fork (a fork's proxy
 # update replaces the files).
 #
@@ -12,17 +14,16 @@
 # TOD_CA_SKIP_UPDATE=1 skips running the distribution's update command.
 set -eu
 
-proxy="${HTTPS_PROXY:-${https_proxy:-}}"
-if [ -z "$proxy" ]; then
-    echo "trust-proxy-ca: no HTTPS proxy configured; nothing to do"
-    exit 0
-fi
-
 root="${TOD_CA_ROOT:-}"
 ca="$root/etc/ssl/certs/proxy/proxy-ca.pem"
+proxy="${HTTPS_PROXY:-${https_proxy:-}}"
 if [ ! -s "$ca" ]; then
-    echo "trust-proxy-ca: HTTPS_PROXY is set ($proxy) but the proxy CA $ca is missing or empty" >&2
-    exit 1
+    if [ -n "$proxy" ]; then
+        echo "trust-proxy-ca: HTTPS_PROXY is set ($proxy) but the proxy CA $ca is missing or empty" >&2
+        exit 1
+    fi
+    echo "trust-proxy-ca: no proxy CA at $ca and no HTTPS proxy configured; nothing to do"
+    exit 0
 fi
 
 have() { command -v "$1" >/dev/null 2>&1; }

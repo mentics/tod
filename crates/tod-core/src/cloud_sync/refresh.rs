@@ -62,6 +62,11 @@ pub fn install_of(relay: &[u8], supervisor: Option<&[u8]>, tod_cli: Option<&[u8]
     let shim = tod_store::fleet::cli_relay::HTTP_SHIM_SCRIPT.as_bytes();
     part("shim", shim);
     parts.insert("shim".to_string(), hex(Sha256::digest(shim)));
+    // The script that trusts the sandbox proxy's CA runs on every install and
+    // readying: a changed script is a changed install, so existing sandboxes get it.
+    let trust = tod_sandbox::node::TRUST_PROXY_CA_SCRIPT.as_bytes();
+    part("trust-ca", trust);
+    parts.insert("trust-ca".to_string(), hex(Sha256::digest(trust)));
     if let Some(bytes) = supervisor {
         part("supervisor", bytes);
         parts.insert("supervisor".to_string(), hex(Sha256::digest(bytes)));
@@ -350,6 +355,21 @@ mod tests {
 
     fn bundles(media: &str) -> Vec<(String, Vec<u8>)> {
         vec![("process/a".into(), b"p".to_vec()), ("media/b".into(), media.as_bytes().to_vec())]
+    }
+
+    #[test]
+    fn the_install_stamp_covers_the_proxy_ca_script() {
+        let i = install_of(b"relay", None, None, &[]);
+        assert_eq!(i.parts.get("trust-ca"), Some(&hex(Sha256::digest(tod_sandbox::node::TRUST_PROXY_CA_SCRIPT.as_bytes()))));
+        // The stamp hashes the script too: the same inputs without that part differ.
+        let mut h = Sha256::new();
+        for (name, bytes) in [("relay", &b"relay"[..]), ("shim", tod_store::fleet::cli_relay::HTTP_SHIM_SCRIPT.as_bytes())] {
+            h.update((name.len() as u64).to_le_bytes());
+            h.update(name.as_bytes());
+            h.update((bytes.len() as u64).to_le_bytes());
+            h.update(bytes);
+        }
+        assert_ne!(i.stamp, hex(h.finalize()));
     }
 
     #[test]

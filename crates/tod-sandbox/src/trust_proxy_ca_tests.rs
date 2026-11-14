@@ -34,6 +34,15 @@ fn no_proxy_is_a_no_op() {
 }
 
 #[test]
+fn a_sandbox_with_the_ca_file_but_no_proxy_variables_still_trusts_it() {
+    let t = tempfile::tempdir().unwrap();
+    with_ca(t.path());
+    let o = run(t.path(), None);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(t.path().join("fs/etc/profile.d/tod-ca.sh").exists());
+}
+
+#[test]
 fn a_proxy_without_its_ca_is_an_explicit_error() {
     let t = tempfile::tempdir().unwrap();
     let o = run(t.path(), Some("http://localhost:49152"));

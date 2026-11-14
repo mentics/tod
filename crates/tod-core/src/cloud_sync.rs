@@ -1638,6 +1638,9 @@ pub fn ensure_supervisor(
     let url = info.url.clone().ok_or_else(|| anyhow!("sandbox {name} has no URL"))?;
     progress(&format!("waking {name}…"));
     bx.wait_reachable(&url, tod_sandbox::blaxel::WAKE_CEILING).with_context(|| format!("wake {name}"))?;
+    // Every readying, the Current case included (Start, reinstall, Reset
+    // environment): the system trust store holds the proxy's CA. Idempotent.
+    node::trust_proxy_ca(&bx, &url, progress).with_context(|| format!("{name}: system-wide trust of the proxy CA"))?;
 
     let files = refresh::install_files(root)?;
     let current = files.install();

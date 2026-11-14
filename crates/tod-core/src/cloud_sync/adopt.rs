@@ -256,6 +256,8 @@ impl Backend for Live {
         if !tod_sandbox::provision::is_node_manifest(&manifest) {
             bail!("{} reports manifest {manifest:?}, which is not a node sandbox's", info.name);
         }
+        tod_sandbox::node::trust_proxy_ca(&self.bx, &url, &mut |_| {})
+            .with_context(|| format!("sandbox {} was not adopted: trusting the proxy CA failed", info.name))?;
         // Commands reach a sandbox through its entry in sandboxes.toml.
         self.sandboxes.config.upsert(tod_sandbox::config::Sandbox {
             name: info.name.clone(),

@@ -669,7 +669,7 @@ pub const TRUST_PROXY_CA_SCRIPT: &str = include_str!("../../../assets/sandbox/tr
 /// `SSL_CERT_FILE`). Runs on every install and every fork, since a fork's proxy
 /// update replaces the files. A no-op without a proxy; with one, a missing CA
 /// or a failed install is the error.
-fn trust_proxy_ca(bx: &Blaxel, url: &str, progress: &mut dyn FnMut(&str)) -> Result<()> {
+pub fn trust_proxy_ca(bx: &Blaxel, url: &str, progress: &mut dyn FnMut(&str)) -> Result<()> {
     progress("trusting the sandbox proxy's CA system-wide…");
     let res = bx.run(url, &format!("sh -c {} 2>&1", shell_quote(TRUST_PROXY_CA_SCRIPT)), 120)?;
     if res.exit_code != 0 {

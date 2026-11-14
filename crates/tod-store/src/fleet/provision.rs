@@ -1183,6 +1183,7 @@ fn make_sandbox_once(
             // redeploys the fork from its image on that update and drops them,
             // the relay does not report it and the files are put in below,
             // with the user told.
+            node::trust_proxy_ca(&bx, &url, progress)?;
             node::start_relay(&bx, &url, &supervisor_env)?;
         } else {
             progress("installing tod's files…");
