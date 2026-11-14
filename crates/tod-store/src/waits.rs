@@ -532,6 +532,7 @@ pub fn spec_states(spec: &str) -> Option<&'static [&'static str]> {
     } else if spec.ends_with(":merged") {
         Some(&["approved"])
     } else if spec.contains(":bot-review:")
+        || spec.ends_with(":bot-review")
         || spec.ends_with(":review")
         || spec.contains(":review:")
         || spec.ends_with(":checks")
@@ -795,6 +796,19 @@ mod tests {
     }
 
     #[test]
+    fn leaving_pr_review_cancels_a_parked_bot_review_wait() {
+        let r = real();
+        let node = node_in(&r, "pr_review");
+        WaitRepo::new(&r.conn).create(node, &NewWait::event("github:pr:1:bot-review", 5)).unwrap();
+        NodeRepo::new(&r.conn).set_lifecycle(node, "pr_draft").unwrap();
+        assert!(pending(&r, node).is_empty(), "the lifecycle move ends every event wait of the state it leaves");
+        let node = node_in(&r, "pr_review");
+        WaitRepo::new(&r.conn).create(node, &NewWait::event("github:pr:2:bot-review", 5)).unwrap();
+        NodeRepo::new(&r.conn).set_lifecycle(node, "approved").unwrap();
+        assert!(pending(&r, node).is_empty());
+    }
+
+    #[test]
     fn moving_back_cancels_too() {
         let r = real();
         let node = node_in(&r, "pr_review");
@@ -821,6 +835,9 @@ mod tests {
         ev(review, "github:pr:4:ready_for_review");
         ev(review, "github:pr:4:review:alice");
         ev(review, "github:pr:4:bot-review:greptile");
+        ev(review, "github:pr:4:bot-review");
+        ev(approved, "github:pr:5:bot-review");
+        ev(done, "github:pr:1:bot-review");
         ev(approved, "github:pr:5:merged");
         ev(approved, "github:pr:5:review");
         ev(merged, "github:release:published");
@@ -837,9 +854,11 @@ mod tests {
             ended,
             [
                 "custom:thing",
+                "github:pr:1:bot-review",
                 "github:pr:1:review",
                 "github:pr:2:checks",
                 "github:pr:4:ready_for_review",
+                "github:pr:5:bot-review",
                 "github:pr:5:review",
                 "github:pr:6:merged",
                 "github:pr:7:review",
@@ -849,7 +868,7 @@ mod tests {
         assert!(swept.iter().find(|s| s.node_id == lost).unwrap().reason.contains("lost"));
         assert!(swept.iter().find(|s| s.spec.ends_with("5:review")).unwrap().reason.contains("approved"));
         assert_eq!(pending(&r, draft), ["github:pr:3:ready_for_review"]);
-        assert_eq!(pending(&r, review).len(), 2);
+        assert_eq!(pending(&r, review).len(), 3, "review, the named bot's review and the bare bot-review wait stay");
         assert_eq!(pending(&r, merged), ["github:release:published"]);
         assert_eq!(pending(&r, planning), ["slack:message"], "an unknown family is left alone");
     }
