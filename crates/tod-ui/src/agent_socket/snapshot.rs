@@ -16,7 +16,7 @@
 
 use std::collections::BTreeSet;
 
-use gpui::{AnyWindowHandle, App, WeakEntity, Window, px, size};
+use gpui::{AnyWindowHandle, App, WeakEntity, Window};
 use gpui_component::WindowExt;
 use gpui_component::input::AnyInputState;
 use uuid::Uuid;
@@ -136,6 +136,29 @@ pub struct ViewSnapshot {
     pub fingerprint: Fingerprint,
 }
 
+impl ViewSnapshot {
+    /// The content size this view had.
+    pub fn size(&self) -> (f32, f32) {
+        self.size
+    }
+
+    /// One line saying what the view holds (the `test-user peek` seam).
+    pub fn summary(&self) -> String {
+        format!(
+            "size={}x{} view={:?} draft={:?}",
+            self.size.0.round(),
+            self.size.1.round(),
+            self.shell.unified,
+            self.input.as_ref().map(|i| i.text.to_string()),
+        )
+    }
+
+    pub fn with_size(mut self, size: (f32, f32)) -> Self {
+        self.size = size;
+        self
+    }
+}
+
 /// The two parties' snapshots. `agent` is `Err` when taking it failed, which
 /// is then reported as a conflict instead of being dropped.
 #[derive(Default)]
@@ -197,7 +220,8 @@ pub fn fingerprint_now(
         .map_err(|err| format!("the shell is gone: {err}"))
 }
 
-/// Put the window back as `snapshot` says. `with_input` is false when the
+/// Put the window's view back as `snapshot` says (not its size: the driver
+/// sets that, marking the resize as the app's own, see `ViewSnapshot::size`). `with_input` is false when the
 /// text field it was editing must stay blurred (the user takes over).
 pub fn restore(
     shell: &WeakEntity<Shell>,
@@ -206,11 +230,6 @@ pub fn restore(
     window: &mut Window,
     cx: &mut App,
 ) -> Result<(), String> {
-    let (w, h) = snapshot.size;
-    let now = window.viewport_size();
-    if (f32::from(now.width) - w).abs() >= 1.0 || (f32::from(now.height) - h).abs() >= 1.0 {
-        window.resize(size(px(w), px(h)));
-    }
     shell
         .update(cx, |shell, cx| shell.shepherd_restore(&snapshot.shell, window, cx))
         .map_err(|err| format!("the shell is gone: {err}"))?;

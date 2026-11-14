@@ -202,7 +202,8 @@ If the chosen port is already in use, startup fails immediately with a bind erro
 | `sync` | Wait one UI frame |
 | `mode` | Reply `ok driven`, `ok user` or `ok idle`: who has the app (see below). Runs at once in any mode |
 | `size` | Reply `ok W H`: the window's content size in logical pixels. Runs at once in any mode |
-| `resize W H` | Set the window's content size. It is part of the agent's saved view (see below) |
+| `resize W H` | Set the window's content size. While driven the app owns that size (see below) |
+| `test-user move X Y \| click X Y \| key K \| resize W H \| leave \| blur \| focus \| peek` | **Test-only seam, not for agents.** Plays an event of the *user's* through the same path real input takes (no synthetic guard; `resize` is not marked as the app's own), so the mode machine sees the user. It is not agent input: it never waits and does not keep the agent "driving". Needs no OS permission and never moves the real cursor. `move` needs two moves 2px or more apart to count (the first only anchors the pointer). `blur`/`focus` call what the window-activation observer calls (the observer itself cannot be triggered from here). `peek` replies the mode, window size, view state and the text of the focused input, whoever has the app. |
 | `close` | Ask the window to close as the user would: the close guard runs (replies `ok blocked` while its toast is up). `click` also works on macOS. |
 | `quit` | Close every window, so the app quits as if the user closed it |
 | `shot <path>` | PNG screenshot of the window (Windows and macOS; on macOS the app reads its own window back from the window server, so no Screen Recording permission, and it works while the window is covered or unfocused) |
@@ -244,6 +245,16 @@ its pending request ids, and each open panel still applying) it runs and replies
 pr_draft→approved` (what changed) without running. After 60 s it replies `err
 user-mode` and the agent resends. `shot`/`shot2` in user mode reply `err
 user-mode: …` since the screen shows the user's view.
+
+**Window size.** While driven the app owns the content size: what the agent's
+`resize` set, or what the last restore put back. A size change the app did not
+make (the user dragging an edge, a tiling tool, a display change) is user
+activity like a key: the mode goes to `user`, the user's size is theirs while
+they have the app, and when driven mode resumes the agent's size is put back
+before any waiting command runs. Before every input command the app also checks
+the window is at its size and puts it back if not. If the screen is too small
+for the size (an OS clamp), the command still runs and its reply carries ` # note:
+window is WxH, the size WxH did not fit` on the first line.
 
 See `.local/agent/ui-smoke/BATCH.md` for the full smoke workflow.
 

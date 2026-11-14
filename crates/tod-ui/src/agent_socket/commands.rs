@@ -91,12 +91,68 @@ pub enum Command {
     /// exposes; the ones it does not.
     /// `coverage [frames N]`: clickable-versus-exposed counts; with `frames`, also times N draws with the tree off and on.
     Coverage { frames: usize },
+    /// Dev-only test seam: play an event of the *user* (see `TestUser`).
+    TestUser(TestUser),
     /// Block until a selector matches (or, with `gone`, stops matching).
     WaitFor {
         selector: String,
         gone: bool,
         timeout_ms: u64,
     },
+}
+
+/// An event of the user's, delivered the way real input arrives (no
+/// `synthetic` guard), so the capture listeners, the keystroke interceptor and
+/// the bounds observer see it as theirs. Test-only: no real OS input is made.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TestUser {
+    Move { x: f32, y: f32 },
+    Click { x: f32, y: f32 },
+    Key(String),
+    /// The window's content size changes and the app did not do it.
+    Resize { w: f32, h: f32 },
+    /// The pointer leaves the window.
+    Leave,
+    /// The window loses / regains key focus (what the activation observer reports).
+    Blur,
+    Focus,
+    /// Reply what the view holds now, whoever has the app; changes nothing.
+    Peek,
+}
+
+fn parse_test_user(rest: &str) -> Result<TestUser, String> {
+    let usage = "usage: test-user move X Y | click X Y | key K | resize W H | leave | blur | focus | peek";
+    let mut p = rest.split_whitespace();
+    let verb = p.next().ok_or_else(|| usage.to_string())?;
+    let mut num = |name: &str| -> Result<f32, String> {
+        p.next()
+            .ok_or_else(|| usage.to_string())
+            .and_then(|v| parse_coord(v, name))
+    };
+    let out = match verb {
+        "move" => TestUser::Move { x: num("X")?, y: num("Y")? },
+        "click" => TestUser::Click { x: num("X")?, y: num("Y")? },
+        "resize" => {
+            let (w, h) = (num("W")?, num("H")?);
+            if !(w.is_finite() && h.is_finite() && w >= 1.0 && h >= 1.0) {
+                return Err("resize needs a positive W and H".into());
+            }
+            TestUser::Resize { w, h }
+        }
+        "key" => {
+            let key = rest.trim()["key".len()..].trim();
+            if key.is_empty() {
+                return Err(usage.to_string());
+            }
+            TestUser::Key(key.to_string())
+        }
+        "leave" => TestUser::Leave,
+        "blur" => TestUser::Blur,
+        "focus" => TestUser::Focus,
+        "peek" => TestUser::Peek,
+        _ => return Err(usage.to_string()),
+    };
+    Ok(out)
 }
 
 /// Parse one protocol line into a command.
@@ -305,6 +361,7 @@ pub fn parse_line(line: &str) -> Result<Command, String> {
             }
             Ok(Command::Resize { w, h })
         }
+        "test-user" => Ok(Command::TestUser(parse_test_user(line["test-user".len()..].trim())?)),
         "coverage" => {
             let frames = match (parts.next(), parts.next(), parts.next()) {
                 (None, _, _) => 0,
@@ -337,6 +394,23 @@ fn parse_coord(raw: &str, name: &str) -> Result<f32, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_test_user_events() {
+        let t = |l: &str| match parse_line(l).unwrap() {
+            Command::TestUser(t) => t,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(t("test-user move 1 2.5"), TestUser::Move { x: 1.0, y: 2.5 });
+        assert_eq!(t("test-user click 3 4"), TestUser::Click { x: 3.0, y: 4.0 });
+        assert_eq!(t("test-user key ctrl-j"), TestUser::Key("ctrl-j".into()));
+        assert_eq!(t("test-user resize 900 600"), TestUser::Resize { w: 900.0, h: 600.0 });
+        assert_eq!(t("test-user leave"), TestUser::Leave);
+        assert_eq!(t("test-user peek"), TestUser::Peek);
+        for bad in ["test-user", "test-user key", "test-user move 1", "test-user resize 0 5", "test-user nope"] {
+            assert!(parse_line(bad).is_err(), "{bad}");
+        }
+    }
 
     #[test]
     fn parses_mode_size_and_resize() {

@@ -45,6 +45,9 @@ pub enum Kind {
     /// Acts on the app but not through the window's input (quit, close, the
     /// transcript window, the agent platform): runs at once.
     Other,
+    /// The dev-only `test-user` seam: plays the *user's* input. It is not the
+    /// agent's, so it neither waits nor keeps the agent "driving".
+    Seam,
 }
 
 /// A new `Command` variant is an [`Kind::Input`] until someone says otherwise:
@@ -54,6 +57,7 @@ pub fn classify(command: &Command) -> Kind {
     match command {
         Command::Shot { .. } | Command::Shot2 { .. } => Kind::Shot,
         Command::Sync | Command::Mode | Command::Size => Kind::Read,
+        Command::TestUser(_) => Kind::Seam,
         Command::Quit
         | Command::Close
         | Command::Transcripts(_)
@@ -124,6 +128,9 @@ pub enum RealInput {
     PointerMove { x: f32, y: f32 },
     /// The pointer left the window.
     PointerExit,
+    /// The window's content size changed and the app did not do it (the
+    /// user dragging an edge, a tiling tool, a display change).
+    Resize,
 }
 
 /// What the app must do because of a transition. The mode has already
@@ -260,7 +267,7 @@ impl Machine {
     /// A real event. Returns whether to swallow it, and a switch to carry out.
     pub fn on_real_input(&mut self, now: Ms, input: RealInput) -> (bool, Option<Effect>) {
         let interaction = match input {
-            RealInput::Key | RealInput::Button | RealInput::Scroll => true,
+            RealInput::Key | RealInput::Button | RealInput::Scroll | RealInput::Resize => true,
             RealInput::PointerMove { x, y } => self.pointer_delta(x, y),
             RealInput::PointerExit => {
                 if self.mode == Mode::User && self.leave_at.is_none() {
@@ -425,6 +432,45 @@ mod tests {
         for line in ["quit", "close", "transcripts status", "agent-platform get"] {
             assert_eq!(kind(line), Kind::Other, "{line}");
         }
+    }
+
+    #[test]
+    fn the_test_user_seam_is_neither_agent_input_nor_a_read() {
+        use super::super::commands::parse_line;
+        for line in ["test-user move 1 2", "test-user click 1 2", "test-user key a", "test-user resize 900 600", "test-user leave", "test-user blur", "test-user focus", "test-user peek"] {
+            assert_eq!(classify(&parse_line(line).unwrap()), Kind::Seam, "{line}");
+        }
+    }
+
+    #[test]
+    fn a_resize_the_app_did_not_make_switches_without_being_consumed() {
+        let mut m = driven();
+        assert_eq!(m.on_real_input(100, RealInput::Resize), (false, Some(Effect::EnterUser)));
+        assert_eq!(m.mode(), Mode::User);
+    }
+
+    #[test]
+    fn a_resize_while_idle_is_nothing() {
+        let mut m = machine();
+        assert_eq!(m.on_real_input(100, RealInput::Resize), (false, None));
+        assert_eq!(m.mode(), Mode::Idle);
+    }
+
+    #[test]
+    fn a_resize_in_user_mode_counts_as_activity_and_cancels_the_leave() {
+        let mut m = driven();
+        m.on_real_input(100, RealInput::Resize);
+        m.on_real_input(110, RealInput::PointerExit);
+        // Still dragging the edge: activity, so the leave is cancelled.
+        assert_eq!(m.on_real_input(200, RealInput::Resize), (false, None));
+        assert_eq!(m.tick(500), None);
+        assert_eq!(m.mode(), Mode::User);
+        // Quiet for idle_ms: back to driven, restore pending.
+        assert_eq!(m.tick(200 + Config::default().idle_ms), Some(Effect::EnterDriven));
+        let t = m.begin_input(200 + Config::default().idle_ms);
+        assert_eq!(m.poll(t, 200 + Config::default().idle_ms), Poll::Pending);
+        m.restored(vec![]);
+        assert_eq!(m.poll(t, 6_000), Poll::Run);
     }
 
     #[test]

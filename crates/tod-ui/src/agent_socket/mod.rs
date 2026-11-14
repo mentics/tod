@@ -17,7 +17,10 @@
 //! - `agent-platform set cursor|claude` — set platform and reply with new value
 //! - `mode` — reply `ok driven|user|idle` (see below)
 //! - `size` — reply `ok W H`, the window's content size in logical pixels
-//! - `resize W H` — set the content size (part of the agent's saved view)
+//! - `resize W H` — set the content size (the app owns it while driven)
+//! - `test-user move X Y | click X Y | key K | resize W H | leave | blur | focus | peek`
+//!   — **test-only**: plays an event of the user's through the real input path
+//!   (see README)
 //!
 //! # Sharing the app with the user (driven mode vs user mode)
 //!
@@ -131,6 +134,11 @@ enum UiRequest {
     /// Reply `ok W H`: the window's content size.
     Size,
     Resize { w: f32, h: f32 },
+    /// Before an agent command runs: put the window back at the size the app
+    /// owns if it differs; reply the note to attach (empty for none).
+    EnsureSize,
+    /// The dev-only `test-user` seam.
+    TestUser(commands::TestUser),
     A11yTree(a11y_tree::TreeQuery),
     A11yCoverage { frames: usize },
     A11yAct {
@@ -246,9 +254,24 @@ fn handle_client(stream: TcpStream, tx: async_channel::Sender<Pending>, shared: 
         }
 
         // Input commands wait here while the user has the app (`mode.rs`).
-        let reply = match parse_line(line.trim_end_matches(['\r', '\n']))
-            .and_then(|cmd| gate(&cmd, &shared).map(|()| cmd))
-        {
+        let parsed = parse_line(line.trim_end_matches(['\r', '\n']))
+            .and_then(|cmd| gate(&cmd, &shared).map(|()| cmd));
+        // The agent's command runs on the window at the size the app owns.
+        let mut note: Option<String> = None;
+        let parsed = match parsed {
+            Ok(cmd)
+                if mode::classify(&cmd) == Kind::Input
+                    && !matches!(cmd, Command::Resize { .. }) =>
+            {
+                ensure_size(&tx).map(|n| {
+                    note = n;
+                    cmd
+                })
+            }
+            other => other,
+        };
+        let reply = match parsed {
+            Ok(Command::TestUser(event)) => dispatch_ui(&tx, UiRequest::TestUser(event)),
             Ok(Command::Shot { path, crop }) => window_size(&tx).and_then(|(w, h)| {
                 capture::capture_window_png(&path, w, h, crop).map(|()| "ok".to_string())
             }),
@@ -301,13 +324,36 @@ fn handle_client(stream: TcpStream, tx: async_channel::Sender<Pending>, shared: 
         };
 
         let msg = match reply {
-            Ok(line) => format!("{line}\n"),
+            Ok(line) => match note {
+                // On the first line, so a multi-line reply (`tree`) keeps its
+                // announced line count.
+                Some(note) => match line.split_once('\n') {
+                    Some((first, rest)) => format!("{first} # note: {note}\n{rest}\n"),
+                    None => format!("{line} # note: {note}\n"),
+                },
+                None => format!("{line}\n"),
+            },
             Err(e) => format!("err {e}\n"),
         };
         if writer.write_all(msg.as_bytes()).is_err() || writer.flush().is_err() {
             break;
         }
     }
+}
+
+/// Ask the UI thread to put the window at the size the app owns before an
+/// agent command runs. The platform reports a resize a moment after it is
+/// made, so ask again (bounded) while it says so; a note comes back when the
+/// platform would not give the size.
+fn ensure_size(tx: &async_channel::Sender<Pending>) -> Result<Option<String>, String> {
+    for _ in 0..20 {
+        let reply = dispatch_ui(tx, UiRequest::EnsureSize)?;
+        if reply != driver::ENSURE_WAIT {
+            return Ok(Some(reply).filter(|n| !n.is_empty()));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Err("the window did not settle at its size".into())
 }
 
 /// Decide whether a command may run now (`mode::classify`): an input command
@@ -325,6 +371,7 @@ fn gate(command: &Command, shared: &Shared) -> Result<(), String> {
                 Ok(())
             }
         }
+        Kind::Seam => Ok(()),
         Kind::Read | Kind::Other => {
             shared.with(|m, now| m.note_command(now));
             Ok(())
@@ -435,6 +482,15 @@ fn handle_ui_request(
     shell: &gpui::WeakEntity<crate::app::window::Shell>,
     request: UiRequest,
 ) -> Result<String, String> {
+    // The test seam plays the user: no synthetic guard.
+    if let UiRequest::TestUser(event) = request {
+        return window
+            .update(cx, |_root, window, cx| match driver::of(cx) {
+                Some(driver) => driver.test_user(event, window, cx),
+                None => Err("no driver installed".to_string()),
+            })
+            .map_err(|e| format!("window update failed: {e}"))?;
+    }
     // Everything the socket does to the window is synthetic: input seen
     // meanwhile is not the user's (`driver::synthetic`).
     let _synthetic = driver::synthetic();
@@ -451,11 +507,21 @@ fn handle_ui_request(
             })
             .map_err(|e| format!("window update failed: {e}")),
         UiRequest::Resize { w, h } => window
-            .update(cx, |_root, window, _| {
-                window.resize(gpui::size(gpui::px(w), gpui::px(h)));
-                "ok".to_string()
+            .update(cx, |_root, window, cx| match driver::of(cx) {
+                Some(driver) => {
+                    driver.agent_resize(window, (w, h));
+                    Ok("ok".to_string())
+                }
+                None => Err("no driver installed".to_string()),
             })
-            .map_err(|e| format!("window update failed: {e}")),
+            .map_err(|e| format!("window update failed: {e}"))?,
+        UiRequest::EnsureSize => window
+            .update(cx, |_root, window, cx| match driver::of(cx) {
+                Some(driver) => Ok(driver.ensure_size(window)),
+                None => Err("no driver installed".to_string()),
+            })
+            .map_err(|e| format!("window update failed: {e}"))?,
+        UiRequest::TestUser(_) => unreachable!("handled above"),
         UiRequest::Shot2 { path, crop } => window
             .update(cx, |_root, window, cx| {
                 // Force a fresh layout+paint of the current state: an occluded
