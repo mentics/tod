@@ -2729,7 +2729,7 @@ mod tests {
         assert_eq!(dir.git(&["rev-parse", "HEAD"]).unwrap(), latest);
         // Making it recorded where the branch was born, for the lost-work rule.
         let starts = store.read(|conn| crate::branch_starts::get(conn, &child, &branch)).unwrap();
-        assert_eq!(starts.get(".").map(String::as_str), Some(latest.as_str()), "{starts:?}");
+        assert_eq!(starts.born.get(".").map(String::as_str), Some(latest.as_str()), "{starts:?}");
         let files = store.resolve_files_for_node(&child).unwrap().unwrap();
         assert_eq!(files.branch(), Some(branch.as_str()));
         assert_eq!(files.ready_directory(), Some(dir.clone()));

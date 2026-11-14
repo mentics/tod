@@ -47,6 +47,7 @@
 use crate::lifecycle;
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
+use tod_store::branch_starts::BranchStarts;
 use tod_store::decisions::{DecisionRepo, REASON_BROKEN};
 use tod_store::fleet::{FleetMutation, FleetStore, Workdir};
 use tod_store::interview::InterviewCommand;
@@ -240,7 +241,7 @@ fn pinned(parent: &Workdir, rel: &str) -> Result<Option<String>> {
 /// dirty: each submodule is looked at on its own, and a checkout whose
 /// submodules sit on newer commits than the ones it records (a sandbox forked
 /// from a golden that moved on) has done no work by that.
-fn state_of(repo: &Workdir, bases: &[String], what: &str, branch: Option<&str>, start: Option<&str>) -> Result<RepoState> {
+fn state_of(repo: &Workdir, bases: &[String], what: &str, branch: Option<&str>, start: Option<&str>, replaced: Option<&str>) -> Result<RepoState> {
     if !git_text(repo, &["status", "--porcelain", "--ignore-submodules=all"])?.is_empty() {
         return Ok(RepoState::Dirty);
     }
@@ -284,6 +285,16 @@ fn state_of(repo: &Workdir, bases: &[String], what: &str, branch: Option<&str>, 
         if start == Some(tip.as_str()) {
             // Still at the commit it was born at: it never held work.
             continue;
+        }
+        if replaced == Some(tip.as_str()) {
+            // Made fresh again at a newer base: the branch's earlier work may
+            // have been merged and the branch deleted, or never pushed.
+            return Ok(RepoState::Unknown(format!(
+                "{what}: branch {branch} was recreated at a newer base ({}) when the checkout was replaced, and its earlier work \
+                 cannot be confirmed (it may have been merged and the branch deleted, or never pushed); check that the work is in \
+                 the default branch",
+                &tip[..tip.len().min(12)]
+            )));
         }
         if on_the_line.is_none() {
             let mut line = Vec::new();
@@ -358,14 +369,14 @@ fn is_checkout(cwd: &Workdir) -> Result<bool> {
 ///
 /// `starts` is where tod recorded the node's branch was born, by repository
 /// path ([`tod_store::branch_starts`]); a branch tip is a stub only if it is
-/// that commit (see [`state_of`]).
-pub fn inspect(cwd: &Workdir, branch: Option<&str>, starts: &BTreeMap<String, String>) -> Result<Vec<(String, RepoState)>> {
+/// that commit, and proves nothing at a commit it was recreated at (see [`state_of`]).
+pub fn inspect(cwd: &Workdir, branch: Option<&str>, starts: &BranchStarts) -> Result<Vec<(String, RepoState)>> {
     if !is_checkout(cwd)? {
         return Ok(Vec::new());
     }
     // Only the node's own branch, as Files records it; with none known, HEAD
     // alone is compared (never a guess from the branch checked out).
-    let mut out = vec![(".".to_string(), state_of(cwd, &default_ref(cwd)?.into_iter().collect::<Vec<_>>(), "the checkout", branch, starts.get(".").map(String::as_str))?)];
+    let mut out = vec![(".".to_string(), state_of(cwd, &default_ref(cwd)?.into_iter().collect::<Vec<_>>(), "the checkout", branch, starts.born.get(".").map(String::as_str), starts.replaced.get(".").map(String::as_str))?)];
     // No `.gitmodules` is the only way to have none; a listing that fails is an error.
     let subs: Vec<String> = if git_text(cwd, &["ls-files", "--", ".gitmodules"])?.is_empty() {
         Vec::new()
@@ -388,7 +399,7 @@ pub fn inspect(cwd: &Workdir, branch: Option<&str>, starts: &BTreeMap<String, St
         // their default branch, ahead of what the checkout records.
         let sub = cwd.join(rel);
         let bases: Vec<String> = pinned(&parent, &in_parent)?.into_iter().chain(default_ref_opt(&sub)?).collect();
-        out.push((rel.clone(), state_of(&sub, &bases, &format!("submodule {rel}"), branch, starts.get(rel).map(String::as_str))?));
+        out.push((rel.clone(), state_of(&sub, &bases, &format!("submodule {rel}"), branch, starts.born.get(rel).map(String::as_str), starts.replaced.get(rel).map(String::as_str))?));
     }
     Ok(out)
 }
@@ -501,7 +512,7 @@ pub fn check(fleet: &FleetStore, node: Uuid, state: &str) -> Result<Finding> {
     let branch = fleet.resolve_files_for_node(&node.to_string())?.and_then(|files| files.branch().map(str::to_string));
     let starts = match &branch {
         Some(branch) => fleet.read(|conn| tod_store::branch_starts::get(conn, &node.to_string(), branch))?,
-        None => BTreeMap::new(),
+        None => BranchStarts::default(),
     };
     let repos = inspect(&cwd, branch.as_deref(), &starts)?;
     Ok(conclude(&repos, done))
@@ -588,13 +599,13 @@ mod tests {
         (dir, work)
     }
 
-    fn no_starts() -> BTreeMap<String, String> {
-        BTreeMap::new()
+    fn no_starts() -> BranchStarts {
+        BranchStarts::default()
     }
 
     /// What making the checkout records, taken now (the fixture's branch is new).
-    fn born(work: &Path) -> BTreeMap<String, String> {
-        tod_store::fleet::checkout_start::capture(&Workdir::host(work), "task/x").unwrap()
+    fn born(work: &Path) -> BranchStarts {
+        BranchStarts { born: tod_store::fleet::checkout_start::capture(&Workdir::host(work), "task/x").unwrap(), replaced: BTreeMap::new() }
     }
 
     fn states(work: &Path) -> Vec<(String, RepoState)> {
@@ -765,7 +776,7 @@ mod tests {
         // The parent now reports the submodule as modified.
         assert!(run(&work, &["status", "--porcelain"]).contains("kb"));
         let starts = born(&work);
-        assert!(starts.contains_key("kb"), "{starts:?}");
+        assert!(starts.born.contains_key("kb"), "{starts:?}");
         let repos = inspect(&Workdir::host(&work), Some("task/x"), &starts).unwrap();
         assert!(repos.iter().all(|(_, s)| *s == RepoState::Untouched), "{repos:?}");
         assert!(is_lost(&repos));
@@ -807,7 +818,7 @@ mod tests {
         assert_eq!(run(&shallow, &["rev-parse", "--is-shallow-repository"]), "true");
         // Without the correction git reports the one commit as not on origin/main.
         assert_eq!(run(&shallow, &["rev-list", "--count", "HEAD", "--not", "origin/main"]), "1");
-        let starts = BTreeMap::from([(".".to_string(), parent.clone())]);
+        let starts = BranchStarts { born: BTreeMap::from([(".".to_string(), parent.clone())]), replaced: BTreeMap::new() };
         let repos = inspect(&Workdir::host(&shallow), Some("t"), &starts).unwrap();
         assert_eq!(repos[0].1, RepoState::Untouched, "{repos:?}");
         // A commit of the node's own on top is still work.
@@ -837,7 +848,7 @@ mod tests {
     fn a_branch_still_at_its_recorded_birth_commit_is_a_stub() {
         let (_dir, work) = fixture();
         let starts = born(&work);
-        assert_eq!(starts.keys().map(String::as_str).collect::<Vec<_>>(), [".", "kb"]);
+        assert_eq!(starts.born.keys().map(String::as_str).collect::<Vec<_>>(), [".", "kb"]);
         run(&work, &["push", "-q", "origin", "HEAD:refs/heads/task/x"]);
         run(&work.join("kb"), &["push", "-q", "origin", "HEAD:refs/heads/task/x"]);
         // Others move both default branches on.
@@ -971,12 +982,12 @@ mod tests {
         // Pushed before: origin already has it.
         run(&work, &["push", "-q", "origin", "HEAD:refs/heads/task/x"]);
         run(&work, &["fetch", "-q", "origin"]);
-        assert!(!born(&work).contains_key("."));
+        assert!(!born(&work).born.contains_key("."));
         // With work on it, and not pushed.
         let (_dir, work) = fixture();
         commit_in(&work, "w");
         let starts = born(&work);
-        assert!(!starts.contains_key("."), "{starts:?}");
+        assert!(!starts.born.contains_key("."), "{starts:?}");
     }
 
     #[test]

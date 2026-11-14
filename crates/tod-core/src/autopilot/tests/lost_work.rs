@@ -252,3 +252,87 @@ fn a_merged_branch_with_no_recorded_start_is_not_proven_lost_and_not_reopened() 
     let timeline = fx.fleet.read(|c| tod_store::node_timeline::TimelineRepo::new(c).list(fx.node)).unwrap();
     assert_eq!(timeline.iter().filter(|e| e.title == "Lost work: not proven either way" && e.phase == "review").count(), 1, "{timeline:#?}");
 }
+
+/// The sandbox is replaced: a new checkout makes the node's branch fresh at
+/// origin's main, and `make_location` records that birth through the store.
+fn replace_checkout(fx: &Fixture, workspace: &std::path::Path) {
+    git_in(workspace, &["fetch", "-q", "--prune", "origin"]);
+    git_in(workspace, &["checkout", "-q", "-B", "task/x", "origin/main"]);
+    let starts = tod_store::fleet::checkout_start::capture(&tod_store::fleet::Workdir::host(workspace), "task/x").unwrap();
+    assert!(starts.contains_key("."), "{starts:?}");
+    fx.fleet
+        .enqueue(tod_store::fleet::FleetMutation::RecordBranchStarts { node_id: fx.node.to_string(), branch: "task/x".into(), starts })
+        .unwrap();
+    fx.fleet.writer().flush().unwrap();
+    fx.fleet.reload_if_stale().unwrap();
+}
+
+fn assert_unproven_not_reopened(fx: &Fixture) {
+    in_review_with_done_steps(fx);
+    let finding = crate::lost_work::reopen_if_lost(&fx.fleet, fx.node).unwrap();
+    let crate::lost_work::Finding::Unproven(reasons) = finding else { panic!("{finding:?}") };
+    assert!(reasons[0].contains("recreated at a newer base") && reasons[0].contains("cannot be confirmed"), "{reasons:?}");
+    assert_eq!(lifecycle::current_state(&fx.fleet, fx.node).unwrap(), "review");
+}
+
+/// P1: a branch never pushed, replaced at a base that moved on, is neither
+/// called merged nor lost: nothing proves where its work went.
+#[test]
+fn an_unpushed_stub_replaced_at_a_moved_base_is_unproven() {
+    let fx = setup();
+    let workspace = workspace_is_a_clone(&fx);
+    git_in(&workspace, &["checkout", "-q", "main"]);
+    std::fs::write(workspace.join("later"), "l").unwrap();
+    git_in(&workspace, &["add", "."]);
+    git_in(&workspace, &["commit", "-qm", "main moves"]);
+    git_in(&workspace, &["push", "-q", "origin", "main"]);
+    replace_checkout(&fx, &workspace);
+    assert_unproven_not_reopened(&fx);
+}
+
+/// P2/P3: work pushed and merged (fast-forward, or squashed), the branch
+/// deleted locally and on origin, then the sandbox replaced: not lost.
+#[test]
+fn merged_and_deleted_then_replaced_is_never_lost() {
+    for squash in [false, true] {
+        let fx = setup();
+        let workspace = workspace_is_a_clone(&fx);
+        std::fs::write(workspace.join("work"), "w").unwrap();
+        git_in(&workspace, &["add", "."]);
+        git_in(&workspace, &["commit", "-qm", "the node's work"]);
+        git_in(&workspace, &["push", "-q", "origin", "HEAD:refs/heads/task/x"]);
+        git_in(&workspace, &["checkout", "-q", "main"]);
+        if squash {
+            std::fs::write(workspace.join("work"), "w").unwrap();
+            git_in(&workspace, &["add", "."]);
+            git_in(&workspace, &["commit", "-qm", "squashed"]);
+        } else {
+            git_in(&workspace, &["merge", "-q", "--ff-only", "task/x"]);
+        }
+        git_in(&workspace, &["push", "-q", "origin", "main"]);
+        git_in(&workspace, &["branch", "-q", "-D", "task/x"]);
+        git_in(&workspace, &["push", "-q", "origin", ":refs/heads/task/x"]);
+        replace_checkout(&fx, &workspace);
+        assert_unproven_not_reopened(&fx);
+    }
+}
+
+/// The first record is kept: a replacement that finds the branch fresh at the
+/// same commit changes nothing, a different one is kept apart.
+#[test]
+fn the_first_birth_is_kept_and_a_later_different_one_is_kept_apart() {
+    let fx = setup();
+    let workspace = workspace_is_a_clone(&fx);
+    let first = fx.fleet.read(|c| tod_store::branch_starts::get(c, &fx.node.to_string(), "task/x")).unwrap();
+    assert!(first.replaced.is_empty());
+    git_in(&workspace, &["checkout", "-q", "main"]);
+    std::fs::write(workspace.join("later"), "l").unwrap();
+    git_in(&workspace, &["add", "."]);
+    git_in(&workspace, &["commit", "-qm", "main moves"]);
+    git_in(&workspace, &["push", "-q", "origin", "main"]);
+    replace_checkout(&fx, &workspace);
+    let after = fx.fleet.read(|c| tod_store::branch_starts::get(c, &fx.node.to_string(), "task/x")).unwrap();
+    assert_eq!(after.born, first.born);
+    assert_ne!(after.replaced.get("."), first.born.get("."));
+    assert!(after.replaced.contains_key("."));
+}

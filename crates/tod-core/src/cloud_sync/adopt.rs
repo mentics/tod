@@ -266,6 +266,10 @@ impl Backend for Live {
         self.sandboxes.save()
     }
 
+    /// Adoption records no branch start ([`tod_store::branch_starts`]): the sandbox
+    /// was made and worked in before tod saw it, so nothing proves where its branch
+    /// was born (a tip at the default tip could be work merged by fast-forward).
+    /// With no record the lost-work rule proves nothing for it.
     fn probe_checkout(&mut self, sandbox: &str) -> Result<(String, String)> {
         let repo = provision::find_sandbox_checkout(sandbox)?;
         let branch = provision::sandbox_checkout_branch(sandbox, &repo)?;
