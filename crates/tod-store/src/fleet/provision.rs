@@ -1657,7 +1657,7 @@ pub fn commit_location_changes(fleet: &FleetStore, node_id: &str) -> Result<()> 
     let location = node_location(fleet, node_id)?.context("This node has no files of its own")?;
     let dir = location_dir(&location)?;
     for repo in repos_deepest_first(&dir)? {
-        repo.git(&["add", "-A"])?;
+        super::checkpoint::stage_all(&repo)?;
         // Unstage any submodule pointer `add -A` picked up.
         let staged = repo.git(&["diff", "--cached", "--raw", "--no-renames"])?;
         for line in staged.lines() {
@@ -2117,6 +2117,19 @@ pub fn stale_locations(fleet: &FleetStore) -> Result<Vec<AffectedLocation>> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The commit before a location is removed stages through the shared
+    /// retrying `stage_all` (a file vanishing under `add -A` must not fail
+    /// it), never its own bare `add -A`. Its behaviour is run for real by
+    /// the location test below that calls `commit_location_changes`.
+    #[test]
+    fn commit_location_changes_stages_through_the_retrying_helper() {
+        let src = include_str!("provision.rs");
+        let body = src.split("pub fn commit_location_changes").nth(1).unwrap();
+        let body = body.split("pub fn discard_location_changes").next().unwrap();
+        assert!(body.contains("checkpoint::stage_all("), "{body}");
+        assert!(!body.contains(r#"git(&["add", "-A"])"#), "{body}");
+    }
 
     use std::sync::{Arc, Mutex};
     use std::time::Duration;

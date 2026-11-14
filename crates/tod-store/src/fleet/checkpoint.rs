@@ -241,7 +241,7 @@ pub fn save_repo(repo: &Workdir, reference: &str, limits: &Limits) -> Result<Sav
     // Its own file: the app and the node's supervisor may checkpoint the
     // same checkout at once.
     let index = format!("{}/tod-checkpoint-{}.index", git_dir.trim_end_matches('/'), uuid::Uuid::new_v4().simple());
-    let result = retry_vanished(VANISH_ATTEMPTS, VANISH_PAUSE, || build_commit(repo, &index, &head, reference));
+    let result = build_commit(repo, &index, &head, reference);
     // Never left behind, whatever happened.
     let _ = repo.output("rm", &["-f", &index]);
     let (commit, files) = match result? {
@@ -295,6 +295,13 @@ fn is_vanished(err: &anyhow::Error) -> bool {
         || msg.contains("did not match any files")
 }
 
+/// `add -A` in `repo`'s own index, retried while files vanish under it. The
+/// one place a staging that is not the checkpoint's (a commit before a
+/// location is removed) takes the same retry.
+pub(crate) fn stage_all(repo: &Workdir) -> Result<()> {
+    retry_vanished(VANISH_ATTEMPTS, VANISH_PAUSE, || repo.git(&["add", "-A"]).map(|_| ()))
+}
+
 /// Run `build`, again (after `pause`) while it fails because files vanished,
 /// up to `attempts` times in all. Any other error is returned at once, and
 /// a vanish that persists is returned saying so.
@@ -331,7 +338,7 @@ enum Built {
 fn build_commit(repo: &Workdir, index: &str, head: &str, reference: &str) -> Result<Built> {
     let _ = repo.output("rm", &["-f", index]);
     git_with_index(repo, index, &["read-tree", head])?;
-    git_with_index(repo, index, &["add", "-A"])?;
+    retry_vanished(VANISH_ATTEMPTS, VANISH_PAUSE, || git_with_index(repo, index, &["add", "-A"]))?;
     // A submodule's recorded commit is not work worth keeping (it moves with
     // the submodule, which has a checkpoint of its own).
     let staged = git_with_index(repo, index, &["diff", "--cached", "--raw", "--no-renames", head])?;
@@ -522,6 +529,36 @@ mod tests {
         .to_string();
         assert_eq!(calls, 1);
         assert!(err.contains("index.lock"), "{err}");
+    }
+
+    #[test]
+    fn only_staging_is_retried_so_other_failures_are_never_called_files_changing() {
+        let fx = Fixture::new();
+        let work = fx.clone_named("w");
+        let dir = Workdir::host(&work);
+        // read-tree of a missing commit fails outside the staging step.
+        let err = match build_commit(&dir, &work.join("idx").to_string_lossy(), "0000000000000000000000000000000000000001", REF) {
+            Ok(_) => panic!("expected an error"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(!err.contains("kept changing"), "{err}");
+        // Staging is: a vanish there is retried (attempts counted by the helper).
+        let mut n = 0;
+        let _ = retry_vanished::<()>(3, std::time::Duration::ZERO, || {
+            n += 1;
+            Err(anyhow::anyhow!("fatal: unable to stat 'x': No such file or directory"))
+        });
+        assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn stage_all_stages_new_files_in_the_real_index() {
+        let fx = Fixture::new();
+        let work = fx.clone_named("w");
+        std::fs::write(work.join("new.txt"), "n").unwrap();
+        stage_all(&Workdir::host(&work)).unwrap();
+        let out = Command::new("git").arg("-C").arg(&work).args(["diff", "--cached", "--name-only"]).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "new.txt");
     }
 
     #[test]
