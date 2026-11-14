@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""List Claude Code transcripts that invoked a skill (default: shepherd-nodes).
+"""List Claude Code transcripts that invoked a skill (default: shepherd-manager;
+pass `shepherd-nodes` for runs of the old single-session skill).
 
 Usage: python3 -I find_runs.py [skill-name] [--ledger <reviews.md>]
        python3 -I find_runs.py [skill-name] --ledger <reviews.md> --mark <transcript> "<title>"
@@ -15,6 +16,10 @@ times the skill was invoked, and its review status:
 --mark writes the transcript's ledger line (its last timestamp, the current
 version, the title), replacing any earlier line for it. Use it instead of
 editing the ledger by hand.
+
+Under each run it also lists the subagent transcripts that session started
+(`<session>/subagents/agent-*.jsonl`), by agent type: the cli-shepherd and
+ui-shepherd agents, and the fixers and verifiers.
 """
 import json
 import os
@@ -27,7 +32,7 @@ if "--ledger" in args:
     i = args.index("--ledger")
     ledger_path = args[i + 1]
     del args[i : i + 2]
-skill = args[0] if args else "shepherd-nodes"
+skill = args[0] if args else "shepherd-manager"
 marker = f"<command-name>/{skill}</command-name>"
 
 # The review skill's own version: `version` is bumped on any change that could
@@ -117,3 +122,16 @@ for first, path, size, last, inv, rev in sorted(rows):
     print(f"{path}\n  {size/1e6:.1f} MB  {first} .. {last}  {status}")
     for ts, a in inv:
         print(f"  invoked {ts}: {a!r}")
+    sub = os.path.join(path[:-6], "subagents")
+    if os.path.isdir(sub):
+        for name in sorted(os.listdir(sub)):
+            if not name.endswith(".meta.json"):
+                continue
+            try:
+                meta = json.load(open(os.path.join(sub, name), encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as err:
+                print(f"  subagent {name}: unreadable meta ({err})")
+                continue
+            t = os.path.join(sub, name[: -len(".meta.json")] + ".jsonl")
+            size = os.path.getsize(t) / 1e6 if os.path.exists(t) else 0
+            print(f"  subagent {meta.get('agentType', '?'):<16} {size:5.1f} MB  {t}  {meta.get('description', '')!r}")

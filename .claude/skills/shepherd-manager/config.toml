@@ -1,0 +1,49 @@
+# Defaults for shepherd-manager. Any key can be overridden for one run by a
+# `key=value` skill argument (dotted for tables: `cli_shepherd.model=opus`),
+# e.g. `/shepherd-manager ENG-2925 max_parallel=8 ui_shepherd=off`.
+# An override lasts for the session; edit this file to change the default.
+
+# Shepherds running at once, the UI shepherd included.
+max_parallel = 5
+# Nodes one shepherd holds at a time.
+nodes_per_shepherd = 5
+# Start a new shepherd only when at least this many due nodes are unclaimed
+# that running shepherds have no room for...
+min_batch = 3
+# ...or when one of them has waited this long.
+max_queue_delay_minutes = 15
+# A shepherd stays while something it holds is due within this window.
+linger_minutes = 10
+# Node visits before a shepherd retires (its context budget).
+max_visits_per_shepherd = 40
+
+# One UI shepherd drives the app over its control socket.
+ui_shepherd = true
+ui_window = { width = 1800, height = 1000 }
+ui_socket_port = 47621
+
+# Minutes until a node in motion is looked at again, by what it waits on.
+[recheck_minutes]
+agent_working = 10
+ci = 20
+bot = 30
+webhook_wait = 60
+all_parked = 60
+
+# Model and effort per role. The shepherd agents' own defaults are Sonnet,
+# medium; the manager passes `model`/`effort` only when these differ.
+[cli_shepherd]
+model = "sonnet"
+effort = "medium"
+
+[ui_shepherd_agent]
+model = "sonnet"
+effort = "medium"
+
+[fixer]
+model = "sonnet"
+effort = "medium"
+
+[verifier]
+model = "haiku"
+effort = "medium"

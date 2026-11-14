@@ -1,15 +1,17 @@
 ---
 name: review-shepherd-runs
-description: Review past runs of the shepherd-nodes skill (its Claude Code transcripts). Analyze what the shepherd agent itself did (its mistakes, self-corrections, wasted steps, unverified claims, idle time, repeated errors) as well as where the user corrected it, and improve .claude/skills/shepherd-nodes/SKILL.md so the next run is more accurate, efficient and robust. Use when asked to review, learn from, audit or improve shepherd-nodes, or to look at how past shepherd sessions went.
+description: Review past runs of the shepherd-manager skill (the manager's Claude Code transcript and its cli-shepherd and ui-shepherd subagents' transcripts, plus older shepherd-nodes runs). Analyze what the manager and each shepherd did (mistakes, self-corrections, wasted steps, unverified claims, idle time, churn, repeated errors) as well as where the user corrected them, and improve the shepherd skills and agents so the next run is more accurate, efficient and robust. Use when asked to review, learn from, audit or improve the shepherds, or to look at how past shepherd sessions went.
 user_invocable: true
-version: 1
+version: 2
 reviews_ok_from: 1
 ---
 
 ## The goal
 
-`shepherd-nodes` gets better from how it actually ran. A review is a deep look
-at the shepherd agent's own behavior, not only at the moments the user stepped
+The shepherds get better from how they actually ran. A run is one
+`shepherd-manager` session and the shepherd agents it started: several
+`cli-shepherd`s, at most one `ui-shepherd` at a time, and the fixers and
+verifiers. A review is a deep look at their own behavior, not only at the moments the user stepped
 in. Most of what goes wrong in a run, the user never sees: the agent guesses
 instead of checking, retries the same broken command, waits idle, ships a fix
 it never verified, or notices its own mistake an hour later. Each of those is
@@ -23,18 +25,29 @@ So for every run, ask three questions:
 - **Robustness:** where did it stall, break or depend on luck (a compaction,
   a misfired click, a deploy that happened to work)?
 
-The output is a change to `.claude/skills/shepherd-nodes/SKILL.md` and an
-updated ledger (`reviews.md`, next to this file). Problems in tod itself (the
+The output is a change to the shepherd files and an updated review ledger
+(`reviews.md`, next to this file). The shepherd files are:
+- `.claude/skills/shepherd-manager/SKILL.md` and its `config.toml`;
+- `.claude/skills/shepherd-cli/SKILL.md`, `.claude/skills/shepherd-ui/SKILL.md`;
+- `.claude/skills/shepherd-common/` (shared rules, triage, gap reports,
+  reference, the shepherd ledger's docs and scripts);
+- `.claude/agents/shepherd/cli-shepherd.md`, `ui-shepherd.md`.
+
+Any change to a shepherd skill, a shared file or an agent retires every
+running shepherd when it is deployed, so batch changes into one review. Problems in tod itself (the
 product) are not skill changes: they belong in `doc/improvement-log.md`.
 
 ## 1. Find the runs
 
 ```bash
-python3 -I .claude/skills/review-shepherd-runs/scripts/find_runs.py shepherd-nodes --ledger .claude/skills/review-shepherd-runs/reviews.md
+python3 -I .claude/skills/review-shepherd-runs/scripts/find_runs.py shepherd-manager --ledger .claude/skills/review-shepherd-runs/reviews.md
 ```
 
-It lists every transcript under `~/.claude/projects/` that invoked the skill,
-with its size, time span, arguments, and whether the ledger has it. Review:
+It lists every manager transcript under `~/.claude/projects/` (the session
+that invoked the skill), with its size, time span, arguments, whether the
+ledger has it, and under it every subagent transcript that session started,
+by agent type. Pass `shepherd-nodes` instead for runs of the old
+single-session skill. Review:
 - every run marked `NOT REVIEWED`;
 - every run with newer activity, from its "reviewed through" time on
   (`--since` below).
@@ -48,7 +61,10 @@ still going: its lessons aren't in yet.
 
 ## 2. Profile and digest each run
 
-Start with the profile; it shows where to look:
+Profile the manager's transcript and each shepherd's (`cli-shepherd`,
+`ui-shepherd`). Fixers' and verifiers' transcripts are worth reading only
+where a fix went back and forth. Start with the profile; it shows where to
+look:
 
 ```bash
 python3 -I .claude/skills/review-shepherd-runs/scripts/digest.py <transcript> --stats [--since <ISO>]
@@ -70,6 +86,16 @@ failed or refused tool calls (`!! ERROR`), and with `--tools` every tool call.
 The `>> SELF` match is a wide net: read each one, many are honest status, not
 mistakes.
 
+Then read the shepherd ledger's churn counts (read-only; the ledger is
+`<root>/shepherd/ledger.db`, `<root>` the `data_root` in `install.toml`):
+
+```bash
+python3 -I .claude/skills/shepherd-common/scripts/ledger.py <root> owners --history
+```
+
+Per shepherd: when it started and retired, why it retired, node visits,
+empty visits (a visit where it did nothing), and the gaps it reported.
+
 The tool results themselves (command output, screenshots) are only in the raw
 transcript. When a moment matters, read those records directly (find them by
 timestamp) rather than trusting the agent's summary of them.
@@ -77,7 +103,7 @@ timestamp) rather than trusting the agent's summary of them.
 A digest under ~150 KB you can read yourself. For a larger one, or several
 runs, give each to its own subagent (Sonnet, medium effort): the brief is step
 3 of this file, the paths to the profile, the digest, the raw transcript and
-the current `shepherd-nodes/SKILL.md`, and the ask for findings with evidence
+the shepherd files that run used, and the ask for findings with evidence
 (timestamp and a short quote). Read the user's messages and the `>> SELF` lines
 yourself either way.
 
@@ -129,26 +155,51 @@ and what the agent would have needed in advance to avoid it.
 10. **What worked.** A move the agent improvised that went well (a query, a
     script, a way of briefing a fixer). Codify it so the next run starts there.
 
+### Running in parallel
+
+11. **Churn.** Shepherds that retired after a visit or two, many empty
+    visits, nodes dispatched with no fingerprint change or recheck due, a
+    node visited again and again for the same reason. Is it the settings
+    (`linger_minutes`, `min_batch`, recheck times), a verdict chosen wrong
+    (`in_motion` with too short a recheck), or a rule in the dispatch?
+12. **Idle slots.** A shepherd blocked in `wait` while the queue held due
+    nodes it should have claimed; fewer shepherds running than
+    `max_parallel` with work waiting; a deploy drain that took long because
+    one shepherd never reached an action boundary.
+13. **Gaps.** The same cause reported under two signatures (the signature
+    rules in `gap-report.md` failed), a gap the manager fixed twice, a
+    summary a fixer had to re-investigate, a shepherd that fixed or deployed
+    anything itself.
+14. **Conflicts.** Lost leases, `check` replies other than `ok`, the UI
+    shepherd's `user-conflict` and `no-target` replies: did the shepherd
+    re-decide, or carry on as if it had acted?
+
 ### The user's interventions
 
-11. **Corrections and questions** ("why didn't you…", "why are you asking
+15. **Corrections and questions** ("why didn't you…", "why are you asking
     me…", "that's a bug"). Find the line of the skill the agent followed or
     lacked. When the agent quoted a skill rule as its reason, that rule is the
     finding.
-12. **Arguments that override the skill** ("the skill says only up to
+16. **Arguments that override the skill** ("the skill says only up to
     pr_draft, but…"). The default was wrong for this user.
-13. **Questions the agent asked that it could have answered**, and requests it
+17. **Questions the agent asked that it could have answered**, and requests it
     relayed that the user then called bugs. Either a permission is missing
     from the skill, or a rule sits where the agent doesn't reach it in time.
 
 For each finding decide where it belongs:
-- **Skill**: what the shepherd agent should do, check or know. Edit `SKILL.md`.
-- **Tooling**: a script or query the shepherd keeps reconstructing by hand.
-  Add it under `.claude/skills/shepherd-nodes/` and point to it from the skill.
+- **Skill**: what the manager or a shepherd should do, check or know. Edit
+  the file that agent reads: the manager's, one shepherd kind's, or a shared
+  file when both kinds need it. Never put GUI matter in the CLI shepherd's
+  context, or the other way round.
+- **Config**: a default in `shepherd-manager/config.toml` that was wrong for
+  the load (churn and idle slots usually land here).
+- **Tooling**: a script or query a shepherd keeps reconstructing by hand.
+  Add it under `.claude/skills/shepherd-common/scripts/` and point to it from
+  the skill that uses it.
 - **tod**: what the product should do (a missing `tod-cli` command, a status
   that misled the agent). Add or bump an entry in `doc/improvement-log.md`.
 - **Neither**: a one-off, or already fixed. Check
-  `git log -p -- .claude/skills/shepherd-nodes/` and the working-tree diff
+  `git log -p -- .claude/skills/shepherd-* .claude/agents/shepherd/` and the working-tree diff
   first, so you don't propose what's already there.
 
 Rank by cost: a wrong answer the user acted on, or hours idle, matters more
@@ -167,8 +218,9 @@ than a retried shell command.
   story of what happened. The *why* goes in the ledger, not the skill.
 - Keep it general. "A verify-phase obligation that can only hold after rollout
   is a wrong `acts_in`" is a rule; "ENG-2287's obligation" is not.
-- Don't let it grow without bound: if the skill passes ~300 lines, tighten
-  something as you add.
+- Don't let them grow without bound: if a skill passes ~300 lines, tighten
+  something as you add. Every line of a shepherd skill is paid once per
+  shepherd started.
 
 Show the user the diff with one line per change saying which finding it
 answers. Commit it to main when they agree (tod has no PRs).
@@ -180,11 +232,13 @@ hand; it writes the line in the form `find_runs.py` reads, with the current
 version:
 
 ```bash
-python3 -I .claude/skills/review-shepherd-runs/scripts/find_runs.py shepherd-nodes --ledger .claude/skills/review-shepherd-runs/reviews.md --mark <transcript path> "<session title>"
+python3 -I .claude/skills/review-shepherd-runs/scripts/find_runs.py shepherd-manager --ledger .claude/skills/review-shepherd-runs/reviews.md --mark <manager transcript path> "<session title>"
 ```
 
-Then one section for this review: the date, the run profiles (wall time,
-compactions, errors, idle), the findings (each with evidence, cost, and where
+Mark the manager's transcript only; its shepherds' transcripts count as part
+of it. Then one section for this review: the date, the run profiles (wall
+time, compactions, errors, idle, and for the shepherds: started, visits,
+empty visits), the findings (each with evidence, cost, and where
 it went: skill, tooling, tod, or neither), and what was applied. Findings you
 didn't apply stay listed as open, so the next review starts from them, and a
 finding that comes back in a later run gets its count bumped.
@@ -205,3 +259,8 @@ choose which to redo.
 
 - v1: lenses on the agent's own behavior and on the user's interventions,
   tooling and tod gaps, the ledger.
+- v2: runs are a `shepherd-manager` session and its shepherd subagents;
+  `find_runs.py` lists the subagent transcripts; the shepherd ledger's churn
+  counts; the "Running in parallel" lenses. Old `shepherd-nodes` runs had no
+  shepherd subagents, so their v1 reviews still count (`reviews_ok_from`
+  stays 1).
