@@ -657,8 +657,25 @@ pub fn checkout_script(repo_url: &str, branch: &str, identity: &GitIdentity, all
 pub fn install(bx: &Blaxel, url: &str, payload: &NodePayload, progress: &mut dyn FnMut(&str)) -> Result<()> {
     upload_tod_files(bx, url, payload, progress)?;
     ensure_curl(bx, url, progress)?;
+    trust_proxy_ca(bx, url, progress)?;
     ensure_claude_adapter(bx, url, progress)?;
     install_bundles(bx, url, payload, progress)
+}
+
+/// The script that makes the sandbox proxy's CA trusted system-wide.
+pub const TRUST_PROXY_CA_SCRIPT: &str = include_str!("../../../assets/sandbox/trust-proxy-ca.sh");
+
+/// Makes the proxy's CA trusted system-wide (apt, pip, Java, ... ignore
+/// `SSL_CERT_FILE`). Runs on every install and every fork, since a fork's proxy
+/// update replaces the files. A no-op without a proxy; with one, a missing CA
+/// or a failed install is the error.
+fn trust_proxy_ca(bx: &Blaxel, url: &str, progress: &mut dyn FnMut(&str)) -> Result<()> {
+    progress("trusting the sandbox proxy's CA system-wide…");
+    let res = bx.run(url, &format!("sh -c {} 2>&1", shell_quote(TRUST_PROXY_CA_SCRIPT)), 120)?;
+    if res.exit_code != 0 {
+        bail!("trusting the proxy CA failed (exit {}): {}", res.exit_code, res.output().trim());
+    }
+    Ok(())
 }
 
 /// Free space an install needs on the sandbox's root filesystem, at least.
@@ -828,6 +845,7 @@ pub fn install_into_fork(bx: &Blaxel, url: &str, payload: &NodePayload, progress
     crate::provision::check_relay_arch(payload.relay)?;
     crate::provision::require_fork_prerequisites(bx, url, true, progress)?;
     upload_tod_files(bx, url, payload, progress)?;
+    trust_proxy_ca(bx, url, progress)?;
     install_bundles(bx, url, payload, progress)
 }
 

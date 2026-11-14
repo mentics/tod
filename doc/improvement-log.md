@@ -641,3 +641,12 @@ from Blaxel.
 - **Ways to go on**: Start/Resume (local `RunnerStart` / supervisor keep_going), Resume with a fresh budget (`renew_budget` / fresh_budget), Rerun this phase (`request_rerun_phase` / fresh_session), a "run" request, and an answered stop question (keep_going; supervisor `run_requested`).
 - **Tests**: `a_user_go_on_after_the_review_round_limit_starts_a_fresh_set_of_rounds` (stop, an automatic wake stays stopped, go on runs five more reviews, the second limit stops, and again), `a_user_go_on_after_the_pr_draft_review_limit_counts_the_rounds_from_then`.
 - **Measure**: a `review_not_converging` run state recorded within a minute of a user Resume or Rerun (target 0).
+
+## 2026-11-13: apt failed "certificate is NOT trusted" in a node sandbox (ENG-3129)
+
+- **Seen**: 1, ENG-3129 (sandbox tod-ci-tests-run-on-postgresql-14-17-prod-ecb10c): `apt-get update` failed for apt.postgresql.org, so the agent could not install packages and handed the work to the user.
+- **Symptom**: tools using the system trust store failed TLS verification through the sandbox's intercepting proxy; `openssl s_client` worked.
+- **Cause**: Blaxel routes HTTPS through a proxy (`HTTPS_PROXY=http://localhost:49152`) whose CA (`/etc/ssl/certs/proxy/proxy-ca.pem`) is only referenced by env vars (`SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`); apt (gnutls), pip/requests (certifi), Java and the like ignore them.
+- **Fix**: `assets/sandbox/trust-proxy-ca.sh`, run by `node::trust_proxy_ca` from both `node::install` (images, goldens, bases) and `node::install_into_fork` (every fork, whose proxy update replaces files). With a proxy set it copies the CA into the system store (`update-ca-certificates` or `update-ca-trust`, idempotent) and points Python at the system bundle (`/etc/profile.d/tod-ca.sh` exporting `REQUESTS_CA_BUNDLE`/`PIP_CERT`/`CURL_CA_BUNDLE`, and `/etc/pip.conf` `cert`). No proxy: nothing to do. A proxy with a missing CA, or a failed update, is an error naming what failed. Existing sandboxes get it at their next install or `tod-sandbox golden refresh`.
+- **Tests**: `trust_proxy_ca_tests` run the real script against a temp root (no proxy is a no-op; a proxy without its CA errors; install and rerun are idempotent and write the profile and pip.conf). The real `update-ca-certificates` run is not exercised off a sandbox.
+- **Measure**: `apt-get update` / `pip install` certificate failures in node sessions (target 0).

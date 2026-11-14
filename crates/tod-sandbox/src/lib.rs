@@ -19,6 +19,8 @@ pub mod drive;
 pub mod edge;
 pub mod golden;
 pub mod node;
+#[cfg(test)]
+mod trust_proxy_ca_tests;
 pub mod orchestrator;
 pub mod provision;
 pub mod relay;
