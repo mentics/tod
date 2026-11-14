@@ -158,7 +158,11 @@ pub fn for_nodes(conn: &Connection, node_ids: &[Uuid]) -> Result<HashMap<Uuid, N
     // 1. Pending decisions: one item per decision still awaiting an answer.
     // An answered or withdrawn decision no longer counts, since
     // `DecisionRepo::list_pending_for_nodes` only returns `pending` ones.
-    for decision in DecisionRepo::new(conn).list_pending_for_nodes(node_ids)? {
+    let pending = DecisionRepo::new(conn).list_pending_for_nodes(node_ids)?;
+    // A plan step a pending decision holds up (`Decision::blocks`) is part of
+    // that request, not one of its own: one cause, one item.
+    let held_up: std::collections::HashSet<Uuid> = pending.iter().flat_map(|d| d.blocks.iter().copied()).collect();
+    for decision in pending {
         by_node
             .entry(decision.node_id)
             .or_default()
@@ -171,6 +175,9 @@ pub fn for_nodes(conn: &Connection, node_ids: &[Uuid]) -> Result<HashMap<Uuid, N
     // is the same test `Standing::load` (`crate::lifecycle_next`) uses for
     // `steps_need_user`.
     for (step, updated_at) in PlanStepRepo::new(conn).list_needs_user_for_nodes(node_ids)? {
+        if held_up.contains(&step.id) {
+            continue;
+        }
         by_node
             .entry(step.node_id)
             .or_default()
@@ -490,5 +497,49 @@ mod tests {
         for node in [a, b, c] {
             assert_eq!(batched[&node], for_node(&fx.conn, node).unwrap());
         }
+    }
+
+    #[test]
+    fn a_decision_and_the_steps_it_holds_up_are_one_request() {
+        let fx = fixture();
+        let node = make_node(&fx.conn, "one-cause");
+        let steps = PlanStepRepo::new(&fx.conn);
+        let ids: Vec<Uuid> = (0..3).map(|_| Uuid::new_v4()).collect();
+        for (i, id) in ids.iter().enumerate() {
+            steps.insert_at(*id, node, i, &format!("Step {i}")).unwrap();
+            steps
+                .update_status(
+                    *id,
+                    STATUS_BLOCKED,
+                    Some("no access"),
+                    Some(&HandoffReason::Access { needs: "a key".into(), tried: "ran it".into() }),
+                )
+                .unwrap();
+        }
+        // Three hand-backs, no question yet: three requests.
+        assert_eq!(for_node(&fx.conn, node).unwrap().count, 3);
+        let decision = DecisionRepo::new(&fx.conn)
+            .create(
+                node,
+                None,
+                None,
+                &NewDecision {
+                    question: "Carry on without PG 18?".into(),
+                    options: vec!["Carry on".into(), "Wait".into()],
+                    blocks: vec![ids[0], ids[1]],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        // The question and the two steps it holds up are one; the third stays.
+        let attention = for_node(&fx.conn, node).unwrap();
+        assert_eq!(attention.count, 2);
+        assert!(attention.items.iter().any(|i| i.kind == AttentionKind::Decision && i.id == decision.id));
+        assert!(attention.items.iter().any(|i| i.kind == AttentionKind::PlanStep && i.id == ids[2]));
+        // Answering it releases both, leaving only the unlinked one.
+        DecisionRepo::new(&fx.conn).answer(decision.id, Some(1), None, "user").unwrap();
+        let attention = for_node(&fx.conn, node).unwrap();
+        assert_eq!(attention.count, 1);
+        assert_eq!(attention.items[0].id, ids[2]);
     }
 }

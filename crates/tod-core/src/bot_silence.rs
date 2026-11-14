@@ -213,6 +213,7 @@ pub fn new_decision(tried: &Tried) -> NewDecision {
         evidence: Vec::new(),
         reason: REASON_BROKEN.to_string(),
         moves: Vec::new(),
+        ..Default::default()
     }
 }
 

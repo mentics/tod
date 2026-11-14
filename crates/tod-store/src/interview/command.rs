@@ -340,6 +340,9 @@ pub enum InterviewCommand {
     /// (`DecisionRepo::withdraw`): the app's own, when what it asked about
     /// was settled without the user.
     WithdrawDecision { decision_id: Uuid },
+    /// Hold plan steps up with a pending decision (`plan update --decision`,
+    /// `DecisionRepo::link_steps`): one cause, one request.
+    LinkDecisionSteps { decision_id: Uuid, step_ids: Vec<Uuid> },
     /// Record an evaluation's verdict on a node's incoming changes and
     /// resolve the entries it covers (`crate::incoming`): `action_ids`, or
     /// every pending entry when unset.
@@ -1183,6 +1186,10 @@ pub fn execute(
             let (steps, verdicts) = crate::outline::repos::PlanStepRepo::new(conn)
                 .reopen_lost_work(*node_id, why)?;
             Ok(json!({ "steps": steps, "verdicts": verdicts }))
+        }
+        InterviewCommand::LinkDecisionSteps { decision_id, step_ids } => {
+            crate::decisions::DecisionRepo::new(conn).link_steps(*decision_id, step_ids)?;
+            Ok(json!({ "id": decision_id.to_string() }))
         }
         InterviewCommand::WithdrawDecision { decision_id } => {
             crate::decisions::DecisionRepo::new(conn).withdraw(*decision_id)?;

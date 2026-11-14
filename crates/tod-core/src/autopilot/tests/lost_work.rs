@@ -69,6 +69,7 @@ fn ask_broken(fx: &Fixture, protocol: &str) {
                     evidence: Vec::new(),
                     reason: tod_store::decisions::REASON_BROKEN.into(),
                     moves: Vec::new(),
+                    ..Default::default()
                 },
             },
         )
@@ -179,6 +180,7 @@ fn only_the_broken_questions_of_the_checking_agents_are_withdrawn() {
                     evidence: Vec::new(),
                     reason: tod_store::decisions::REASON_BROKEN.into(),
                     moves: Vec::new(),
+                    ..Default::default()
                 },
             },
         )

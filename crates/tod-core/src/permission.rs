@@ -201,6 +201,7 @@ mod tests {
                 created_at: 0,
                 reason: "access".into(),
                 moves: vec![],
+                blocks: vec![],
             },
             answers: vec![DecisionAnswer {
                 id: 1,

@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 94;
+pub const CURRENT_USER_VERSION: i32 = 95;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -632,6 +632,11 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         crate::decisions::add_option_moves(conn)?;
         conn.pragma_update(None, "user_version", 94)?;
     }
+    if version < 95 {
+        // The plan steps a decision holds up (`crate::decisions::Decision::blocks`).
+        crate::decisions::add_blocks(conn)?;
+        conn.pragma_update(None, "user_version", 95)?;
+    }
     // Other branches (the task panel) numbered their own steps 66–67 at the
     // same time as 66–70 above, so a store may be past a version without
     // having these. Every one is idempotent: make sure of them all.
@@ -661,6 +666,7 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     crate::lifecycle_config::add_checks(conn)?;
     crate::lifecycle_config::add_pr_draft_review(conn)?;
     crate::decisions::add_option_moves(conn)?;
+    crate::decisions::add_blocks(conn)?;
     crate::review::add_pr_columns(conn)?;
     // A cloud supervisor's heartbeat for a node (`crate::cloud_activity`):
     // synced, and not journaled (high-frequency bookkeeping).

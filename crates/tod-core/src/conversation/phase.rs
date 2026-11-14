@@ -492,6 +492,7 @@ pub fn mock_turn(
                         evidence: Vec::new(),
                         reason: REASON_INTENT.to_string(),
                         moves: Vec::new(),
+                        ..Default::default()
                     },
                 })?;
                 return Ok(String::new());

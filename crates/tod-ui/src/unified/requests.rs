@@ -1423,6 +1423,20 @@ impl Requests {
             return div().into_any_element();
         };
         let footer = self.render_footer(item, window, cx);
+        // The steps this request holds up, listed under it: one cause, one
+        // request (`Decision::blocks`).
+        let held_up: Vec<String> = decision
+            .blocks
+            .iter()
+            .filter_map(|id| self.loaded.handoff_steps.iter().find(|s| s.id == *id))
+            .map(|step| {
+                let why = step.note.as_deref().map(first_line).filter(|n| !n.is_empty());
+                match why {
+                    Some(why) => format!("- {} ({why})", first_line(&step.body)),
+                    None => format!("- {}", first_line(&step.body)),
+                }
+            })
+            .collect();
         self.card(format!("unified-decisions-pending-{}", decision.id), cx)
             .child(capped_scroll(
                 format!("unified-decisions-question-scroll-{}", decision.id),
@@ -1434,6 +1448,14 @@ impl Requests {
                     cx,
                 ),
             ))
+            .when(!held_up.is_empty(), |el| {
+                el.child(style::text_muted(div().text_sm()).child(selectable_markdown(
+                    SharedString::from(format!("unified-decisions-held-up-{}", decision.id)),
+                    format!("Holds up {} plan step(s); answering opens them again:\n\n{}", held_up.len(), held_up.join("\n")),
+                    window,
+                    cx,
+                )))
+            })
             .when(tod_core::environment_request::is_request(&decision), |el| {
                 el.child(self.render_credential_buttons(&decision, cx))
             })
@@ -1748,6 +1770,7 @@ mod tests {
             created_at: asked.timestamp_millis(),
             reason: "intent".into(),
             moves: Vec::new(),
+            blocks: Vec::new(),
         };
         let answer = DecisionAnswer {
             id: 1,

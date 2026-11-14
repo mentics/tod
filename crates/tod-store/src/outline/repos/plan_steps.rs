@@ -348,6 +348,14 @@ impl<'a> PlanStepRepo<'a> {
             "unknown plan step status `{status}`"
         );
         let note = note.map(str::trim).filter(|note| !note.is_empty());
+        let before: Option<(String, Vec<u8>)> = self
+            .conn
+            .query_row(
+                "SELECT status, node_id FROM node_plan_steps WHERE id = ?1",
+                params![uuid_to_blob(id)],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
         let n = self.conn.execute(
             "UPDATE node_plan_steps SET status = ?1, note = ?2, reason = ?3, updated_at = ?4
              WHERE id = ?5",
@@ -364,6 +372,15 @@ impl<'a> PlanStepRepo<'a> {
         }
         if let Some(note) = note {
             self.record_note(id, status, note)?;
+        }
+        // A step leaving `partial`/`blocked` settles the decision that held
+        // it up (one cause, one item): see `DecisionRepo::release_for_step`.
+        if let Some((was, node)) = &before
+            && needs_user(was)
+            && !needs_user(status)
+        {
+            crate::decisions::DecisionRepo::new(self.conn)
+                .release_for_step(id, crate::outline::uuid_blob::blob_to_uuid(node)?)?;
         }
         if !matches!(status, STATUS_PENDING | STATUS_READY) {
             crate::branch_starts::mark_worked_for_step(self.conn, &uuid_to_blob(id))?;

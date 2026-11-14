@@ -26,7 +26,7 @@ COMMANDS:
     add       --node <UUID> --body <TEXT> [--phase active|verifying|merged|released] [--after <ID>] [--before] [--depends-on <ID>] [--satisfies <OBLIGATION_ID>]
 
 Use `depend`/`satisfy` to add further links after creation — `add` only takes one of each.
-    update    <ID> [--body <TEXT>] [--phase active|verifying|merged|released] [--status pending|ready|in_progress|implemented|verified|failed|partial|blocked] [--reason conflict|decision|access] [--why <TEXT>] [--did <TEXT>] [--cites <OBLIGATION_ID>]... [--option <TEXT>]... [--needs <TEXT>] [--tried <TEXT>] [--note <TEXT>]
+    update    <ID> [--body <TEXT>] [--phase active|verifying|merged|released] [--status pending|ready|in_progress|implemented|verified|failed|partial|blocked] [--reason conflict|decision|access] [--why <TEXT>] [--did <TEXT>] [--cites <OBLIGATION_ID>]... [--option <TEXT>]... [--needs <TEXT>] [--tried <TEXT>] [--note <TEXT>] [--decision <DECISION_ID>]
     delete    <ID>
     depend    <ID> --on <ID>
     undepend  <ID> --on <ID>
@@ -430,6 +430,16 @@ fn update(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
             options,
         },
     )?;
+    let decision = match args.get("--decision") {
+        Some(raw) => {
+            anyhow::ensure!(
+                status.is_some_and(needs_user),
+                "--decision links a step handed back (--status partial or blocked) to the question that holds it up"
+            );
+            Some(inv.client().read(|conn| tod_store::decisions::DecisionRepo::new(conn).resolve(raw))?)
+        }
+        None => None,
+    };
     let client = inv.client();
     let mut target = Some(id);
     if let Some(body) = body {
@@ -460,6 +470,9 @@ fn update(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
             },
             target,
         })?;
+    }
+    if let Some(decision_id) = decision {
+        client.interview(InterviewCommand::LinkDecisionSteps { decision_id, step_ids: vec![id] })?;
     }
     Ok(ack(id, inv.json))
 }

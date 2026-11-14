@@ -732,7 +732,24 @@ impl AgentRuns {
             },
         };
 
-        Ok(Some((conversation_id, format!("{message}{}", moved.unwrap_or_default()))))
+        // The plan steps this answer opened again, so the agent takes them up
+        // with the answer rather than waiting for a retry.
+        let released = if after.decision.blocks.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n\nThis answer also opened the plan steps it held up ([{}]) again: they are ready, carry on \
+                 with them using this answer. Do not ask this again.",
+                after
+                    .decision
+                    .blocks
+                    .iter()
+                    .map(|id| tod_store::interview::short_id(*id))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        Ok(Some((conversation_id, format!("{message}{released}{}", moved.unwrap_or_default()))))
     }
 
     /// Records the user's answer to `decision_id` (append-only: a change of

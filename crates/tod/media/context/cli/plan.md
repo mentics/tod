@@ -4,7 +4,7 @@
 tod-cli --data-root <DATA_ROOT> plan list      [--node <NODE_UUID>] [--search <TEXT>]
 tod-cli --data-root <DATA_ROOT> plan show      <STEP_ID>
 tod-cli --data-root <DATA_ROOT> plan add       --node <NODE_UUID> --body <TEXT> [--phase active|verifying|merged|released] [--after <STEP_ID>] [--before] [--depends-on <STEP_ID>] [--satisfies <OBLIGATION_ID>]
-tod-cli --data-root <DATA_ROOT> plan update    <STEP_ID> [--body <TEXT>] [--phase active|verifying|merged|released] [--status pending|ready|in_progress|implemented|verified|failed|partial|blocked] [--reason conflict|decision|access] [--why <TEXT>] [--did <TEXT>] [--cites <OBLIGATION_ID>]... [--option <TEXT>]... [--needs <TEXT>] [--tried <TEXT>] [--note <TEXT>]
+tod-cli --data-root <DATA_ROOT> plan update    <STEP_ID> [--body <TEXT>] [--phase active|verifying|merged|released] [--status pending|ready|in_progress|implemented|verified|failed|partial|blocked] [--reason conflict|decision|access] [--why <TEXT>] [--did <TEXT>] [--cites <OBLIGATION_ID>]... [--option <TEXT>]... [--needs <TEXT>] [--tried <TEXT>] [--note <TEXT>] [--decision <DECISION_ID>]
 tod-cli --data-root <DATA_ROOT> plan delete    <STEP_ID>
 tod-cli --data-root <DATA_ROOT> plan depend    <STEP_ID> --on <STEP_ID>
 tod-cli --data-root <DATA_ROOT> plan undepend  <STEP_ID> --on <STEP_ID>
@@ -52,6 +52,12 @@ for anything long). The reason is one of:
 `partial` also requires `--did`, what you changed or built; a step with
 nothing done is `blocked`, and takes no `--did`. If there is nothing for the
 user to do, there is nothing to hand back.
+
+When you also asked the user a question (`decisions ask`) about the same cause,
+link the two instead of leaving two requests: give `--decision <DECISION_ID>`
+with the step, or `--blocks <STEP_ID>` on the `decisions ask`. The user then
+answers once, the step opens again, and you are told the answer. A cause that
+holds up several steps is one question with every step linked.
 
 For example:
 

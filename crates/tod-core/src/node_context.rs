@@ -451,9 +451,94 @@ fn lowercase_first(s: &str) -> String {
     }
 }
 
+/// The questions the user answered on `node_id` within
+/// [`tod_store::decisions::REASK_WINDOW_MS`], with their answers: the agent's
+/// next turn carries them so it acts on the answer and never asks it again
+/// (`decisions ask` refuses the repeat, too). Empty when there are none. A
+/// permission (a standing grant) and a credential request (never to echo)
+/// are left out.
+pub fn render_recent_answers(conn: &Connection, node_id: Uuid) -> Result<String> {
+    use tod_store::decisions::{DECISION_ANSWERED, DecisionRepo, REASK_WINDOW_MS};
+    let repo = DecisionRepo::new(conn);
+    let since = tod_store::outline::uuid_blob::now_ms() - REASK_WINDOW_MS;
+    let mut out = String::new();
+    for decision in repo.list_for_node(node_id)? {
+        if decision.status != DECISION_ANSWERED
+            || decision.protocol.as_deref() == Some(crate::permission::PROTOCOL)
+            || crate::environment_request::is_request(&decision)
+        {
+            continue;
+        }
+        let Some(found) = repo.get_with_answers(decision.id)? else { continue };
+        let Some(answer) = found.answers.iter().rev().find(|a| a.answered_at >= since) else { continue };
+        let picked = answer
+            .option
+            .and_then(|o| decision.options.get(usize::try_from(o).ok()?.checked_sub(1)?))
+            .map(|label| format!("\"{label}\""));
+        let given = match (picked, answer.text.as_deref()) {
+            (Some(label), Some(text)) => format!("{label} ({text})"),
+            (Some(label), None) => label,
+            (None, Some(text)) => format!("\"{text}\""),
+            (None, None) => continue,
+        };
+        if out.is_empty() {
+            out.push_str(
+                "The user has already answered these on this node. Act on the answers; do not ask them again.\n",
+            );
+        }
+        let _ = writeln!(out, "\n- Question: {}\n  Answer: {given}", decision.question.lines().next().unwrap_or(""));
+        if !decision.blocks.is_empty() {
+            let steps: Vec<String> = decision.blocks.iter().map(|id| short_id(*id)).collect();
+            let _ = writeln!(out, "  It held up plan steps [{}], which are open again.", steps.join(", "));
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What the user answered a moment ago reaches the agent's next turn, so
+    /// it acts on it instead of asking again; what nobody answered does not.
+    #[test]
+    fn a_recent_answer_is_in_the_next_turn_and_a_pending_question_is_not() {
+        use tod_store::decisions::{DecisionRepo, NewDecision};
+        use tod_store::interview::InterviewCommand;
+        let fx = crate::interview::test_support::fixture();
+        fx.fleet
+            .interview(
+                "user",
+                InterviewCommand::AskDecision {
+                    node_id: fx.node,
+                    conversation_id: None,
+                    protocol: None,
+                    decision: NewDecision {
+                        question: "Leave PG 18 verification to CI?".into(),
+                        options: vec!["Carry on without it".into(), "Wait".into()],
+                        ..Default::default()
+                    },
+                },
+            )
+            .unwrap();
+        let pending = fx
+            .fleet
+            .read(|conn| Ok(DecisionRepo::new(conn).list_pending_for_node(fx.node)?))
+            .unwrap()
+            .remove(0);
+        let render = || fx.fleet.read(|conn| render_recent_answers(conn, fx.node)).unwrap();
+        assert_eq!(render(), "");
+        fx.fleet
+            .interview(
+                "user",
+                InterviewCommand::AnswerDecision { decision_id: pending.id, option: Some(1), text: None },
+            )
+            .unwrap();
+        let text = render();
+        assert!(text.contains("Leave PG 18 verification to CI?"), "{text}");
+        assert!(text.contains("\"Carry on without it\""), "{text}");
+        assert!(text.contains("do not ask them again"), "{text}");
+    }
 
     fn obligation(n: u128, kind: &str, section: Option<&str>) -> NodeObligation {
         NodeObligation {

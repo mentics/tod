@@ -83,7 +83,11 @@ must stand on its own. The question text has this shape:
    alone"). They do not restate the question. Put your recommendation first
    and mark it "(recommended)".
 5. **Ask for one thing at a time.** Several steps or choices are several
-   requests, filed in the order they matter.
+   requests, filed in the order they matter. One cause is one request: when
+   steps you handed back and a question you ask have the same cause, ask once
+   and link the steps to it (`--blocks`, see the `decisions` commands) rather
+   than filing each separately. Never repeat a question the user has answered:
+   the answer is in your context, so act on it.
 6. **Do not ask the user to do what you or the app can do**: fix a checkout,
    re-run a command, read a page you can reach, install a program. Ask only for what is theirs
    (a login, a prod action, a judgment, a preference).

@@ -7,7 +7,7 @@ as what a node with nothing on it is for. You only ask; answering is the
 user's.
 
 ```
-tod-cli --data-root <DATA_ROOT> decisions ask  [--node <NODE_UUID>] <QUESTION> [--option <TEXT> (repeatable)] [--evidence <KIND>:<ID> (repeatable)] [--reason <KIND>] [--moves-to <N>:<STATE> (repeatable)]
+tod-cli --data-root <DATA_ROOT> decisions ask  [--node <NODE_UUID>] <QUESTION> [--option <TEXT> (repeatable)] [--evidence <KIND>:<ID> (repeatable)] [--reason <KIND>] [--moves-to <N>:<STATE> (repeatable)] [--blocks <STEP_ID> (repeatable)] [--new-evidence <TEXT>]
 tod-cli --data-root <DATA_ROOT> decisions list [--node <NODE_UUID>] [--all]
 tod-cli --data-root <DATA_ROOT> decisions show <DECISION_ID>
 ```
@@ -41,6 +41,20 @@ in full or as the 8-character prefix listings show.
   your session cannot, so a plain option worded that way does nothing. `STATE`
   must be earlier than the node's current state and before `pr_review`; the
   ask fails otherwise.
+- `--blocks`: repeatable plan step id (the 8-character prefix is fine) of this
+  node that the question holds up. Use it whenever you hand a step back
+  (`plan update --status blocked|partial`) for the same cause: ask once, with
+  every step it holds up in `--blocks`, instead of a separate hand-back
+  request and a question. The user sees one request with the steps listed
+  under it, and answering it opens the steps again (ready) and tells you the
+  answer. If the step is handed back after the question, pass
+  `plan update <STEP> --status blocked ... --decision <DECISION_ID>` instead.
+- `--new-evidence`: a question the user answered on this node in the last 30
+  minutes (the same text, or one whose `--blocks` an answer already released)
+  is refused, and the message gives the answer: act on it. Pass
+  `--new-evidence` only when something really changed since (you did what
+  they said and it failed: say the command and the error). Never to repeat
+  the question, and never to re-word it.
 
 `list` shows a node's pending decisions, oldest first; `--all` also lists
 answered and withdrawn ones. `show` prints one decision and its full answer

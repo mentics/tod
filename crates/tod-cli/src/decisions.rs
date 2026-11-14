@@ -26,7 +26,7 @@ Inside a conversation --node defaults to the node it is about, and asks are
 filed under that conversation and its protocol.
 
 COMMANDS:
-    ask   [--node <UUID>] <QUESTION> [--option <TEXT> (repeatable)] [--evidence <KIND>:<ID> (repeatable)] [--reason <KIND>] [--moves-to <N>:<STATE> (repeatable)]
+    ask   [--node <UUID>] <QUESTION> [--option <TEXT> (repeatable)] [--evidence <KIND>:<ID> (repeatable)] [--reason <KIND>] [--moves-to <N>:<STATE> (repeatable)] [--blocks <STEP_ID> (repeatable)] [--new-evidence <TEXT>]
     list  [--node <UUID>] [--all]
     show  <ID>
 
@@ -40,6 +40,12 @@ other when omitted). --moves-to makes option N (1-based) send the node back to
 STATE when the user picks it: the app moves the node itself, as the user's own
 move, and reopens its implementation steps when STATE is active or earlier. STATE
 must be before the node's current state and before pr_review.
+--blocks links a plan step of the node that this question holds up (one cause,
+one request): the user answers once, the step opens again, and the question and
+its steps show as one request. A question already answered on the node in the
+last 30 minutes (the same text, or one holding up a step that answer released)
+is refused with the answer in the message; --new-evidence <TEXT>, what has
+changed since, lets it through.
 `list` shows a node's pending decisions, oldest first; --all includes
 answered and withdrawn ones too.
 `show` prints one decision and its full answer log, oldest first.
@@ -116,6 +122,7 @@ pub(crate) fn report_broken(inv: &Invocation, what: &str) -> anyhow::Result<bool
             evidence: Vec::new(),
             reason: tod_store::decisions::REASON_BROKEN.to_string(),
             moves: Vec::new(),
+            ..Default::default()
         },
     })?;
     Ok(true)
@@ -187,12 +194,22 @@ fn ask(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
         .iter()
         .map(|raw| parse_move(raw))
         .collect::<anyhow::Result<Vec<_>>>()?;
+    let mut blocks = Vec::new();
+    for raw in args.get_all("--blocks") {
+        for id in raw.split(',').map(str::trim).filter(|id| !id.is_empty()) {
+            blocks.push(inv.client().read(|conn| InterviewRepo::new(conn).resolve_plan_step_id(id))?);
+        }
+    }
+    let new_evidence = args.get("--new-evidence").unwrap_or("").trim().to_string();
     let (conversation_id, mut protocol) = asking_conversation(inv)?;
-    // The orchestrator filing one of the app's own stop questions.
+    // The orchestrator filing one of the app's own stop questions is not
+    // an agent that may be repeating itself.
+    let mut guard_reask = true;
     if let Ok(kind) = std::env::var(tod_core::stop_questions::KIND_ENV)
         && tod_core::stop_questions::is_kind(Some(&kind))
     {
         protocol = Some(kind);
+        guard_reask = false;
     }
     let result = inv.client().interview(InterviewCommand::AskDecision {
         node_id: node,
@@ -204,6 +221,9 @@ fn ask(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
             evidence,
             reason,
             moves,
+            blocks,
+            guard_reask,
+            new_evidence,
         },
     })?;
     let id = result
@@ -229,6 +249,7 @@ fn decision_json(d: &Decision) -> serde_json::Value {
         "status": d.status,
         "reason": d.reason,
         "moves": d.moves.iter().map(|m| serde_json::json!({"option": m.option, "to": m.to})).collect::<Vec<_>>(),
+        "blocks": d.blocks.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
     })
 }
 
@@ -246,8 +267,16 @@ fn decision_line(d: &Decision) -> String {
             .collect::<Vec<_>>()
             .join(" | ")
     };
+    let blocks = if d.blocks.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n    holds up plan steps: {}",
+            d.blocks.iter().map(|id| short_id(*id)).collect::<Vec<_>>().join(", ")
+        )
+    };
     format!(
-        "[{}] {} {} · {}\n    {options}",
+        "[{}] {} {} · {}\n    {options}{blocks}",
         short_id(d.id),
         d.status,
         d.question,

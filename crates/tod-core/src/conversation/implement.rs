@@ -203,6 +203,14 @@ impl Protocol for ImplementationProtocol {
              carry its progress: work the ones that are not yet `implemented` \
              or `verified`.\n",
         );
+        let node = node_id(env)?;
+        let answered = env
+            .fleet
+            .read(|conn| Ok(crate::node_context::render_recent_answers(conn, node)?))?;
+        if !answered.is_empty() {
+            out.push('\n');
+            out.push_str(&answered);
+        }
         Ok(out)
     }
 
@@ -248,8 +256,17 @@ impl Protocol for ImplementationProtocol {
         if let Some(done) = cap_or_stall(turn) {
             return Ok(done);
         }
+        let answered = turn
+            .env
+            .fleet
+            .read(|conn| Ok(crate::node_context::render_recent_answers(conn, node)?))?;
+        let mut message = continuation_message(&open, tests.as_ref());
+        if !answered.is_empty() {
+            message.push_str("\n\n");
+            message.push_str(&answered);
+        }
         Ok(Next::Continue {
-            message: continuation_message(&open, tests.as_ref()),
+            message,
             reason: continuation_reason(&open, tests.as_ref()),
         })
     }

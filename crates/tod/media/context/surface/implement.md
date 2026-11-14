@@ -199,7 +199,13 @@ You have no free-text reply the user reads as a question — your turn ends and
 nobody is there to see it. When a step's `decision` or `conflict` reason is a
 real question, also record it with `decisions ask`: the question, every option
 you see as `--option`, and `--evidence` linking whatever backs it up (the
-obligation, the plan step, a test run). This turn then ends, since nothing
+obligation, the plan step, a test run). Ask once per cause, and link every step
+it holds up with `--blocks <STEP>` (or `plan update ... --decision <ID>` for a
+step handed back after the question): never a hand-back per step plus a
+separate question about the same thing. The user answers once, and the answer
+opens every linked step again. A question the user answered a moment ago is
+refused; act on the answer in the refusal (or in this turn's context) rather
+than asking again. This turn then ends, since nothing
 more can happen on that step until the user answers; the app hands the session
 back to you with the answer once they do. Never ask in your reply text —
 `decisions ask` is the only way to ask here.

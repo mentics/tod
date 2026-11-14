@@ -366,6 +366,7 @@ fn request(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
             evidence: Vec::new(),
             reason: tod_store::decisions::REASON_ACCESS.into(),
             moves: Vec::new(),
+            ..Default::default()
         },
     })?;
     let _ = result;
