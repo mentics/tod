@@ -1378,7 +1378,10 @@ mod tests {
         let paths = TodPaths::discover().unwrap();
         let settings = TodSettings::default();
         let root = settings.resolve_fleet_storage_root(&paths).unwrap();
-        assert_eq!(root, sandbox);
+        // The resolver canonicalizes an existing path (macOS /var -> /private/var,
+        // Windows verbatim prefix), so compare against the canonical form.
+        let expected = crate::fleet::paths::normalize_absolute(&sandbox).unwrap();
+        assert_eq!(root, expected);
         clear_data_root_override();
         let _ = fs::remove_dir_all(sandbox);
     }

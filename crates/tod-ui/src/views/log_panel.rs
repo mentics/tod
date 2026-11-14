@@ -295,6 +295,9 @@ mod tests {
             message: "boom".into(),
             notified: false,
         };
-        assert_eq!(entry_text(&entry), "01:01:01 ERROR [agentd] boom");
+        // `clock` renders local time, so derive the expected clock from the same
+        // instant instead of assuming a timezone.
+        let local = chrono::DateTime::<chrono::Local>::from(entry.at).format("%H:%M:%S");
+        assert_eq!(entry_text(&entry), format!("{local} ERROR [agentd] boom"));
     }
 }
