@@ -24,9 +24,12 @@ churning them. You don't work nodes yourself.
 
 ## Pieces
 
-- **Ledger** (`<root>/shepherd/ledger.db`), owned by the shepherds, not tod:
-  scope, each node's verdict and fingerprint, leases, gaps, signals, churn
-  counts. See [the ledger](../shepherd-common/ledger.md). Below, `L` is
+- **Ledger** (`<root>/shepherd/ledger.db`), owned by the shepherds, not tod,
+  and the one place for what is current: the nodes being shepherded (scope,
+  verdict, fingerprint, lease) and the open gaps, i.e. the tod bugs and
+  improvements not yet deployed. What is finished goes to `history.jsonl`
+  beside it (`L history`), which nothing reads to decide what to do. See
+  [the ledger](../shepherd-common/ledger.md). Below, `L` is
   `python3 -I .claude/skills/shepherd-common/scripts/ledger.py <root>`.
 - **`cli-shepherd`** agents (several): work nodes through `tod-cli`
   ([shepherd-cli](../shepherd-cli/SKILL.md)).
@@ -115,7 +118,9 @@ shepherd that reported it.
   - every code path that does the same thing: the fixer lists them and puts
     the guard at the lowest point they share;
   - the bar: a regression test, scoped tests and `cargo check --workspace
-    --all-targets` pass, and `doc/improvement-log.md` updated.
+    --all-targets` pass, and a commit message that says the symptom, the
+    cause, the fix, and the statistic that would have shown it sooner (that
+    statistic, if tod doesn't keep it, is a `measure` gap: report it).
   When done, the fixer rebases on `origin/main` and pushes straight to main
   (`git push origin HEAD:main`; tod has no PRs).
 - A `cli-parity` gap's fix is a new verb in the shepherd tier of `tod-cli`
@@ -134,6 +139,10 @@ shepherd that reported it.
   fixer.
 - A change to another repository goes on a branch and waits for the user's
   OK to push and open a PR.
+- A gap you learn of yourself (from a fixer, a deploy, the user) goes in with
+  `L gap report --owner manager --signature … --summary …` (`--node` when
+  one shows it). A new gap whose reply has `closed_before` means an earlier
+  fix didn't hold: give its fixer that commit.
 
 ## Deploy, with the shepherds drained
 
@@ -219,17 +228,7 @@ Keep `.local/agent/scratchpad/shepherd/state.md` for what the ledger doesn't
 hold: fixer and verifier agent ids, commits not yet deployed, briefs given to
 the user. Read it and `L owners` first after a compaction.
 
-## Improvement log
-
-`doc/improvement-log.md` gets one entry per kind of problem, with these
-fields:
-- **Seen**: count, nodes, dates;
-- **Symptom**;
-- **Cause**;
-- **Fix**: the commit, or "open";
-- **Measure**: the statistic that would have shown it sooner.
-
-Bump the count when a kind comes back. Commit log updates to main as you go.
+## Lessons for the skills
 
 When you learn something these skills should have told you, don't edit them
 mid-run (that would retire every shepherd): add it under "Lessons from runs"
@@ -240,5 +239,8 @@ in `.claude/skills/review-shepherd-runs/reviews.md`.
 When the user asks, and at the end:
 - what was fixed and deployed (the orchestrator included);
 - each node's state and verdict (`L status`);
-- open gaps and what is still open;
-- churn: shepherds started, visits, empty visits (`L owners`).
+- open gaps and what is still open (`L gap list`), and gaps that came back
+  (`recurrence`);
+- churn: shepherds started, visits, empty visits (`L owners` for running
+  ones, `L history --event owner_gone --since-hours <run length>` for the
+  rest).

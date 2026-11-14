@@ -318,6 +318,101 @@ class Gaps(Base):
         self.assertEqual(self.cli("gap", "show", "1")["status"], "deployed")
 
 
+class History(Base):
+    """The ledger holds only what is current; the past goes to history.jsonl."""
+
+    def rows(self, sql):
+        db = sqlite3.connect(os.path.join(self.root, "shepherd", "ledger.db"))
+        try:
+            return db.execute(sql).fetchall()
+        finally:
+            db.close()
+
+    def history(self, *args):
+        return self.cli("history", "--limit", "0", *args)["history"]
+
+    def test_closed_gap_leaves_the_ledger_and_a_recurrence_is_flagged(self):
+        self.setup_nodes("a")
+        self.lease("o")
+        self.cli("gap", "report", "--owner", "o", "--node", "a", "--signature", "bug:x:y", "--summary", "s")
+        self.cli("gap", "set", "1", "--status", "fixing", "--commit", "abc")
+        out = self.cli("gap", "set", "1", "--status", "deployed")
+        self.assertTrue(out["moved_to_history"])
+        self.assertEqual(self.rows("SELECT COUNT(*) FROM gaps")[0][0], 0)
+        self.assertEqual(self.rows("SELECT COUNT(*) FROM gap_nodes")[0][0], 0)
+        self.assertEqual(self.cli("gap", "list")["gaps"], [])
+        [rec] = self.history("--event", "gap_closed")
+        self.assertEqual((rec["id"], rec["status"], rec["commit"], [n["slug"] for n in rec["nodes"]]), (1, "deployed", "abc", ["a"]))
+        again = self.cli("gap", "report", "--owner", "o", "--signature", "bug:x:y", "--summary", "s2")
+        self.assertEqual((again["id"], again["recurrence"]), (2, 1))
+        self.assertEqual(again["closed_before"][0]["commit"], "abc")
+        self.cli("gap", "set", "2", "--status", "wontfix")
+        # even with the ledger deleted, an id in the history is never reused
+        os.remove(os.path.join(self.root, "shepherd", "ledger.db"))
+        self.assertEqual(self.cli("gap", "report", "--owner", "o", "--signature", "z", "--summary", "s")["id"], 3)
+
+    def test_a_gap_without_a_node(self):
+        g = self.cli("gap", "report", "--owner", "manager", "--signature", "measure:review:rounds", "--summary", "s")
+        self.assertEqual((g["id"], g["nodes"]), (1, []))
+        self.assertEqual(self.cli("owners")["owners"], [])  # the reporter is not made a shepherd
+
+    def test_done_and_unscoped_nodes_leave_the_ledger(self):
+        self.setup_nodes("a", "b", "c")
+        self.lease("o")
+        self.verdict("a", "o")
+        self.tod.state("a", "done")
+        c = self.cli("sync")
+        self.assertEqual((c["in_scope"], c["finished"]), (3, 1))
+        self.assertEqual(sorted(r[0] for r in self.rows("SELECT slug FROM nodes")), ["b", "c"])
+        [rec] = self.history("--event", "node_done")
+        self.assertEqual((rec["slug"], rec["last_verdict"]), ("a", "ceiling"))
+        self.cli("sync")  # a done node is not put back
+        self.assertEqual(len(self.rows("SELECT slug FROM nodes")), 2)
+        self.cli("scope", "remove", "c")
+        self.cli("sync")
+        self.assertEqual([r[0] for r in self.rows("SELECT slug FROM nodes")], ["b"])
+        self.assertEqual([r["slug"] for r in self.history("--event", "node_left_scope")], ["c"])
+
+    def test_every_verdict_is_recorded(self):
+        self.setup_nodes("a")
+        self.lease("o")
+        self.verdict("a", "o", "parked", "--no-action")
+        [rec] = self.history("--event", "verdict")
+        self.assertEqual((rec["slug"], rec["verdict"], rec["owner"], rec["no_action"]), ("a", "parked", "o", True))
+
+    def test_a_gone_shepherd_leaves_the_ledger_with_its_counts(self):
+        self.setup_nodes("a")
+        self.lease("o")
+        self.verdict("a", "o", "ceiling", "--acted")
+        self.cli("signal", "retire", "--owner", "o")
+        self.cli("gate", "--owner", "o", expect=11)
+        self.clock[0] += ledger.RETIRED_OWNER_SECONDS + 1
+        self.cli("sync")
+        self.assertEqual(self.cli("owners")["owners"], [])
+        [rec] = self.history("--event", "owner_gone")
+        self.assertEqual((rec["owner"], rec["how"], rec["visits"]), ("o", "retired", 1))
+        self.assertEqual(self.rows("SELECT COUNT(*) FROM signals")[0][0], 0)
+
+    def test_only_the_latest_signal_is_kept(self):
+        self.cli("signal", "pause", "--owner", "o")
+        self.cli("signal", "resume", "--owner", "o")
+        self.cli("signal", "pause", "--all")
+        self.cli("signal", "resume", "--all")
+        self.assertEqual(self.rows("SELECT owner, signal FROM signals"), [("*", "resume")])
+        self.assertEqual(len(self.history("--event", "signal")), 4)
+
+    def test_old_fingerprints_are_pruned(self):
+        self.setup_nodes("a")
+        self.lease("o")
+        self.tod.run("a", "stopped")
+        self.cli("sync")
+        self.tod.run("a", "working", "working", "x")  # back to the leased state
+        self.clock[0] += ledger.FP_PARTS_KEEP_SECONDS + 1
+        self.cli("sync")
+        # left: the current fingerprint (also the lease's); gone: the stopped one
+        self.assertEqual(self.rows("SELECT COUNT(*) FROM fp_parts")[0][0], 1)
+
+
 class Signals(Base):
     def test_gate_and_status(self):
         self.setup_nodes("a")
@@ -337,6 +432,12 @@ class Signals(Base):
     def test_all_applies_to_late_owners(self):
         self.cli("signal", "pause", "--all")
         self.assertEqual(self.cli("gate", "--owner", "late", expect=10), "pause")
+
+    def test_retire_to_all_spares_shepherds_started_after_it(self):
+        self.assertEqual(self.cli("gate", "--owner", "old"), "ok")
+        self.cli("signal", "retire", "--all")
+        self.assertEqual(self.cli("gate", "--owner", "old", expect=11), "retire")
+        self.assertEqual(self.cli("gate", "--owner", "fresh"), "ok")
 
 
 class Wait(Base):

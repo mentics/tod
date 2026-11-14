@@ -25,8 +25,9 @@ So for every run, ask three questions:
 - **Robustness:** where did it stall, break or depend on luck (a compaction,
   a misfired click, a deploy that happened to work)?
 
-The output is a change to the shepherd files and an updated review ledger
-(`reviews.md`, next to this file). The shepherd files are:
+The output is a change to the shepherd files, an updated review ledger
+(`reviews.md`, next to this file: only what is current) and this review's
+write-up appended to `history.md` beside it. The shepherd files are:
 - `.claude/skills/shepherd-manager/SKILL.md` and its `config.toml`;
 - `.claude/skills/shepherd-cli/SKILL.md`, `.claude/skills/shepherd-ui/SKILL.md`;
 - `.claude/skills/shepherd-common/` (shared rules, triage, gap reports,
@@ -35,7 +36,8 @@ The output is a change to the shepherd files and an updated review ledger
 
 Any change to a shepherd skill, a shared file or an agent retires every
 running shepherd when it is deployed, so batch changes into one review. Problems in tod itself (the
-product) are not skill changes: they belong in `doc/improvement-log.md`.
+product) are not skill changes: they are gaps in the live root's shepherd
+ledger (`ledger.py <root> gap report --owner review …`).
 
 ## 1. Find the runs
 
@@ -52,8 +54,10 @@ single-session skill. Review:
 - every run with newer activity, from its "reviewed through" time on
   (`--since` below).
 
-Also read "Lessons from runs" at the top of `reviews.md`: what a shepherd
-wrote down mid-run. Each one is a finding with its evidence already found.
+Also read `reviews.md`: "Lessons from runs" (what the manager or a shepherd
+wrote down mid-run, each a finding with its evidence already found) and "Open
+findings" (what earlier reviews left). Don't read `history.md` unless you are
+mining past reviews.
 
 If the user named sessions (for example by title), match them with the
 `list_sessions` tool's titles and times, and review those. Skip a run that is
@@ -199,7 +203,9 @@ For each finding decide where it belongs:
   Add it under `.claude/skills/shepherd-common/scripts/` and point to it from
   the skill that uses it.
 - **tod**: what the product should do (a missing `tod-cli` command, a status
-  that misled the agent). Add or bump an entry in `doc/improvement-log.md`.
+  that misled the agent). Report it as a gap
+  ([gap reports](../shepherd-common/gap-report.md)); one already open with
+  the same signature just gains the node.
 - **Neither**: a one-off, or already fixed. Check
   `git log -p -- .claude/skills/shepherd-* .claude/agents/shepherd/` and the working-tree diff
   first, so you don't propose what's already there.
@@ -238,12 +244,20 @@ python3 -I .claude/skills/review-shepherd-runs/scripts/find_runs.py shepherd-man
 ```
 
 Mark the manager's transcript only; its shepherds' transcripts count as part
-of it. Then one section for this review: the date, the run profiles (wall
+of it.
+
+`reviews.md` holds only what is current, so the next review reads little:
+- "Lessons from runs": remove each one you applied;
+- "Open findings": the findings you didn't apply, one line each with its
+  count and evidence, so the next review starts from them; bump the count of
+  one that came back, and remove one once applied;
+- "Transcripts reviewed", written by `--mark`.
+
+The write-up goes at the end of `history.md`: the date, the run profiles (wall
 time, compactions, errors, idle, and for the shepherds: started, visits,
-empty visits), the findings (each with evidence, cost, and where
-it went: skill, tooling, tod, or neither), and what was applied. Findings you
-didn't apply stay listed as open, so the next review starts from them, and a
-finding that comes back in a later run gets its count bumped.
+empty visits), the findings (each with evidence, cost, and where it went:
+skill, tooling, tod, or neither), and what was applied. Nothing reads it to
+decide what to do; it is there for data mining.
 
 ## Versions
 

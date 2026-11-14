@@ -4,9 +4,12 @@
 Usage:
   python3 -I ledger.py <data-root> [--ledger PATH] [--text] <command> ...
 
-The ledger is `<data-root>/shepherd/ledger.db` (SQLite, WAL). tod.db is only
-ever read, read-only. See ../ledger.md for every command; `ledger.py <root>
---help` lists them.
+The ledger is `<data-root>/shepherd/ledger.db` (SQLite, WAL) and holds only
+what is current. Whatever stops being current (a closed gap, a finished or
+unscoped node, a shepherd that is gone, a superseded signal, every verdict as
+it is recorded) is appended to `history.jsonl` next to it and removed from the
+ledger. tod.db is only ever read, read-only. See ../ledger.md for every
+command; `ledger.py <root> --help` lists them.
 
 Exit codes: 0 ok; 1 error (message on stderr); 2 usage; 3 `check` refused;
 10 `gate` says pause; 11 `gate` says retire.
@@ -28,10 +31,13 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 VERDICTS = ("ceiling", "parked", "in_motion", "blocked_on_gap")
 GAP_STATUSES = ("open", "fixing", "verified", "deployed", "wontfix")
 GAP_UNRESOLVED = ("open", "fixing", "verified")
+GAP_CLOSED = ("deployed", "wontfix")
 LIFECYCLE = ["proposed", "design", "planning", "ready", "active", "verifying", "review", "pr",
              "pr_draft", "pr_review", "approved", "merged", "released", "learn", "done"]
 DEFAULT_LEASE_MINUTES = 20.0
 STALE_OWNER_SECONDS = 30 * 60
+RETIRED_OWNER_SECONDS = 10 * 60  # a retired shepherd may still record verdicts for a while
+FP_PARTS_KEEP_SECONDS = 24 * 3600
 
 
 def now():
@@ -74,17 +80,26 @@ CREATE TABLE IF NOT EXISTS nodes (
   verdict TEXT, reason TEXT, verdict_fp TEXT, verdict_version TEXT, verdict_at REAL, verdict_owner TEXT,
   recheck_at REAL, gap_id INTEGER,
   force_due TEXT, due INTEGER NOT NULL DEFAULT 0, due_reason TEXT);
-CREATE TABLE IF NOT EXISTS fp_parts (fp TEXT PRIMARY KEY, parts TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS fp_parts (fp TEXT PRIMARY KEY, parts TEXT NOT NULL, at REAL);
 CREATE TABLE IF NOT EXISTS holds (node_id TEXT PRIMARY KEY, slug TEXT, reason TEXT, at REAL);
 CREATE TABLE IF NOT EXISTS owners (
   owner TEXT PRIMARY KEY, kind TEXT, last_heartbeat REAL, visits INTEGER NOT NULL DEFAULT 0,
-  empty_visits INTEGER NOT NULL DEFAULT 0, ack TEXT NOT NULL DEFAULT 'running', ack_at REAL);
+  empty_visits INTEGER NOT NULL DEFAULT 0, ack TEXT NOT NULL DEFAULT 'running', ack_at REAL,
+  first_seen REAL, first_signal_id INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS signals (id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL, signal TEXT NOT NULL, at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS gaps (
   id INTEGER PRIMARY KEY AUTOINCREMENT, signature TEXT NOT NULL, summary TEXT, status TEXT NOT NULL,
-  commit_sha TEXT, note TEXT, created_at REAL, updated_at REAL);
+  commit_sha TEXT, note TEXT, created_at REAL, updated_at REAL, recurrence INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS gap_nodes (gap_id INTEGER NOT NULL, node_id TEXT NOT NULL, owner TEXT, at REAL, PRIMARY KEY (gap_id, node_id));
 """
+
+
+ADDED_COLUMNS = [
+    ("fp_parts", "at", "REAL"),
+    ("owners", "first_seen", "REAL"),
+    ("owners", "first_signal_id", "INTEGER NOT NULL DEFAULT 0"),
+    ("gaps", "recurrence", "INTEGER NOT NULL DEFAULT 0"),
+]
 
 
 def open_ledger(path):
@@ -98,6 +113,9 @@ def open_ledger(path):
         for stmt in SCHEMA.strip().split(";\n"):
             if stmt.strip():
                 conn.execute(stmt)
+        for table, column, decl in ADDED_COLUMNS:  # ledgers made before the column existed
+            if column not in {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
         conn.execute("COMMIT")
     except (sqlite3.Error, OSError) as e:
         die(f"cannot open the ledger {path}: {e}")
@@ -114,6 +132,91 @@ def txn(conn):
         raise
     else:
         conn.execute("COMMIT")
+
+
+# --------------------------------------------------------------- history
+
+HISTORY_PATH = None  # set by main(): history.jsonl next to the ledger
+
+
+def history_path():
+    if HISTORY_PATH is None:
+        die("the history file is not set (main() sets it next to the ledger)")
+    return HISTORY_PATH
+
+
+def to_history(event, **fields):
+    """Append one record. Called inside the ledger's write transaction, so
+    writers are serialised and a record goes out before its row is removed
+    (a failed commit can at worst leave a duplicate record, never lose one)."""
+    rec = {"at": now(), "event": event, **fields}
+    try:
+        with open(history_path(), "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, default=str) + "\n")
+    except OSError as e:
+        die(f"cannot append to the history {history_path()}: {e}")
+
+
+def read_history():
+    path = history_path()
+    if not os.path.exists(path):
+        return []
+    out = []
+    with open(path, encoding="utf-8") as f:
+        for n, line in enumerate(f, 1):
+            if line.strip():
+                try:
+                    out.append(json.loads(line))
+                except ValueError as e:
+                    die(f"{path} line {n} is not JSON: {e}")
+    return out
+
+
+def gap_record(conn, g):
+    nodes = conn.execute(
+        "SELECT g.node_id, g.owner, g.at, n.slug, n.ticket FROM gap_nodes g LEFT JOIN nodes n ON n.node_id = g.node_id WHERE g.gap_id = ?",
+        (g["id"],)).fetchall()
+    return dict(id=g["id"], signature=g["signature"], summary=g["summary"], status=g["status"], commit=g["commit_sha"],
+                note=g["note"], created_at=g["created_at"], updated_at=g["updated_at"], recurrence=g["recurrence"],
+                nodes=[dict(node_id=n["node_id"], slug=n["slug"], ticket=n["ticket"], owner=n["owner"], at=n["at"]) for n in nodes])
+
+
+def node_record(r):
+    return dict(node_id=r["node_id"], slug=r["slug"], ticket=r["ticket"], state=r["state"],
+                last_verdict=r["verdict"], reason=r["reason"], verdict_at=r["verdict_at"], verdict_owner=r["verdict_owner"],
+                gap=r["gap_id"], first_seen=r["first_seen"])
+
+
+def housekeep(conn):
+    """Inside a transaction: move what is no longer current to the history."""
+    t = now()
+    for g in conn.execute(f"SELECT * FROM gaps WHERE status IN {GAP_CLOSED}").fetchall():
+        to_history("gap_closed", **gap_record(conn, g))
+        conn.execute("DELETE FROM gap_nodes WHERE gap_id = ?", (g["id"],))
+        conn.execute("DELETE FROM gaps WHERE id = ?", (g["id"],))
+    for r in conn.execute("SELECT * FROM nodes WHERE finished = 1 OR in_scope = 0").fetchall():
+        to_history("node_done" if r["finished"] else "node_left_scope", **node_record(r))
+        conn.execute("DELETE FROM nodes WHERE node_id = ?", (r["node_id"],))
+    for r in conn.execute("SELECT * FROM owners").fetchall():
+        if conn.execute("SELECT 1 FROM nodes WHERE lease_owner = ? AND lease_expires > ?", (r["owner"], t)).fetchone():
+            continue
+        age = t - (r["last_heartbeat"] or 0)
+        how = "retired" if r["ack"] == "retired" and age > RETIRED_OWNER_SECONDS else (
+            "went_silent" if age > STALE_OWNER_SECONDS else None)
+        if how:
+            to_history("owner_gone", owner=r["owner"], kind=r["kind"], how=how, visits=r["visits"],
+                       empty_visits=r["empty_visits"], first_seen=r["first_seen"], last_heartbeat=r["last_heartbeat"])
+            conn.execute("DELETE FROM signals WHERE owner = ?", (r["owner"],))
+            conn.execute("DELETE FROM owners WHERE owner = ?", (r["owner"],))
+    conn.execute(
+        """DELETE FROM fp_parts WHERE COALESCE(at, 0) < ? AND fp NOT IN (
+             SELECT fingerprint FROM nodes WHERE fingerprint IS NOT NULL UNION SELECT verdict_fp FROM nodes WHERE verdict_fp IS NOT NULL
+             UNION SELECT lease_fp FROM nodes WHERE lease_fp IS NOT NULL)""", (t - FP_PARTS_KEEP_SECONDS,))
+
+
+def remember_fp(conn, fp, parts):
+    conn.execute("INSERT OR IGNORE INTO fp_parts(fp, parts, at) VALUES (?, ?, ?)", (fp, json.dumps(parts), now()))
+    conn.execute("UPDATE fp_parts SET at = ? WHERE fp = ?", (now(), fp))
 
 
 # --------------------------------------------------------------- sync
@@ -158,21 +261,28 @@ def sync_apply(conn, snaps, warnings, version):
     """Inside a transaction: upsert nodes, finish done ones, recompute due."""
     t = now()
     seen = set()
+    finished = 0
     for s in snaps:
+        if s["state"] == "done":
+            finished += 1
+            # a done node is history: a row left from before is finished (housekeep moves it), none is made
+            conn.execute("UPDATE nodes SET finished = 1, state = 'done' WHERE node_id = ?", (s["id"],))
+            continue
         seen.add(s["id"])
         info = dict(phase=s["phase"], kind=s["kind"], text=s["text"], requests=len(s["decisions"]),
                     first_question=(s["decisions"][0][1] if s["decisions"] else None),
                     overdue_waits=s["overdue_waits"], waits=[w[0] for w in s["waits"]],
                     sandbox=s["sandbox"], state_at=s["state_at"], since=s["since"], title=s["title"])
-        conn.execute("INSERT OR IGNORE INTO fp_parts(fp, parts) VALUES (?, ?)", (s["fp"], json.dumps(s["parts"])))
+        remember_fp(conn, s["fp"], s["parts"])
         conn.execute("INSERT OR IGNORE INTO nodes(node_id, slug, first_seen) VALUES (?, ?, ?)", (s["id"], s["slug"], t))
         conn.execute(
-            "UPDATE nodes SET slug=?, ticket=?, state=?, fingerprint=?, parts=?, info=?, in_scope=1, finished=? WHERE node_id=?",
-            (s["slug"], s["ticket"], s["state"], s["fp"], json.dumps(s["parts"]), json.dumps(info),
-             1 if s["state"] == "done" else 0, s["id"]))
-    for r in conn.execute("SELECT node_id FROM nodes WHERE in_scope = 1").fetchall():
+            "UPDATE nodes SET slug=?, ticket=?, state=?, fingerprint=?, parts=?, info=?, in_scope=1, finished=0 WHERE node_id=?",
+            (s["slug"], s["ticket"], s["state"], s["fp"], json.dumps(s["parts"]), json.dumps(info), s["id"]))
+    for r in conn.execute("SELECT node_id FROM nodes WHERE in_scope = 1 AND finished = 0").fetchall():
         if r["node_id"] not in seen:
             conn.execute("UPDATE nodes SET in_scope = 0, due = 0, due_reason = NULL WHERE node_id = ?", (r["node_id"],))
+    conn.execute("INSERT OR REPLACE INTO meta(k, v) VALUES ('finished_in_scope', ?)", (str(finished),))
+    housekeep(conn)
     for r in conn.execute("SELECT * FROM nodes WHERE in_scope = 1").fetchall():
         reason = None
         if not r["finished"]:
@@ -207,33 +317,45 @@ def is_leased(r, t):
 
 def summary(conn):
     t = now()
-    rows = conn.execute("SELECT * FROM nodes WHERE in_scope = 1").fetchall()
+    rows = conn.execute("SELECT * FROM nodes WHERE in_scope = 1 AND finished = 0").fetchall()
     holds = {r["node_id"] for r in conn.execute("SELECT node_id FROM holds")}
-    active = [r for r in rows if not r["finished"]]
+    active = rows
+    fin = conn.execute("SELECT v FROM meta WHERE k = 'finished_in_scope'").fetchone()
     by = {}
     for r in active:
         by[r["verdict"] or "none"] = by.get(r["verdict"] or "none", 0) + 1
     return {
-        "in_scope": len(rows),
+        "in_scope": len(rows) + (int(fin["v"]) if fin else 0),
         "due": sum(1 for r in active if r["due"] and r["node_id"] not in holds),
         "leased": sum(1 for r in active if is_leased(r, t)),
         "by_verdict": by,
         "held": sum(1 for r in rows if r["node_id"] in holds),
-        "finished": sum(1 for r in rows if r["finished"]),
+        "finished": int(fin["v"]) if fin else 0,
     }
 
 
 # --------------------------------------------------------------- owners & signals
 
 def touch_owner(conn, owner, kind=None):
-    conn.execute("INSERT OR IGNORE INTO owners(owner, kind, last_heartbeat) VALUES (?, ?, ?)", (owner, kind, now()))
+    last = conn.execute("SELECT COALESCE(MAX(id), 0) FROM signals").fetchone()[0]
+    conn.execute("INSERT OR IGNORE INTO owners(owner, kind, last_heartbeat, first_seen, first_signal_id) VALUES (?, ?, ?, ?, ?)",
+                 (owner, kind, now(), now(), last))
     conn.execute("UPDATE owners SET last_heartbeat = ?, kind = COALESCE(?, kind) WHERE owner = ?", (now(), kind, owner))
 
 
 def effective_signal(conn, owner):
-    """(id, signal) of the latest signal addressed to the owner or to all; (0, None) if none."""
-    r = conn.execute("SELECT id, signal FROM signals WHERE owner IN (?, '*') ORDER BY id DESC LIMIT 1", (owner,)).fetchone()
-    return (r["id"], r["signal"]) if r else (0, None)
+    """(id, signal) of the latest signal addressed to the owner or to all; (0, None) if none.
+    A `retire` sent to all before the owner existed is not for it: the manager
+    retires every running shepherd and then starts fresh ones. A `pause` to all
+    does reach late owners (a deploy is under way)."""
+    r = conn.execute("SELECT id, owner, signal FROM signals WHERE owner IN (?, '*') ORDER BY id DESC LIMIT 1", (owner,)).fetchone()
+    if not r:
+        return (0, None)
+    if r["owner"] == "*" and r["signal"] == "retire":
+        o = conn.execute("SELECT first_signal_id FROM owners WHERE owner = ?", (owner,)).fetchone()
+        if o is None or r["id"] <= o["first_signal_id"]:
+            return (r["id"], None)
+    return (r["id"], r["signal"])
 
 
 def set_ack(conn, owner, ack):
@@ -372,7 +494,7 @@ def cmd_verdict(a, conn, tod):
             die(f"node `{a.node}` is leased by {row['lease_owner']}, not {a.owner}")
         if a.gap is not None and not conn.execute("SELECT 1 FROM gaps WHERE id = ?", (a.gap,)).fetchone():
             die(f"gap {a.gap} does not exist")
-        conn.execute("INSERT OR IGNORE INTO fp_parts(fp, parts) VALUES (?, ?)", (fp, json.dumps(parts)))
+        remember_fp(conn, fp, parts)
         conn.execute(
             """UPDATE nodes SET verdict=?, reason=?, verdict_fp=?, verdict_version=?, verdict_at=?, verdict_owner=?,
                  recheck_at=?, gap_id=?, force_due=NULL, due=0, due_reason=NULL, fingerprint=?, parts=?,
@@ -382,6 +504,9 @@ def cmd_verdict(a, conn, tod):
         touch_owner(conn, a.owner)
         conn.execute("UPDATE owners SET visits = visits + 1, empty_visits = empty_visits + ? WHERE owner = ?",
                      (1 if a.no_action else 0, a.owner))
+        to_history("verdict", node_id=nid, slug=row["slug"], ticket=row["ticket"], state=row["state"], verdict=a.verdict,
+                   reason=a.reason, owner=a.owner, gap=a.gap, acted=bool(a.acted), no_action=bool(a.no_action),
+                   fingerprint=fp, version=version, recheck_minutes=a.recheck_minutes)
     return {"node": row["slug"], "verdict": a.verdict, "fingerprint": fp, "version": version,
             "recheck_at": t + a.recheck_minutes * 60 if a.recheck_minutes is not None else None}
 
@@ -414,7 +539,7 @@ def cmd_ack(a, conn, tod):
             if row is None or row["lease_owner"] != a.owner:
                 die(f"node `{ref}` is not leased by {a.owner}")
             fp, parts = live_fp(tod, nid)
-            conn.execute("INSERT OR IGNORE INTO fp_parts(fp, parts) VALUES (?, ?)", (fp, json.dumps(parts)))
+            remember_fp(conn, fp, parts)
             conn.execute("UPDATE nodes SET lease_fp = ?, lease_at = ? WHERE node_id = ?", (fp, now(), nid))
             out.append({"node": row["slug"], "fingerprint": fp})
     return {"acked": out}
@@ -515,8 +640,15 @@ def cmd_signal(a, conn, tod):
                 "awaiting_pause": pending}
     if bool(a.owner) == bool(a.all):
         die("signal needs exactly one of --owner <id> or --all")
+    to = "*" if a.all else a.owner
     with txn(conn):
-        conn.execute("INSERT INTO signals(owner, signal, at) VALUES (?, ?, ?)", ("*" if a.all else a.owner, a.action, now()))
+        cur = conn.execute("INSERT INTO signals(owner, signal, at) VALUES (?, ?, ?)", (to, a.action, now()))
+        # only the latest signal per addressee counts; one to all supersedes every older one
+        if a.all:
+            conn.execute("DELETE FROM signals WHERE id < ?", (cur.lastrowid,))
+        else:
+            conn.execute("DELETE FROM signals WHERE owner = ? AND id < ?", (to, cur.lastrowid))
+        to_history("signal", to=to, signal=a.action)
     return {"signal": a.action, "to": "all" if a.all else a.owner}
 
 
@@ -525,7 +657,8 @@ def gap_view(conn, g, full=False):
         "SELECT g.node_id, g.owner, n.slug, n.ticket FROM gap_nodes g LEFT JOIN nodes n ON n.node_id = g.node_id WHERE g.gap_id = ?",
         (g["id"],)).fetchall()
     out = dict(id=g["id"], signature=g["signature"], summary=g["summary"], status=g["status"], commit=g["commit_sha"],
-               note=g["note"], nodes=[n["slug"] or n["node_id"] for n in nodes], created_at=g["created_at"], updated_at=g["updated_at"])
+               note=g["note"], nodes=[n["slug"] or n["node_id"] for n in nodes], created_at=g["created_at"], updated_at=g["updated_at"],
+               recurrence=g["recurrence"])
     if full:
         out["node_details"] = [dict(node_id=n["node_id"], slug=n["slug"], ticket=n["ticket"], owner=n["owner"]) for n in nodes]
     return out
@@ -533,33 +666,43 @@ def gap_view(conn, g, full=False):
 
 def cmd_gap(a, conn, tod):
     if a.action == "list":
-        q = "SELECT * FROM gaps"
-        if a.open:
-            q += " WHERE status IN ('open','fixing','verified')"
-        return {"gaps": [gap_view(conn, g) for g in conn.execute(q + " ORDER BY id")]}
+        return {"gaps": [gap_view(conn, g) for g in conn.execute("SELECT * FROM gaps ORDER BY id")]}
     if a.action == "show":
         g = conn.execute("SELECT * FROM gaps WHERE id = ?", (a.id,)).fetchone()
-        if not g:
+        if g:
+            return gap_view(conn, g, full=True)
+        closed = [h for h in read_history() if h.get("event") == "gap_closed" and h.get("id") == a.id]
+        if not closed:
             die(f"gap {a.id} does not exist")
-        return gap_view(conn, g, full=True)
+        return dict(closed[-1], closed=True)
     t = now()
     if a.action == "report":
-        nid, _ = lookup_node(conn, tod, a.node)
+        nid = lookup_node(conn, tod, a.node)[0] if a.node else None
+        earlier = [dict(id=h["id"], status=h["status"], commit=h.get("commit"), closed_at=h["at"])
+                   for h in read_history() if h.get("event") == "gap_closed" and h.get("signature") == a.signature]
         with txn(conn):
             g = conn.execute("SELECT * FROM gaps WHERE signature = ? AND status IN ('open','fixing','verified') ORDER BY id LIMIT 1",
                              (a.signature,)).fetchone()
             created = g is None
             if created:
-                cur = conn.execute("INSERT INTO gaps(signature, summary, status, created_at, updated_at) VALUES (?, ?, 'open', ?, ?)",
-                                   (a.signature, a.summary, t, t))
-                gid = cur.lastrowid
+                # ids keep counting past closed gaps, so a history record's id is never reused
+                # (also when the ledger was deleted and the history kept)
+                last = max([h["id"] for h in read_history() if h.get("event") == "gap_closed"] + [0])
+                seq = conn.execute("SELECT seq FROM sqlite_sequence WHERE name = 'gaps'").fetchone() if conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE name = 'sqlite_sequence'").fetchone() else None
+                gid = max(last, seq[0] if seq else 0, conn.execute("SELECT COALESCE(MAX(id), 0) FROM gaps").fetchone()[0]) + 1
+                conn.execute(
+                    "INSERT INTO gaps(id, signature, summary, status, created_at, updated_at, recurrence) VALUES (?, ?, ?, 'open', ?, ?, ?)",
+                    (gid, a.signature, a.summary, t, t, len(earlier)))
             else:
                 gid = g["id"]
-            conn.execute("INSERT OR IGNORE INTO gap_nodes(gap_id, node_id, owner, at) VALUES (?, ?, ?, ?)", (gid, nid, a.owner, t))
-            touch_owner(conn, a.owner)
+            if nid:
+                conn.execute("INSERT OR IGNORE INTO gap_nodes(gap_id, node_id, owner, at) VALUES (?, ?, ?, ?)", (gid, nid, a.owner, t))
             g = conn.execute("SELECT * FROM gaps WHERE id = ?", (gid,)).fetchone()
             out = gap_view(conn, g)
         out["created"] = created
+        if created and earlier:
+            out["closed_before"] = earlier  # the same signature was fixed (or dropped) before: it came back
         return out
     # set
     with txn(conn):
@@ -575,6 +718,9 @@ def cmd_gap(a, conn, tod):
                 (f"fix for gap {a.id} deployed", f"fix for gap {a.id} deployed", a.id)).rowcount
         g = conn.execute("SELECT * FROM gaps WHERE id = ?", (a.id,)).fetchone()
         out = gap_view(conn, g)
+        if a.status in GAP_CLOSED:
+            housekeep(conn)  # a closed gap is history now
+            out["moved_to_history"] = True
     out["nodes_made_due"] = woken
     return out
 
@@ -617,7 +763,7 @@ def cmd_clear(a, conn, tod):
 
 def cmd_status(a, conn, tod):
     out = summary(conn)
-    out["open_gaps"] = conn.execute("SELECT COUNT(*) FROM gaps WHERE status IN ('open','fixing','verified')").fetchone()[0]
+    out["open_gaps"] = conn.execute("SELECT COUNT(*) FROM gaps").fetchone()[0]
     out["owners"] = [r["owner"] for r in conn.execute("SELECT owner FROM owners ORDER BY owner")]
     sa = conn.execute("SELECT v FROM meta WHERE k = 'synced_at'").fetchone()
     out["synced_age_s"] = round(now() - float(sa["v"])) if sa else None
@@ -635,6 +781,21 @@ def cmd_owners(a, conn, tod):
         out.append(dict(owner=r["owner"], kind=r["kind"], heartbeat_age_s=round(t - (r["last_heartbeat"] or 0)),
                         held=held, visits=r["visits"], empty_visits=r["empty_visits"], signal=sig, ack=r["ack"]))
     return {"owners": out}
+
+
+def cmd_history(a, conn, tod):
+    recs = read_history()
+    if a.event:
+        recs = [r for r in recs if r.get("event") == a.event]
+    if a.signature:
+        recs = [r for r in recs if r.get("signature") == a.signature]
+    if a.node:
+        recs = [r for r in recs if a.node in (r.get("slug"), r.get("node_id")) or a.node in (r.get("ticket") or "")]
+    if a.owner:
+        recs = [r for r in recs if r.get("owner") == a.owner]
+    if a.since_hours is not None:
+        recs = [r for r in recs if r.get("at", 0) >= now() - a.since_hours * 3600]
+    return {"history": recs[-a.limit:] if a.limit else recs}
 
 
 # --------------------------------------------------------------- output
@@ -734,11 +895,11 @@ def build_parser():
     gsub = sp.add_subparsers(dest="action", required=True)
     g = gsub.add_parser("report")
     owner(g)
-    g.add_argument("--node", required=True)
+    g.add_argument("--node", help="the node that hit it (omit for a gap no node shows, e.g. a measure)")
     g.add_argument("--signature", required=True)
     g.add_argument("--summary", required=True)
     g = gsub.add_parser("list")
-    g.add_argument("--open", action="store_true")
+    g.add_argument("--open", action="store_true", help="the same as no flag: closed gaps are in the history")
     g = gsub.add_parser("show")
     g.add_argument("id", type=int)
     g = gsub.add_parser("set")
@@ -760,6 +921,13 @@ def build_parser():
     sp.add_argument("--reason-like")
     add("status", cmd_status)
     add("owners", cmd_owners)
+    sp = add("history", cmd_history)
+    sp.add_argument("--event", choices=["verdict", "gap_closed", "node_done", "node_left_scope", "owner_gone", "signal"])
+    sp.add_argument("--signature")
+    sp.add_argument("--node")
+    sp.add_argument("--owner")
+    sp.add_argument("--since-hours", type=float)
+    sp.add_argument("--limit", type=int, default=50, help="the last N records (0: all)")
     return p
 
 
@@ -778,6 +946,8 @@ def main(argv=None):
         i += 1
     a = build_parser().parse_args(rest[:1] + extra + rest[1:])
     path = a.ledger or os.path.join(a.root, "shepherd", "ledger.db")
+    global HISTORY_PATH
+    HISTORY_PATH = os.path.join(os.path.dirname(os.path.abspath(path)), "history.jsonl")
     tod = lib.open_tod(a.root)
     conn = open_ledger(path)
     try:

@@ -91,4 +91,4 @@ by the branch push: the supervisor's, at every turn and step boundary and when
 it exits, in the checkout and in each submodule that holds commits no remote
 has (`tod_supervisor::git::push_branch`). Before 2026-11-12 that push skipped
 submodules, so work committed in a submodule (`kb`) died with its sandbox (see
-`doc/improvement-log.md`).
+`doc/history/improvement-log.md`).

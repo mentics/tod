@@ -8,6 +8,8 @@ fixers. Many nodes hit the same gap, so one gap must collect them all.
 
 Before reporting, list the open gaps (`ledger.py gap list`) and attach the
 node to one that matches (`gap report` with the same signature does this).
+If the reply has `closed_before`, an earlier fix for it did not hold: say so
+in the summary, with the commit it names.
 
 ## Signature
 
@@ -15,7 +17,8 @@ node to one that matches (`gap report` with the same signature does this).
 on another node must produce the same signature.
 
 - `kind`: one of `bug`, `enhancement`, `prompt`, `status`, `setup`,
-  `cli-parity`, `ui`, `ui-target`.
+  `cli-parity`, `ui`, `ui-target`, `measure` (a statistic tod should keep,
+  that would have shown a problem sooner).
 - `area`: the phase, protocol or component (`pr_draft`, `review`, `evaluator`,
   `runner-menu`, `sandbox`, `gate`, `babysitter`, `task-panel`, …).
 - `short-slug`: the cause, not the symptom or the node:
