@@ -11,7 +11,7 @@ path = "src/lib.rs"
 [features]
 default = ["agent-socket"]
 # `shot2` needs gpui's `Window::render_to_image`, gated behind `test-support`.
-agent-socket = ["gpui/test-support", "gpui_platform/test-support"]
+agent-socket = ["gpui/test-support", "gpui_platform/test-support", "gpui/tod-a11y"]
 
 [dependencies]
 anyhow = "1.0"

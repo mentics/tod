@@ -58,6 +58,11 @@ pub fn classify(command: &Command) -> Kind {
         | Command::Close
         | Command::Transcripts(_)
         | Command::AgentPlatform(_) => Kind::Other,
+        // The tree describes the screen, which in user mode is the user's
+        // view: these wait for the agent's view to be restored, as input does.
+        Command::Tree(_) | Command::WaitFor { .. } | Command::Coverage { .. } | Command::Act { .. } => {
+            Kind::Input
+        }
         _ => Kind::Input,
     }
 }

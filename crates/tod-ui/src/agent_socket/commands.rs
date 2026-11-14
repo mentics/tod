@@ -1,3 +1,4 @@
+use crate::agent_socket::a11y_tree::{self, ActAction, TreeQuery};
 use crate::agent_socket::capture::DragStep;
 use std::path::PathBuf;
 
@@ -77,6 +78,24 @@ pub enum Command {
     Resize {
         w: f32,
         h: f32,
+    },
+    /// The accessibility tree, one line per node (see `a11y_tree`).
+    Tree(TreeQuery),
+    /// Act on the one element a selector names, through its own handler.
+    /// An input command, like `Click`.
+    Act {
+        selector: String,
+        action: ActAction,
+    },
+    /// How many clickable elements the current frame has and how many the tree
+    /// exposes; the ones it does not.
+    /// `coverage [frames N]`: clickable-versus-exposed counts; with `frames`, also times N draws with the tree off and on.
+    Coverage { frames: usize },
+    /// Block until a selector matches (or, with `gone`, stops matching).
+    WaitFor {
+        selector: String,
+        gone: bool,
+        timeout_ms: u64,
     },
 }
 
@@ -286,6 +305,26 @@ pub fn parse_line(line: &str) -> Result<Command, String> {
             }
             Ok(Command::Resize { w, h })
         }
+        "coverage" => {
+            let frames = match (parts.next(), parts.next(), parts.next()) {
+                (None, _, _) => 0,
+                (Some("frames"), Some(n), None) => n
+                    .parse::<usize>()
+                    .map_err(|_| format!("`{n}` is not a frame count"))?,
+                _ => return Err("usage: coverage [frames N]".into()),
+            };
+            Ok(Command::Coverage { frames })
+        }
+        "tree" => Ok(Command::Tree(a11y_tree::parse_tree(line["tree".len()..].trim())?)),
+        "act" => {
+            let (selector, action) = a11y_tree::parse_act(line["act".len()..].trim())?;
+            Ok(Command::Act { selector, action })
+        }
+        "wait-for" => {
+            let (selector, gone, timeout_ms) =
+                a11y_tree::parse_wait_for(line["wait-for".len()..].trim())?;
+            Ok(Command::WaitFor { selector, gone, timeout_ms })
+        }
         other => Err(format!("unknown command `{other}`")),
     }
 }
@@ -419,6 +458,32 @@ mod tests {
                 assert_eq!(value, "claude");
             }
             _ => panic!("expected set"),
+        }
+    }
+
+    #[test]
+    fn parses_tree_act_and_wait_for() {
+        assert!(matches!(parse_line("tree").unwrap(), Command::Tree(_)));
+        match parse_line("tree --role button --json").unwrap() {
+            Command::Tree(q) => {
+                assert_eq!(q.role.as_deref(), Some("button"));
+                assert!(q.json);
+            }
+            _ => panic!(),
+        }
+        match parse_line("act button:Resume").unwrap() {
+            Command::Act { selector, action } => {
+                assert_eq!(selector, "button:Resume");
+                assert_eq!(action, ActAction::Click);
+            }
+            _ => panic!(),
+        }
+        assert!(parse_line("act").is_err());
+        match parse_line("wait-for #runner-menu --gone --timeout-ms 100").unwrap() {
+            Command::WaitFor { selector, gone, timeout_ms } => {
+                assert_eq!((selector.as_str(), gone, timeout_ms), ("#runner-menu", true, 100));
+            }
+            _ => panic!(),
         }
     }
 

@@ -207,6 +207,12 @@ If the chosen port is already in use, startup fails immediately with a bind erro
 | `quit` | Close every window, so the app quits as if the user closed it |
 | `shot <path>` | PNG screenshot of the window (Windows and macOS; on macOS the app reads its own window back from the window server, so no Screen Recording permission, and it works while the window is covered or unfocused) |
 | `shot2 <path> [x0 y0 x1 y1]` | Like `shot`, but forces a fresh draw and renders the scene offscreen through gpui (`Window::render_to_image`, so it needs no window-server readback and is current while the window is covered or minimized). macOS-tested; dev builds only, since it turns on gpui's `test-support` |
+| `tree [--role R] [--label S] [--within SEL] [--json]` | Force a fresh frame, then list the UI by identity: `ok N nodes` followed by N lines of `selector`, role, label, value, bounds (window coords), actions, `focused`/`disabled`. Reads GPUI's accessibility tree (see `vendor/README.md`), so it needs no coordinates. |
+| `act <selector> [click\|focus\|set-value <text>\|scroll-into-view]` | Do something to the one element a selector matches (default `click`). Goes through the accessibility action path; if the element has no handler for it, falls back to a synthetic click at its centre and says so. `err no-match <selector>` or `err ambiguous <n> matches: …` otherwise. Counts as input, like `click`. |
+| `wait-for <selector> [--gone] [--timeout-ms N]` | Wait until the selector matches (or, with `--gone`, stops matching); `ok N matches` or `err timeout …`. Default timeout 5000 ms. |
+| `coverage [frames N]` | Clickable elements this frame versus how many the tree exposes (`ok C clickable E exposed X explicit M missing`, then M lines naming each missing one). With `frames N`, first times N forced draws with the tree off and on. |
+
+Selectors: `#<id-path-suffix>` (the tail of an element's id path, on a `/` boundary), `<role>:<label>` (case-insensitive substring of the label or value, e.g. `button:Start`), and `<sel> >> <sel>` to scope the right one to what is inside the left one (`#unified-task-panel >> button:Start`). An element with no id of its own gets `#~file.rs:LINE` (where it was built; `#1`, `#2` for repeats). Run `tree` to see what is there. The tree is switched on by the first of these commands and off again after 30 s without one; with the socket idle it costs nothing.
 
 ### Sharing the app with the user: driven mode and user mode
 
