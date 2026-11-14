@@ -265,6 +265,17 @@ pub fn fork_needs_tod_files(golden_has_tod_files: bool, reported: Option<&str>, 
     !golden_has_tod_files || reported.map(str::trim) != Some(expected_node_manifest)
 }
 
+/// Whether a node manifest on the sandbox means "a node's, leave it". Not for
+/// [`Mode::Fork`]: that is a sandbox just forked, and a tod golden carries
+/// tod's files with the node manifest ([`node_manifest`], written by
+/// `node::install`), so every fork of one has it with no relay running (a
+/// fork starts none). Adopting it only replaces the fork's own relay,
+/// `tod-cli` and manifest; a real node's sandbox is refused by its
+/// `tod-kind` label before this (`Sandboxes::ensure_inner`).
+fn refuses_node_manifest(mode: Mode, current_manifest: &str) -> bool {
+    mode != Mode::Fork && is_node_manifest(current_manifest)
+}
+
 /// Makes the sandbox at `url` ready. `progress` hears about each slow step.
 pub fn ensure(
     bx: &Blaxel,
@@ -310,7 +321,7 @@ pub fn ensure_with(
         bail!("{}", node_sandbox_refusal(name));
     }
     let current = bx.run(url, &format!("cat {MANIFEST_PATH} 2>/dev/null"), 30)?;
-    if is_node_manifest(current.output()) {
+    if refuses_node_manifest(mode, current.output()) {
         // Its relay is started by the node's provisioning, with the
         // supervisor's environment; starting one here would lack it.
         bail!(
@@ -318,7 +329,7 @@ pub fn ensure_with(
             reprovision it"
         );
     }
-    if mode == Mode::Fork && !is_node_manifest(current.output()) {
+    if mode == Mode::Fork {
         return adopt_fork(bx, url, payload, &fork_manifest, current.output().trim(), progress);
     }
     let mut outcome = Outcome::RelayStarted;
@@ -610,6 +621,17 @@ mod tests {
         assert!(is_node_kind(Some("node")) && is_node_kind(Some("node-base")));
         assert!(!is_node_kind(Some("golden")) && !is_node_kind(None));
         assert!(node_sandbox_refusal("tod-x-1").contains("tod-x-1"));
+    }
+
+    #[test]
+    fn a_fork_of_a_golden_is_adopted_though_it_carries_the_node_manifest() {
+        // The 2026-11-14 failure: `tod-sandbox fork <tod golden>` was refused
+        // as "a node's sandbox" and deleted.
+        let node = node_manifest(b"relay");
+        assert!(!refuses_node_manifest(Mode::Fork, &node));
+        assert!(refuses_node_manifest(Mode::Install, &node));
+        assert!(refuses_node_manifest(Mode::ForceInstall, &node));
+        assert!(!refuses_node_manifest(Mode::Install, "bootstrap=1 relay=2"));
     }
 
     #[test]

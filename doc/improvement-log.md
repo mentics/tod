@@ -722,3 +722,12 @@ from Blaxel.
 - **Tests**: `quiet_turns_after_progress_continue_until_the_limit_and_progress_resets` (protocol), `a_quiet_turn_after_progress_continues_and_an_exhausted_allowance_stops`, `a_post_merge_step_is_not_owed_by_verification` (verify), existing per-protocol `NoProgress` tests at continuations 1.
 - **Measure**: `no_progress` run states whose conversation has at most one agent turn (target 0).
 
+
+## 2026-11-14: `tod-sandbox fork <tod golden>` was refused as "a node's sandbox" and the fork deleted
+
+- **Seen**: 1 (a subagent; also reproduced with one test fork, `tod-exp-goldenfork-2377`, of `tod-golden-cofactr-workspace-6af8711b`, with and without `--agents`).
+- **Symptom**: `this is a node's sandbox and its relay is not answering; run the node in the cloud again to reprovision it`, then the fork was deleted. A fork of the repository's own (wsx) golden worked.
+- **Cause**: a tod golden carries tod's files and `/opt/tod/manifest` in the node form (`node relay=...`, written by `node::install`). A golden runs no relay, so its fork has that manifest and nothing answering. `provision::ensure_with` took any node manifest with no answering relay for a half-made node sandbox and bailed, even in `Mode::Fork`, whose job is to adopt exactly such a fork. Only the plain fork path (`Sandboxes::create` from `tod-sandbox fork`) runs `ensure_with` after a fork; `provision::make_sandbox` (nodes) forks with `node::fork_golden`, installs through `install_into_fork` and `ensure_supervisor`, and never calls it, so no node was affected.
+- **Fix**: `refuses_node_manifest` (the one test in `ensure_with`): a node manifest is refused only outside `Mode::Fork`. A node's own sandbox is still refused by its `tod-kind` label (`Sandboxes::ensure_inner`) and by the plain `Install` modes.
+- **Tests**: `a_fork_of_a_golden_is_adopted_though_it_carries_the_node_manifest`.
+- **Measure**: `tod-sandbox fork` of a tod golden succeeds (target: always).
