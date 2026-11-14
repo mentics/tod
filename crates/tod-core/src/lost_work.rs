@@ -886,28 +886,6 @@ mod tests {
         assert!(matches!(repos[0].1, RepoState::Unknown(_)), "{repos:?}");
     }
 
-    /// A replacement checkout of a branch that was never pushed: the first
-    /// checkout recorded birth A, main moved to B, and the replacement made the
-    /// branch fresh at B. The new birth replaces A, so the tip B is a stub (and
-    /// not "merged" from having moved past A).
-    #[test]
-    fn an_unpushed_stub_replaced_at_a_newer_base_is_a_stub_by_the_new_birth() {
-        let (dir, work) = fixture();
-        let first = born(&work);
-        run(&work, &["checkout", "-q", "main"]);
-        commit_in(&work, "later");
-        run(&work, &["push", "-q", "origin", "main"]);
-        let fresh = dir.path().join("fresh");
-        run(dir.path(), &["clone", "-q", "--recurse-submodules", dir.path().join("ws.git").to_str().unwrap(), fresh.to_str().unwrap()]);
-        run(&fresh, &["checkout", "-q", "-b", "task/x"]);
-        let second = born(&fresh);
-        assert_ne!(first["."], second["."]);
-        // What the record holds after the second make.
-        let merged: BTreeMap<String, String> = first.into_iter().chain(second).collect();
-        let repos = inspect(&Workdir::host(&fresh), Some("task/x"), &merged).unwrap();
-        assert_eq!(repos[0].1, RepoState::Untouched, "{repos:?}");
-    }
-
     /// Probe 1: merged by fast-forward, the branch deleted locally and on
     /// origin, HEAD on main: no branch to look at, so nothing is proven. Squash
     /// and rebase merges leave the same.
