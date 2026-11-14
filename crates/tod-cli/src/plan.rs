@@ -449,26 +449,31 @@ fn update(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
     };
     let client = inv.client();
     let mut target = Some(id);
+    // Everything this call writes goes as one command, so one transaction:
+    // the step handed back and the question holding it are written together
+    // or not at all (a failure between them used to leave a blocked step with
+    // no holder).
+    let mut commands = Vec::new();
     if let Some(body) = body {
-        client.interview(InterviewCommand::Outline {
+        commands.push(InterviewCommand::Outline {
             mutation: OutlineMutation::UpdatePlanStepBody {
                 step_id: id,
                 body: body.to_string(),
             },
             target: target.take(),
-        })?;
+        });
     }
     if let Some(phase) = phase {
-        client.interview(InterviewCommand::Outline {
+        commands.push(InterviewCommand::Outline {
             mutation: OutlineMutation::SetPlanStepPhase {
                 step_id: id,
                 phase: phase.to_string(),
             },
             target: target.take(),
-        })?;
+        });
     }
     if let Some(status) = status {
-        client.interview(InterviewCommand::Outline {
+        commands.push(InterviewCommand::Outline {
             mutation: OutlineMutation::UpdatePlanStepStatus {
                 step_id: id,
                 status: status.to_string(),
@@ -476,10 +481,19 @@ fn update(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
                 reason,
             },
             target,
-        })?;
+        });
     }
     if let Some(decision_id) = decision {
-        client.interview(InterviewCommand::LinkDecisionSteps { decision_id, step_ids: vec![id] })?;
+        commands.push(InterviewCommand::LinkDecisionSteps { decision_id, step_ids: vec![id] });
+    }
+    match commands.len() {
+        0 => {}
+        1 => {
+            client.interview(commands.pop().expect("one command"))?;
+        }
+        _ => {
+            client.interview(InterviewCommand::Batch { commands })?;
+        }
     }
     Ok(ack(id, inv.json))
 }

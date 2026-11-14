@@ -343,6 +343,10 @@ pub enum InterviewCommand {
     /// Hold plan steps up with a pending decision (`plan update --decision`,
     /// `DecisionRepo::link_steps`): one cause, one request.
     LinkDecisionSteps { decision_id: Uuid, step_ids: Vec<Uuid> },
+    /// Several commands as one: they run in order inside the one transaction
+    /// the writer gives a command, so all take effect or none does (`plan
+    /// update --decision`: the step handed back and the question holding it).
+    Batch { commands: Vec<InterviewCommand> },
     /// Record an evaluation's verdict on a node's incoming changes and
     /// resolve the entries it covers (`crate::incoming`): `action_ids`, or
     /// every pending entry when unset.
@@ -1186,6 +1190,13 @@ pub fn execute(
             let (steps, verdicts) = crate::outline::repos::PlanStepRepo::new(conn)
                 .reopen_lost_work(*node_id, why)?;
             Ok(json!({ "steps": steps, "verdicts": verdicts }))
+        }
+        InterviewCommand::Batch { commands } => {
+            let mut outputs = Vec::with_capacity(commands.len());
+            for command in commands {
+                outputs.push(execute(conn, media_root, actor, command)?);
+            }
+            Ok(Value::Array(outputs))
         }
         InterviewCommand::LinkDecisionSteps { decision_id, step_ids } => {
             crate::decisions::DecisionRepo::new(conn).link_steps(*decision_id, step_ids)?;
@@ -2078,5 +2089,60 @@ mod tests {
         assert!(delta.iter().all(|c| c.entity_id != q2.id));
         assert!(delta.iter().any(|c| c.entity == ENTITY_QUESTION));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_batch_that_fails_midway_writes_nothing() {
+        use crate::outline::repos::PlanStepRepo;
+        let (dir, conn, node, _session) = setup();
+        let step = Uuid::new_v4();
+        PlanStepRepo::new(&conn).insert_at(step, node, 0, "Step").unwrap();
+        let blocked = InterviewCommand::Outline {
+            mutation: OutlineMutation::UpdatePlanStepStatus {
+                step_id: step,
+                status: "blocked".into(),
+                note: Some("stuck".into()),
+                reason: Some(crate::outline::repos::plan_steps::HandoffReason::Access {
+                    needs: "a key".into(),
+                    tried: "ran it".into(),
+                }),
+            },
+            target: None,
+        };
+        // The decision does not exist, so the link fails after the step was set.
+        let batch = InterviewCommand::Batch {
+            commands: vec![
+                blocked.clone(),
+                InterviewCommand::LinkDecisionSteps { decision_id: Uuid::new_v4(), step_ids: vec![step] },
+            ],
+        };
+        // As the fleet writer runs a command: an error drops the transaction
+        // uncommitted.
+        {
+            let tx = conn.unchecked_transaction().unwrap();
+            assert!(execute(&conn, Path::new("."), ACTOR_USER, &batch).is_err());
+            drop(tx);
+        }
+        assert_eq!(PlanStepRepo::new(&conn).get(step).unwrap().unwrap().status, "pending");
+        // The same batch with a real decision lands whole.
+        let d = crate::decisions::DecisionRepo::new(&conn)
+            .create(
+                node,
+                None,
+                None,
+                &crate::decisions::NewDecision {
+                    question: "Key?".into(),
+                    options: vec!["ok".into()],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let batch = InterviewCommand::Batch {
+            commands: vec![blocked, InterviewCommand::LinkDecisionSteps { decision_id: d.id, step_ids: vec![step] }],
+        };
+        run(&conn, ACTOR_USER, batch).unwrap();
+        assert_eq!(PlanStepRepo::new(&conn).get(step).unwrap().unwrap().status, "blocked");
+        assert_eq!(crate::decisions::DecisionRepo::new(&conn).get(d.id).unwrap().unwrap().blocks, vec![step]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

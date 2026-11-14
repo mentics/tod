@@ -381,8 +381,11 @@ impl<'a> DecisionRepo<'a> {
             self.check_blockable(node_id, *step)?;
             blocks.push(*step);
         }
-        if decision.guard_reask && decision.new_evidence.trim().is_empty() {
-            self.check_not_reasked(node_id, question)?;
+        if decision.guard_reask {
+            self.check_not_pending(node_id, question)?;
+            if decision.new_evidence.trim().is_empty() {
+                self.check_not_reasked(node_id, question)?;
+            }
         }
         let id = Uuid::new_v4();
         let now = now_ms();
@@ -425,6 +428,22 @@ impl<'a> DecisionRepo<'a> {
             }
             Some(_) => Ok(()),
         }
+    }
+
+    /// Refuse a question that is already waiting on this node (the same text,
+    /// case and spacing aside): a question withdrawn because its step was
+    /// retried may be asked again for a new cause, but never twice at once.
+    fn check_not_pending(&self, node_id: Uuid, question: &str) -> Result<()> {
+        let normal = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+        let wanted = normal(question);
+        if let Some(d) = self.list_pending_for_node(node_id)?.into_iter().find(|d| normal(&d.question) == wanted) {
+            bail!(
+                "this question is already waiting for the user's answer (request {}): do not ask it twice. \
+                 Carry on with other work until it is answered.",
+                crate::interview::short_id(d.id)
+            );
+        }
+        Ok(())
     }
 
     /// Refuse a question the user already answered on this node a moment ago
@@ -613,11 +632,28 @@ impl<'a> DecisionRepo<'a> {
         let steps = crate::outline::repos::PlanStepRepo::new(self.conn);
         for id in &decision.blocks {
             let Some(step) = steps.get(*id)? else { continue };
-            if crate::outline::repos::plan_steps::needs_user(&step.status) {
-                steps.update_status(*id, crate::outline::repos::plan_steps::STATUS_READY, None, None)?;
+            if !crate::outline::repos::plan_steps::needs_user(&step.status) {
+                continue;
             }
+            // Another pending decision still holds this step up: its cause
+            // stands, so the step stays handed back until the last holder is
+            // settled. (`update_status` would otherwise withdraw that holder.)
+            if self.pending_holder_of(*id, step.node_id, Some(decision.id))?.is_some() {
+                continue;
+            }
+            steps.update_status(*id, crate::outline::repos::plan_steps::STATUS_READY, None, None)?;
         }
         Ok(())
+    }
+
+    /// A pending decision on `node_id` that holds `step` up, other than
+    /// `except`.
+    pub fn pending_holder_of(&self, step: Uuid, node_id: Uuid, except: Option<Uuid>) -> Result<Option<Uuid>> {
+        Ok(self
+            .list_pending_for_node(node_id)?
+            .into_iter()
+            .find(|d| Some(d.id) != except && d.blocks.contains(&step))
+            .map(|d| d.id))
     }
 
     /// Hold `steps` up with the pending `decision_id` (`plan update
@@ -1343,5 +1379,111 @@ mod tests {
             .unwrap();
         repo.create(fx.node, None, None, &NewDecision { guard_reask: true, ..decision("Old question?", &["yes"]) })
             .unwrap();
+    }
+
+    /// Two requests hold the same step for different causes.
+    fn two_holders(fx: &Fx) -> (Uuid, Decision, Decision) {
+        let step = blocked_steps(fx, 1)[0];
+        let repo = DecisionRepo::new(&fx.conn);
+        let a = repo.create(fx.node, None, None, &NewDecision { blocks: vec![step], ..decision("A: the key?", &["ok"]) }).unwrap();
+        let b = repo.create(fx.node, None, None, &NewDecision { blocks: vec![step], ..decision("B: the login?", &["ok"]) }).unwrap();
+        (step, a, b)
+    }
+
+    #[test]
+    fn answering_one_of_two_holders_leaves_the_other_and_the_step() {
+        let fx = setup();
+        let (step, a, b) = two_holders(&fx);
+        let repo = DecisionRepo::new(&fx.conn);
+        repo.answer(a.id, Some(1), None, "user").unwrap();
+        assert_eq!(repo.get(b.id).unwrap().unwrap().status, DECISION_PENDING);
+        assert_eq!(status_of(&fx, step), "blocked");
+        // The last holder settled opens it.
+        repo.answer(b.id, Some(1), None, "user").unwrap();
+        assert_eq!(status_of(&fx, step), "ready");
+    }
+
+    #[test]
+    fn withdrawing_one_of_two_holders_leaves_the_other_and_the_step() {
+        let fx = setup();
+        let (step, a, b) = two_holders(&fx);
+        let repo = DecisionRepo::new(&fx.conn);
+        repo.withdraw(a.id).unwrap();
+        assert_eq!(repo.get(b.id).unwrap().unwrap().status, DECISION_PENDING);
+        assert_eq!(status_of(&fx, step), "blocked");
+        repo.withdraw(b.id).unwrap();
+        assert_eq!(status_of(&fx, step), "ready");
+    }
+
+    #[test]
+    fn a_shared_other_step_stays_blocked_while_any_holder_remains() {
+        let fx = setup();
+        let steps = blocked_steps(&fx, 2);
+        let repo = DecisionRepo::new(&fx.conn);
+        let a = repo.create(fx.node, None, None, &NewDecision { blocks: steps.clone(), ..decision("A?", &["ok"]) }).unwrap();
+        let b = repo.create(fx.node, None, None, &NewDecision { blocks: vec![steps[1]], ..decision("B?", &["ok"]) }).unwrap();
+        repo.answer(a.id, Some(1), None, "user").unwrap();
+        assert_eq!(status_of(&fx, steps[0]), "ready");
+        assert_eq!(status_of(&fx, steps[1]), "blocked");
+        assert_eq!(repo.get(b.id).unwrap().unwrap().status, DECISION_PENDING);
+    }
+
+    #[test]
+    fn retrying_a_step_settles_every_request_holding_it() {
+        let fx = setup();
+        let (step, a, b) = two_holders(&fx);
+        crate::outline::repos::PlanStepRepo::new(&fx.conn).update_status(step, "in_progress", None, None).unwrap();
+        let repo = DecisionRepo::new(&fx.conn);
+        assert_eq!(repo.get(a.id).unwrap().unwrap().status, DECISION_WITHDRAWN);
+        assert_eq!(repo.get(b.id).unwrap().unwrap().status, DECISION_WITHDRAWN);
+    }
+
+    #[test]
+    fn restoring_a_step_keeps_it_blocked_while_a_request_is_pending() {
+        use crate::conversation::EntitySnapshot;
+        let fx = setup();
+        NodeRepo::new(&fx.conn).enable_capability(fx.node, crate::outline::Capability::Spec).unwrap();
+        let step = blocked_steps(&fx, 1)[0];
+        let repo = DecisionRepo::new(&fx.conn);
+        let old = repo.create(fx.node, None, None, &NewDecision { blocks: vec![step], ..decision("Old?", &["ok"]) }).unwrap();
+        repo.answer(old.id, Some(1), None, "user").unwrap();
+        crate::outline::repos::PlanStepRepo::new(&fx.conn)
+            .update_status(step, "blocked", Some("again"), Some(&crate::outline::repos::plan_steps::HandoffReason::Access { needs: "x".into(), tried: "y".into() }))
+            .unwrap();
+        let pending = repo.create(fx.node, None, None, &NewDecision { blocks: vec![step], ..decision("New?", &["ok"]) }).unwrap();
+        for snapshot_status in ["blocked", "ready"] {
+            fx.conn.execute("DELETE FROM node_plan_steps WHERE id = ?1", params![uuid_to_blob(step)]).unwrap();
+            let snapshot = EntitySnapshot::PlanStep {
+                node_id: fx.node,
+                ordinal: 0,
+                body: "Step 0".into(),
+                status: snapshot_status.into(),
+                note: None,
+                reason: None,
+                depends_on: vec![],
+                satisfies: vec![],
+                phase: "active".into(),
+            };
+            crate::outline::mutations::restore_plan_step(&fx.conn, step, &snapshot).unwrap();
+            assert_eq!(status_of(&fx, step), "blocked", "restored as {snapshot_status}");
+            assert_eq!(repo.get(pending.id).unwrap().unwrap().status, DECISION_PENDING);
+        }
+    }
+
+    #[test]
+    fn a_question_withdrawn_by_a_retry_may_be_asked_again_but_never_twice_at_once() {
+        let fx = setup();
+        let steps = blocked_steps(&fx, 1);
+        let repo = DecisionRepo::new(&fx.conn);
+        let ask = |q: &str| NewDecision { guard_reask: true, blocks: steps.clone(), ..decision(q, &["ok"]) };
+        repo.create(fx.node, None, None, &ask("Key?")).unwrap();
+        // Still waiting: the same question again is refused, whatever the spacing.
+        let err = repo.create(fx.node, None, None, &ask("key?  ")).unwrap_err().to_string();
+        assert!(err.contains("already waiting"), "{err}");
+        assert_eq!(repo.list_pending_for_node(fx.node).unwrap().len(), 1);
+        // Retried (withdrawn), the same question is a new cause and may return once.
+        crate::outline::repos::PlanStepRepo::new(&fx.conn).update_status(steps[0], "in_progress", None, None).unwrap();
+        repo.create(fx.node, None, None, &ask("Key?")).unwrap();
+        assert_eq!(repo.list_pending_for_node(fx.node).unwrap().len(), 1);
     }
 }

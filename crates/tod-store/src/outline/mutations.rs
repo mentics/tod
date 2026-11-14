@@ -1317,11 +1317,21 @@ pub(crate) fn restore_plan_step(
     if !matches!(status.as_str(), "pending" | "ready") {
         crate::branch_starts::mark_worked_for_step(conn, &uuid_to_blob(id))?;
     }
-    // A step restored as handed back, whose question was answered or
-    // withdrawn since, is stale: open it, as that answer did.
-    if crate::outline::repos::plan_steps::needs_user(status)
-        && crate::decisions::DecisionRepo::new(conn).settled_hold(id, *node_id)?
-    {
+    // A pending decision that holds this step up still stands, so the step is
+    // handed back, whatever status the snapshot recorded: keep it blocked
+    // (setting it directly, so nothing is withdrawn) rather than orphan the
+    // decision or, by opening the step, withdraw it.
+    let decisions = crate::decisions::DecisionRepo::new(conn);
+    if decisions.pending_holder_of(id, *node_id, None)?.is_some() {
+        if !crate::outline::repos::plan_steps::needs_user(status) {
+            conn.execute(
+                "UPDATE node_plan_steps SET status = ?1 WHERE id = ?2",
+                params![crate::outline::repos::plan_steps::STATUS_BLOCKED, uuid_to_blob(id)],
+            )?;
+        }
+    } else if crate::outline::repos::plan_steps::needs_user(status) && decisions.settled_hold(id, *node_id)? {
+        // Handed back, whose question was answered or withdrawn since: stale,
+        // so open it, as that answer did.
         repo.update_status(id, crate::outline::repos::plan_steps::STATUS_READY, None, None)?;
     }
     for dep in depends_on {
