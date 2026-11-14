@@ -241,7 +241,7 @@ pub fn save_repo(repo: &Workdir, reference: &str, limits: &Limits) -> Result<Sav
     // Its own file: the app and the node's supervisor may checkpoint the
     // same checkout at once.
     let index = format!("{}/tod-checkpoint-{}.index", git_dir.trim_end_matches('/'), uuid::Uuid::new_v4().simple());
-    let result = build_commit(repo, &index, &head, reference);
+    let result = retry_vanished(VANISH_ATTEMPTS, VANISH_PAUSE, || build_commit(repo, &index, &head, reference));
     // Never left behind, whatever happened.
     let _ = repo.output("rm", &["-f", &index]);
     let (commit, files) = match result? {
@@ -275,6 +275,47 @@ fn retire_own(repo: &Workdir, reference: &str) -> Result<Saved> {
         None => {
             repo.git(&["update-ref", "-d", reference])?;
             Ok(Saved::Clean)
+        }
+    }
+}
+
+/// How many times staging is tried when files keep vanishing under it.
+const VANISH_ATTEMPTS: u32 = 3;
+const VANISH_PAUSE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Whether the staging failed because a file it had listed was gone (or
+/// changed size) by the time it was read: an agent was creating and deleting
+/// files while the checkpoint ran. `add -A` prints `unable to stat '<p>': No
+/// such file or directory`, `open("<p>"): No such file or directory`, `short
+/// read while indexing <p>`, or `pathspec '<p>' did not match any files`.
+fn is_vanished(err: &anyhow::Error) -> bool {
+    let msg = format!("{err:#}");
+    msg.contains("No such file or directory")
+        || msg.contains("short read while indexing")
+        || msg.contains("did not match any files")
+}
+
+/// Run `build`, again (after `pause`) while it fails because files vanished,
+/// up to `attempts` times in all. Any other error is returned at once, and
+/// a vanish that persists is returned saying so.
+fn retry_vanished<T>(
+    attempts: u32,
+    pause: std::time::Duration,
+    mut build: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    let mut tried = 0;
+    loop {
+        tried += 1;
+        match build() {
+            Err(err) if is_vanished(&err) => {
+                if tried >= attempts {
+                    return Err(err.context(format!(
+                        "files kept changing under the checkpoint ({tried} attempts); it is tried again next period"
+                    )));
+                }
+                std::thread::sleep(pause);
+            }
+            other => return other,
         }
     }
 }
@@ -450,6 +491,48 @@ mod tests {
     }
 
     const REF: &str = "refs/tod/checkpoints/n1/root";
+
+    #[test]
+    fn a_file_vanishing_during_staging_is_retried_but_other_errors_and_persistent_vanishing_are_not() {
+        let gone = || anyhow::anyhow!("git add -A failed in /w: fatal: unable to stat 'a.py': No such file or directory");
+        let none = std::time::Duration::ZERO;
+        let mut calls = 0;
+        let ok = retry_vanished(3, none, || {
+            calls += 1;
+            if calls < 3 { Err(gone()) } else { Ok(7) }
+        });
+        assert_eq!((ok.unwrap(), calls), (7, 3));
+
+        calls = 0;
+        let err = retry_vanished::<()>(3, none, || {
+            calls += 1;
+            Err(gone())
+        })
+        .unwrap_err()
+        .to_string();
+        assert_eq!(calls, 3);
+        assert!(err.contains("kept changing"), "{err}");
+
+        calls = 0;
+        let err = retry_vanished::<()>(3, none, || {
+            calls += 1;
+            Err(anyhow::anyhow!("fatal: index.lock exists"))
+        })
+        .unwrap_err()
+        .to_string();
+        assert_eq!(calls, 1);
+        assert!(err.contains("index.lock"), "{err}");
+    }
+
+    #[test]
+    fn the_real_vanish_message_is_recognised() {
+        let fx = Fixture::new();
+        let work = fx.clone_named("w");
+        let out = Command::new("git").arg("-C").arg(&work).args(["add", "missing.txt"]).output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        assert!(!out.status.success());
+        assert!(is_vanished(&anyhow::anyhow!("add failed: {stderr}")), "{stderr}");
+    }
 
     #[test]
     fn ref_names_never_nest_and_name_their_node() {
