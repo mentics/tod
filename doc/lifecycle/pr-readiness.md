@@ -545,6 +545,59 @@ its own words. Now:
    alone (a rejected token) or an unrelated request about the draft is never
    withdrawn. No prompt or code names a bot: it comes from the configuration.
 
+## A failing check that is not the change's
+
+Seen 2026-11-14 (ENG-2504, infra#551): a "Kasm offline validation and tests"
+check failed on a lock-file error in a root the change does not touch (it ran
+only because `atlantis.yaml` changed, and failed the same on an unrelated
+branch). The babysitter sent it to the agent as work; the agent, rightly,
+changed nothing; two quiet turns stopped the run with "the pull request keeps
+needing work".
+
+A failing check is agent work (`Work::FailingChecks(names)`, from
+`PrStatus::failing_checks`), but not every failure is the change's. The agent
+records that it is not with `tod-cli pr checks unrelated <check> --reason
+<evidence>` (`tod_core::check_unrelated`; the surface doc says when: the
+failure is in code or configuration the change does not touch, or the check
+fails on the base or other branches; and that unrelated breakage is not fixed
+in this pull request unless trivial and clearly in scope). The verb refuses a
+check that is not failing, and raises **one** pending decision on the node
+(protocol `check_unrelated`, reason `broken`; none if one is pending or
+answered): "Decide whether the failing check ... is fixed in that pull request
+or carried on without", with the agent's evidence and the options *It's not
+this change's: carry on without "<check>" (<pr>)* and *Fix it in this pull
+request*.
+
+- While it is pending the check is not work (`Assessment::checks_to_fix`
+  leaves it out), so no turn is spent on it, and a turn that raised a
+  question is never counted as a quiet one. The run stops for the user like
+  for any decision.
+- **Carry on** is a standing answer for that check on that pull request
+  (`check_unrelated::standings`, read by `bot_silence::settings_for_node`
+  into `PrReadinessSettings::unrelated_checks`, the same hook the waived bots
+  use): not work, not a failure for the babysitter, and the gate's
+  `pr-approved.mergeable` accepts GitHub's `unstable` when every failing
+  check is waived and none is running. A check still running while only
+  waived ones fail is still waited for (`PrStatus::checks_running`).
+- **Fix it here** makes the check work again, tells the agent the user
+  decided so, and `checks unrelated` is refused for it afterwards.
+- A pending question whose check no longer fails, or whose pull request is
+  merged or unlinked, is withdrawn with a note
+  (`Autopilot::tend_unrelated_check_questions`).
+- A standing holds for the head it was given for, never a later one (the key is
+  check, pull request and head, in the carry-on option). On a new head that
+  still fails the check it is agent work for one look again, and a question
+  for an older head is withdrawn. If the agent records it unrelated again and
+  the user once said to carry on without that check on this pull request, the
+  autopilot applies that to the new head without asking (a timeline note says
+  so); the agent must re-attest per head, and nothing is carried unprompted.
+  Only this node's own pr conversation may record one.
+
+If the agent records nothing and changes nothing twice, the stop
+(`NeedsHuman::PrStuck`) names what is outstanding on which pull request
+(`pr_readiness::outstanding`: the failing checks by name, thread counts, ...)
+and, for a check, what the user can decide (`stuck_advice`).
+
 ## What is built where
 
 - `tod-store`: PR thread, review, check and comment reads (GraphQL for

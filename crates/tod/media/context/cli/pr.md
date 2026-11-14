@@ -13,6 +13,8 @@ tod-cli --data-root <DATA_ROOT> pr status                            [--node <NO
 tod-cli --data-root <DATA_ROOT> pr comment reply <COMMENT_ID> <TEXT> [--node <NODE_UUID>] [--pr <LINK>]
 tod-cli --data-root <DATA_ROOT> pr threads                           [--node <NODE_UUID>] [--pr <LINK>] [--all]
 tod-cli --data-root <DATA_ROOT> pr threads answer <THREAD_ID>        (--fixed | --rejected) --reply <TEXT> [--node <NODE_UUID>] [--pr <LINK>]
+tod-cli --data-root <DATA_ROOT> pr checks                            [--node <NODE_UUID>] [--pr <LINK>]
+tod-cli --data-root <DATA_ROOT> pr checks unrelated <CHECK>          --reason <TEXT> [--node <NODE_UUID>] [--pr <LINK>]
 tod-cli --data-root <DATA_ROOT> pr mergeable                         [--note <TEXT>]
 tod-cli --data-root <DATA_ROOT> pr merged                            [--note <TEXT>]
 tod-cli --data-root <DATA_ROOT> pr blocked                           --why <TEXT>
@@ -26,6 +28,7 @@ tod-cli --data-root <DATA_ROOT> pr blocked                           --why <TEXT
   roughly how many rounds each has had. `threads answer` posts `--reply` (what
   you did, or why not) and resolves the thread. `--fixed`: push first
   so the reply can name the commit. `--rejected`: you changed nothing.
+- `checks` lists each linked PR's failing checks by name, with where the user's decision stands for any you called unrelated. `checks unrelated` says a failing check is not caused by this change; `--reason` is your evidence (the file or log line, and where else it fails: the base branch, other branches). The app takes that check off your list and asks the user once whether to fix it in this PR or carry on without it, so end your turn after it. It refuses a check that is not failing, and one the user decided to fix in this PR.
 - `blocked --why` hands back to the user when you cannot proceed.
 - `mergeable` and `merged` only record; the gates are the app's own checks.
 

@@ -126,6 +126,15 @@ pub struct PrStatus {
     /// `failure` if any failed, else `pending` if any is still running, else
     /// `success`. `None` when it has none (or they could not be read).
     pub checks: Option<String>,
+    /// The names of the checks behind a `failure` in [`Self::checks`]: each
+    /// failing commit status's context and each check run that concluded
+    /// badly (a cancelled run only when nothing else is pending and it was
+    /// never replaced, as [`combine_checks`] reads it). Empty when none
+    /// failed.
+    pub failing_checks: Vec<String>,
+    /// Some check is still running (a status `pending`, a run not completed),
+    /// whatever else failed: `checks` says `failure` first.
+    pub checks_running: bool,
     /// The head commit's SHA.
     pub head_sha: Option<String>,
     /// When the head commit was committed (RFC 3339); filled by
@@ -400,6 +409,8 @@ impl Github {
         // Both kinds of check: commit statuses (the combined status, which
         // says `pending` when there are none at all) and check runs (GitHub
         // Actions and apps), which the combined status leaves out.
+        let mut failing_checks = Vec::new();
+        let mut checks_running = false;
         let checks = match &raw.head {
             Some(head) => {
                 // A failed look is an error, never "no checks": a caller that
@@ -407,6 +418,8 @@ impl Github {
                 let statuses = self
                     .get_json::<CombinedStatusRaw>(&format!("/repos/{owner}/{repo}/commits/{}/status", head.sha))?;
                 let runs = self.get_check_runs(owner, repo, &head.sha)?;
+                failing_checks = failing_check_names(Some(&statuses), Some(&runs));
+                checks_running = checks_running_in(Some(&statuses), Some(&runs));
                 combine_checks(Some(&statuses), Some(&runs))
             }
             None => None,
@@ -427,6 +440,8 @@ impl Github {
             behind_by,
             merged: raw.merged.unwrap_or(false),
             checks,
+            failing_checks,
+            checks_running,
             head_sha: raw.head.as_ref().map(|h| h.sha.clone()),
             head_committed_at: None,
             draft: raw.draft.unwrap_or(false),
@@ -1714,6 +1729,16 @@ struct CombinedStatusRaw {
     state: String,
     #[serde(default)]
     total_count: i64,
+    /// The latest state of each commit-status context.
+    #[serde(default)]
+    statuses: Vec<StatusRaw>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StatusRaw {
+    #[serde(default)]
+    context: Option<String>,
+    state: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1797,6 +1822,67 @@ fn combine_checks(statuses: Option<&CombinedStatusRaw>, runs: Option<&CheckRunsR
         .into_iter()
         .find(|state| states.contains(state))
         .map(str::to_string)
+}
+
+/// The checks behind a `failure` from [`combine_checks`], by name, each once:
+/// failing commit statuses, check runs that concluded badly, and (only when
+/// nothing else failed or runs, and then exactly as [`combine_checks`] counts
+/// them) cancelled runs nothing replaced. A check GitHub gave no name is
+/// `(unnamed check)`.
+fn failing_check_names(statuses: Option<&CombinedStatusRaw>, runs: Option<&CheckRunsRaw>) -> Vec<String> {
+    let unnamed = || "(unnamed check)".to_string();
+    let mut names: Vec<String> = Vec::new();
+    for s in statuses.map(|s| s.statuses.as_slice()).unwrap_or_default() {
+        if !matches!(s.state.as_str(), "success" | "pending") {
+            let name = s.context.clone().unwrap_or_else(unnamed);
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
+    let all = runs.map(|r| r.check_runs.as_slice()).unwrap_or_default();
+    let mut cancelled: Vec<String> = Vec::new();
+    for run in all {
+        let name = run.name.clone().unwrap_or_else(unnamed);
+        match (run.status.as_str(), run.conclusion.as_deref()) {
+            ("completed", Some("success" | "neutral" | "skipped")) => {}
+            ("completed", Some("cancelled")) => {
+                let replaced = all.iter().any(|other| {
+                    !std::ptr::eq(other, run)
+                        && run.name.is_some()
+                        && other.name == run.name
+                        && run.app.is_some()
+                        && other.app == run.app
+                        && matches!((&run.started_at, &other.started_at), (Some(a), Some(b)) if b > a)
+                });
+                if !replaced {
+                    cancelled.push(name);
+                }
+            }
+            ("completed", _) => {
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+            _ => {}
+        }
+    }
+    // As combine_checks: a cancelled run is a failure only when nothing else
+    // failed and nothing is still running.
+    if names.is_empty() && !checks_running_in(statuses, runs) {
+        for name in cancelled {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
+    names
+}
+
+/// Whether a commit status is `pending` or a check run has not completed.
+fn checks_running_in(statuses: Option<&CombinedStatusRaw>, runs: Option<&CheckRunsRaw>) -> bool {
+    statuses.is_some_and(|s| s.statuses.iter().any(|s| s.state == "pending"))
+        || runs.is_some_and(|r| r.check_runs.iter().any(|run| run.status != "completed"))
 }
 
 #[derive(Debug, Deserialize)]
@@ -2232,7 +2318,7 @@ mod tests {
     #[test]
     fn checks_combine_statuses_and_check_runs() {
         use super::{CheckRunsRaw, CombinedStatusRaw, combine_checks};
-        let status = |state: &str, total_count| CombinedStatusRaw { state: state.into(), total_count };
+        let status = |state: &str, total_count| CombinedStatusRaw { state: state.into(), total_count, statuses: Vec::new() };
         let runs = |json: &str| -> CheckRunsRaw { serde_json::from_str(json).unwrap() };
         let green = runs(r#"{"total_count":1,"check_runs":[{"status":"completed","conclusion":"success"}]}"#);
         let running = runs(r#"{"check_runs":[{"status":"in_progress","conclusion":null}]}"#);
@@ -2296,6 +2382,34 @@ mod tests {
         let status = client(&url, &[]).get_pr_status("o", "r", 1).unwrap();
         assert_eq!(status.checks.as_deref(), Some("failure"));
         assert_eq!(handle.join().unwrap(), 4);
+    }
+
+    #[test]
+    fn failing_checks_are_named() {
+        use super::{CheckRunsRaw, CombinedStatusRaw, checks_running_in, failing_check_names};
+        let runs = |json: &str| -> CheckRunsRaw { serde_json::from_str(json).unwrap() };
+        let statuses: CombinedStatusRaw = serde_json::from_str(
+            r#"{"state":"failure","total_count":2,"statuses":[{"context":"ci/lint","state":"error"},{"context":"ci/ok","state":"success"}]}"#,
+        )
+        .unwrap();
+        let r = runs(
+            r#"{"check_runs":[{"name":"Kasm offline validation and tests","status":"completed","conclusion":"failure"},{"name":"build","status":"completed","conclusion":"success"},{"name":"slow","status":"in_progress","conclusion":null},{"name":"Kasm offline validation and tests","status":"completed","conclusion":"timed_out"}]}"#,
+        );
+        assert_eq!(
+            failing_check_names(Some(&statuses), Some(&r)),
+            vec!["ci/lint".to_string(), "Kasm offline validation and tests".to_string()]
+        );
+        assert!(checks_running_in(Some(&statuses), Some(&r)));
+        // A cancelled run alone counts, as combine_checks has it; nothing running.
+        let c = runs(r#"{"check_runs":[{"name":"a","status":"completed","conclusion":"cancelled"}]}"#);
+        assert_eq!(failing_check_names(None, Some(&c)), vec!["a".to_string()]);
+        assert!(!checks_running_in(None, Some(&c)));
+        // Cancelled while another is running: not named (it may be replaced).
+        let c = runs(r#"{"check_runs":[{"name":"a","status":"completed","conclusion":"cancelled"},{"name":"b","status":"queued","conclusion":null}]}"#);
+        assert!(failing_check_names(None, Some(&c)).is_empty());
+        // Nameless.
+        let n = runs(r#"{"check_runs":[{"status":"completed","conclusion":"failure"}]}"#);
+        assert_eq!(failing_check_names(None, Some(&n)), vec!["(unnamed check)".to_string()]);
     }
 
     #[test]

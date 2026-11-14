@@ -760,6 +760,17 @@ fn pr_mergeable_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutco
             passed.push(format!("{} is already merged.", pr.url));
         } else if status.mergeable_state.as_deref() == Some("clean") {
             passed.push(format!("{} is mergeable.", pr.url));
+        } else if status.mergeable_state.as_deref() == Some("unstable")
+            && waived_checks_only(conn, node_id, pr, &status)?
+        {
+            // GitHub says `unstable` for a failing check that is not
+            // required: the user said to carry on without each one that
+            // fails (`crate::check_unrelated`), so nothing else holds it.
+            passed.push(format!(
+                "{} is mergeable apart from {}, which you said to carry on without.",
+                pr.url,
+                status.failing_checks.iter().map(|c| format!("\"{c}\"")).collect::<Vec<_>>().join(", ")
+            ));
         } else {
             return Ok(fail(format!(
                 "{} is not mergeable yet (state: {}).",
@@ -772,6 +783,27 @@ fn pr_mergeable_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutco
         outcome: OUTCOME_PASS,
         detail: passed.join(" "),
     })
+}
+
+/// Whether every check failing on `pr` is one the user told `node` to carry
+/// on without ([`crate::check_unrelated`]), and none is still running.
+fn waived_checks_only(
+    conn: &Connection,
+    node_id: Uuid,
+    pr: &tod_store::github::NodePr,
+    status: &tod_store::github::PrStatus,
+) -> Result<bool> {
+    if status.checks.as_deref() != Some("failure") || status.checks_running {
+        return Ok(false);
+    }
+    let standings = crate::check_unrelated::standings(conn, node_id)?;
+    let settings = tod_store::PrReadinessSettings { unrelated_checks: standings, ..Default::default() };
+    Ok(crate::check_unrelated::all_waived(
+        &settings,
+        &crate::pr_readiness::pr_label(pr),
+        status.head_sha.as_deref().unwrap_or_default(),
+        &status.failing_checks,
+    ))
 }
 
 /// Which of the readiness criteria to answer (`doc/lifecycle/pr-readiness.md`).
@@ -1730,6 +1762,8 @@ mod readiness_tests {
             behind_by: Some(0),
             merged: false,
             checks: None,
+            failing_checks: Vec::new(),
+            checks_running: false,
             head_sha: None,
             head_committed_at: None,
             draft,
