@@ -695,7 +695,8 @@ fn checks(inv: &Invocation, rest: &[String]) -> anyhow::Result<String> {
         }
         let mut failing = Vec::new();
         for check in &status.failing_checks {
-            let standing = tod_store::settings::unrelated_standing(&standings, &label, check);
+            let head = status.head_sha.as_deref().unwrap_or_default();
+            let standing = tod_store::settings::unrelated_standing(&standings, &label, check, head);
             let words = match standing {
                 None => "failing",
                 Some(UnrelatedStanding::Pending) => "failing; you said it is not this change's, the user has been asked",
@@ -732,11 +733,26 @@ fn checks_unrelated(inv: &Invocation, rest: &[String]) -> anyhow::Result<String>
         anyhow::bail!("--reason must be your evidence: the file or log line, and where else the check fails");
     }
     let node = node(&args)?;
+    // Only this node's pull request agent may raise the user's question: a
+    // shell given `--node` is refused, as the other verbs that record for a
+    // conversation are.
+    let conversation = conversation(inv)?;
+    let in_node = inv
+        .client()
+        .read(|conn| Ok(ConversationRepo::new(conn).get(conversation)?.and_then(|c| c.focus.node_id())))?;
+    if in_node != Some(node) {
+        anyhow::bail!(
+            "this pr conversation is not about node {node}: only that node's pull request agent may record a check as unrelated"
+        );
+    }
     let pr = pick_pr(linked(inv, node)?.prs, &args, node)?;
     let label = tod_core::pr_readiness::pr_label(&pr);
     let status = github(inv)?
         .get_pr_status(&pr.owner, &pr.repo, pr.pr_number)
         .map_err(|err| gh_err(inv, &format!("GitHub ({})", pr.url), err))?;
+    let Some(head) = status.head_sha.clone().filter(|h| !h.is_empty()) else {
+        anyhow::bail!("GitHub did not name {label}'s head commit: try again (the answer is for one head)");
+    };
     let Some(name) = status.failing_checks.iter().find(|c| c.eq_ignore_ascii_case(check)) else {
         anyhow::bail!(
             "`{check}` is not failing on {label}: {} (see `pr checks`)",
@@ -747,7 +763,7 @@ fn checks_unrelated(inv: &Invocation, rest: &[String]) -> anyhow::Result<String>
             }
         );
     };
-    match inv.client().read(|conn| cu::standing(conn, node, &label, name))? {
+    match inv.client().read(|conn| cu::standing(conn, node, &label, name, &head))? {
         Some(UnrelatedStanding::Pending) => {
             return Ok(format!("ok: the user has already been asked about \"{name}\" on {label}; end your turn"));
         }
@@ -759,7 +775,7 @@ fn checks_unrelated(inv: &Invocation, rest: &[String]) -> anyhow::Result<String>
         ),
         None => {}
     }
-    let claim = cu::Claim { pr: label.clone(), pr_url: pr.url.clone(), check: name.clone(), reason };
+    let claim = cu::Claim { pr: label.clone(), pr_url: pr.url.clone(), check: name.clone(), head, reason };
     inv.client().interview(InterviewCommand::AskDecision {
         node_id: node,
         conversation_id: None,
@@ -768,6 +784,33 @@ fn checks_unrelated(inv: &Invocation, rest: &[String]) -> anyhow::Result<String>
     })?;
     Ok(format!(
         "ok: asked the user whether to fix \"{name}\" on {label} here or carry on without it; \
-         tod no longer sends you back for it. End your turn (do not fix it in this pull request)."
+         tod no longer sends you back for it on this commit (a later push that fails it is yours to judge again). End your turn (do not fix it in this pull request)."
     ))
+}
+
+#[cfg(test)]
+mod unrelated_tests {
+    use super::*;
+
+    /// A shell (no pr conversation) given `--node` cannot put a question to
+    /// the user: refused before anything is read or written.
+    #[test]
+    fn recording_a_check_as_unrelated_is_refused_outside_a_pr_conversation() {
+        // Only meaningful when the test process is not itself a pr conversation.
+        if std::env::var(IMPLEMENT_CONVERSATION_ENV).is_ok() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let node = Uuid::new_v4().to_string();
+        let inv = Invocation {
+            data_root: root.path().to_path_buf(),
+            json: false,
+            rest: ["checks", "unrelated", "terraform", "--reason", "x", "--node", node.as_str()]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        };
+        let err = run(inv).unwrap_err().to_string();
+        assert!(err.contains("only works inside a pr conversation"), "{err}");
+    }
 }

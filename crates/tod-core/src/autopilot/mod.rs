@@ -1475,9 +1475,16 @@ impl Autopilot {
                     // not the change's, a thread it cannot decide) did what
                     // it could: the question stops the run at the top of the
                     // loop, and is not a quiet turn.
-                    let asked = !fleet
-                        .read(|conn| Ok(DecisionRepo::new(conn).list_pending_for_node(node)?))?
-                        .is_empty();
+                    // Only this node's check-unrelated questions about its own
+                    // pull requests excuse the turn: any other pending
+                    // request stops the run at the top of the loop on its own
+                    // and says nothing about this turn.
+                    let asked = fleet
+                        .read(|conn| Ok(crate::check_unrelated::pending(conn, node)?))?
+                        .iter()
+                        .any(|(_, pr, _, _)| {
+                            links.prs.iter().any(|p| pr_readiness::pr_label(p).eq_ignore_ascii_case(pr))
+                        });
                     if !asked && works.iter().any(pr_readiness::Work::agent_can_fix) {
                         self.state.loops.pr_unchanged = if same { self.state.loops.pr_unchanged + 1 } else { 0 };
                         self.save()?;
@@ -1875,14 +1882,43 @@ impl Autopilot {
         };
         let state = lifecycle::current_state(fleet, node)?;
         let mut withdrew = false;
-        for (decision, pr, check) in questions {
-            let why = match live.iter().find(|p| pr_readiness::pr_label(&p.pr).eq_ignore_ascii_case(&pr)) {
+        for (decision, pr, check, head) in questions {
+            let live_pr = live.iter().find(|p| pr_readiness::pr_label(&p.pr).eq_ignore_ascii_case(&pr));
+            let why = match live_pr {
                 None => format!("{pr} is no longer linked to the node"),
                 Some(p) if p.assessment.merged => format!("{pr} is merged"),
                 Some(p) if !p.assessment.failing_checks.iter().any(|c| c.eq_ignore_ascii_case(&check)) => {
                     format!("\"{check}\" no longer fails on {pr}")
                 }
-                Some(_) => continue,
+                // The agent judged an earlier commit: a push since may be the
+                // one that broke the check, so it is judged again.
+                Some(p) if !p.assessment.head_sha.as_deref().unwrap_or_default().eq_ignore_ascii_case(&head) => {
+                    format!("{pr} has a new head since the agent judged \"{check}\"")
+                }
+                Some(_) => {
+                    // The agent said again, on this head, that the check is
+                    // not the change's, and the user once said to carry on
+                    // without it on this pull request: apply that, and say so.
+                    if tod_store::settings::waived_on_earlier_head(&settings.unrelated_checks, &pr, &check, &head) {
+                        tracing::info!(%node, %pr, %check, "carrying an earlier carry-on forward to the new head");
+                        fleet
+                            .interview(
+                                "autopilot",
+                                InterviewCommand::AnswerDecision { decision_id: decision.id, option: Some(1), text: None },
+                            )
+                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+                        let title = format!("Carried on without \"{check}\" on {pr}: you said so for an earlier commit");
+                        let detail = format!(
+                            "The agent said again, for the new head, that \"{check}\" is not this change's. Its question: {}",
+                            decision.question
+                        );
+                        let entry = TimelineEntry::new(node, KIND_NOTE, &state, title, false, detail);
+                        fleet.enqueue(tod_store::fleet::FleetMutation::RecordTimeline(Box::new(entry)))?;
+                        fleet.writer().flush()?;
+                        withdrew = true;
+                    }
+                    continue;
+                }
             };
             tracing::info!(%node, %pr, %check, "a failing check the agent called unrelated is gone: withdrawing the question");
             fleet

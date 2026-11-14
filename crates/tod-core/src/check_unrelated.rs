@@ -45,19 +45,21 @@ pub struct Claim {
     pub pr: String,
     pub pr_url: String,
     pub check: String,
+    /// The head commit the agent judged: the answer stands for that head only.
+    pub head: String,
     /// The agent's evidence, as it gave it.
     pub reason: String,
 }
 
 /// The option that carries on without the check. It carries the key (the
 /// check and the pull request) that [`key_of`] reads back.
-pub fn carry_on_option(pr: &str, check: &str) -> String {
-    format!("{CARRY_ON_PREFIX}{check}\" ({pr})")
+pub fn carry_on_option(pr: &str, check: &str, head: &str) -> String {
+    format!("{CARRY_ON_PREFIX}{check}\" ({pr} @ {head})")
 }
 
 /// The options, in order: the agent's judgement first.
-pub fn options(pr: &str, check: &str) -> Vec<String> {
-    vec![carry_on_option(pr, check), FIX_HERE.to_string()]
+pub fn options(pr: &str, check: &str, head: &str) -> Vec<String> {
+    vec![carry_on_option(pr, check, head), FIX_HERE.to_string()]
 }
 
 /// The request's question, in the shape the stance asks for: what to decide
@@ -66,7 +68,8 @@ pub fn question(claim: &Claim) -> String {
     format!(
         "Decide whether the failing check \"{check}\" on pull request {pr} ({url}) is fixed in that pull request or carried on without.\n\n\
          The pull request's agent says this change did not cause it. Its evidence: {reason}\n\n\
-         Until you answer, tod does not send the agent back for this check. Carrying on without it leaves the check failing on GitHub, and the pull request stays blocked from merging there if the project requires it.",
+         Until you answer, tod does not send the agent back for this check. Carrying on without it leaves the check failing on GitHub, and the pull request stays blocked from merging there if the project requires it. Your answer is for commit {head} only: if a later push fails the check, the agent must say again that it is not the change's, and a carry-on you gave here is then applied without asking you again.",
+        head = claim.head.chars().take(7).collect::<String>(),
         check = claim.check,
         pr = claim.pr,
         url = claim.pr_url,
@@ -78,7 +81,7 @@ pub fn question(claim: &Claim) -> String {
 pub fn new_decision(claim: &Claim) -> NewDecision {
     NewDecision {
         question: question(claim),
-        options: options(&claim.pr, &claim.check),
+        options: options(&claim.pr, &claim.check, &claim.head),
         evidence: Vec::new(),
         reason: REASON_BROKEN.to_string(),
         moves: Vec::new(),
@@ -86,36 +89,39 @@ pub fn new_decision(claim: &Claim) -> NewDecision {
     }
 }
 
-/// The pull request (`owner/repo#number`) and check a check-unrelated
-/// decision is about.
-pub fn key_of(decision: &Decision) -> Option<(String, String)> {
+/// The pull request (`owner/repo#number`), check and head commit a
+/// check-unrelated decision is about.
+pub fn key_of(decision: &Decision) -> Option<(String, String, String)> {
     if decision.protocol.as_deref() != Some(PROTOCOL) {
         return None;
     }
     let rest = decision.options.first()?.strip_prefix(CARRY_ON_PREFIX)?;
     let (check, pr) = rest.rsplit_once("\" (")?;
-    Some((pr.strip_suffix(')')?.to_string(), check.to_string()))
+    let (pr, head) = pr.strip_suffix(')')?.rsplit_once(" @ ")?;
+    Some((pr.to_string(), check.to_string(), head.to_string()))
 }
 
-/// `check`'s standing on `pr` for `node`, from the node's check-unrelated
-/// decisions; `None` when never raised (or withdrawn).
+/// `check`'s standing on `pr` at `head` for `node`, from the node's
+/// check-unrelated decisions; `None` when never raised for that head (or
+/// withdrawn). What was decided for another head does not count.
 pub fn standing(
     conn: &rusqlite::Connection,
     node: Uuid,
     pr: &str,
     check: &str,
+    head: &str,
 ) -> anyhow::Result<Option<UnrelatedStanding>> {
-    Ok(tod_store::settings::unrelated_standing(&standings(conn, node)?, pr, check))
+    Ok(tod_store::settings::unrelated_standing(&standings(conn, node)?, pr, check, head))
 }
 
-/// Every standing the node has, one per check and pull request: a pending
-/// question, else the latest answer.
+/// Every standing the node has, one per check, pull request and head: a
+/// pending question, else the latest answer.
 pub fn standings(conn: &rusqlite::Connection, node: Uuid) -> anyhow::Result<Vec<UnrelatedCheck>> {
     let repo = DecisionRepo::new(conn);
-    // (pr, check) -> (when, standing); a pending question is "now".
+    // (pr, check, head) -> (when, standing); a pending question is "now".
     let mut found: Vec<(UnrelatedCheck, i64)> = Vec::new();
     for decision in repo.list_for_node(node)? {
-        let Some((pr, check)) = key_of(&decision) else { continue };
+        let Some((pr, check, head)) = key_of(&decision) else { continue };
         let (standing, at) = match decision.status.as_str() {
             "pending" => (UnrelatedStanding::Pending, i64::MAX),
             "answered" => {
@@ -131,11 +137,13 @@ pub fn standings(conn: &rusqlite::Connection, node: Uuid) -> anyhow::Result<Vec<
         };
         match found
             .iter_mut()
-            .find(|(u, _)| u.pr.eq_ignore_ascii_case(&pr) && u.check.eq_ignore_ascii_case(&check))
+            .find(|(u, _)| {
+                u.pr.eq_ignore_ascii_case(&pr) && u.check.eq_ignore_ascii_case(&check) && u.head.eq_ignore_ascii_case(&head)
+            })
         {
-            Some(entry) if entry.1 <= at => *entry = (UnrelatedCheck { pr, check, standing }, at),
+            Some(entry) if entry.1 <= at => *entry = (UnrelatedCheck { pr, check, head, standing }, at),
             Some(_) => {}
-            None => found.push((UnrelatedCheck { pr, check, standing }, at)),
+            None => found.push((UnrelatedCheck { pr, check, head, standing }, at)),
         }
     }
     Ok(found.into_iter().map(|(u, _)| u).collect())
@@ -149,21 +157,21 @@ pub fn apply(conn: &rusqlite::Connection, node: Uuid, settings: &mut PrReadiness
 }
 
 /// Whether every one of `failing` is a check the user said to carry on
-/// without, on `pr`. False for an empty list: a failure GitHub named nothing
+/// without, on `pr` at `head`. False for an empty list: a failure GitHub named nothing
 /// for is never waived.
-pub fn all_waived(settings: &PrReadinessSettings, pr: &str, failing: &[String]) -> bool {
+pub fn all_waived(settings: &PrReadinessSettings, pr: &str, head: &str, failing: &[String]) -> bool {
     !failing.is_empty()
         && failing.iter().all(|c| {
-            tod_store::settings::unrelated_standing(&settings.unrelated_checks, pr, c) == Some(UnrelatedStanding::Waived)
+            tod_store::settings::unrelated_standing(&settings.unrelated_checks, pr, c, head) == Some(UnrelatedStanding::Waived)
         })
 }
 
 /// The pending check-unrelated decisions of `node`, with their key.
-pub fn pending(conn: &rusqlite::Connection, node: Uuid) -> anyhow::Result<Vec<(Decision, String, String)>> {
+pub fn pending(conn: &rusqlite::Connection, node: Uuid) -> anyhow::Result<Vec<(Decision, String, String, String)>> {
     Ok(DecisionRepo::new(conn)
         .list_pending_for_node(node)?
         .into_iter()
-        .filter_map(|d| key_of(&d).map(|(pr, check)| (d, pr, check)))
+        .filter_map(|d| key_of(&d).map(|(pr, check, head)| (d, pr, check, head)))
         .collect())
 }
 
@@ -176,6 +184,7 @@ mod tests {
             pr: "Cofactr/infra#551".into(),
             pr_url: "https://github.com/Cofactr/infra/pull/551".into(),
             check: "Kasm offline validation and tests".into(),
+            head: "abc1234".into(),
             reason: "the lock file error is in modules/aws/stacks/kasm, which this change does not touch; the same check fails on vageli/retool-security-update".into(),
         }
     }
@@ -188,7 +197,7 @@ mod tests {
         assert!(first.contains("Kasm offline validation and tests") && first.contains("Cofactr/infra#551"), "{first}");
         assert!(q.contains("modules/aws/stacks/kasm"), "{q}");
         assert!(q.contains("https://github.com/Cofactr/infra/pull/551"), "{q}");
-        let o = options("Cofactr/infra#551", "Kasm offline validation and tests");
+        let o = options("Cofactr/infra#551", "Kasm offline validation and tests", "abc1234");
         assert_eq!(o[1], "Fix it in this pull request");
         assert!(o[0].starts_with("It's not this change's: carry on without"), "{o:?}");
     }
@@ -202,7 +211,7 @@ mod tests {
             conversation_id: None,
             protocol: Some(PROTOCOL.into()),
             question: question(&c),
-            options: options(&c.pr, &c.check),
+            options: options(&c.pr, &c.check, &c.head),
             evidence: Vec::new(),
             status: "pending".into(),
             created_at: 0,
@@ -211,10 +220,13 @@ mod tests {
             blocks: Vec::new(),
             new_evidence: String::new(),
         };
-        assert_eq!(key_of(&d), Some((c.pr.clone(), c.check.clone())));
+        assert_eq!(key_of(&d), Some((c.pr.clone(), c.check.clone(), c.head.clone())));
         // A check whose name has quotes and parentheses still round-trips.
-        d.options = options("o/r#1", "build (linux) \"x\"");
-        assert_eq!(key_of(&d), Some(("o/r#1".to_string(), "build (linux) \"x\"".to_string())));
+        d.options = options("o/r#1", "build (linux) \"x\"", "def5678");
+        assert_eq!(
+            key_of(&d),
+            Some(("o/r#1".to_string(), "build (linux) \"x\"".to_string(), "def5678".to_string()))
+        );
         d.protocol = Some("bot_silence".into());
         assert_eq!(key_of(&d), None);
     }
@@ -223,14 +235,16 @@ mod tests {
     fn only_waived_checks_are_waived_and_an_unnamed_failure_never_is() {
         let settings = PrReadinessSettings {
             unrelated_checks: vec![
-                UnrelatedCheck { pr: "o/r#1".into(), check: "a".into(), standing: UnrelatedStanding::Waived },
-                UnrelatedCheck { pr: "o/r#1".into(), check: "b".into(), standing: UnrelatedStanding::Pending },
+                UnrelatedCheck { pr: "o/r#1".into(), check: "a".into(), head: "h1".into(), standing: UnrelatedStanding::Waived },
+                UnrelatedCheck { pr: "o/r#1".into(), check: "b".into(), head: "h1".into(), standing: UnrelatedStanding::Pending },
             ],
             ..Default::default()
         };
-        assert!(all_waived(&settings, "O/R#1", &["A".to_string()]));
-        assert!(!all_waived(&settings, "o/r#1", &["a".to_string(), "b".to_string()]));
-        assert!(!all_waived(&settings, "o/r#2", &["a".to_string()]));
-        assert!(!all_waived(&settings, "o/r#1", &[]));
+        assert!(all_waived(&settings, "O/R#1", "H1", &["A".to_string()]));
+        assert!(!all_waived(&settings, "o/r#1", "h1", &["a".to_string(), "b".to_string()]));
+        assert!(!all_waived(&settings, "o/r#2", "h1", &["a".to_string()]));
+        assert!(!all_waived(&settings, "o/r#1", "h1", &[]));
+        // A waiver given for another head never covers this one.
+        assert!(!all_waived(&settings, "o/r#1", "h2", &["a".to_string()]));
     }
 }

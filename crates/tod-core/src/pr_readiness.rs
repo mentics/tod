@@ -297,6 +297,9 @@ pub struct Assessment {
     pub failing_checks: Vec<String>,
     /// A check is still running, whatever else failed.
     pub checks_running: bool,
+    /// The head commit this was read at; a standing for a failing check
+    /// holds for one head only.
+    pub head_sha: Option<String>,
     /// Where the user's decision stands for the failing checks the agent said
     /// are not the change's ([`crate::check_unrelated`]), set by
     /// [`Self::with_unrelated`]: a pending or waived one is not work, a
@@ -545,6 +548,7 @@ impl Assessment {
             checks: snapshot.status.checks.clone(),
             failing_checks: snapshot.status.failing_checks.clone(),
             checks_running: snapshot.status.checks_running,
+            head_sha: snapshot.status.head_sha.clone(),
             check_standings: Vec::new(),
             open_threads: snapshot.threads.iter().filter(|t| wants_answer(t)).map(open_thread).collect(),
             bots,
@@ -579,12 +583,15 @@ impl Assessment {
 
     /// This assessment with the node's standings for `pr`'s failing checks
     /// ([`crate::check_unrelated`]): the ones in `list` for that pull request
-    /// and still failing.
+    /// and still failing, given for the head this was read at: a standing
+    /// for another head is not here, so a new head that fails the check is
+    /// work again.
     pub fn with_unrelated(mut self, pr: &str, list: &[UnrelatedCheck]) -> Self {
+        let head = self.head_sha.clone().unwrap_or_default();
         self.check_standings = self
             .failing_checks
             .iter()
-            .filter_map(|c| tod_store::settings::unrelated_standing(list, pr, c).map(|s| (c.clone(), s)))
+            .filter_map(|c| tod_store::settings::unrelated_standing(list, pr, c, &head).map(|s| (c.clone(), s)))
             .collect();
         self
     }
@@ -2459,7 +2466,7 @@ Not safe.
     }
 
     fn standing_of(check: &str, standing: UnrelatedStanding) -> Vec<UnrelatedCheck> {
-        vec![UnrelatedCheck { pr: "acme/app#42".into(), check: check.into(), standing }]
+        vec![UnrelatedCheck { pr: "acme/app#42".into(), check: check.into(), head: "abcdef1234567".into(), standing }]
     }
 
     #[test]
@@ -2483,6 +2490,19 @@ Not safe.
         let a = failing(&["terraform"], "unstable", "failure")
             .with_unrelated("acme/app#7", &standing_of("terraform", UnrelatedStanding::Waived));
         assert_eq!(a.work(), vec![Work::FailingChecks(vec!["terraform".into()])]);
+    }
+
+    #[test]
+    fn a_standing_for_another_head_is_not_a_standing_for_this_one() {
+        // Waived, asked or fix-here on an earlier head: the new head that
+        // still fails the check is work again, never silently excused.
+        for standing in [UnrelatedStanding::Waived, UnrelatedStanding::Pending, UnrelatedStanding::FixHere] {
+            let mut old = standing_of("terraform", standing);
+            old[0].head = "1111111".into();
+            let a = failing(&["terraform"], "unstable", "failure").with_unrelated("acme/app#42", &old);
+            assert_eq!(a.work(), vec![Work::FailingChecks(vec!["terraform".into()])], "{standing:?}");
+            assert_eq!(a.check_standing("terraform"), None);
+        }
     }
 
     #[test]

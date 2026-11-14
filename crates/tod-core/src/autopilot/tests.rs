@@ -4351,6 +4351,16 @@ fn a_silent_bot_with_a_fallback_is_given_up_on_visibly_without_asking_the_user()
 /// `fixed` is set.
 struct FailingCheckFeed {
     fixed: std::sync::atomic::AtomicBool,
+    /// The head commit, which a new commit changes.
+    head: std::sync::Mutex<String>,
+    /// Every agent turn says the check is not the change's, not only the first.
+    repeats: std::sync::atomic::AtomicBool,
+}
+
+impl FailingCheckFeed {
+    fn new_head(&self, head: &str) {
+        *self.head.lock().unwrap() = head.to_string();
+    }
 }
 
 impl crate::pr_readiness::PrFeed for FailingCheckFeed {
@@ -4368,7 +4378,7 @@ impl crate::pr_readiness::PrFeed for FailingCheckFeed {
                 behind_by: Some(0),
                 checks: Some(if fixed { "success" } else { "failure" }.into()),
                 failing_checks: if fixed { Vec::new() } else { vec!["terraform".into()] },
-                head_sha: Some("abc1234".into()),
+                head_sha: Some(self.head.lock().unwrap().clone()),
                 head_committed_at: Some("2020-01-01T00:00:00Z".into()),
                 open: true,
                 reviewers: vec!["maria".into()],
@@ -4399,23 +4409,28 @@ fn failing_check_node(says_unrelated: bool) -> (Fixture, Arc<FailingCheckFeed>, 
     let fx = bare();
     retire_outside_criteria(&fx);
     std::fs::write(fx.root.join("tod.yml"), "pr_readiness:\n  max_rounds: 2\n").unwrap();
-    let feed = Arc::new(FailingCheckFeed { fixed: std::sync::atomic::AtomicBool::new(false) });
+    let feed = Arc::new(FailingCheckFeed {
+        fixed: std::sync::atomic::AtomicBool::new(false),
+        head: std::sync::Mutex::new("abc1234".into()),
+        repeats: std::sync::atomic::AtomicBool::new(false),
+    });
     crate::pr_readiness::set_feed_override(Some(feed.clone()));
     linked_to_prs(&fx, "pr_review", &["https://github.com/acme/app/pull/42"]);
     let mut agent = FakeAgent::new(&fx.fleet);
     let sent = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-    let (fleet, node, log) = (fx.fleet.clone(), fx.node, sent.clone());
+    let (fleet, node, log, feed_seen) = (fx.fleet.clone(), fx.node, sent.clone(), feed.clone());
     agent.pr_hook = Some(Arc::new(move |prompt: &str| {
         let first = {
             let mut log = log.lock().unwrap();
             log.push(prompt.to_string());
             log.len() == 1
         };
-        if says_unrelated && first {
+        if says_unrelated && (first || feed_seen.repeats.load(std::sync::atomic::Ordering::SeqCst)) {
             let claim = crate::check_unrelated::Claim {
                 pr: "acme/app#42".into(),
                 pr_url: "https://github.com/acme/app/pull/42".into(),
                 check: "terraform".into(),
+                head: feed_seen.head.lock().unwrap().clone(),
                 reason: "the lock file in infra/ fails the same way on main".into(),
             };
             fleet
@@ -4482,7 +4497,7 @@ fn carrying_on_without_the_check_leaves_the_pull_request_to_its_person() {
     assert_eq!(unrelated_decisions(&fx).len(), 1, "never asked again");
     let settings = crate::pr_readiness::settings_for_node(&fx.fleet, fx.node, &fx.root).unwrap();
     assert!(
-        crate::check_unrelated::all_waived(&settings, "acme/app#42", &["terraform".to_string()]),
+        crate::check_unrelated::all_waived(&settings, "acme/app#42", "abc1234", &["terraform".to_string()]),
         "{settings:?}"
     );
 }
@@ -4526,4 +4541,78 @@ fn two_quiet_turns_on_a_failing_check_stop_naming_the_check() {
         }
         other => panic!("{other:?}"),
     }
+}
+
+/// With one quiet turn already counted, the turn that records the check as
+/// unrelated must stop for the question, not for "changed nothing": a turn
+/// that asked the user is not a quiet turn.
+#[test]
+fn the_turn_that_records_a_check_as_unrelated_is_not_a_quiet_turn() {
+    let (fx, _, mut agent, _) = failing_check_node(true);
+    let mut pilot = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO);
+    pilot.state.loops.pr_unchanged = 1;
+    let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
+    assert!(
+        matches!(&outcome, Outcome::NeedsHuman { reason: NeedsHuman::Decision { pending: 1 } }),
+        "{outcome:?}"
+    );
+    assert_eq!(pilot.state().loops.pr_unchanged, 1, "the turn was not counted");
+}
+
+/// A carry-on given for one head must not excuse a later head on which the
+/// same check fails again: the agent is sent back and judges it again.
+#[test]
+fn a_carry_on_for_one_head_does_not_excuse_a_new_head() {
+    let (fx, feed, mut agent, sent) = failing_check_node(true);
+    run_babysitter(&fx, &mut agent);
+    let d = unrelated_decisions(&fx).remove(0);
+    fx.fleet
+        .interview(ACTOR_USER, InterviewCommand::AnswerDecision { decision_id: d.id, option: Some(1), text: None })
+        .unwrap();
+    // A commit lands before the next look: the waiver was for the old head.
+    feed.new_head("def5678");
+    run_babysitter(&fx, &mut agent);
+    assert!(agent.turns >= 2, "a new head that fails the check is work again");
+    assert_eq!(lifecycle::current_state(&fx.fleet, fx.node).unwrap(), "pr_review", "and the gate does not pass");
+    assert!(sent.lock().unwrap()[1].contains("terraform"));
+}
+
+/// The agent says again, on the new head, that the check is not the change's,
+/// and the user already said to carry on: applied without asking again, with
+/// a note. Nothing is carried unless the agent attests for the new head.
+#[test]
+fn a_carry_on_is_carried_to_a_new_head_only_when_the_agent_says_so_again() {
+    let (fx, feed, mut agent, _) = failing_check_node(true);
+    run_babysitter(&fx, &mut agent);
+    let d = unrelated_decisions(&fx).remove(0);
+    fx.fleet
+        .interview(ACTOR_USER, InterviewCommand::AnswerDecision { decision_id: d.id, option: Some(1), text: None })
+        .unwrap();
+    feed.new_head("def5678");
+    feed.repeats.store(true, std::sync::atomic::Ordering::SeqCst);
+    run_babysitter(&fx, &mut agent);
+    assert_eq!(agent.turns, 2, "sent back for the new head");
+    let all = unrelated_decisions(&fx);
+    assert_eq!(all.len(), 2, "{all:?}");
+    assert!(pending_requests(&fx).is_empty(), "the user is not asked again");
+    assert!(all.iter().all(|d| d.status == "answered"), "{all:?}");
+    let notes = fx.fleet.read(|conn| Ok(tod_store::node_timeline::TimelineRepo::new(conn).list(fx.node)?)).unwrap();
+    assert!(notes.iter().any(|e| e.title.starts_with("Carried on without")), "{notes:?}");
+    let before = agent.turns;
+    run_babysitter(&fx, &mut agent);
+    assert_eq!(agent.turns, before, "no more turns on this head");
+}
+
+/// A question raised for an earlier head is withdrawn when a new commit
+/// arrives: it is judged again, not answered for the wrong commit.
+#[test]
+fn a_question_for_an_earlier_head_is_withdrawn_by_a_new_commit() {
+    let (fx, feed, mut agent, _) = failing_check_node(true);
+    run_babysitter(&fx, &mut agent);
+    assert_eq!(pending_requests(&fx).len(), 1);
+    feed.new_head("def5678");
+    run_babysitter(&fx, &mut agent);
+    let notes = fx.fleet.read(|conn| Ok(tod_store::node_timeline::TimelineRepo::new(conn).list(fx.node)?)).unwrap();
+    assert!(notes.iter().any(|e| e.title.contains("has a new head")), "{notes:?}");
+    assert!(agent.turns >= 2);
 }

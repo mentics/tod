@@ -451,15 +451,32 @@ pub struct UnrelatedCheck {
     /// `owner/repo#number`.
     pub pr: String,
     pub check: String,
+    /// The head commit the standing was given for: it applies to that head
+    /// only, so a later push that breaks the check is judged again.
+    pub head: String,
     pub standing: UnrelatedStanding,
 }
 
-/// Whether a list of [`UnrelatedCheck`] holds `check` of `pr` (names and
-/// repositories compare without case).
-pub fn unrelated_standing(list: &[UnrelatedCheck], pr: &str, check: &str) -> Option<UnrelatedStanding> {
+/// The standing a list of [`UnrelatedCheck`] holds for `check` of `pr` on the
+/// head `head` (names, repositories and commits compare without case). A
+/// standing given for another head does not count.
+pub fn unrelated_standing(list: &[UnrelatedCheck], pr: &str, check: &str, head: &str) -> Option<UnrelatedStanding> {
     list.iter()
-        .find(|u| u.pr.eq_ignore_ascii_case(pr) && u.check.eq_ignore_ascii_case(check))
+        .find(|u| {
+            u.pr.eq_ignore_ascii_case(pr) && u.check.eq_ignore_ascii_case(check) && u.head.eq_ignore_ascii_case(head)
+        })
         .map(|u| u.standing)
+}
+
+/// Whether the user once said to carry on without `check` of `pr`, on a head
+/// other than `head`.
+pub fn waived_on_earlier_head(list: &[UnrelatedCheck], pr: &str, check: &str, head: &str) -> bool {
+    list.iter().any(|u| {
+        u.standing == UnrelatedStanding::Waived
+            && u.pr.eq_ignore_ascii_case(pr)
+            && u.check.eq_ignore_ascii_case(check)
+            && !u.head.eq_ignore_ascii_case(head)
+    })
 }
 
 /// What tod's own review of a node's pull requests says, for the bots' asks

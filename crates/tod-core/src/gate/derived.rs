@@ -798,7 +798,12 @@ fn waived_checks_only(
     }
     let standings = crate::check_unrelated::standings(conn, node_id)?;
     let settings = tod_store::PrReadinessSettings { unrelated_checks: standings, ..Default::default() };
-    Ok(crate::check_unrelated::all_waived(&settings, &crate::pr_readiness::pr_label(pr), &status.failing_checks))
+    Ok(crate::check_unrelated::all_waived(
+        &settings,
+        &crate::pr_readiness::pr_label(pr),
+        status.head_sha.as_deref().unwrap_or_default(),
+        &status.failing_checks,
+    ))
 }
 
 /// Which of the readiness criteria to answer (`doc/lifecycle/pr-readiness.md`).

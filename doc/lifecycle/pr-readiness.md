@@ -584,8 +584,14 @@ request*.
 - A pending question whose check no longer fails, or whose pull request is
   merged or unlinked, is withdrawn with a note
   (`Autopilot::tend_unrelated_check_questions`).
-- The standing is per check and pull request, not per head: a new push does
-  not ask again.
+- A standing holds for the head it was given for, never a later one (the key is
+  check, pull request and head, in the carry-on option). On a new head that
+  still fails the check it is agent work for one look again, and a question
+  for an older head is withdrawn. If the agent records it unrelated again and
+  the user once said to carry on without that check on this pull request, the
+  autopilot applies that to the new head without asking (a timeline note says
+  so); the agent must re-attest per head, and nothing is carried unprompted.
+  Only this node's own pr conversation may record one.
 
 If the agent records nothing and changes nothing twice, the stop
 (`NeedsHuman::PrStuck`) names what is outstanding on which pull request
