@@ -1314,6 +1314,9 @@ fn restore_plan_step(
             uuid_to_blob(id)
         ],
     )?;
+    if !matches!(status.as_str(), "pending" | "ready") {
+        crate::branch_starts::mark_worked_for_step(conn, &uuid_to_blob(id))?;
+    }
     for dep in depends_on {
         if repo.get(*dep)?.is_some() {
             repo.add_dependency(id, *dep)?;

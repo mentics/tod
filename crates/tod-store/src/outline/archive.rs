@@ -884,6 +884,9 @@ fn restore_node(conn: &Connection, archived: &ArchivedNode) -> Result<()> {
                 step.updated_at,
             ],
         )?;
+        if !matches!(step.status.as_str(), "pending" | "ready") {
+            crate::branch_starts::mark_worked_for_step(conn, &uuid_to_blob(step.id))?;
+        }
     }
     for cap_arch in &archived.capability_archives {
         conn.execute(

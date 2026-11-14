@@ -5895,3 +5895,24 @@ mod reclaim_tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 }
+
+#[cfg(test)]
+mod node_worked_migration_tests {
+    use super::*;
+
+    #[test]
+    fn an_existing_database_gets_node_worked_and_node_branch_starts() {
+        let dir = std::env::temp_dir().join(format!("tod-node-worked-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = open_writer_connection(&dir.join("tod.db")).unwrap();
+        conn.execute_batch("DROP TABLE node_worked; DROP TABLE node_branch_starts;").unwrap();
+        apply_migrations(&conn).unwrap();
+        for table in ["node_worked", "node_branch_starts"] {
+            let n: i64 = conn
+                .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1", [table], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 1, "{table} missing after migrating an existing database");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}

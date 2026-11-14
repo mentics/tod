@@ -74,6 +74,10 @@
 //! - `node_branch_starts` (`crate::branch_starts`) — the commit a node's branch
 //!   was born at, read off a checkout when tod makes it: machine-local derived
 //!   data the lost-work rule reads, not an edit anyone made.
+//! - `node_worked` (`crate::branch_starts`) — a sticky, machine-local mark that
+//!   a node's plan steps have been past `ready`, kept so the lost-work rule
+//!   knows a checkout is not the node's first; derived from step changes that
+//!   are journaled themselves, and never synced.
 //! - `gate_criteria` — a global catalog with no `node_id`.
 //! - `incoming_changes` — a queue over changes that are already journaled at
 //!   their source; recording it too would double-count the same edit.
