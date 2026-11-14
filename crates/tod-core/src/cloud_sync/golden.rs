@@ -41,28 +41,36 @@ fn normalized(repo: &str) -> Result<String> {
 /// thread.
 pub fn ensure_golden_current(sandboxes: &mut Sandboxes, bx: &Blaxel, repo: &str, progress: &mut dyn FnMut(&str)) -> Result<String> {
     let repo = normalized(repo)?;
+    // The one place that decides what a failed refresh means for a node's
+    // start: a repository's existing golden that can still be forked (it
+    // exists and is not newer than this build) is used as it is, whatever
+    // happened (any failure, the lock and the reload included, not only a
+    // left-behind one). Only a repository with no such golden is refused, with
+    // the reason. (Every node start, the app and the daemon's periodic check
+    // come through here.)
+    let made = ensure_golden_current_inner(sandboxes, bx, &repo, progress);
+    use_existing_if_failed(&repo, made, || usable_golden(sandboxes, bx, &repo), progress)
+}
+
+/// [`ensure_golden_current`] without the fallback: the lock, the reload, a
+/// standing left-behind record, then the refresh.
+fn ensure_golden_current_inner(sandboxes: &mut Sandboxes, bx: &Blaxel, repo: &str, progress: &mut dyn FnMut(&str)) -> Result<String> {
     // One refresh at a time on a data root (the app making a node and the
     // daemon's background check both come here); the one that waits then
     // finds the golden current.
     let _lock = RefreshLock::take(&sandboxes.root)?;
     // What another process saved while this one waited.
     sandboxes.reload()?;
-    // The one place that decides what a failed refresh means for a node's
-    // start: a repository's existing golden that can still be forked (it
-    // exists and is not newer than this build) is used as it is, whatever
-    // happened to a refresh of it (any failure, not only a left-behind one).
-    // Only a repository with no such golden is refused, with the reason.
-    // (Every node start, the app and the daemon's periodic check come
-    // through here.)
-    let usable = |sandboxes: &Sandboxes| usable_golden(sandboxes, bx, &repo);
-    let made = match standing_left_behind(sandboxes, bx, &repo, progress)? {
-        Some(record) => Err(left_behind_refusal(&repo, &record, now_secs()?)),
+    match standing_left_behind(sandboxes, bx, repo, progress)? {
+        Some(record) => match now_secs() {
+            Ok(now) => Err(left_behind_refusal(repo, &record, now)),
+            Err(e) => Err(e.context(format!("{repo}'s golden has a left-behind record ({})", record.targets.join(", ")))),
+        },
         None => {
-            let made = ensure_golden_current_locked(sandboxes, bx, &repo, progress);
-            record_if_left_behind(&sandboxes.root, &repo, made)
+            let made = ensure_golden_current_locked(sandboxes, bx, repo, progress);
+            record_if_left_behind(&sandboxes.root, repo, made)
         }
-    };
-    use_existing_if_failed(&repo, made, || usable(sandboxes), progress)
+    }
 }
 
 /// `made` (what a refresh or a standing refusal came to), or, when it failed,
@@ -81,9 +89,9 @@ fn use_existing_if_failed(
     };
     match usable() {
         Ok(Some(name)) => {
-            tracing::error!("the golden refresh for {repo} did not happen: {err:#}");
+            tracing::error!("the golden refresh for {repo} did not complete: {err:#}");
             progress(&format!(
-                "the golden refresh for {repo} did not happen, so nodes keep using {name}, which can still be forked: {err:#}"
+                "the golden refresh for {repo} did not complete, so nodes keep using {name}, which can still be forked: {err:#}"
             ));
             Ok(name)
         }
@@ -101,7 +109,7 @@ fn usable_golden(sandboxes: &Sandboxes, bx: &Blaxel, repo: &str) -> Result<Optio
         return Ok(None);
     }
     let name = sandboxes.resolve_golden(bx, repo)?;
-    let info = bx.get_strict(&name)?;
+    let info = bx.get(&name)?;
     let mine = my_stamp(&install_files(&sandboxes.root)?)?;
     Ok(usable_in(&name, info.as_ref(), &mine)?.then_some(name))
 }
@@ -139,8 +147,8 @@ fn ensure_golden_current_locked(sandboxes: &mut Sandboxes, bx: &Blaxel, repo: &s
         )
     });
     let (files, mine) = loaded?;
-    let info = info.transpose()?.flatten();
-    let name = match golden::decide_source(&repo, own_name.as_deref().map(|name| (name, info.is_some()))) {
+    let (source, info) = decide_source_from(&repo, own_name.as_deref(), info)?;
+    let name = match source {
         golden::Source::Build { why } => {
             progress(&format!("{why}: making one from a fresh sandbox with the repository cloned into it"));
             return build_golden(sandboxes, bx, &repo, &files, &mine, progress);
@@ -302,15 +310,26 @@ fn origin_moved(
 /// the workspace's idle prune did to goldens made before they were labelled
 /// `keep-when-idle`) is built again too, and the user is told why.
 fn source_for(sandboxes: &Sandboxes, bx: &Blaxel, repo: &str) -> Result<golden::Source> {
-    let own = match sandboxes.account()?.golden_for(repo) {
-        Some(_) => {
-            let name = sandboxes.resolve_golden(bx, repo)?;
-            let exists = bx.get(&name)?.is_some();
-            Some((name, exists))
-        }
+    let own_name = match sandboxes.account()?.golden_for(repo) {
+        Some(_) => Some(sandboxes.resolve_golden(bx, repo)?),
         None => None,
     };
-    Ok(golden::decide_source(repo, own.as_ref().map(|(name, exists)| (name.as_str(), *exists))))
+    let looked = own_name.as_ref().map(|name| bx.get(name));
+    Ok(decide_source_from(repo, own_name.as_deref(), looked)?.0)
+}
+
+/// [`golden::decide_source`] from the look at the repository's own golden
+/// (`looked`, `None` with no entry): the sandbox's record when it exists. A look
+/// that failed (a not-ready 404 included, see `Blaxel::get`) is an error, never
+/// "gone": only a golden Blaxel says does not exist is built again, since a
+/// second golden would orphan the first.
+fn decide_source_from(
+    repo: &str,
+    own_name: Option<&str>,
+    looked: Option<Result<Option<tod_sandbox::blaxel::SandboxInfo>>>,
+) -> Result<(golden::Source, Option<tod_sandbox::blaxel::SandboxInfo>)> {
+    let info = looked.transpose()?.flatten();
+    Ok((golden::decide_source(repo, own_name.map(|name| (name, info.is_some()))), info))
 }
 
 /// The decision of [`ensure_golden_current`], apart from Blaxel and the
@@ -441,12 +460,6 @@ fn read_record(root: &std::path::Path, repo: &str) -> Result<Option<LeftBehindRe
     }
 }
 
-/// The record of a golden step that may have left a sandbox at Blaxel
-/// ([`golden::LeftBehind`]), if there is one for `repo`: its note.
-pub fn left_behind_note(root: &std::path::Path, repo: &str) -> Option<String> {
-    read_record(root, &normalized(repo).ok()?).ok().flatten().map(|r| r.note)
-}
-
 /// Whether a record may clear itself: at least [`SELF_CLEAR_AFTER`] since the
 /// failure, and `exists` (a look at Blaxel for the target, `Ok(false)` only for
 /// "not found") says the target is not there. A record with no known target
@@ -469,7 +482,7 @@ fn self_clear_decision(record: &LeftBehindRecord, now: u64, mut exists: impl FnM
 /// through `progress` and the log, and the record stays.
 fn standing_left_behind(sandboxes: &Sandboxes, bx: &Blaxel, repo: &str, progress: &mut dyn FnMut(&str)) -> Result<Option<LeftBehindRecord>> {
     // A 404 saying the workload is not ready is unknown, not gone.
-    standing_with(&sandboxes.root, repo, now_secs()?, |target| Ok(bx.get_strict(target)?.is_some()), progress)
+    standing_with(&sandboxes.root, repo, now_secs()?, |target| Ok(bx.get(target)?.is_some()), progress)
 }
 
 /// [`standing_left_behind`] with Blaxel's answer (`exists`) and the time given.
@@ -512,15 +525,6 @@ fn next_check_text(record: &LeftBehindRecord, now: u64) -> String {
     }
 }
 
-/// A short statement of why a refresh waits, for the progress line while nodes
-/// go on using the existing golden.
-fn refresh_blocked_summary(record: &LeftBehindRecord) -> String {
-    match record.targets.join(", ") {
-        target if !target.is_empty() => format!("an earlier attempt may have left {target} at Blaxel; it is cleared once Blaxel shows no such sandbox"),
-        _ => "an earlier attempt may have left a sandbox at Blaxel; clear it with `tod-sandbox golden clear`".to_string(),
-    }
-}
-
 /// What a standing record refuses when there is no golden a node can use (a
 /// refresh by name, or a repository with no usable golden): typed
 /// [`golden::LeftBehind`] so nothing retries it, with what happens next
@@ -543,7 +547,12 @@ fn record_if_left_behind(root: &std::path::Path, repo: &str, made: Result<String
     let Err(err) = made else { return made };
     let Some(left) = err.downcast_ref::<golden::LeftBehind>() else { return Err(err) };
     let path = left_behind_path(root, repo);
-    let record = LeftBehindRecord { targets: left.target().map(str::to_string).into_iter().collect(), at: now_secs()?, note: left.0.clone() };
+    let at = match now_secs() {
+        Ok(at) => at,
+        // The failure stays first and typed; the clock is added to it.
+        Err(clock) => return Err(err.context(format!("(and the left-behind record could not be dated: {clock:#})"))),
+    };
+    let record = LeftBehindRecord { targets: left.target().map(str::to_string).into_iter().collect(), at, note: left.0.clone() };
     match write_record(root, repo, &record) {
         Ok(()) => Err(err),
         Err(e) => Err(anyhow::Error::new(golden::LeftBehind::new(format!(
@@ -640,13 +649,13 @@ fn refresh_locked(sandboxes: &mut Sandboxes, bx: &Blaxel, repo: &str, progress: 
 /// may still be making the sandbox: a first look that finds nothing is
 /// repeated a few times before it is believed.
 fn clean_up_half_made(bx: &Blaxel, name: &str, old: &str, recheck: bool) -> (String, bool) {
-    let mut found = bx.get_strict(name);
+    let mut found = bx.get(name);
     for _ in 0..3 {
         if !(recheck && matches!(&found, Ok(None))) {
             break;
         }
         std::thread::sleep(Duration::from_secs(3));
-        found = bx.get_strict(name);
+        found = bx.get(name);
     }
     match found {
         Err(e) => (format!("tod could not check whether {name} exists ({e:#}); if `tod-sandbox list` shows it, delete it with `tod-sandbox delete {name}`"), false),
@@ -872,7 +881,7 @@ fn refresh_with(
 /// next look clears it once it is verifiably absent or a person is told.
 fn settle_abandoned(root: &std::path::Path, bx: &Blaxel, repo: &str, abandoned: &[String], progress: &mut dyn FnMut(&str)) -> Result<()> {
     for first in abandoned {
-        let note = match bx.get_strict(first) {
+        let note = match bx.get(first) {
             Ok(Some(_)) => {
                 let (after, clean) = clean_up_half_made(bx, first, "", false);
                 if clean {
@@ -940,7 +949,7 @@ fn refresh_attempt(
     let mut name = golden::new_name(repo, now);
     let mut retried = false;
     loop {
-        if bx.get_strict(&name)?.is_some() {
+        if bx.get(&name)?.is_some() {
             bail!("a sandbox named {name} already exists; try again in a moment");
         }
         progress(&format!("forking {origin} to {name}…"));
@@ -955,8 +964,14 @@ fn refresh_attempt(
         // Seen live: the workspace's golden was replaced while the fork ran,
         // and the fork failed on its deadline. A source that is gone is a
         // stale source, not a maybe-made target.
-        let source_exists = bx.get_strict(&origin).map(|found| found.is_some());
+        let source_exists = bx.get(&origin).map(|found| found.is_some());
         let (after, clean) = clean_up_half_made(bx, &name, old, tod_sandbox::blaxel::error_is_transient(&err));
+        // A look at the source that failed keeps the "never make a second
+        // golden" rule, and says why in the error.
+        let after = match &source_exists {
+            Err(look) => format!("{after}; tod could not tell whether {origin} still exists ({look:#}), so it does not fork again"),
+            Ok(_) => after,
+        };
         if golden::retry_from_new_source(source_exists.as_ref().ok().copied(), retried, clean) {
             retried = true;
             progress(&format!("{origin} is gone (it was replaced during the fork) and {name} does not exist: {after}; forking the repository's current original once"));
@@ -969,7 +984,10 @@ fn refresh_attempt(
                 Err(again) => return Err(made_call_failed(err.context(format!("(and finding its replacement failed: {again:#})")), &name, repo, &after)),
             };
             // Never the first attempt's name: it may still appear.
-            now = (now + 1).max(now_secs()?);
+            now = match now_secs() {
+                Ok(clock) => (now + 1).max(clock),
+                Err(e) => return Err(made_call_failed(err.context(format!("(and the clock is unreadable: {e:#})")), &name, repo, &after)),
+            };
             name = golden::new_name(repo, now);
             continue;
         }
@@ -1052,18 +1070,61 @@ fn refresh_attempt(
     // Forks are independent of the sandbox they were made from, so nothing
     // needs the old one once nothing points at it. One tod did not make is
     // the user's to delete.
-    let made_by_tod = bx.get(old)?.is_some_and(|i| i.label("tod-kind") == Some(golden::KIND_GOLDEN));
-    if wanted_elsewhere {
-        say(&format!("left {old} in place: another repository's golden setting still points at it"));
-    } else if old == origin {
-        say(&format!("left {old} in place: {name} is forked from it"));
-    } else if !made_by_tod {
-        say(&format!("left {old} in place: tod did not make it (delete it yourself when you no longer need it)"));
-    } else {
-        say(&format!("deleting the old golden {old}…"));
-        bx.delete(old).with_context(|| format!("{name} is the golden now, but deleting the old golden {old} failed"))?;
+    let root = sandboxes.root.clone();
+    let looked = bx.get(old);
+    Ok(settle_old_golden(&root, repo, &name, old, origin, wanted_elsewhere, looked, || bx.delete(old), &mut |m| say(m)))
+}
+
+/// What becomes of the old golden `old` once `sandboxes.toml` points at `new`.
+/// The refresh has succeeded by then, so this never fails it: a look or a
+/// delete that fails is recorded (the left-behind record, target `old`, so the
+/// next look clears it once it is gone and a person is told while it is not)
+/// and said as a warning. Returns `new`.
+#[allow(clippy::too_many_arguments)]
+fn settle_old_golden(
+    root: &std::path::Path,
+    repo: &str,
+    new: &str,
+    old: &str,
+    origin: &str,
+    wanted_elsewhere: bool,
+    looked: Result<Option<tod_sandbox::blaxel::SandboxInfo>>,
+    delete: impl FnOnce() -> Result<()>,
+    say: &mut dyn FnMut(&str),
+) -> String {
+    let problem = match looked {
+        Err(e) => Some(format!("tod could not look at the old golden {old} ({e:#})")),
+        Ok(found) => {
+            let made_by_tod = found.is_some_and(|i| i.label("tod-kind") == Some(golden::KIND_GOLDEN));
+            if wanted_elsewhere {
+                say(&format!("left {old} in place: another repository's golden setting still points at it"));
+                None
+            } else if old == origin {
+                say(&format!("left {old} in place: {new} is forked from it"));
+                None
+            } else if !made_by_tod {
+                say(&format!("left {old} in place: tod did not make it (delete it yourself when you no longer need it)"));
+                None
+            } else {
+                say(&format!("deleting the old golden {old}…"));
+                delete().err().map(|e| format!("deleting the old golden {old} failed ({e:#})"))
+            }
+        }
+    };
+    if let Some(problem) = problem {
+        let note = format!(
+            "{new} is the golden of {repo} now, but {problem}: delete {old} with `tod-sandbox delete {old}` if `tod-sandbox list` shows it."
+        );
+        let record = now_secs().map(|at| LeftBehindRecord { targets: vec![old.to_string()], at, note: note.clone() });
+        match record.and_then(|record| write_record(root, repo, &record)) {
+            Ok(()) => say(&format!("warning: {note} It is tracked, and cleared once Blaxel shows no such sandbox.")),
+            Err(e) => {
+                tracing::error!("{note} (and recording it failed: {e:#})");
+                say(&format!("warning: {note} It could not be recorded either ({e:#}): delete it yourself."));
+            }
+        }
     }
-    Ok(name)
+    new.to_string()
 }
 
 /// The proxy a golden carries so nodes can be forked from it: one rule that
@@ -1420,5 +1481,48 @@ mod tests {
         assert_eq!(normalized("Acme/Widget").unwrap(), "acme/widget");
         assert_eq!(normalized("https://github.com/acme/widget.git").unwrap(), "acme/widget");
         assert!(normalized("widget").is_err());
+    }
+
+    /// A not-ready 404 on the repository's own golden is an unknown, never
+    /// "gone": it must not lead to building a second golden.
+    #[test]
+    fn a_not_ready_look_at_the_own_golden_is_an_error_not_a_build() {
+        let err = decide_source_from("a/b", Some("tod-golden-a-b-1"), Some(Err(anyhow!("Blaxel: 404 workload is not ready")))).unwrap_err();
+        assert!(format!("{err:#}").contains("not ready"));
+        // Blaxel saying it does not exist is the one case that builds.
+        let (source, info) = decide_source_from("a/b", Some("tod-golden-a-b-1"), Some(Ok(None))).unwrap();
+        assert!(matches!(source, golden::Source::Build { .. }), "{source:?}");
+        assert!(info.is_none());
+    }
+
+    /// A lock or reload failure, like any other, falls back to the usable golden.
+    #[test]
+    fn a_lock_or_reload_failure_uses_the_existing_golden() {
+        let mut said = Vec::new();
+        let made: Result<String> = Err(anyhow!("take the refresh lock: busy"));
+        let got = use_existing_if_failed("a/b", made, || Ok(Some("tod-golden-a-b-1".into())), &mut |m| said.push(m.to_string())).unwrap();
+        assert_eq!(got, "tod-golden-a-b-1");
+        assert!(said[0].contains("refresh lock") && said[0].contains("did not complete"), "{said:?}");
+    }
+
+    /// After sandboxes.toml points at the new golden, a failed look or delete of
+    /// the old one is recorded and reported as success with a warning.
+    #[test]
+    fn a_failure_settling_the_old_golden_is_recorded_and_the_refresh_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut said = Vec::new();
+        let got = settle_old_golden(root, "a/b", "new", "old", "orig", false, Err(anyhow!("502")), || panic!("not deleted"), &mut |m| said.push(m.to_string()));
+        assert_eq!(got, "new");
+        let record = read_record(root, "a/b").unwrap().expect("recorded");
+        assert_eq!(record.targets, vec!["old".to_string()]);
+        assert!(said.last().unwrap().starts_with("warning:") && said.last().unwrap().contains("old"), "{said:?}");
+
+        // A delete that fails the same way (a tod-made golden).
+        std::fs::remove_file(left_behind_path(root, "a/b")).unwrap();
+        let info = tod_sandbox::blaxel::SandboxInfo { name: "old".into(), status: "DEPLOYED".into(), state: None, url: None, image: String::new(), labels: vec![("tod-kind".into(), golden::KIND_GOLDEN.into())], volumes: vec![], node_env: vec![] };
+        let got = settle_old_golden(root, "a/b", "new", "old", "orig", false, Ok(Some(info)), || Err(anyhow!("503")), &mut |m| said.push(m.to_string()));
+        assert_eq!(got, "new");
+        assert!(read_record(root, "a/b").unwrap().is_some());
     }
 }

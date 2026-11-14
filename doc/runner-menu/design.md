@@ -134,6 +134,7 @@ the error) and nothing makes a second golden beside it. The rules, all decided
 in `ensure_golden_current` (every node start, the app, and the daemon's check)
 and `refresh_golden` (`golden refresh`, Settings):
 
+- **A 404 that says the workload is not ready is unknown, never gone** (`Blaxel::get` errors on it), so it never leads to building a second golden. A failed look or delete of the old golden after the switch is recorded as a left-behind target and warned about; the refresh still succeeded.
 - **Nodes are never blocked while a golden can be forked.** With a record
   standing, or when a refresh fails just now, a node start uses the
   repository's existing golden if Blaxel has it and it is not newer than this

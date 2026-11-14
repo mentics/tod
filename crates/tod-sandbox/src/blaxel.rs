@@ -573,21 +573,12 @@ impl Blaxel {
         }
     }
 
+    /// The sandbox as Blaxel has it; `None` only when Blaxel says it does not
+    /// exist. A 404 whose body says the workload is not ready
+    /// ([`classify_failure`]) is unknown, not gone, and is an error saying so:
+    /// every decision tod makes on "it does not exist" (making a second golden,
+    /// forgetting a sandbox) reads this, so it must never take that for gone.
     pub fn get(&self, name: &str) -> Result<Option<SandboxInfo>> {
-        let mut resp = self.cp(true, || self.auth(self.agent.get(&format!("{API}/sandboxes/{name}"))).call())
-            .context("Blaxel API")?;
-        if resp.status().as_u16() == 404 {
-            return Ok(None);
-        }
-        check(&mut resp, "get sandbox")?;
-        let v: Value = resp.body_mut().read_json()?;
-        Ok(Some(parse_info(&v)))
-    }
-
-    /// [`Self::get`] for a decision that acts on "it does not exist": a 404
-    /// whose body says the workload is not ready ([`classify_failure`]) is not
-    /// "gone" but unknown, and is an error saying so.
-    pub fn get_strict(&self, name: &str) -> Result<Option<SandboxInfo>> {
         let mut resp = self.cp(true, || self.auth(self.agent.get(&format!("{API}/sandboxes/{name}"))).call())
             .context("Blaxel API")?;
         if resp.status().as_u16() == 404 {
@@ -601,11 +592,13 @@ impl Blaxel {
 
     /// The sandbox's whole record as Blaxel returns it (for live checks of
     /// its `spec.network.proxy`; may hold rule values: never print it as is).
+    /// `None` and the not-ready 404 as for [`Self::get`].
     pub fn get_json(&self, name: &str) -> Result<Option<Value>> {
         let mut resp = self.cp(true, || self.auth(self.agent.get(&format!("{API}/sandboxes/{name}"))).call())
             .with_context(|| format!("Blaxel API: GET {API}/sandboxes/{name}"))?;
         if resp.status().as_u16() == 404 {
-            return Ok(None);
+            let body = resp.body_mut().read_to_string().with_context(|| format!("read Blaxel's 404 for {name}"))?;
+            return not_found_means_gone(name, &body).map(|()| None);
         }
         check(&mut resp, "get sandbox")?;
         Ok(Some(resp.body_mut().read_json()?))
@@ -720,7 +713,14 @@ impl Blaxel {
         let mut resp = self.cp(false, || self.auth(self.agent.post(&format!("{API}/sandboxes/{source}/fork"))).send_json(&body))
             .context("Blaxel API")?;
         match resp.status().as_u16() {
-            404 => bail!("fork: no sandbox named {source}"),
+            404 => {
+                let body = resp.body_mut().read_to_string().with_context(|| format!("read Blaxel's 404 for {source}"))?;
+                // Gone, or "not ready" (a wait, not a missing sandbox).
+                return match not_found_means_gone(source, &body) {
+                    Ok(()) => bail!("fork: no sandbox named {source}"),
+                    Err(unknown) => Err(unknown.context(format!("fork {source}"))),
+                };
+            }
             409 => bail!("fork: a sandbox named {target} already exists"),
             // The same sign-in can create sandboxes: forking is what is refused.
             403 => {
@@ -737,11 +737,13 @@ impl Blaxel {
         }
     }
 
-    /// `DELETE {API}{path}`; a 404 (already gone) is not an error.
+    /// `DELETE {API}{path}`; a 404 (already gone) is not an error, but one
+    /// saying the workload is not ready is (it was not deleted).
     pub fn delete_path(&self, path: &str, what: &str) -> Result<()> {
         let mut resp = self.cp(true, || self.auth(self.agent.delete(&format!("{API}{path}"))).call()).context("Blaxel API")?;
         if resp.status().as_u16() == 404 {
-            return Ok(());
+            let body = resp.body_mut().read_to_string().with_context(|| format!("read Blaxel's 404 for {path}"))?;
+            return not_found_means_gone(path, &body);
         }
         check(&mut resp, what)
     }
@@ -860,22 +862,39 @@ impl Blaxel {
         let mut resp =
             self.cp(true, || self.auth(self.agent.delete(&format!("{API}/sandboxes/{name}"))).call()).context("Blaxel API")?;
         if resp.status().as_u16() == 404 {
-            return Ok(());
+            let body = resp.body_mut().read_to_string().with_context(|| format!("read Blaxel's 404 for {name}"))?;
+            return not_found_means_gone(name, &body);
         }
         check(&mut resp, "delete sandbox")
     }
 
     pub fn wait_deployed(&self, name: &str, timeout: Duration) -> Result<SandboxInfo> {
         let start = Instant::now();
+        let mut not_ready: Option<String> = None;
         loop {
-            match self.get(name)? {
+            // A 404 saying the workload is not ready is part of the wait.
+            let found = match self.get(name) {
+                Ok(found) => {
+                    not_ready = None;
+                    found
+                }
+                Err(err) if error_is_not_ready(&err) && start.elapsed() <= timeout => {
+                    not_ready = Some(format!("{err:#}"));
+                    None
+                }
+                Err(err) => return Err(err),
+            };
+            match found {
                 Some(info) if info.status == "DEPLOYED" && info.url.is_some() => return Ok(info),
                 Some(info) if matches!(info.status.as_str(), "FAILED" | "TERMINATED" | "DELETING") => {
                     bail!("sandbox {name} is {}", info.status)
                 }
                 // A fork can take a moment to appear.
                 None if start.elapsed() > Duration::from_secs(30) => {
-                    bail!("sandbox {name} does not exist")
+                    match &not_ready {
+                        Some(why) => bail!("sandbox {name} is not answering yet: {why}"),
+                        None => bail!("sandbox {name} does not exist"),
+                    }
                 }
                 _ => {}
             }
@@ -1390,8 +1409,6 @@ mod tests {
         assert!(text_is_transient("fork y: 502 Bad Gateway Error 502: compute plane fork instance failed (FORK_FAILED)"));
         assert!(!text_is_transient("fork y: 400 Bad Request: invalid image"));
     }
-
-    use super::*;
 
     #[test]
     fn transient_errors_are_told_from_permanent_ones() {
