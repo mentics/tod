@@ -79,6 +79,7 @@ pub mod pull_requests;
 pub mod run_transcript;
 pub mod run_state;
 pub mod runner_menu;
+pub mod direct_store;
 pub mod runner_operator;
 pub mod runner_place;
 pub mod sandbox_retire;

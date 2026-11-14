@@ -150,8 +150,8 @@ impl InterviewClient {
         if !self.data_root.is_dir() {
             bail!("data root {} does not exist", self.data_root.display());
         }
-        FleetStore::open(&self.data_root)
-            .map_err(|err| anyhow::anyhow!("open store at {}: {err}", self.data_root.display()))
+        crate::direct_store::open(&self.data_root, true)
+            .with_context(|| format!("open store at {}", self.data_root.display()))
     }
 
     /// `Ok(None)` when no live instance is reachable (no port file, or a stale

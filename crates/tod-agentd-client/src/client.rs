@@ -131,6 +131,30 @@ pub fn connect(paths: &Paths) -> Option<Connection> {
     (hello.info.as_ref() == Some(&info)).then_some(connection)
 }
 
+/// Why [`connect`] gets no answer for `paths`, in words for the person who
+/// has to act on it. Only for an error message: it repeats the checks.
+pub fn why_unreachable(paths: &Paths) -> String {
+    let info_path = paths.info();
+    let bytes = match std::fs::read(&info_path) {
+        Ok(bytes) => bytes,
+        Err(err) => return format!("there is no readable {} ({err})", info_path.display()),
+    };
+    let info: Info = match serde_json::from_slice(&bytes) {
+        Ok(info) => info,
+        Err(err) => {
+            return format!("{} is not in the format this build reads ({err}): the daemon is from another version", info_path.display());
+        }
+    };
+    let addr = SocketAddr::from(([127, 0, 0, 1], info.port));
+    let stream = match TcpStream::connect_timeout(&addr, Duration::from_millis(1000)) {
+        Ok(stream) => stream,
+        Err(err) => return format!("nothing accepts connections on port {} named by {} ({err})", info.port, info_path.display()),
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    drop(stream);
+    format!("the process on port {} did not answer the hello with the identity {} records", info.port, info_path.display())
+}
+
 /// What [`ensure_running`] found or did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ensured {

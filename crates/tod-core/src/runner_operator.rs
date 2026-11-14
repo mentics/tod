@@ -258,11 +258,7 @@ impl Session {
             tod_agentd_client::remote::open_store(root, None)
                 .with_context(|| format!("open the store through tod-agentd for {}", root.display()))?
         } else {
-            FleetStore::open_without_reattach(root)
-                .map_err(|err| anyhow!("{err}"))
-                .with_context(|| {
-                    format!("tod-agentd is not running for {}, and the store could not be opened directly", root.display())
-                })?
+            crate::direct_store::open(root, false)?
         };
         Ok(Self { fleet, root: root.to_path_buf(), daemon: running.then(|| AgentDaemon::new(root)) })
     }
