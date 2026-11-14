@@ -120,6 +120,14 @@ pub mod color {
     pub fn node_retrying_text() -> Hsla {
         hex(0xfbbf24ff)
     }
+    #[cfg(feature = "agent-socket")]
+    pub fn shepherd_driving_fill() -> Hsla {
+        hex(0x7c3aedff)
+    }
+    #[cfg(feature = "agent-socket")]
+    pub fn shepherd_driving_text() -> Hsla {
+        hex(0xffffffff)
+    }
     pub fn linked_source_text() -> Hsla {
         hex(0xa06707ff)
     }
@@ -510,6 +518,14 @@ pub fn panel_header<E: Styled>(el: E) -> E {
         .gap(space::RELATED)
         .border_b(size::BORDER)
         .border_color(color::divider())
+}
+
+/// `styles.title-bar-shepherd-driving`: the title bar while the shepherd
+/// agent drives the app.
+#[cfg(feature = "agent-socket")]
+pub fn title_bar_shepherd_driving<E: Styled>(el: E) -> E {
+    el.bg(color::shepherd_driving_fill())
+        .text_color(color::shepherd_driving_text())
 }
 
 /// `styles.column-header`, in its `column-focused` state while `focused`.

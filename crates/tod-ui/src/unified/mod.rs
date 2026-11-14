@@ -15,6 +15,8 @@ pub mod panels;
 pub mod requests;
 mod resize;
 pub mod runners;
+#[cfg(feature = "agent-socket")]
+pub mod view_state;
 pub mod status_label;
 
 pub use columns::{Column, ColumnModel, PanelKind};

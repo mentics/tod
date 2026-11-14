@@ -14,6 +14,10 @@ pub struct LaunchOptions {
     pub height_from_cli: bool,
     #[cfg(feature = "agent-socket")]
     pub agent_socket: Option<SocketAddr>,
+    /// `--driven-idle-ms`: how long the user may sit idle in user mode before
+    /// the shepherd agent gets the app back (`agent_socket::mode`).
+    #[cfg(feature = "agent-socket")]
+    pub driven_idle_ms: u64,
     /// When set, all `TodPaths` resolve under this root (isolated sandbox).
     pub data_root: Option<PathBuf>,
     pub agent_backend: AgentBackend,
@@ -36,6 +40,8 @@ impl Default for LaunchOptions {
             height_from_cli: false,
             #[cfg(feature = "agent-socket")]
             agent_socket: None,
+            #[cfg(feature = "agent-socket")]
+            driven_idle_ms: 5_000,
             data_root: None,
             agent_backend: AgentBackend::Cursor,
             agent_backend_from_cli: false,
@@ -97,6 +103,20 @@ impl LaunchOptions {
                     );
                 }
                 #[cfg(feature = "agent-socket")]
+                #[cfg(feature = "agent-socket")]
+                "--driven-idle-ms" => {
+                    i += 1;
+                    let v = rest.get(i).ok_or_else(|| {
+                        anyhow::anyhow!("--driven-idle-ms requires a number of milliseconds")
+                    })?;
+                    opts.driven_idle_ms = v
+                        .parse::<u64>()
+                        .ok()
+                        .filter(|ms| *ms > 0)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("invalid --driven-idle-ms `{v}` (must be a positive number)")
+                        })?;
+                }
                 "--agent-socket-port" => {
                     i += 1;
                     let v = rest.get(i).ok_or_else(|| {
@@ -259,6 +279,20 @@ mod tests {
     }
 
     #[cfg(feature = "agent-socket")]
+    #[test]
+    #[cfg(feature = "agent-socket")]
+    fn parses_driven_idle_ms() {
+        let opts = LaunchOptions::from_args(["tod".to_string()]).unwrap();
+        assert_eq!(opts.driven_idle_ms, 5_000);
+        let opts = LaunchOptions::from_args(
+            ["tod", "--driven-idle-ms", "1500"].map(String::from),
+        )
+        .unwrap();
+        assert_eq!(opts.driven_idle_ms, 1_500);
+        assert!(LaunchOptions::from_args(["tod", "--driven-idle-ms", "0"].map(String::from)).is_err());
+        assert!(LaunchOptions::from_args(["tod", "--driven-idle-ms"].map(String::from)).is_err());
+    }
+
     #[test]
     fn parses_agent_socket_port_flag() {
         let opts =

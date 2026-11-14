@@ -15,6 +15,40 @@
 //! - `agent-platform get` — reply `ok claude` or `ok cursor`
 //! - `agent-platform cycle` — cycle platform and reply with new value
 //! - `agent-platform set cursor|claude` — set platform and reply with new value
+//! - `mode` — reply `ok driven|user|idle` (see below)
+//! - `size` — reply `ok W H`, the window's content size in logical pixels
+//! - `resize W H` — set the content size (part of the agent's saved view)
+//!
+//! # Sharing the app with the user (driven mode vs user mode)
+//!
+//! The same instance is the user's. The socket marks its own injected events
+//! (`driver::synthetic`), so any input outside that mark is the user's
+//! (`driver.rs` says where it is seen). `mode.rs` is the state machine:
+//!
+//! - `driven`: a client is driving, from its first input command until no
+//!   socket command for 2 minutes (then `idle`: no indicator, no snapshots).
+//!   The title bar is violet and says "Shepherd driving".
+//! - `user`: the person is interacting. Real key, click, scroll, or a pointer
+//!   move with a real delta switches to it; focus gained, or the pointer
+//!   merely over the window, does not. A key or click that switches is
+//!   consumed, so it never lands in a field the agent focused. On the switch
+//!   the agent's view state is saved and the user's own last view restored
+//!   (and the reverse on switching back): `snapshot.rs` lists what a view
+//!   holds. Only view state, never data. Menus are closed on a switch.
+//! - Back to `driven` when the window loses key focus or the pointer leaves
+//!   it for 300 ms, or when the user stops interacting for `--driven-idle-ms`
+//!   (default 5000).
+//!
+//! Input commands (`key`, `text`, `click`, `rclick`, `scroll`, `drag`,
+//! `press`/`moveto`/`release`, `resize`) that arrive in `user` mode **block**
+//! until driven mode resumes and the agent's view is restored. Then, if the
+//! data it depended on is unchanged, the command runs and replies `ok`; if
+//! something changed it replies `err user-conflict: <what changed>` (for
+//! example `request 3f2a answered; ENG-2925 pr_draft→approved`) without
+//! running; after 60 s it replies `err user-mode` and the agent resends.
+//! `sync`, `mode` and `size` run at once in any mode. `shot`/`shot2` in
+//! `user` mode reply `err user-mode: …`, since the screen shows the user's
+//! view.
 //!
 //! Keys use GPUI `dispatch_keystroke` (same path as typed input). Clicks use
 //! `SendMessage` to this process's HWND — synchronous, no focus steal, no sleep.
@@ -22,9 +56,15 @@
 
 mod capture;
 pub mod commands;
+mod driver;
+pub mod mode;
+mod snapshot;
+
+pub use driver::{driving, input_watch};
 
 use crate::app::transcript_window::{TranscriptWindowControl, TranscriptWindowStatus};
 use commands::{AgentPlatformSocketCommand, Command, TranscriptsCommand, parse_line};
+use mode::{Kind, Mode, Shared};
 use gpui::{AnyWindowHandle, AsyncApp, Keystroke};
 use gpui_component::WindowExt;
 use std::io::{BufRead, BufReader, Write};
@@ -71,6 +111,9 @@ enum UiRequest {
     Scroll { x: f32, y: f32, dx: f32, dy: f32 },
     Transcripts(TranscriptsCommand),
     AgentPlatform(AgentPlatformSocketCommand),
+    /// Reply `ok W H`: the window's content size.
+    Size,
+    Resize { w: f32, h: f32 },
 }
 
 struct Pending {
@@ -85,8 +128,9 @@ pub fn start(
     window: AnyWindowHandle,
     listener: TcpListener,
     addr: SocketAddr,
-    logical_width: f32,
-    logical_height: f32,
+    _logical_width: f32,
+    _logical_height: f32,
+    driven_idle_ms: u64,
     transcript_window: TranscriptWindowControl,
     shell: gpui::WeakEntity<crate::app::window::Shell>,
 ) {
@@ -94,13 +138,33 @@ pub fn start(
     let _ = SHUTDOWN.set(shutdown.clone());
     eprintln!("agent-socket: listening on {addr}");
     let (tx, rx) = async_channel::bounded::<Pending>(32);
-    let lw = logical_width.round().max(1.0) as u32;
-    let lh = logical_height.round().max(1.0) as u32;
+    let shared = Arc::new(Shared::new(mode::Config {
+        idle_ms: driven_idle_ms,
+        ..mode::Config::default()
+    }));
 
+    let for_threads = shared.clone();
     std::thread::Builder::new()
         .name("tod-agent-socket".into())
-        .spawn(move || listen_loop(listener, tx, lw, lh, shutdown))
+        .spawn(move || listen_loop(listener, tx, shutdown, for_threads))
         .expect("spawn agent socket thread");
+
+    // Real vs synthetic input, the mode, snapshots, the title bar.
+    let driver = driver::Driver::install(cx, window, shell.clone(), shared);
+    cx.spawn(async move |cx| {
+        loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(100))
+                .await;
+            if window
+                .update(cx, |_, window, cx| driver.tick(window, cx))
+                .is_err()
+            {
+                break;
+            }
+        }
+    })
+    .detach();
 
     cx.spawn(async move |cx| {
         drain_loop(cx, window, transcript_window, shell, rx).await;
@@ -111,18 +175,18 @@ pub fn start(
 fn listen_loop(
     listener: TcpListener,
     tx: async_channel::Sender<Pending>,
-    logical_width: u32,
-    logical_height: u32,
     shutdown: Arc<AtomicBool>,
+    shared: Arc<Shared>,
 ) {
     let _ = listener.set_nonblocking(true);
     while !shutdown.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, _)) => {
                 let tx = tx.clone();
+                let shared = shared.clone();
                 let _ = std::thread::Builder::new()
                     .name("tod-agent-client".into())
-                    .spawn(move || handle_client(stream, tx, logical_width, logical_height));
+                    .spawn(move || handle_client(stream, tx, shared));
             }
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(100));
@@ -135,12 +199,7 @@ fn listen_loop(
     }
 }
 
-fn handle_client(
-    stream: TcpStream,
-    tx: async_channel::Sender<Pending>,
-    logical_width: u32,
-    logical_height: u32,
-) {
+fn handle_client(stream: TcpStream, tx: async_channel::Sender<Pending>, shared: Arc<Shared>) {
     // Accepted sockets can inherit the listener's non-blocking mode (notably on
     // Windows). Force blocking so read_line waits for the next command instead
     // of treating WouldBlock as a disconnect.
@@ -161,11 +220,16 @@ fn handle_client(
             }
         }
 
-        let reply = match parse_line(line.trim_end_matches(['\r', '\n'])) {
-            Ok(Command::Shot { path, crop }) => {
-                capture::capture_window_png(&path, logical_width, logical_height, crop)
-                    .map(|()| "ok".to_string())
-            }
+        // Input commands wait here while the user has the app (`mode.rs`).
+        let reply = match parse_line(line.trim_end_matches(['\r', '\n']))
+            .and_then(|cmd| gate(&cmd, &shared).map(|()| cmd))
+        {
+            Ok(Command::Shot { path, crop }) => window_size(&tx).and_then(|(w, h)| {
+                capture::capture_window_png(&path, w, h, crop).map(|()| "ok".to_string())
+            }),
+            Ok(Command::Mode) => Ok(format!("ok {}", shared.mode().word())),
+            Ok(Command::Size) => dispatch_ui(&tx, UiRequest::Size),
+            Ok(Command::Resize { w, h }) => dispatch_ui(&tx, UiRequest::Resize { w, h }),
             Ok(Command::Shot2 { path, crop }) => {
                 dispatch_ui(&tx, UiRequest::Shot2 { path, crop })
             }
@@ -173,20 +237,26 @@ fn handle_client(
             Ok(Command::Text { text }) => dispatch_ui(&tx, UiRequest::Text(text)),
             #[cfg(windows)]
             Ok(Command::Click { x, y, right }) => {
-                capture::send_click(x, y, logical_width, logical_height, right)
-                    .map(|()| "ok".to_string())
+                let _synthetic = driver::synthetic();
+                window_size(&tx).and_then(|(w, h)| {
+                    capture::send_click(x, y, w, h, right).map(|()| "ok".to_string())
+                })
             }
             #[cfg(not(windows))]
             Ok(Command::Click { x, y, right }) => dispatch_ui(&tx, UiRequest::Click { x, y, right }),
             Ok(Command::Scroll { x, y, dx, dy }) => dispatch_ui(&tx, UiRequest::Scroll { x, y, dx, dy }),
             Ok(Command::Close) => dispatch_ui(&tx, UiRequest::Close),
             Ok(Command::Drag { from, to }) => {
-                capture::send_drag(from, to, logical_width, logical_height)
-                    .map(|()| "ok".to_string())
+                let _synthetic = driver::synthetic();
+                window_size(&tx).and_then(|(w, h)| {
+                    capture::send_drag(from, to, w, h).map(|()| "ok".to_string())
+                })
             }
             Ok(Command::DragStep { step, x, y }) => {
-                capture::send_drag_step(step, x, y, logical_width, logical_height)
-                    .map(|()| "ok".to_string())
+                let _synthetic = driver::synthetic();
+                window_size(&tx).and_then(|(w, h)| {
+                    capture::send_drag_step(step, x, y, w, h).map(|()| "ok".to_string())
+                })
             }
             Ok(Command::Sync) => dispatch_ui(&tx, UiRequest::Sync),
             Ok(Command::Quit) => dispatch_ui(&tx, UiRequest::Quit),
@@ -205,6 +275,41 @@ fn handle_client(
             break;
         }
     }
+}
+
+/// Decide whether a command may run now (`mode::classify`): an input command
+/// waits for the user to be done, a screenshot is refused while they are in
+/// control. `Err` is the text after `err `.
+fn gate(command: &Command, shared: &Shared) -> Result<(), String> {
+    match mode::classify(command) {
+        Kind::Input => shared.gate_input(),
+        Kind::Shot => {
+            shared.with(|m, now| m.note_command(now));
+            if shared.mode() == Mode::User {
+                Err("user-mode: the screen shows the user's view; retry when `mode` says driven"
+                    .into())
+            } else {
+                Ok(())
+            }
+        }
+        Kind::Read | Kind::Other => {
+            shared.with(|m, now| m.note_command(now));
+            Ok(())
+        }
+    }
+}
+
+/// The window's content size now, which `resize` and the user can change.
+fn window_size(tx: &async_channel::Sender<Pending>) -> Result<(u32, u32), String> {
+    let reply = dispatch_ui(tx, UiRequest::Size)?;
+    let mut parts = reply.split_whitespace().skip(1);
+    let mut next = || {
+        parts
+            .next()
+            .and_then(|v| v.parse::<u32>().ok())
+            .ok_or_else(|| format!("unreadable size reply `{reply}`"))
+    };
+    Ok((next()?, next()?))
 }
 
 fn dispatch_ui(tx: &async_channel::Sender<Pending>, request: UiRequest) -> Result<String, String> {
@@ -266,8 +371,27 @@ fn handle_ui_request(
     shell: &gpui::WeakEntity<crate::app::window::Shell>,
     request: UiRequest,
 ) -> Result<String, String> {
+    // Everything the socket does to the window is synthetic: input seen
+    // meanwhile is not the user's (`driver::synthetic`).
+    let _synthetic = driver::synthetic();
     match request {
         UiRequest::Sync => Ok("ok".into()),
+        UiRequest::Size => window
+            .update(cx, |_root, window, _| {
+                let size = window.viewport_size();
+                format!(
+                    "ok {} {}",
+                    f32::from(size.width).round() as u32,
+                    f32::from(size.height).round() as u32
+                )
+            })
+            .map_err(|e| format!("window update failed: {e}")),
+        UiRequest::Resize { w, h } => window
+            .update(cx, |_root, window, _| {
+                window.resize(gpui::size(gpui::px(w), gpui::px(h)));
+                "ok".to_string()
+            })
+            .map_err(|e| format!("window update failed: {e}")),
         UiRequest::Shot2 { path, crop } => window
             .update(cx, |_root, window, cx| {
                 // Force a fresh layout+paint of the current state: an occluded
