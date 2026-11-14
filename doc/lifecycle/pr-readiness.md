@@ -389,10 +389,26 @@ its own words. Now:
    `bot_silence`, reason `broken`, so it shows with the other requests). The
    run does not stop on it and does not poll GitHub for the bot: while every
    bot still waited on is silent with its question pending, it parks on an
-   `event` wait on the bot's review (`github:pr:<n>:bot-review:<bot>`, due at
-   the next scheduled look; the bot's review webhook satisfies it sooner;
-   `Autopilot::park_for_silent_bots`), using no turns or budget. A bot that
-   comes withdraws the question with a note (`tend_silence_questions`). With no `ask` text the same patience is measured
+   `event` wait per pull request (`github:pr:<n>:bot-review`,
+   `next_actor::bot_review_wake_spec`), due at the next scheduled look. Any
+   review, review comment or comment on the pull request satisfies it sooner:
+   the orchestrator's webhook adds the key `github:pr:<n>:bot-review:<login>` to
+   those events (`webhooks::bot_review_key`); the woken run reads GitHub and
+   parks again if the bot has still not reviewed
+   (`Autopilot::park_for_silent_bots`; it parks while the question is pending
+   or answered "Keep waiting"), using no turns or budget. Answering the
+   question releases the wait (`bot_silence::release_parked_wait`, from
+   `send_back::answer_decision`): the cloud supervisor's "check now" then finds
+   nothing pending and runs, and the local daemon starts a parked run when an
+   answer is newer than its start (`bot_silence::answered_since`, in
+   `runners::start_due`). A bot that comes withdraws the question with a note
+   (`tend_silence_questions`). An ask is any comment from someone but the bot
+   that mentions the bot's `@handle` (the handle words of its `ask` text), on
+   the current head: asks on an earlier head do not count, since a new head
+   restarts the bot's work and has its own `max_asks`. A bot silent on every
+   repository of the owner is never taken to skip drafts
+   (`reviews_drafts` needs ready-PR activity to call it blind), so a draft
+   goes through this same question and park. With no `ask` text the same patience is measured
    from the later of the head commit and the agent's last turn
    (`rerun_after_minutes + max_asks * ask_every_minutes`). The wording is
    fixed, with what was tried:

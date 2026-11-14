@@ -630,42 +630,52 @@ impl Github {
     /// bot reviews drafts (`tod_core::pr_readiness::reviews_drafts`). One
     /// query; the caller caches it.
     pub fn recent_pr_activity(&self, owner: &str, repo: &str) -> Result<Vec<RecentPr>, GithubError> {
-        const QUERY: &str = "query($owner: String!, $repo: String!) { repository(owner: $owner, name: $repo) { pullRequests(last: 40, orderBy: {field: CREATED_AT, direction: ASC}) { nodes { number isDraft createdAt timelineItems(itemTypes: [READY_FOR_REVIEW_EVENT, CONVERT_TO_DRAFT_EVENT], first: 20) { nodes { __typename ... on ReadyForReviewEvent { createdAt } ... on ConvertToDraftEvent { createdAt } } } reviews(last: 20) { nodes { submittedAt author { login } } } comments(last: 20) { nodes { createdAt author { login } } } } } } }";
+        const QUERY: &str = "query($owner: String!, $repo: String!) { repository(owner: $owner, name: $repo) { pullRequests(last: 40, orderBy: {field: CREATED_AT, direction: ASC}) { nodes { number isDraft createdAt timelineItems(itemTypes: [READY_FOR_REVIEW_EVENT, CONVERT_TO_DRAFT_EVENT], first: 20) { nodes { __typename ... on ReadyForReviewEvent { createdAt } ... on ConvertToDraftEvent { createdAt } } } reviews(last: 20) { nodes { state submittedAt author { login } } } comments(last: 20) { nodes { createdAt author { login } } } } } } }";
         let data: RecentData =
             self.graphql(QUERY, serde_json::json!({ "owner": owner, "repo": repo }), Some((owner, repo)))?;
         let repository = data.repository.ok_or(GithubError::NotFound)?;
-        Ok(repository
-            .pull_requests
-            .nodes
-            .into_iter()
-            .map(|p| {
-                let mut activity: Vec<(String, String)> = Vec::new();
-                for r in p.reviews.nodes {
-                    if let (Some(a), Some(at)) = (r.author, r.submitted_at) {
-                        activity.push((a.login, at));
+        let mut out = Vec::new();
+        for p in repository.pull_requests.nodes {
+            let number = p.number;
+            let mut activity: Vec<(String, String)> = Vec::new();
+            for r in p.reviews.nodes {
+                let Some(a) = r.author else { continue };
+                match r.submitted_at {
+                    Some(at) => activity.push((a.login, at)),
+                    // A review still being written has no time and is nobody's
+                    // activity yet; any other review without one is an error.
+                    None if r.state.as_deref() == Some("PENDING") => {}
+                    None => {
+                        return Err(GithubError::Api(format!(
+                            "{owner}/{repo}#{number}: a {} review by {} has no submittedAt",
+                            r.state.as_deref().unwrap_or("stateless"),
+                            a.login
+                        )));
                     }
                 }
-                for c in p.comments.nodes {
-                    if let Some(a) = c.author {
-                        activity.push((a.login, c.created_at));
-                    }
+            }
+            for c in p.comments.nodes {
+                if let Some(a) = c.author {
+                    activity.push((a.login, c.created_at));
                 }
-                let ready_events = p
-                    .timeline_items
-                    .nodes
-                    .into_iter()
-                    .filter_map(|e| Some((e.created_at?, e.typename == "ConvertToDraftEvent")))
-                    .collect();
-                RecentPr {
-                    repo: format!("{owner}/{repo}"),
-                    number: p.number,
-                    draft: p.is_draft,
-                    created_at: p.created_at,
-                    ready_events,
-                    activity,
-                }
-            })
-            .collect())
+            }
+            let mut ready_events = Vec::new();
+            for e in p.timeline_items.nodes {
+                let at = e.created_at.ok_or_else(|| {
+                    GithubError::Api(format!("{owner}/{repo}#{number}: a {} event has no createdAt", e.typename))
+                })?;
+                ready_events.push((at, e.typename == "ConvertToDraftEvent"));
+            }
+            out.push(RecentPr {
+                repo: format!("{owner}/{repo}"),
+                number,
+                draft: p.is_draft,
+                created_at: p.created_at,
+                ready_events,
+                activity,
+            });
+        }
+        Ok(out)
     }
 
     /// Reply in a review thread (by the thread's GraphQL id).
@@ -1193,6 +1203,7 @@ struct RecentEvent {
 
 #[derive(Debug, Deserialize)]
 struct RecentReview {
+    state: Option<String>,
     #[serde(rename = "submittedAt")]
     submitted_at: Option<String>,
     author: Option<RecentAuthor>,
@@ -2085,6 +2096,37 @@ mod tests {
     fn client(url: &str, delays: &[u64]) -> Github {
         let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
         Github::with_agent(GithubAuth::Token("t".into()), agent, url).with_retry_delays(delays)
+    }
+
+    fn recent_reply(timeline: &str, review: &str) -> String {
+        format!(
+            r#"{{"data":{{"repository":{{"pullRequests":{{"nodes":[{{"number":7,"isDraft":true,"createdAt":"2026-01-01T00:00:00Z","timelineItems":{{"nodes":[{timeline}]}},"reviews":{{"nodes":[{review}]}},"comments":{{"nodes":[]}}}}]}}}}}}}}"#
+        )
+    }
+
+    /// An event or a submitted review without a time is an error naming it,
+    /// not left out of the history; a review still being written is nobody's
+    /// activity and is skipped.
+    #[test]
+    fn recent_activity_without_a_time_is_an_error_except_a_pending_review() {
+        let leak = |body: String| -> &'static str { Box::leak(body.into_boxed_str()) };
+        let pending = r#"{"state":"PENDING","submittedAt":null,"author":{"login":"a"}}"#;
+        let (url, handle) = serve_canned(vec![("200 OK", leak(recent_reply("", pending)))]);
+        let prs = client(&url, &[]).recent_pr_activity("o", "r").unwrap();
+        assert!(prs[0].activity.is_empty());
+        handle.join().unwrap();
+
+        let submitted = r#"{"state":"COMMENTED","submittedAt":null,"author":{"login":"a"}}"#;
+        let (url, handle) = serve_canned(vec![("200 OK", leak(recent_reply("", submitted)))]);
+        let err = client(&url, &[]).recent_pr_activity("o", "r").unwrap_err();
+        assert!(err.to_string().contains("no submittedAt"), "{err}");
+        handle.join().unwrap();
+
+        let event = r#"{"__typename":"ReadyForReviewEvent","createdAt":null}"#;
+        let (url, handle) = serve_canned(vec![("200 OK", leak(recent_reply(event, "")))]);
+        let err = client(&url, &[]).recent_pr_activity("o", "r").unwrap_err();
+        assert!(err.to_string().contains("no createdAt"), "{err}");
+        handle.join().unwrap();
     }
 
     #[test]

@@ -92,6 +92,50 @@ pub(crate) fn bot_of(decision: &Decision) -> Option<&str> {
     decision.options.first()?.strip_prefix(PROCEED_PREFIX)
 }
 
+/// The user answered the bot-silence question `decision_id`: the run parked
+/// on the bot's review (`Autopilot::park_for_silent_bots`) is let go, so the
+/// node's waits no longer hold it and its next look (the local daemon's
+/// `start_due`, the cloud supervisor's wake) is a run, not "still waiting".
+/// Any other decision is left alone.
+pub fn release_parked_wait(fleet: &tod_store::fleet::FleetStore, decision_id: Uuid) -> anyhow::Result<()> {
+    let Some(decision) = fleet.read(|conn| DecisionRepo::new(conn).get(decision_id))? else {
+        return Ok(());
+    };
+    if bot_of(&decision).is_none() {
+        return Ok(());
+    }
+    let node = decision.node_id;
+    let waits = fleet.read(|conn| tod_store::waits::WaitRepo::new(conn).list_pending_for_node(node))?;
+    for wait in waits {
+        let spec = tod_store::waits::normalize_spec(&wait.match_spec);
+        if spec.starts_with("github:pr:") && (spec.ends_with(":bot-review") || spec.contains(":bot-review:")) {
+            fleet
+                .interview(
+                    tod_store::interview::ACTOR_USER,
+                    tod_store::interview::InterviewCommand::SetWaitState { wait_id: wait.id, state: "cancelled".into() },
+                )
+                .map_err(|e| anyhow::anyhow!("release the wait on the bot: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether the user answered one of `node`'s bot-silence questions after
+/// `since_ms` (a run's start): what wakes a run parked on the bot at once.
+pub fn answered_since(conn: &rusqlite::Connection, node: Uuid, since_ms: i64) -> anyhow::Result<bool> {
+    let repo = DecisionRepo::new(conn);
+    for decision in repo.list_for_node(node)? {
+        if bot_of(&decision).is_none() || decision.status != "answered" {
+            continue;
+        }
+        let Some(found) = repo.get_with_answers(decision.id)? else { continue };
+        if found.answers.last().is_some_and(|a| a.answered_at > since_ms) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// What the node's saved answers say about `bot`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Standing {

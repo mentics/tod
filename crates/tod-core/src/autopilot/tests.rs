@@ -3778,7 +3778,7 @@ fn a_silent_bot_is_asked_a_bounded_number_of_times_by_tod_then_the_user_is_asked
     // Parked, not polling: a recorded wait on the bot's review (a webhook for
     // it wakes the run), and the question is pending without stopping the run.
     let waits = fx.fleet.read(|conn| tod_store::waits::WaitRepo::new(conn).list_pending_for_node(fx.node)).unwrap();
-    assert!(waits.iter().any(|w| w.match_spec.starts_with("github:pr:42:bot-review:greptile")), "{waits:?}");
+    assert!(waits.iter().any(|w| w.match_spec == crate::next_actor::bot_review_wake_spec(42)), "{waits:?}");
     // tod asked, three times and no more; the agent was never sent.
     assert_eq!(*feed.posted.lock().unwrap(), vec!["@greptileai please review"; 3]);
     assert_eq!(agent.turns, 0);
@@ -3884,6 +3884,51 @@ fn the_same_bot_is_still_asked_on_a_draft_with_no_evidence_it_skips_them() {
         .unwrap();
     assert!(matches!(outcome, Outcome::Waiting { .. }), "{outcome:?}");
     assert_eq!(feed.posted.lock().unwrap().len(), 3);
+    // A bot silent everywhere (no history to say it skips drafts) is the
+    // silence question, and the run is parked on it: it neither stops nor
+    // polls until its budget is gone.
+    assert_eq!(bot_decisions(&fx).len(), 1);
+    let waits = fx.fleet.read(|conn| tod_store::waits::WaitRepo::new(conn).list_pending_for_node(fx.node)).unwrap();
+    assert!(waits.iter().any(|w| w.match_spec == crate::next_actor::bot_review_wake_spec(42)), "{waits:?}");
+    assert_eq!(agent.turns, 0);
+}
+
+/// The user's answer to the silence question lets the parked run go (its
+/// wait is cancelled and the daemon sees an answer since the run began);
+/// "Keep waiting" parks the run again instead of polling for hours.
+#[test]
+fn answering_the_silence_question_wakes_the_parked_run_and_keep_waiting_parks_it_again() {
+    let feed = BotFeed::new("2020-01-01T00:00:00Z", None);
+    let (fx, mut agent) = bot_node(feed.clone(), SILENT_BOT);
+    let run = |agent: &mut FakeAgent| {
+        autopilot(&fx, Budget { max_duration: Duration::from_millis(300), ..Budget::default() })
+            .with_pr_poll_interval(Duration::ZERO)
+            .run(&fx.fleet, agent)
+            .unwrap()
+    };
+    assert!(matches!(run(&mut agent), Outcome::Waiting { .. }));
+    let wait_specs = || {
+        fx.fleet
+            .read(|conn| tod_store::waits::WaitRepo::new(conn).list_pending_for_node(fx.node))
+            .unwrap()
+            .into_iter()
+            .map(|w| w.match_spec)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(wait_specs(), vec![crate::next_actor::bot_review_wake_spec(42)]);
+    let d = bot_decisions(&fx).remove(0);
+    let before = chrono::Utc::now().timestamp_millis() - 1;
+    assert!(!fx.fleet.read(|conn| crate::bot_silence::answered_since(conn, fx.node, before)).unwrap());
+    // "Keep waiting".
+    crate::lifecycle::send_back::answer_decision(&fx.fleet, d.id, Some(2), None).unwrap();
+    assert!(wait_specs().is_empty(), "the wait is released: {:?}", wait_specs());
+    assert!(fx.fleet.read(|conn| crate::bot_silence::answered_since(conn, fx.node, before)).unwrap());
+    // The woken run parks again (a bot held back by "Keep waiting" is still
+    // silent), never BudgetExhausted from polling in place.
+    let outcome = run(&mut agent);
+    assert!(matches!(outcome, Outcome::Waiting { .. }), "{outcome:?}");
+    assert_eq!(wait_specs(), vec![crate::next_actor::bot_review_wake_spec(42)]);
+    assert_eq!(agent.turns, 0);
 }
 
 #[test]

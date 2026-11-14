@@ -53,6 +53,40 @@ pub fn ask_text(configured: &PrReviewBotSettings) -> Option<String> {
         .map(str::to_string)
 }
 
+/// What marks a comment as a request to the bot, lower case: the `@handle`
+/// words of its ask text (so "@somebot please review" and "@somebot take
+/// another look" are both asks), else the whole ask text.
+pub fn ask_markers(configured: &PrReviewBotSettings) -> Vec<String> {
+    let Some(ask) = ask_text(configured) else { return Vec::new() };
+    let handles: Vec<String> = ask
+        .split_whitespace()
+        .filter(|w| w.starts_with('@') && w.len() > 1)
+        .map(|w| w.trim_end_matches(|c: char| !(c.is_alphanumeric() || matches!(c, '-' | '_' | '[' | ']'))).to_ascii_lowercase())
+        .filter(|w| w.len() > 1)
+        .collect();
+    if handles.is_empty() { vec![ask.to_ascii_lowercase()] } else { handles }
+}
+
+/// Whether `body` asks the bot, by any of `markers` ([`ask_markers`]); a
+/// handle counts only as a whole word, so `@somebot` is not `@somebotics`.
+fn is_ask(body: &str, markers: &[String]) -> bool {
+    let body = body.to_ascii_lowercase();
+    markers.iter().any(|m| {
+        let mut from = 0;
+        while let Some(at) = body[from..].find(m.as_str()) {
+            let start = from + at;
+            let end = start + m.len();
+            let boundary = !m.starts_with('@')
+                || !body[end..].chars().next().is_some_and(|c| c.is_alphanumeric() || matches!(c, '-' | '_'));
+            if boundary {
+                return true;
+            }
+            from = start + 1;
+        }
+        false
+    })
+}
+
 /// The built-in bot `name` selects.
 pub fn builtin_bot(name: &str) -> Option<&'static ReviewBot> {
     [&GREPTILE].into_iter().find(|bot| bot.name.eq_ignore_ascii_case(name.trim()))
@@ -382,9 +416,13 @@ pub enum Next {
 /// [`Next`], and what the babysitter is stuck on: rounds spent.
 impl Assessment {
     /// `snapshot`, read at `now`, against `settings`.
+    ///
+    /// Without a comparison and with every time readable: a fixture's, which
+    /// is why it is for tests; the readers of a real pull request go through
+    /// [`assess`].
+    #[cfg(test)]
     pub fn of(snapshot: &PrSnapshot, settings: &PrReadinessSettings, now: DateTime<Utc>) -> Self {
-        let Ok(assessment) = Self::of_with(snapshot, settings, now, &mut |_, _| Ok::<_, std::convert::Infallible>(false));
-        assessment
+        Self::of_with(snapshot, settings, now, &mut |_, _| Ok::<_, String>(false)).expect("a readable fixture")
     }
 
     /// [`Self::of`], where `same_change(reviewed, head)` says whether the pull
@@ -392,7 +430,7 @@ impl Assessment {
     /// the head (the head only merges the base in): the bot's review then
     /// counts as current. It is asked only for a review that names a commit
     /// other than the head; its error is the assessment's.
-    pub fn of_with<E>(
+    pub fn of_with<E: From<String>>(
         snapshot: &PrSnapshot,
         settings: &PrReadinessSettings,
         now: DateTime<Utc>,
@@ -423,7 +461,7 @@ impl Assessment {
                     now.signed_duration_since(h)
                         >= chrono::Duration::minutes(configured.rerun_after_minutes as i64)
                 });
-                let (asks, last_ask_at, first_ask_at) = asks_made(snapshot, bot, configured, head_at);
+                let (asks, last_ask_at, first_ask_at) = asks_made(snapshot, bot, configured, head_at).map_err(E::from)?;
                 let exhausted = !matches!(standing, BotStanding::Current { .. })
                     && exhausted_since(snapshot, bot, configured, head_at);
                 let reviewed_at = snapshot
@@ -875,6 +913,12 @@ fn parse_time(text: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(text).ok().map(|t| t.with_timezone(&Utc))
 }
 
+/// [`parse_time`] where a time that cannot be read is an error naming what it
+/// was, never a value quietly left out.
+fn parse_time_strict(text: &str, what: &str) -> Result<DateTime<Utc>, String> {
+    parse_time(text).ok_or_else(|| format!("{what} is not a time GitHub gave ({text:?})"))
+}
+
 /// A bot's standing: the newest of its comments that says a score. It is
 /// for the current head when it names the head's SHA, or was written or
 /// edited after the head was committed (bots edit their summary in place).
@@ -1051,26 +1095,33 @@ pub fn render_work(url: &str, assessment: &Assessment) -> String {
 }
 
 /// The comments on the pull request since the head commit that ask `bot`
-/// for a review (they contain the settings' `ask` text, ignoring case),
-/// from anyone but the bot, and when the latest was posted.
+/// for a review (they mention its handle, [`ask_markers`], whatever else they
+/// say), from anyone but the bot, and when the latest and the earliest were
+/// posted. Asks on an earlier head do not count: a new head restarts the
+/// bot's work and has its own budget of asks, so "silent" is judged on this
+/// head's asks alone. A comment time that cannot be read is an error.
 fn asks_made(
     snapshot: &PrSnapshot,
     bot: &ReviewBot,
     configured: &PrReviewBotSettings,
     head_at: Option<DateTime<Utc>>,
-) -> (u32, Option<DateTime<Utc>>, Option<DateTime<Utc>>) {
+) -> Result<(u32, Option<DateTime<Utc>>, Option<DateTime<Utc>>), String> {
     // Every bot here is a built-in (`of_with` skips the rest): it has an ask.
-    let ask = ask_text(configured).expect("a built-in bot has an ask text");
-    let ask = ask.to_ascii_lowercase();
-    let times: Vec<DateTime<Utc>> = snapshot
+    let markers = ask_markers(configured);
+    assert!(!markers.is_empty(), "a built-in bot has an ask text");
+    let mut times: Vec<DateTime<Utc>> = Vec::new();
+    for c in snapshot
         .comments
         .iter()
         .filter(|c| !c.author.as_deref().is_some_and(|a| bot.is_author(a)))
-        .filter(|c| c.body.to_ascii_lowercase().contains(&ask))
-        .filter_map(|c| parse_time(&c.created_at))
-        .filter(|at| head_at.is_none_or(|h| *at >= h))
-        .collect();
-    (times.len() as u32, times.iter().copied().max(), times.iter().copied().min())
+        .filter(|c| is_ask(&c.body, &markers))
+    {
+        let at = parse_time_strict(&c.created_at, "a comment's created_at")?;
+        if head_at.is_none_or(|h| at >= h) {
+            times.push(at);
+        }
+    }
+    Ok((times.len() as u32, times.iter().copied().max(), times.iter().copied().min()))
 }
 
 /// Whether the bot's latest comment or review, written since the head
@@ -1545,21 +1596,21 @@ Not safe.
             recent(4, true, 10, None),
             recent(5, true, 5, None),
         ];
-        assert!(!reviews_drafts(&blind, bot, now(), None));
+        assert!(!reviews_drafts(&blind, bot, now(), None).unwrap());
         // Two drafts are too few.
-        assert!(reviews_drafts(&blind[..4], bot, now(), None));
+        assert!(reviews_drafts(&blind[..4], bot, now(), None).unwrap());
         // A bot silent everywhere is silent, not blind to drafts.
         let silent: Vec<_> = (0..6).map(|n| recent(n, n % 2 == 0, 10 + n, None)).collect();
-        assert!(reviews_drafts(&silent, bot, now(), None));
+        assert!(reviews_drafts(&silent, bot, now(), None).unwrap());
         // It reviewed a draft after the others were passed over.
         let mut back = blind.clone();
         back.push(recent(6, true, 4, Some(3)));
-        assert!(reviews_drafts(&back, bot, now(), None));
+        assert!(reviews_drafts(&back, bot, now(), None).unwrap());
         // Drafts under two hours old may just not have been reached.
         let fresh = vec![recent(1, false, 30, Some(29)), recent(2, true, 1, None), recent(3, true, 1, None), recent(4, true, 1, None)];
-        assert!(reviews_drafts(&fresh, bot, now(), None));
+        assert!(reviews_drafts(&fresh, bot, now(), None).unwrap());
         // Nothing known: as before.
-        assert!(reviews_drafts(&[], bot, now(), None));
+        assert!(reviews_drafts(&[], bot, now(), None).unwrap());
     }
 
     fn in_repo(mut p: tod_store::github::RecentPr, repo: &str) -> tod_store::github::RecentPr {
@@ -1573,14 +1624,14 @@ Not safe.
         // kb-like: one draft of its own, passed over. flagship-like: the
         // bot reviews ready pull requests and passes over drafts.
         let kb = vec![in_repo(recent(1, true, 30, None), "o/kb")];
-        assert!(reviews_drafts(&kb, bot, now(), None), "one draft is not enough alone");
+        assert!(reviews_drafts(&kb, bot, now(), None).unwrap(), "one draft is not enough alone");
         let mut pooled = kb.clone();
         pooled.extend([
             in_repo(recent(10, false, 40, Some(39)), "o/flagship"),
             in_repo(recent(11, true, 20, None), "o/flagship"),
             in_repo(recent(12, true, 10, None), "o/flagship"),
         ]);
-        assert!(!reviews_drafts(&pooled, bot, now(), None));
+        assert!(!reviews_drafts(&pooled, bot, now(), None).unwrap());
     }
 
     #[test]
@@ -1592,15 +1643,15 @@ Not safe.
             recent(3, true, 10, None),
             recent(4, true, 1, None),
         ];
-        assert!(reviews_drafts(&history, bot, now(), None), "the newest is too young");
+        assert!(reviews_drafts(&history, bot, now(), None).unwrap(), "the newest is too young");
         let asked = OwnDraft { repo: "o/r".into(), number: 4, asked_at: Some(now() - chrono::Duration::hours(1)) };
-        assert!(reviews_drafts(&history, bot, now(), Some(&asked)), "asked under 2 hours ago is still young");
+        assert!(reviews_drafts(&history, bot, now(), Some(&asked)).unwrap(), "asked under 2 hours ago is still young");
         let asked = OwnDraft { asked_at: Some(now() - chrono::Duration::hours(3)), ..asked };
         // Created an hour ago but asked three hours ago cannot be; the ask
         // time is what settles it.
-        assert!(!reviews_drafts(&history, bot, now(), Some(&asked)));
+        assert!(!reviews_drafts(&history, bot, now(), Some(&asked)).unwrap());
         let other = OwnDraft { number: 9, ..asked };
-        assert!(reviews_drafts(&history, bot, now(), Some(&other)), "only the pull request itself");
+        assert!(reviews_drafts(&history, bot, now(), Some(&other)).unwrap(), "only the pull request itself");
     }
 
     #[test]
@@ -1611,13 +1662,13 @@ Not safe.
         // reviewed it (marked ready 5 hours ago): the review was of a draft.
         let mut was_draft = recent(1, false, 30, Some(20));
         was_draft.ready_events = vec![(t(5), false)];
-        assert!(draft_at(&was_draft, now() - chrono::Duration::hours(20)));
-        assert!(!draft_at(&was_draft, now() - chrono::Duration::hours(2)));
+        assert!(draft_at(&was_draft, now() - chrono::Duration::hours(20)).unwrap());
+        assert!(!draft_at(&was_draft, now() - chrono::Duration::hours(2)).unwrap());
         // Converted back to a draft after being ready.
         let mut back = recent(2, true, 30, None);
         back.ready_events = vec![(t(20), true)];
-        assert!(!draft_at(&back, now() - chrono::Duration::hours(25)));
-        assert!(draft_at(&back, now() - chrono::Duration::hours(1)));
+        assert!(!draft_at(&back, now() - chrono::Duration::hours(25)).unwrap());
+        assert!(draft_at(&back, now() - chrono::Duration::hours(1)).unwrap());
         // With that review of a draft at -20h, drafts opened since do not show
         // blindness: D is -20h, and the bot has spoken on no ready PR since.
         let history = vec![
@@ -1627,16 +1678,16 @@ Not safe.
             recent(5, true, 10, None),
             recent(6, false, 8, Some(7)),
         ];
-        assert!(!reviews_drafts(&history, bot, now(), None), "the ready review after D and three drafts since");
+        assert!(!reviews_drafts(&history, bot, now(), None).unwrap(), "the ready review after D and three drafts since");
         // Without the events the first review reads as one of a ready PR, so D
         // is not set by it, and the drafts before it count too (still blind).
         let mut plain = history.clone();
         plain[0].ready_events.clear();
-        assert!(!reviews_drafts(&plain, bot, now(), None));
+        assert!(!reviews_drafts(&plain, bot, now(), None).unwrap());
         // A review of a draft *after* the others were opened clears it.
         let mut recent_draft_review = history.clone();
         recent_draft_review.push(recent(7, true, 9, Some(1)));
-        assert!(reviews_drafts(&recent_draft_review, bot, now(), None));
+        assert!(reviews_drafts(&recent_draft_review, bot, now(), None).unwrap());
     }
 
     #[test]
@@ -1649,7 +1700,7 @@ Not safe.
             recent(3, true, 20, None),
             recent(4, true, 10, None),
         ];
-        assert!(reviews_drafts(&history, bot, now(), None));
+        assert!(reviews_drafts(&history, bot, now(), None).unwrap());
     }
 
     #[test]
@@ -1771,6 +1822,54 @@ Not safe.
         // Still a wait, never work.
         assert!(a.work().is_empty());
         assert_eq!(a.bots[0].last_ask_at, Some(at("2026-01-01T11:00:00Z")));
+    }
+
+    /// Seen live (#6641): five comments to the bot from us, "0 asks", because
+    /// they did not repeat the configured `ask` text. Any comment from
+    /// someone else that mentions the bot's handle is an ask; the bot's own
+    /// comments, a longer handle, and asks on an earlier head are not.
+    #[test]
+    fn any_comment_mentioning_the_bots_handle_is_an_ask_on_this_head() {
+        let st = status("blocked", "success");
+        let comments = vec![
+            ask_comment("joel", "@GreptileAI could you take another look?", "2026-01-01T10:00:00Z"),
+            ask_comment("joel", "retrying: @greptileai", "2026-01-01T10:30:00Z"),
+            ask_comment("joel", "thanks @greptileai, now fixed.", "2026-01-01T11:00:00Z"),
+            // Not asks: the bot itself, another handle that starts the same,
+            // and a comment before the head commit (an earlier head's).
+            ask_comment("greptile-apps[bot]", "@greptileai mentioned by itself", "2026-01-01T11:10:00Z"),
+            ask_comment("joel", "@greptileaix is another account", "2026-01-01T11:20:00Z"),
+            ask_comment("joel", "@greptileai please review", "2025-12-31T01:00:00Z"),
+        ];
+        let a = Assessment::of(&snap(st, vec![], comments), &asking_settings(30, 3), now());
+        assert_eq!(a.bots[0].asks, 3);
+        assert_eq!(a.bots[0].last_ask_at, Some(at("2026-01-01T11:00:00Z")));
+        assert_eq!(a.silent_bots().len(), 1, "three asks of any wording are asked as often as allowed");
+    }
+
+    /// A time GitHub gave that cannot be read is an error, not a comment, an
+    /// event or a ready/draft change left out.
+    #[test]
+    fn a_time_that_cannot_be_read_is_an_error_not_a_dropped_event() {
+        let st = status("blocked", "success");
+        let bad = vec![ask_comment("joel", "@greptileai please review", "yesterday")];
+        let err = Assessment::of_with(&snap(st, vec![], bad), &asking_settings(30, 3), now(), &mut |_, _| {
+            Ok::<_, String>(false)
+        })
+        .unwrap_err();
+        assert!(err.contains("created_at") && err.contains("yesterday"), "{err}");
+
+        let bot = builtin_bot("greptile").unwrap();
+        let mut broken = recent(7, true, 30, None);
+        broken.activity = vec![("greptile-apps[bot]".into(), "not-a-time".into())];
+        let err = reviews_drafts(&[broken], bot, now(), None).unwrap_err();
+        assert!(err.contains("activity time"), "{err}");
+        let mut event = recent(8, true, 30, None);
+        event.ready_events = vec![("??".into(), false)];
+        assert!(draft_at(&event, now()).unwrap_err().contains("event's time"));
+        let mut created = recent(9, true, 30, None);
+        created.created_at = "later".into();
+        assert!(reviews_drafts(&[created], bot, now(), None).unwrap_err().contains("created_at"));
     }
 
     /// A bot with an ask, a fallback, and the node's own-review state.
@@ -2703,17 +2802,14 @@ pub fn assess(
         for (configured, bot) in open {
             // This draft's own asks count as evidence at once: asked and
             // unanswered, it need not be hours old first.
-            let ask = ask_text(configured).map(|a| a.to_ascii_lowercase());
-            let asked_at = ask.and_then(|ask| {
-                snapshot
-                    .comments
-                    .iter()
-                    .filter(|c| c.body.to_ascii_lowercase().contains(&ask))
-                    .filter_map(|c| parse_time(&c.created_at))
-                    .min()
-            });
+            let markers = ask_markers(configured);
+            let mut asked_at: Option<DateTime<Utc>> = None;
+            for c in snapshot.comments.iter().filter(|c| is_ask(&c.body, &markers)) {
+                let at = parse_time_strict(&c.created_at, &format!("{}: a comment's created_at", pr.url))?;
+                asked_at = Some(asked_at.map_or(at, |a| a.min(at)));
+            }
             let own = OwnDraft { repo: format!("{}/{}", pr.owner, pr.repo), number: pr.pr_number, asked_at };
-            if !reviews_drafts(&history, bot, now, Some(&own)) {
+            if !reviews_drafts(&history, bot, now, Some(&own))? {
                 with_blind.draft_blind.push(configured.name.to_ascii_lowercase());
             }
         }
@@ -2752,17 +2848,17 @@ pub struct OwnDraft {
 
 /// Whether `pr` was a draft at `at`, from its ready/convert-to-draft events
 /// (replayed from the state they imply before the first one), else its state now.
-fn draft_at(pr: &tod_store::github::RecentPr, at: DateTime<Utc>) -> bool {
+fn draft_at(pr: &tod_store::github::RecentPr, at: DateTime<Utc>) -> Result<bool, String> {
     let mut state = match pr.ready_events.first() {
         Some((_, to_draft)) => !*to_draft,
-        None => return pr.draft,
+        None => return Ok(pr.draft),
     };
     for (when, to_draft) in &pr.ready_events {
-        if parse_time(when).is_some_and(|t| t <= at) {
+        if parse_time_strict(when, &format!("{}#{}: a ready/draft event's time", pr.repo, pr.number))? <= at {
             state = *to_draft;
         }
     }
-    state
+    Ok(state)
 }
 
 /// Whether `bot` reviews pull requests that are drafts, from recent pull
@@ -2782,30 +2878,44 @@ pub fn reviews_drafts(
     bot: &ReviewBot,
     now: DateTime<Utc>,
     own: Option<&OwnDraft>,
-) -> bool {
+) -> Result<bool, String> {
     let window = now - chrono::Duration::days(DRAFT_HISTORY_DAYS);
     let settled = now - chrono::Duration::hours(DRAFT_MIN_AGE_HOURS);
-    let spoke = |p: &tod_store::github::RecentPr| -> Vec<DateTime<Utc>> {
-        p.activity.iter().filter(|(who, _)| bot.is_author(who)).filter_map(|(_, at)| parse_time(at)).collect()
+    let spoke = |p: &tod_store::github::RecentPr| -> Result<Vec<DateTime<Utc>>, String> {
+        p.activity
+            .iter()
+            .filter(|(who, _)| bot.is_author(who))
+            .map(|(_, at)| parse_time_strict(at, &format!("{}#{}: an activity time", p.repo, p.number)))
+            .collect()
     };
-    let last_on_draft = history.iter().flat_map(|p| spoke(p).into_iter().filter(|at| draft_at(p, *at))).max();
+    let mut last_on_draft: Option<DateTime<Utc>> = None;
+    let mut ready_activity: Vec<DateTime<Utc>> = Vec::new();
+    let mut silent_on: Vec<&tod_store::github::RecentPr> = Vec::new();
+    for p in history {
+        let times = spoke(p)?;
+        if p.draft && times.is_empty() {
+            silent_on.push(p);
+        }
+        for at in times {
+            if draft_at(p, at)? {
+                last_on_draft = last_on_draft.max(Some(at));
+            } else {
+                ready_activity.push(at);
+            }
+        }
+    }
     let after = |at: DateTime<Utc>| last_on_draft.is_none_or(|d| at > d);
-    let alive = history
-        .iter()
-        .flat_map(|p| spoke(p).into_iter().filter(|at| !draft_at(p, *at)))
-        .any(|at| after(at) && at >= window);
-    let passed_over = history
-        .iter()
-        .filter(|p| p.draft && spoke(p).is_empty())
-        .filter(|p| {
-            let Some(created) = parse_time(&p.created_at) else { return false };
-            let is_own = own.is_some_and(|o| o.number == p.number && o.repo.eq_ignore_ascii_case(&p.repo));
-            let old_enough =
-                created <= settled || (is_own && own.and_then(|o| o.asked_at).is_some_and(|a| a <= settled));
-            created >= window && after(created) && old_enough
-        })
-        .count();
-    !(alive && passed_over >= DRAFT_EVIDENCE)
+    let alive = ready_activity.iter().any(|at| after(*at) && *at >= window);
+    let mut passed_over = 0;
+    for p in silent_on {
+        let created = parse_time_strict(&p.created_at, &format!("{}#{}: created_at", p.repo, p.number))?;
+        let is_own = own.is_some_and(|o| o.number == p.number && o.repo.eq_ignore_ascii_case(&p.repo));
+        let old_enough = created <= settled || (is_own && own.and_then(|o| o.asked_at).is_some_and(|a| a <= settled));
+        if created >= window && after(created) && old_enough {
+            passed_over += 1;
+        }
+    }
+    Ok(!(alive && passed_over >= DRAFT_EVIDENCE))
 }
 
 /// [`live`], with reviews up to `answered_at` counted as answered (see

@@ -1705,19 +1705,45 @@ impl Autopilot {
             if !silent {
                 return Ok(None);
             }
+            // Asked and unanswered, or answered "Keep waiting" (which holds
+            // the question back for hours): either way nothing polling in
+            // place can do better than the wait.
             let standing = fleet.read(|conn| bot_silence::standing(conn, node, bot))?;
-            if standing != Standing::Pending {
+            if !matches!(standing, Standing::Pending | Standing::KeepWaiting { .. }) {
                 return Ok(None);
             }
         }
-        let bot = waited[0];
-        let number = live
-            .iter()
-            .find(|p| p.assessment.waits().iter().any(|w| matches!(w, W::BotReview { bot: b, .. } if b == bot)))
-            .map(|p| p.pr.pr_number);
-        let spec = github_wait::bot_review_spec(number, bot);
-        let what = format!("{}; {bot} stayed silent, waiting for your answer or its review", wait_description(waits));
-        let due_at_ms = self.record_github_wait(fleet, spec, "github:pr:", settings, &what)?;
+        // One wait for each pull request a waited bot is missing from.
+        let mut numbers: Vec<i64> = Vec::new();
+        for p in live {
+            let missing = p.assessment.waits().iter().any(|w| matches!(w, W::BotReview { .. }));
+            if missing && !numbers.contains(&p.pr.pr_number) {
+                numbers.push(p.pr.pr_number);
+            }
+        }
+        if numbers.is_empty() {
+            anyhow::bail!(
+                "{} are waited for but no linked pull request is missing a review, so there is nothing to park on",
+                waited.join(", ")
+            );
+        }
+        let what = format!(
+            "{}; {} stayed silent, waiting for your answer or its review",
+            wait_description(waits),
+            waited.join(", ")
+        );
+        let mut due_at_ms = 0;
+        for (i, number) in numbers.iter().enumerate() {
+            // The first replaces the last look's waits; the rest add to it.
+            let replaces = if i == 0 { "github:pr:" } else { "github:pr:\u{0}" };
+            due_at_ms = self.record_github_wait(
+                fleet,
+                crate::next_actor::bot_review_wake_spec(*number),
+                replaces,
+                settings,
+                &what,
+            )?;
+        }
         self.reset_housekeeping()?;
         Ok(Some(Outcome::Waiting { what, due_at_ms }))
     }

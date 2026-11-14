@@ -197,6 +197,13 @@ pub fn review_spec(number: Option<i64>, reviewers: &[String]) -> String {
     spec
 }
 
+/// The wait a run parked on a silent review bot records for pull request
+/// `number`: any review or comment on it wakes the run, which then looks
+/// again (the webhook sends `github:pr:<n>:bot-review:<login>`).
+pub fn bot_review_wake_spec(number: i64) -> String {
+    format!("github:pr:{number}:bot-review")
+}
+
 /// Whether `spec` is a wait for a person's review, in either form of
 /// [`review_spec`].
 pub fn is_review_spec(spec: &str) -> bool {
@@ -220,7 +227,7 @@ impl WaitKind {
         let spec = &tod_store::waits::normalize_spec(spec);
         if spec.starts_with("github:release:") {
             Self::Release
-        } else if spec.starts_with("github:pr:") && spec.contains(":bot-review:") {
+        } else if spec.starts_with("github:pr:") && (spec.contains(":bot-review:") || spec.ends_with(":bot-review")) {
             Self::BotReview
         } else if is_review_spec(spec) {
             // Before checks and merge: a reviewer's name ends the spec.

@@ -98,9 +98,12 @@ pub fn answer_decision(
     option: Option<i64>,
     text: Option<String>,
 ) -> Result<Answered> {
-    answer_with(fleet, decision_id, option, text, |command| {
+    let answered = answer_with(fleet, decision_id, option, text, |command| {
         fleet.interview(ACTOR_USER, command).map(|_| ()).map_err(anyhow::Error::from)
-    })
+    })?;
+    // An answer about a silent review bot wakes the run parked on it.
+    crate::bot_silence::release_parked_wait(fleet, decision_id)?;
+    Ok(answered)
 }
 
 /// [`answer_decision`] with the recording of the answer, and of the reopening,

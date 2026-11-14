@@ -171,6 +171,18 @@ fn n(v: &Value, path: &[&str]) -> Option<i64> {
     path.iter().try_fold(v, |v, k| v.get(k))?.as_i64()
 }
 
+/// The key a run parked on a silent review bot waits on
+/// (`tod_core::next_actor::bot_review_wake_spec`): any review, review comment
+/// or comment on the pull request, by whoever wrote it
+/// (`github:pr:<n>:bot-review:<login>`). Whether it is the bot's, and a
+/// review, is for the run to find out when it wakes.
+fn bot_review_key(number: i64, payload: &Value) -> String {
+    match s(payload, &["sender", "login"]).filter(|l| !l.is_empty()) {
+        Some(login) => format!("github:pr:{number}:bot-review:{}", login.to_ascii_lowercase()),
+        None => tod_core::next_actor::bot_review_wake_spec(number),
+    }
+}
+
 /// A GitHub delivery as an [`Event`]; `None` when it should wake nobody
 /// (a check still running, a ping).
 pub fn github_event(kind: &str, payload: &Value) -> Option<Event> {
@@ -214,6 +226,9 @@ pub fn github_event(kind: &str, payload: &Value) -> Option<Event> {
                 "review:comment".into()
             };
             pr_keys(&mut e, num, s(payload, &["pull_request", "head", "ref"]), &what);
+            if let Some(num) = num {
+                e.keys.push(bot_review_key(num, payload));
+            }
             e.summary = format!("PR #{} {}", num.unwrap_or(0), what.replace(':', " "));
         }
         "issue_comment" => {
@@ -223,6 +238,7 @@ pub fn github_event(kind: &str, payload: &Value) -> Option<Event> {
                 e.keys.push(format!("github:{}:{num}:comment", if on_pr { "pr" } else { "issue" }));
                 if on_pr {
                     e.pr_numbers.push(num);
+                    e.keys.push(bot_review_key(num, payload));
                 }
             }
             e.summary = format!("comment on #{}", num.unwrap_or(0));
@@ -603,6 +619,44 @@ mod tests {
         assert!(r.keys.contains(&"github:pr:3:review:approved".to_string()));
         let p = github_event("pull_request", &json!({"action":"closed","pull_request":{"number":4,"merged":true,"head":{"ref":"b"}}})).unwrap();
         assert!(p.keys.contains(&"github:pr:4:merged".to_string()), "{:?}", p.keys);
+    }
+
+    /// A run parked on a silent review bot waits on
+    /// `bot_review_wake_spec`; the bot's review, its review comment and its
+    /// summary comment each produce a key that wait matches, and another
+    /// pull request's do not.
+    #[test]
+    fn a_parked_bot_review_wait_is_satisfied_by_the_bots_review_or_comment() {
+        let spec = tod_core::next_actor::bot_review_wake_spec(42);
+        let who = json!({"login": "Some-Bot[bot]"});
+        let review = github_event(
+            "pull_request_review",
+            &json!({"action":"submitted","sender":who,"review":{"state":"COMMENTED"},"pull_request":{"number":42,"head":{"ref":"b"}}}),
+        )
+        .unwrap();
+        let inline = github_event(
+            "pull_request_review_comment",
+            &json!({"action":"created","sender":who,"pull_request":{"number":42,"head":{"ref":"b"}}}),
+        )
+        .unwrap();
+        let summary = github_event(
+            "issue_comment",
+            &json!({"action":"created","sender":who,"issue":{"number":42,"pull_request":{}}}),
+        )
+        .unwrap();
+        for e in [&review, &inline, &summary] {
+            assert!(e.keys.iter().any(|k| spec_matches(&spec, k)), "{:?}", e.keys);
+        }
+        assert!(summary.keys.contains(&"github:pr:42:bot-review:some-bot[bot]".to_string()), "{:?}", summary.keys);
+        let other = github_event(
+            "issue_comment",
+            &json!({"action":"created","sender":who,"issue":{"number":43,"pull_request":{}}}),
+        )
+        .unwrap();
+        assert!(!other.keys.iter().any(|k| spec_matches(&spec, k)), "{:?}", other.keys);
+        // A comment on a plain issue is not a pull request's.
+        let issue = github_event("issue_comment", &json!({"action":"created","sender":who,"issue":{"number":42}})).unwrap();
+        assert!(!issue.keys.iter().any(|k| spec_matches(&spec, k)), "{:?}", issue.keys);
     }
 
     #[test]

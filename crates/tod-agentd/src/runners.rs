@@ -279,23 +279,34 @@ impl Runners {
     }
 
     fn start_due(&self) {
-        let (due, request_nodes) = {
+        let (mut due, request_nodes, parked) = {
             let slots = self.inner.slots.lock().expect("runner slots");
             let now = now_ms();
             let mut due = Vec::new();
             let mut requests = Vec::new();
+            let mut parked = Vec::new();
             for (node, slot) in slots.iter() {
                 if slot.run.is_some() {
                     continue;
                 }
                 match &slot.outcome {
                     Some(Outcome::Waiting { due_at_ms, .. }) if *due_at_ms <= now => due.push(*node),
+                    Some(Outcome::Waiting { .. }) => parked.push((*node, slot.since)),
                     Some(Outcome::NeedsHuman { reason }) if reason.is_request() => requests.push(*node),
                     _ => {}
                 }
             }
-            (due, requests)
+            (due, requests, parked)
         };
+        // A run parked on a silent review bot is woken by the user's answer
+        // to the bot-silence question, not at the wait's time.
+        for (node, since) in parked {
+            match self.inner.store.read(|conn| tod_core::bot_silence::answered_since(conn, node, since)) {
+                Ok(true) => due.push(node),
+                Ok(false) => {}
+                Err(err) => tracing::error!(%node, "could not read the answers to the bot-silence question: {err:#}"),
+            }
+        }
         for node in due {
             tracing::info!(%node, "the wait is due; checking again");
             // A failure is recorded on the node by `start`.
