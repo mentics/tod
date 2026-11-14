@@ -362,21 +362,50 @@ fn label_of(s: &gpui::A11yNodeSnapshot) -> String {
     if !clickable {
         return label.to_string();
     }
-    let Some(path) = s.path.as_deref() else {
+    match s.path.as_deref() {
+        Some(path) => name_from_path(path),
+        None => String::new(),
+    }
+}
+
+/// The name an unlabelled clickable gets from its id path, or "" when its id
+/// is not word-like.
+fn name_from_path(path: &str) -> String {
+    let mut segs = path
+        .rsplit('/')
+        .filter(|seg| !seg.is_empty() && !seg.chars().all(|c| c.is_ascii_digit()));
+    let Some(seg) = segs.next() else {
         return String::new();
     };
-    let Some(seg) = path
-        .rsplit('/')
-        .find(|seg| !seg.is_empty() && !seg.chars().all(|c| c.is_ascii_digit()))
-    else {
-        return String::new();
+    // A split button's arrow (gpui-component's `DropdownButton`) is `popup`
+    // inside the button's own id: name it after the nearest word-like id
+    // above it (`unified-task-runner` -> "Unified task runner menu").
+    let (seg, suffix) = if seg == "popup" {
+        match segs.find_map(word_like) {
+            Some(parent) => (parent, " menu"),
+            None => (seg, ""),
+        }
+    } else {
+        match word_like(seg) {
+            Some(seg) => (seg, ""),
+            None => return String::new(),
+        }
     };
     let words = seg.replace(['-', '_'], " ");
     let mut chars = words.trim().chars();
     match chars.next() {
-        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str() + suffix,
         None => String::new(),
     }
+}
+
+/// Only a word-like id names a node (`close`, `nav-back`, `col-close-3`, with
+/// a trailing index dropped); a generated one (`list-item-IndexPath(…)`, a
+/// `~file.rs:LINE` marker) would read as noise.
+fn word_like(seg: &str) -> Option<&str> {
+    let seg = seg.trim_end_matches(|c: char| c.is_ascii_digit()).trim_end_matches('-');
+    (!seg.is_empty() && seg.chars().all(|c| c.is_ascii_alphabetic() || c == '-' || c == '_'))
+        .then_some(seg)
 }
 
 fn one_line(text: &str) -> String {
@@ -596,7 +625,13 @@ pub fn run_act(
         ActAction::SetValue(text) => {
             let data = Some(ActionData::Value(text.clone().into_boxed_str()));
             if window.dispatch_a11y_action(request(Action::SetValue, data), cx) {
-                Ok(format!("ok set-value {name}"))
+                // Focus it too, so the `key enter` / `text` that usually
+                // follows goes to this field rather than wherever focus was.
+                if window.dispatch_a11y_action(request(Action::Focus, None), cx) {
+                    Ok(format!("ok set-value {name} (focused)"))
+                } else {
+                    Ok(format!("ok set-value {name} (not focusable: focus is unchanged)"))
+                }
             } else {
                 Err(format!("{name} does not accept set-value (not a text input)"))
             }
@@ -692,6 +727,20 @@ fn scroll_into_view(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_word_like_ids_name_an_unlabelled_clickable() {
+        assert_eq!(name_from_path("root/notification/close"), "Close");
+        assert_eq!(name_from_path("unified-col-close-3"), "Unified col close");
+        assert_eq!(name_from_path("panel/unified-task-runner/popup"), "Unified task runner menu");
+        assert_eq!(
+            name_from_path("panel/unified-task-runner/~button_group.rs:88/popup"),
+            "Unified task runner menu"
+        );
+        assert_eq!(name_from_path("list/list-item-IndexPath(section: 0, row: 1, column: 0)"), "");
+        assert_eq!(name_from_path("view/input-4294967389"), "Input");
+        assert_eq!(name_from_path("menu/3"), "Menu");
+    }
+
     use super::*;
 
     #[test]

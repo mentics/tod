@@ -362,6 +362,11 @@ fn one_line_label(label: &str) -> String {
 
 /// Ids made of a long run of digits change between runs (`input-4294967389`).
 fn is_unstable(selector: &str) -> bool {
+    // A bare index (`#3`, a menu item's position) moves when the items do.
+    let bare = selector.trim_start_matches('#');
+    if !bare.is_empty() && bare.chars().all(|c| c.is_ascii_digit()) {
+        return true;
+    }
     let mut run = 0;
     for c in selector.chars() {
         if c.is_ascii_digit() {
@@ -526,6 +531,10 @@ mod tests {
         nodes.push(node(9, Some(0), Some("input-4294967390"), "TextInput", "Item title"));
         let listed = selectors_for(&nodes);
         assert_eq!(listed[6], "#input-4294967389");
+        // A bare index (a menu item's position) is listed by role:label.
+        nodes.push(node(10, Some(0), Some("3"), "MenuItem", "Check now"));
+        let listed = selectors_for(&nodes);
+        assert_eq!(listed[9], r#"menuitem:"Check now""#);
     }
 
     #[test]

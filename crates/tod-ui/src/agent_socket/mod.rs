@@ -59,7 +59,8 @@
 //!   node's label (a button's label excludes the text of buttons inside it).
 //!   Selectors and `act`'s selector accept double quotes (`"textinput:Item title"`)
 //! - `act <selector> [click|focus|set-value <text>|scroll-into-view]` — act on one
-//!   element through the accessibility action path (synthetic click if it has none)
+//!   element through the accessibility action path (synthetic click if it has none);
+//!   `set-value` also focuses the field
 //! - `wait-for <selector> [--gone] [--timeout-ms N]` — poll until it matches
 //! - `coverage [frames N]` — clickable versus exposed elements, optional frame timing
 //!
