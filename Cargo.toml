@@ -2,29 +2,46 @@
 members = ["crates/tod-agent", "crates/tod-integration", "crates/tod-store", "crates/tod-core", "crates/tod-ui", "crates/tod-cli", "crates/tod", "crates/tod-journey", "crates/tod-journeys", "crates/tod-relay", "crates/tod-sandbox", "crates/tod-sandbox-cli", "crates/tod-zed-shim", "crates/tod-orchestrator", "crates/tod-supervisor", "crates/tod-agentd", "crates/tod-agentd-client", "crates/tod-problems", "crates/tod-test-util"]
 resolver = "2"
 
-# Dev profile tuned for fast incremental rebuilds:
-# - local crate stays unoptimized (opt-level 0, default)
-# - dependencies compile once with light optimization (gpui stack is heavy)
-# - line-table debug info keeps binaries smaller and links faster
-# - dependencies carry no debug info, to keep target/ small (every worktree
-#   has its own)
+# Dev profile (the one profile check, test, run and build use; see [profile.dev]):
+# - local crates stay unoptimized (opt-level 0) so edits recompile fast
+# - dependencies are optimized (opt-level 3; gpui's GPU code needs it) with no
+#   debug info, built once and shared through the clone of target/
+# - line tables only in our crates: stack traces, no full debug info
+# - incremental on for our crates; `cargo sweep --maxsize` bounds its disk use
 # Release binaries carry no debug info and no symbol table: the sandbox
 # binaries are uploaded to every cloud sandbox, and the app ships them.
 [profile.release]
 debug = false
 strip = "symbols"
 
+# The one profile for check, test, run and build. Our crates compile fast
+# (opt-level 0, incremental); dependencies are optimized and carry no debug info
+# or symbols, so GPU-heavy code (gpui) runs at speed.
 [profile.dev]
+# Line tables only: stack traces with file and line, no full debug info.
 debug = "line-tables-only"
-split-debuginfo = "unpacked"
+# "packed" writes one .dSYM per binary; "unpacked" leaves a .o per codegen unit
+# in target/ (about 180k files in a debug build), which makes clones and deletes slow.
+split-debuginfo = "packed"
+# Incremental keeps edits fast; `cargo sweep` bounds its disk use.
 incremental = true
 
 [profile.dev.package."*"]
-opt-level = 1
+opt-level = 3
 debug = 0
+strip = "debuginfo"
 
+# Build scripts run at real speed. debug-assertions off here (not for our code)
+# keeps gpui's build script compiling its Windows shaders with fxc, which it
+# gates on `not(debug_assertions)`.
 [profile.dev.build-override]
 opt-level = 3
+debug-assertions = false
+
+# gpui's proc macros are built with build-override too, and gate
+# #[derive_inspector_reflection] on debug_assertions: keep them on.
+[profile.dev.package.gpui-pre-macros]
+debug-assertions = true
 
 # `dev-fast`: use for day-to-day `cargo run` when you want GPUI running at real
 # release performance. This profile *inherits from release*, so build scripts
@@ -37,6 +54,7 @@ opt-level = 3
 [profile.dev-fast]
 inherits = "release"
 incremental = true
+split-debuginfo = "packed"
 # Keep symbols here: this is the profile that gets debugged.
 strip = "none"
 
