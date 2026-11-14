@@ -16,11 +16,17 @@ pub(crate) struct Fixture {
     pub fleet: Arc<FleetStore>,
     pub node: Uuid,
     pub session: Uuid,
+    /// Removes `root` when the fixture is dropped. Declared last so the store
+    /// (and its SQLite connections) is dropped before the directory goes.
+    _dir: tempfile::TempDir,
 }
 
 pub(crate) fn fixture() -> Fixture {
-    let root = std::env::temp_dir().join(format!("tod-interview-{}", Uuid::new_v4()));
-    std::fs::create_dir_all(&root).unwrap();
+    let dir = tempfile::Builder::new()
+        .prefix("tod-interview-")
+        .tempdir()
+        .unwrap();
+    let root = dir.path().to_path_buf();
     let fleet = Arc::new(FleetStore::open(&root).unwrap());
     fleet
         .enqueue_outline(OutlineMutation::CreateList {
@@ -62,6 +68,7 @@ pub(crate) fn fixture() -> Fixture {
         fleet,
         node,
         session,
+        _dir: dir,
     }
 }
 
@@ -183,5 +190,17 @@ impl Fixture {
         self.fleet
             .read(|conn| delta(conn, &self.scope(role, phase), since, actor))
             .unwrap()
+    }
+}
+
+#[cfg(test)]
+mod hygiene {
+    #[test]
+    fn fixture_directory_is_removed_on_drop() {
+        let fx = super::fixture();
+        let root = fx.root.clone();
+        assert!(root.join("tod.db").exists() || root.exists());
+        drop(fx);
+        assert!(!root.exists(), "{} was left behind", root.display());
     }
 }

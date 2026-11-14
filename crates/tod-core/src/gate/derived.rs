@@ -931,10 +931,14 @@ mod tests {
     use tod_store::fleet::{FleetMutation, FleetStore};
     use tod_store::outline::{Capability, CreatePosition, OutlineMutation};
 
-    fn store_with_node() -> (FleetStore, Uuid) {
-        let root = std::env::temp_dir().join(format!("tod-gate-derived-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&root).unwrap();
-        let store = FleetStore::open(&root).unwrap();
+    /// The directory comes first so a caller's `(_dir, store, node)` drops the
+    /// store before the directory is removed.
+    fn store_with_node() -> (tempfile::TempDir, FleetStore, Uuid) {
+        let dir = tempfile::Builder::new()
+            .prefix("tod-gate-derived-")
+            .tempdir()
+            .unwrap();
+        let store = FleetStore::open(dir.path()).unwrap();
         store
             .enqueue_outline(OutlineMutation::CreateList {
                 slug: "t".into(),
@@ -955,7 +959,7 @@ mod tests {
             })
             .unwrap();
         store.writer().flush().unwrap();
-        (store, node)
+        (dir, store, node)
     }
 
     fn enable(store: &FleetStore, node: Uuid, caps: Vec<Capability>) {
@@ -1000,7 +1004,7 @@ mod tests {
     /// in the task editor: a link set there is the node's pull request.
     #[test]
     fn pr_gates_read_the_linked_pull_requests() {
-        let (store, node) = store_with_node();
+        let (_dir, store, node) = store_with_node();
         let merged = |store: &FleetStore| store.read(|conn| pr_merged_outcome(conn, node)).unwrap();
         let outcome = merged(&store);
         assert_eq!(outcome.outcome, OUTCOME_FAIL);
@@ -1031,14 +1035,14 @@ mod tests {
 
     #[test]
     fn fails_without_agent() {
-        let (store, node) = store_with_node();
+        let (_dir, store, node) = store_with_node();
         let outcome = evaluate(&store, node, READY_ACTIVE_ACTION_CONFIG_SLUG).unwrap();
         assert_eq!(outcome.outcome, OUTCOME_FAIL);
     }
 
     #[test]
     fn agent_without_files_fails() {
-        let (store, node) = store_with_node();
+        let (_dir, store, node) = store_with_node();
         enable(&store, node, vec![Capability::Agent]);
         let outcome = evaluate(&store, node, READY_ACTIVE_ACTION_CONFIG_SLUG).unwrap();
         assert_eq!(outcome.outcome, OUTCOME_FAIL);
@@ -1047,7 +1051,7 @@ mod tests {
 
     #[test]
     fn files_without_a_directory_fails() {
-        let (store, node) = store_with_node();
+        let (_dir, store, node) = store_with_node();
         enable(&store, node, vec![Capability::Agent, Capability::Files]);
         let outcome = evaluate(&store, node, READY_ACTIVE_ACTION_CONFIG_SLUG).unwrap();
         assert_eq!(outcome.outcome, OUTCOME_FAIL);
@@ -1055,7 +1059,7 @@ mod tests {
 
     #[test]
     fn passes_with_agent_and_a_ready_directory() {
-        let (store, node) = store_with_node();
+        let (_dir, store, node) = store_with_node();
         enable(&store, node, vec![Capability::Agent, Capability::Files]);
         let dir = std::env::temp_dir();
         set_repo(&store, node, &dir.to_string_lossy());
@@ -1105,7 +1109,7 @@ mod tests {
     #[test]
     fn a_plan_leaves_active_once_no_step_is_open() {
         let slug = ACTIVE_VERIFYING_PLAN_IMPLEMENTED_SLUG;
-        let (store, node) = store_with_node();
+        let (_dir, store, node) = store_with_node();
         let outcome = evaluate(&store, node, slug).unwrap();
         assert_eq!(outcome.outcome, OUTCOME_FAIL, "no plan steps");
 
@@ -1113,7 +1117,7 @@ mod tests {
         let outcome = evaluate(&store, node, slug).unwrap();
         assert_eq!(outcome.outcome, OUTCOME_PASS, "{}", outcome.detail);
 
-        let (store, node) = store_with_node();
+        let (_dir, store, node) = store_with_node();
         plan(&store, node, [STATUS_IMPLEMENTED, STATUS_FAILED]);
         let outcome = evaluate(&store, node, slug).unwrap();
         assert_eq!(outcome.outcome, OUTCOME_FAIL);
@@ -1130,7 +1134,7 @@ mod tests {
     /// gates ask of it.
     #[test]
     fn gates_follow_where_an_obligation_acts() {
-        let (store, node) = store_with_node();
+        let (_dir, store, node) = store_with_node();
         enable(&store, node, vec![Capability::Spec]);
         let add = |body: &str, acts_in: &str| {
             let id = Uuid::new_v4();
@@ -1190,7 +1194,7 @@ mod tests {
     #[test]
     fn verification_passes_only_when_every_obligation_is_verified() {
         let slug = VERIFYING_REVIEW_OBLIGATIONS_VERIFIED_SLUG;
-        let (store, node) = store_with_node();
+        let (_dir, store, node) = store_with_node();
         let outcome = evaluate(&store, node, slug).unwrap();
         assert_eq!(outcome.outcome, OUTCOME_PASS, "nothing promised");
 
@@ -1251,7 +1255,7 @@ mod tests {
     #[test]
     fn a_plan_passes_verification_only_when_every_step_is_verified() {
         let slug = VERIFYING_REVIEW_PLAN_VERIFIED_SLUG;
-        let (store, node) = store_with_node();
+        let (_dir, store, node) = store_with_node();
         let outcome = evaluate(&store, node, slug).unwrap();
         assert_eq!(outcome.outcome, OUTCOME_FAIL, "no plan steps");
 
@@ -1259,7 +1263,7 @@ mod tests {
         let outcome = evaluate(&store, node, slug).unwrap();
         assert_eq!(outcome.outcome, OUTCOME_PASS, "{}", outcome.detail);
 
-        let (store, node) = store_with_node();
+        let (_dir, store, node) = store_with_node();
         let ids = plan(&store, node, [STATUS_FAILED, "implemented"]);
         let outcome = evaluate(&store, node, slug).unwrap();
         assert_eq!(outcome.outcome, OUTCOME_FAIL);
@@ -1292,7 +1296,7 @@ mod tests {
 
         let done = REVIEW_APPROVED_REVIEW_DONE_SLUG;
         let answered = REVIEW_APPROVED_FINDINGS_ANSWERED_SLUG;
-        let (store, node) = store_with_node();
+        let (_dir, store, node) = store_with_node();
         let conn = tod_store::fleet::schema::open_writer_connection(store.writer().db_path())
             .unwrap();
 
@@ -1357,7 +1361,7 @@ mod tests {
         use tod_store::review::{FINDING_FIXED, NewFinding};
 
         let done = REVIEW_APPROVED_REVIEW_DONE_SLUG;
-        let (store, node) = store_with_node();
+        let (_dir, store, node) = store_with_node();
         let conn = writer_conn(&store);
         let conversations = ConversationRepo::new(&conn);
         let finish = |id: Uuid| {
@@ -1391,7 +1395,7 @@ mod tests {
     #[test]
     fn planning_needs_a_step_satisfying_every_requirement() {
         let slug = PLANNING_READY_REQUIREMENTS_TRACEABLE_SLUG;
-        let (store, node) = store_with_node();
+        let (_dir, store, node) = store_with_node();
         let outcome = evaluate(&store, node, slug).unwrap();
         assert_eq!(outcome.outcome, OUTCOME_PASS, "nothing required");
 
@@ -1432,7 +1436,7 @@ mod tests {
     #[test]
     fn leaving_proposed_needs_a_requirement_of_its_own() {
         let slug = PROPOSED_DESIGN_HAS_REQUIREMENTS_SLUG;
-        let (store, node) = store_with_node();
+        let (_dir, store, node) = store_with_node();
         assert_eq!(evaluate(&store, node, slug).unwrap().outcome, OUTCOME_FAIL);
         let conn = writer_conn(&store);
         ObligationRepo::new(&conn)
@@ -1449,7 +1453,7 @@ mod tests {
     fn phase_certified_passes_only_while_the_certificate_is_current() {
         use tod_store::phase::{CERTIFIER_USER, PHASE_CERTIFY};
         let slug = DESIGN_PLANNING_PHASE_CERTIFIED_SLUG;
-        let (store, node) = store_with_node();
+        let (_dir, store, node) = store_with_node();
         let conn = writer_conn(&store);
         NodeRepo::new(&conn).set_lifecycle(node, "design").unwrap();
         let obligation = Uuid::new_v4();
@@ -1480,7 +1484,7 @@ mod tests {
     #[test]
     fn learn_needs_a_retrospective_recorded_in_this_stay() {
         let slug = LEARN_DONE_LEARN_RECORDED_SLUG;
-        let (store, node) = store_with_node();
+        let (_dir, store, node) = store_with_node();
         let conn = writer_conn(&store);
         NodeRepo::new(&conn).set_lifecycle(node, "learn").unwrap();
         assert_eq!(evaluate(&store, node, slug).unwrap().outcome, OUTCOME_FAIL);
@@ -1494,7 +1498,7 @@ mod tests {
     /// answers itself.
     #[test]
     fn every_active_criterion_is_derived() {
-        let (store, node) = store_with_node();
+        let (_dir, store, node) = store_with_node();
         let active: Vec<GateCriterion> = store
             .read(|conn| {
                 let mut stmt = conn.prepare(
@@ -1534,7 +1538,7 @@ mod tests {
 
     #[test]
     fn other_criteria_are_left_to_the_agent() {
-        let (store, node) = store_with_node();
+        let (_dir, store, node) = store_with_node();
         assert_eq!(
             evaluate(&store, node, "planning-ready.plan-actionable"),
             None
@@ -1568,7 +1572,7 @@ mod tests {
     /// The `released` gate does, and the `merged` one has nothing to check.
     #[test]
     fn later_phase_steps_are_checked_by_their_own_phase() {
-        let (store, node) = store_with_node();
+        let (_dir, store, node) = store_with_node();
         let steps = plan(&store, node, [STATUS_VERIFIED, "pending"]);
         set_phase(&store, steps[1], "released");
         let obligation = Uuid::new_v4();

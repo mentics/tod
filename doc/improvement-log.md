@@ -31,6 +31,14 @@ turns, findings, run_state, node_timeline, journey records):
 
 ---
 
+## 2026-11-14: the test suite left directories in the system temp dir (disk full)
+
+- **Seen**: 1, 2026-11-14. The Mac's disk filled (ENOSPC); the system temp dir held 43,880 `tod-interview-*` directories (counted, not removed), each with a SQLite store.
+- **Symptom**: disk full partway through the day's test runs; a full `tod-core` + `tod-store` run left 90+ directories (~190 MB) behind even before counting the interview fixtures.
+- **Cause**: test helpers made `std::env::temp_dir().join("tod-...-<uuid>")` and returned a bare path with nothing to remove it: `interview::test_support::fixture()` (23 files, 150+ tests, the big one), `tod-store`'s `interview::command` `setup()` (removed only on success), `fleet::worktree` tests (`init_temp_repo`, clone and data roots, 35+ dirs per run), `gate::derived::store_with_node` (20 per run). About 290 `temp_dir()` call sites exist across `crates/`; roughly half clean up by hand with `remove_dir_all`, which a failing assertion skips.
+- **Fix**: helpers now own a `tempfile::TempDir`: `Fixture` has a last-declared `_dir` (the store drops first), `command.rs` `setup()` and `store_with_node()` return the `TempDir`, and `tod-store`'s `fleet::test_util::scratch_dir` keeps a directory in a thread-local that is removed when the test's thread ends (used by the worktree tests). Tests: `interview::test_support::hygiene::fixture_directory_is_removed_on_drop`, `fleet::test_util::scratch_tests`. Remaining sites that clean by hand are listed in the commit message; run the suite with `TMPDIR` pointed at an empty directory and list what is left to find the next one.
+- **Measure**: count of entries left in `$TMPDIR` after a full `cargo nextest run --workspace` (should be 0); CI could fail the job when it is not.
+
 ## 2026-11-13: one failed golden refresh blocked every node start (cofactr/workspace)
 
 - **Seen**: 1, live, 2026-11-13 ~17:02 PST, after a deploy. tod's golden refresh for cofactr/workspace forked the workspace golden `wsx-golden-20261113-203335-...`, which the scheduled `refresh-workspace-golden.sh` replaced at the same moment; Blaxel answered `502 FORK_FAILED ... context deadline exceeded`.

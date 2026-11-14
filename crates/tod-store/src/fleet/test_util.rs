@@ -93,3 +93,33 @@ pub fn insert_scale_data(conn: &Connection) -> ScaleSnapshot {
         run_count: RUN_COUNT,
     }
 }
+
+thread_local! {
+    static SCRATCH: std::cell::RefCell<Vec<tempfile::TempDir>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A fresh directory under the system temp dir that is removed when the
+/// calling test's thread ends (libtest runs each test on its own thread), so
+/// a test that returns a plain path still leaves nothing behind, even when it
+/// panics.
+pub fn scratch_dir(prefix: &str) -> PathBuf {
+    let dir = tempfile::Builder::new().prefix(prefix).tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    SCRATCH.with(|s| s.borrow_mut().push(dir));
+    path
+}
+
+#[cfg(test)]
+mod scratch_tests {
+    #[test]
+    fn scratch_dir_is_removed_when_the_test_thread_ends() {
+        let path = std::thread::spawn(|| {
+            let p = super::scratch_dir("tod-scratch-check-");
+            assert!(p.is_dir());
+            p
+        })
+        .join()
+        .unwrap();
+        assert!(!path.exists(), "{} was left behind", path.display());
+    }
+}

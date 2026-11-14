@@ -1310,8 +1310,7 @@ mod tests {
     use std::process::Command as StdCommand;
 
     fn init_temp_repo() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("tod-wt-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = crate::fleet::test_util::scratch_dir("tod-wt-");
         StdCommand::new("git")
             .args(["init", "-b", "main"])
             .current_dir(&dir)
@@ -1416,7 +1415,7 @@ mod tests {
         git_in(&origin, &["commit", "-q", "--allow-empty", "-m", "pushed work"]);
         let tip = git_in(&origin, &["rev-parse", "HEAD"]);
         git_in(&origin, &["switch", "-q", "main"]);
-        let dir = std::env::temp_dir().join(format!("tod-wt-clone-{}", uuid::Uuid::new_v4()));
+        let dir = crate::fleet::test_util::scratch_dir("tod-wt-clone-");
         let out = StdCommand::new("git")
             .args(["clone", "-q"])
             .arg(origin.host_path().unwrap())
@@ -1463,7 +1462,7 @@ mod tests {
     #[test]
     fn a_new_git_worktree_of_a_branch_on_origin_tracks_it() {
         let (clone, tip) = clone_with_remote_feature();
-        let data_root = std::env::temp_dir().join(format!("tod-wt-data-{}", uuid::Uuid::new_v4()));
+        let data_root = crate::fleet::test_util::scratch_dir("tod-wt-data-");
         let dest = worktree_dest_for(&data_root, &clone, "feature").unwrap();
         let path = git_worktree_add(&clone, &dest, "feature").unwrap();
         assert_eq!(run_git(&path, &["rev-parse", "HEAD"]).unwrap(), tip);
@@ -1685,7 +1684,7 @@ mod tests {
     #[test]
     fn git_worktree_reuses_existing_checkout() {
         let repo = Workdir::host(init_temp_repo());
-        let data_root = std::env::temp_dir().join(format!("tod-wt-data-{}", uuid::Uuid::new_v4()));
+        let data_root = crate::fleet::test_util::scratch_dir("tod-wt-data-");
         let dest = worktree_dest_for(&data_root, &repo, "feature").unwrap();
         let first = git_worktree_add(&repo, &dest, "feature").unwrap();
         checkout_branch(&first, "feature").unwrap();
@@ -1701,7 +1700,7 @@ mod tests {
     #[test]
     fn git_worktree_reuses_primary_repo_when_branch_checked_out() {
         let repo = Workdir::host(init_temp_repo());
-        let data_root = std::env::temp_dir().join(format!("tod-wt-data-{}", uuid::Uuid::new_v4()));
+        let data_root = crate::fleet::test_util::scratch_dir("tod-wt-data-");
         let dest = worktree_dest_for(&data_root, &repo, "main").unwrap();
         let path = git_worktree_add(&repo, &dest, "main").unwrap();
         assert!(path.same_location(&repo));
@@ -1848,7 +1847,7 @@ mod tests {
     #[test]
     fn an_uninitialized_nested_submodule_is_set_up_and_put_on_the_branch() {
         let (repo, dirs) = repo_with_nested_submodules();
-        let data_root = std::env::temp_dir().join(format!("tod-wt-data-{}", uuid::Uuid::new_v4()));
+        let data_root = crate::fleet::test_util::scratch_dir("tod-wt-data-");
         // A bare `git worktree add`, like a pool worktree nobody initialized.
         let bare = worktree_dest_for(&data_root, &repo, "bare").unwrap();
         run_git(&repo, &["worktree", "add", "-q", "--detach", &git_path_arg(&bare).unwrap()])
@@ -1907,7 +1906,7 @@ mod tests {
         )
         .unwrap();
 
-        let data_root = std::env::temp_dir().join(format!("tod-wt-data-{}", uuid::Uuid::new_v4()));
+        let data_root = crate::fleet::test_util::scratch_dir("tod-wt-data-");
         let handle = git_worktree(&data_root, &repo, "with-sub").unwrap();
         let subs = submodule_dirs(&handle.path).unwrap();
         assert_eq!(subs.len(), 1, "submodule not initialized in {}", handle.path);
@@ -2014,7 +2013,7 @@ git -c user.name=t -c user.email=t@t commit -q -m 'add sub'"#;
     #[test]
     fn validate_interview_workspace_accepts_existing_worktree() {
         let repo = Workdir::host(init_temp_repo());
-        let data_root = std::env::temp_dir().join(format!("tod-wt-data-{}", uuid::Uuid::new_v4()));
+        let data_root = crate::fleet::test_util::scratch_dir("tod-wt-data-");
         let dest = worktree_dest_for(&data_root, &repo, "feature").unwrap();
         let _ = git_worktree_add(&repo, &dest, "feature").unwrap();
         validate_interview_workspace(repo.host_path().unwrap(), "feature").unwrap();
@@ -2032,7 +2031,7 @@ git -c user.name=t -c user.email=t@t commit -q -m 'add sub'"#;
     #[test]
     fn git_worktree_add_and_checkout() {
         let repo = Workdir::host(init_temp_repo());
-        let data_root = std::env::temp_dir().join(format!("tod-wt-data-{}", uuid::Uuid::new_v4()));
+        let data_root = crate::fleet::test_util::scratch_dir("tod-wt-data-");
         let dest = worktree_dest_for(&data_root, &repo, "feature").unwrap();
         let path = git_worktree_add(&repo, &dest, "feature").unwrap();
         checkout_branch(&path, "feature").unwrap();
@@ -2045,7 +2044,7 @@ git -c user.name=t -c user.email=t@t commit -q -m 'add sub'"#;
     #[test]
     fn remove_git_worktree_finishes_a_half_removed_worktree() {
         let repo = Workdir::host(init_temp_repo());
-        let data_root = std::env::temp_dir().join(format!("tod-wt-data-{}", uuid::Uuid::new_v4()));
+        let data_root = crate::fleet::test_util::scratch_dir("tod-wt-data-");
         let dest = worktree_dest_for(&data_root, &repo, "feature").unwrap();
         let path = git_worktree_add(&repo, &dest, "feature").unwrap();
         assert!(is_registered_worktree(&repo, &path).unwrap());
@@ -2074,7 +2073,7 @@ git -c user.name=t -c user.email=t@t commit -q -m 'add sub'"#;
 
         let git_repo = Workdir::host(init_temp_repo());
         let repo_str = git_repo.storage();
-        let data_root = std::env::temp_dir().join(format!("tod-wt-data-{}", uuid::Uuid::new_v4()));
+        let data_root = crate::fleet::test_util::scratch_dir("tod-wt-data-");
         set_data_root(data_root.clone());
         let paths = TodPaths::discover().unwrap();
         let settings = TodSettings::default();

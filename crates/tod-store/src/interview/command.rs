@@ -1608,10 +1608,12 @@ mod tests {
     use crate::outline::repos::{ListRepo, OutlineRepo};
     use crate::outline::types::{OutlineEntry, OutlineList};
 
-    fn setup() -> (std::path::PathBuf, Connection, Uuid, Uuid) {
-        let dir = std::env::temp_dir().join(format!("tod-interview-cmd-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let conn = schema::open_writer_connection(&dir.join("tod.db")).unwrap();
+    fn setup() -> (tempfile::TempDir, Connection, Uuid, Uuid) {
+        let dir = tempfile::Builder::new()
+            .prefix("tod-interview-cmd-")
+            .tempdir()
+            .unwrap();
+        let conn = schema::open_writer_connection(&dir.path().join("tod.db")).unwrap();
         let list_id = Uuid::new_v4();
         ListRepo::new(&conn)
             .insert(&OutlineList {
@@ -1670,7 +1672,7 @@ mod tests {
 
     #[test]
     fn accepting_a_proposal_applies_it_and_replaces_superseded_obligations() {
-        let (dir, conn, node, session) = setup();
+        let (_dir, conn, node, session) = setup();
         let old = Uuid::new_v4();
         ObligationRepo::new(&conn)
             .insert_at(
@@ -1740,7 +1742,6 @@ mod tests {
                 .iter()
                 .any(|c| c.entity == ENTITY_QUESTION && c.fields.contains(&"status".to_string()))
         );
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn agent_session(conn: &Connection, node: Uuid, session: Uuid) -> Uuid {
@@ -1777,7 +1778,7 @@ mod tests {
 
     #[test]
     fn deleted_obligations_survive_trimming_and_restore_in_place() {
-        let (dir, conn, node, session) = setup();
+        let (_dir, conn, node, session) = setup();
         let ids: Vec<Uuid> = ["First.", "Second.", "Third."]
             .iter()
             .enumerate()
@@ -1850,12 +1851,11 @@ mod tests {
 
         let err = restore(&conn, deleted[0].rev).unwrap_err();
         assert!(err.to_string().contains("already exists"), "{err}");
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn an_edit_restores_the_earlier_wording_and_the_restore_is_itself_restorable() {
-        let (dir, conn, node, session) = setup();
+        let (_dir, conn, node, session) = setup();
         let id = Uuid::new_v4();
         ObligationRepo::new(&conn)
             .insert_at(
@@ -1902,12 +1902,11 @@ mod tests {
             err.to_string().contains("restore its deletion first"),
             "{err}"
         );
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn deleted_obligations_past_retention_are_trimmed() {
-        let (dir, conn, node, _session) = setup();
+        let (_dir, conn, node, _session) = setup();
         let id = Uuid::new_v4();
         let obligations = ObligationRepo::new(&conn);
         obligations
@@ -1932,12 +1931,11 @@ mod tests {
         assert!(repo.obligation_snapshot(rev).unwrap().is_none());
         let err = restore(&conn, rev).unwrap_err();
         assert!(err.to_string().contains("past retention"), "{err}");
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn questions_whose_proposal_target_is_gone_are_withdrawn_as_stale() {
-        let (dir, conn, node, session) = setup();
+        let (_dir, conn, node, session) = setup();
         let target = Uuid::new_v4();
         let unrelated = Uuid::new_v4();
         let obligations = ObligationRepo::new(&conn);
@@ -2008,12 +2006,11 @@ mod tests {
         assert_eq!(q1.withdrawn_reason.as_deref(), Some(STALE_PROPOSAL_REASON));
         assert!(repo.get_question(node, 2).unwrap().unwrap().is_open());
         assert!(repo.stale_proposal_questions(node).unwrap().is_empty());
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn agent_writes_are_attributed_and_guarded() {
-        let (dir, conn, node, session) = setup();
+        let (_dir, conn, node, session) = setup();
         let agent = Uuid::new_v4();
         run(
             &conn,
@@ -2088,13 +2085,12 @@ mod tests {
             .unwrap();
         assert!(delta.iter().all(|c| c.entity_id != q2.id));
         assert!(delta.iter().any(|c| c.entity == ENTITY_QUESTION));
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn a_batch_that_fails_midway_writes_nothing() {
         use crate::outline::repos::PlanStepRepo;
-        let (dir, conn, node, _session) = setup();
+        let (_dir, conn, node, _session) = setup();
         let step = Uuid::new_v4();
         PlanStepRepo::new(&conn).insert_at(step, node, 0, "Step").unwrap();
         let blocked = InterviewCommand::Outline {
@@ -2143,6 +2139,5 @@ mod tests {
         run(&conn, ACTOR_USER, batch).unwrap();
         assert_eq!(PlanStepRepo::new(&conn).get(step).unwrap().unwrap().status, "blocked");
         assert_eq!(crate::decisions::DecisionRepo::new(&conn).get(d.id).unwrap().unwrap().blocks, vec![step]);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
