@@ -3774,7 +3774,11 @@ fn a_silent_bot_is_asked_a_bounded_number_of_times_by_tod_then_the_user_is_asked
             .unwrap()
     };
     let outcome = run(&mut agent);
-    assert_eq!(outcome, Outcome::NeedsHuman { reason: NeedsHuman::Decision { pending: 1 } });
+    assert!(matches!(outcome, Outcome::Waiting { .. }), "{outcome:?}");
+    // Parked, not polling: a recorded wait on the bot's review (a webhook for
+    // it wakes the run), and the question is pending without stopping the run.
+    let waits = fx.fleet.read(|conn| tod_store::waits::WaitRepo::new(conn).list_pending_for_node(fx.node)).unwrap();
+    assert!(waits.iter().any(|w| w.match_spec.starts_with("github:pr:42:bot-review:greptile")), "{waits:?}");
     // tod asked, three times and no more; the agent was never sent.
     assert_eq!(*feed.posted.lock().unwrap(), vec!["@greptileai please review"; 3]);
     assert_eq!(agent.turns, 0);
@@ -3792,7 +3796,7 @@ fn a_silent_bot_is_asked_a_bounded_number_of_times_by_tod_then_the_user_is_asked
     assert_eq!(d.options, vec!["Proceed without greptile", "Keep waiting"]);
 
     // Run again: the same one request, nothing more posted or asked.
-    assert_eq!(run(&mut agent), Outcome::NeedsHuman { reason: NeedsHuman::Decision { pending: 1 } });
+    assert!(matches!(run(&mut agent), Outcome::Waiting { .. }));
     assert_eq!(bot_decisions(&fx).len(), 1);
     assert_eq!(feed.posted.lock().unwrap().len(), 3);
 
@@ -3811,6 +3815,33 @@ fn a_silent_bot_is_asked_a_bounded_number_of_times_by_tod_then_the_user_is_asked
     assert_eq!(agent.turns, 0);
     let settings = crate::pr_readiness::settings_for_node(&fx.fleet, fx.node, &fx.root).unwrap();
     assert!(settings.bots.is_empty(), "{settings:?}");
+}
+
+/// While the silence question is pending the run is parked (a wait on the
+/// bot's review, no turns, no polling); when the bot comes on a later look the
+/// question is withdrawn with a note and the run goes on.
+#[test]
+fn a_parked_run_withdraws_the_silence_question_when_the_bot_comes() {
+    let feed = BotFeed::new("2020-01-01T00:00:00Z", Some(12));
+    let (fx, mut agent) = bot_node(feed.clone(), SILENT_BOT);
+    let run = |agent: &mut FakeAgent| {
+        autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO).run(&fx.fleet, agent).unwrap()
+    };
+    assert!(matches!(run(&mut agent), Outcome::Waiting { .. }));
+    assert_eq!(pending_requests(&fx).len(), 1);
+    let reads = feed.reads.load(std::sync::atomic::Ordering::SeqCst);
+    // Parked: each wake reads GitHub a few times and goes back to sleep.
+    assert!(reads < 12, "the bot has not come yet: {reads}");
+    for _ in 0..10 {
+        run(&mut agent);
+        if pending_requests(&fx).is_empty() {
+            break;
+        }
+    }
+    assert!(pending_requests(&fx).is_empty(), "the question is withdrawn once the bot has reviewed");
+    assert_eq!(agent.turns, 0);
+    let notes = fx.fleet.read(|conn| Ok(tod_store::node_timeline::TimelineRepo::new(conn).list(fx.node)?)).unwrap();
+    assert!(notes.iter().any(|e| e.title.contains("is no longer silent")), "{notes:?}");
 }
 
 const SILENT_BOT: &str =
@@ -3851,7 +3882,7 @@ fn the_same_bot_is_still_asked_on_a_draft_with_no_evidence_it_skips_them() {
         .with_pr_poll_interval(Duration::ZERO)
         .run(&fx.fleet, &mut agent)
         .unwrap();
-    assert_eq!(outcome, Outcome::NeedsHuman { reason: NeedsHuman::Decision { pending: 1 } });
+    assert!(matches!(outcome, Outcome::Waiting { .. }), "{outcome:?}");
     assert_eq!(feed.posted.lock().unwrap().len(), 3);
 }
 
@@ -3876,7 +3907,7 @@ fn a_bot_that_skips_drafts_is_still_required_once_the_pull_request_is_ready() {
         .with_pr_poll_interval(Duration::ZERO)
         .run(&fx.fleet, &mut agent)
         .unwrap();
-    assert_eq!(outcome, Outcome::NeedsHuman { reason: NeedsHuman::Decision { pending: 1 } });
+    assert!(matches!(outcome, Outcome::Waiting { .. }), "{outcome:?}");
     assert_eq!(feed.posted.lock().unwrap().len(), 3);
 }
 
@@ -3989,7 +4020,7 @@ fn keeping_waiting_holds_the_request_back_while_the_bot_stays_silent() {
     let mut pilot = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO);
     assert!(matches!(
         pilot.run(&fx.fleet, &mut agent).unwrap(),
-        Outcome::NeedsHuman { reason: NeedsHuman::Decision { .. } }
+        Outcome::Waiting { .. }
     ));
     let d = bot_decisions(&fx).remove(0);
     fx.fleet
@@ -4111,7 +4142,7 @@ fn a_bot_is_asked_only_after_tods_own_review_of_the_head_is_clean() {
         .unwrap();
     // Three asks, no more; the same head is not reviewed again; no fallback,
     // so the user is asked, once.
-    assert_eq!(outcome, Outcome::NeedsHuman { reason: NeedsHuman::Decision { pending: 1 } });
+    assert!(matches!(outcome, Outcome::Waiting { .. }), "{outcome:?}");
     assert_eq!(*feed.posted.lock().unwrap(), vec!["@greptileai please review"; 3]);
     assert_eq!(openings(&fx, ProtocolKind::Review).len(), 1);
     assert_eq!(bot_decisions(&fx).len(), 1);

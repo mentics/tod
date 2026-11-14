@@ -697,6 +697,13 @@ impl Autopilot {
                 pending = fleet
                     .read(|conn| Ok(DecisionRepo::new(conn).list_pending_for_node(self.node)?))?
                     .len();
+                // A silence question about a bot still silent does not stop
+                // the run: it parks on the bot's review (a bot that comes
+                // withdraws the question).
+                match self.tend_silence_questions(fleet)? {
+                    (Some(outcome), _) => return self.finish(outcome),
+                    (None, open) => pending = pending.saturating_sub(open),
+                }
             }
             if pending > 0 {
                 return self.finish(Outcome::NeedsHuman {
@@ -1235,6 +1242,13 @@ impl Autopilot {
                 pending = fleet
                     .read(|conn| Ok(DecisionRepo::new(conn).list_pending_for_node(self.node)?))?
                     .len();
+                match self.tend_silence_questions(fleet)? {
+                    (Some(outcome), _) => {
+                        hook.waiting(None, None);
+                        return Ok(Some(outcome));
+                    }
+                    (None, open) => pending = pending.saturating_sub(open),
+                }
             }
             if pending > 0 {
                 hook.waiting(None, None);
@@ -1494,6 +1508,15 @@ impl Autopilot {
                         hook.waiting(None, None);
                         return Ok(Some(outcome));
                     }
+                    // Every bot still waited on is silent and its question to
+                    // the user is pending: park the run on the bot's review (a
+                    // webhook, or the next scheduled look) instead of polling
+                    // GitHub in place. A parked run uses no turns and no
+                    // budget until the question is answered or the bot posts.
+                    if let Some(outcome) = self.park_for_silent_bots(fleet, &live, &waits, &settings)? {
+                        hook.waiting(None, None);
+                        return Ok(Some(outcome));
+                    }
                     let since = *waited_since.get_or_insert_with(std::time::Instant::now);
                     let mut what = wait_description(&waits);
                     for note in live.iter().flat_map(|p| p.assessment.fallbacks.iter().map(|f| f.note())) {
@@ -1523,10 +1546,10 @@ impl Autopilot {
     /// "A bot that stays silent"), once nothing else is outstanding:
     ///
     /// - a bot asked as often as allowed that still has not reviewed the head
-    ///   raises the node's one request ([`crate::bot_silence`]) and stops the
-    ///   run on it (`Some`); a bot whose request is pending, answered, or held
-    ///   back by "Keep waiting" raises nothing;
-    /// - otherwise each review that is due is asked for, by posting the
+    ///   raises the node's one request ([`crate::bot_silence`]); the run goes
+    ///   on (and parks while it is pending). A bot whose request is pending,
+    ///   answered, or held back by "Keep waiting" raises nothing;
+    /// - each review that is due is asked for, by posting the
     ///   settings' `ask` comment (retried by the client when GitHub hiccups).
     ///   A failure to post is a failed look at GitHub, handled where those are
     ///   ([`github_wait::github_look_failed`]), never dropped.
@@ -1586,7 +1609,10 @@ impl Autopilot {
                     },
                 )
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            return Ok(Some(Outcome::NeedsHuman { reason: NeedsHuman::Decision { pending: 1 } }));
+            // The run does not stop on it: a bot that has gone quiet often
+            // answers a later ask. It parks on the bot's review instead
+            // ([`Self::park_for_silent_bots`]); a review withdraws the question
+            // ([`Self::tend_silence_questions`]).
         }
         for p in live {
             for ask in p.assessment.asks_due() {
@@ -1644,6 +1670,110 @@ impl Autopilot {
             }
         }
         Ok(())
+    }
+
+    /// Parks the run while the only thing outstanding is bots that stayed
+    /// silent, each with its question to the user pending: an `event` wait on
+    /// the bot's review, due at the next scheduled look (a webhook for the
+    /// review satisfies it sooner; the user's answer wakes the node too).
+    /// `None` when something else is still being polled for, or no silence
+    /// question is pending.
+    fn park_for_silent_bots(
+        &mut self,
+        fleet: &FleetStore,
+        live: &[crate::pr_readiness::LivePr],
+        waits: &[crate::pr_readiness::Wait],
+        settings: &tod_store::PrReadinessSettings,
+    ) -> Result<Option<Outcome>> {
+        use crate::bot_silence::{self, Standing};
+        use crate::pr_readiness::Wait as W;
+        let node = self.node;
+        let mut waited: Vec<&str> = Vec::new();
+        for w in waits {
+            match w {
+                W::BotReview { bot, .. } => waited.push(bot.as_str()),
+                _ => return Ok(None),
+            }
+        }
+        if waited.is_empty() {
+            return Ok(None);
+        }
+        for bot in &waited {
+            let silent = live
+                .iter()
+                .any(|p| p.assessment.silent_bots().iter().any(|r| r.settings.name.eq_ignore_ascii_case(bot)));
+            if !silent {
+                return Ok(None);
+            }
+            let standing = fleet.read(|conn| bot_silence::standing(conn, node, bot))?;
+            if standing != Standing::Pending {
+                return Ok(None);
+            }
+        }
+        let bot = waited[0];
+        let number = live
+            .iter()
+            .find(|p| p.assessment.waits().iter().any(|w| matches!(w, W::BotReview { bot: b, .. } if b == bot)))
+            .map(|p| p.pr.pr_number);
+        let spec = github_wait::bot_review_spec(number, bot);
+        let what = format!("{}; {bot} stayed silent, waiting for your answer or its review", wait_description(waits));
+        let due_at_ms = self.record_github_wait(fleet, spec, "github:pr:", settings, &what)?;
+        self.reset_housekeeping()?;
+        Ok(Some(Outcome::Waiting { what, due_at_ms }))
+    }
+
+    /// Tends the node's pending bot-silence questions
+    /// ([`crate::bot_silence::PROTOCOL`]): one is withdrawn, with a note on the
+    /// node's activity, once its bot is no longer silent and no longer waited
+    /// for on any linked pull request (it reviewed the head, or was waived).
+    /// Returns how many remain open: those do not stop the run, which parks
+    /// on the bot ([`Self::park_for_silent_bots`]). `Some` outcome when GitHub
+    /// could not be read, a failed look like any other.
+    fn tend_silence_questions(&self, fleet: &FleetStore) -> Result<(Option<Outcome>, usize)> {
+        use crate::pr_readiness::{self, Wait};
+        use tod_store::node_timeline::{KIND_NOTE, TimelineEntry};
+        let node = self.node;
+        let questions: Vec<(tod_store::decisions::Decision, String)> = fleet
+            .read(|conn| Ok(DecisionRepo::new(conn).list_pending_for_node(node)?))?
+            .into_iter()
+            .filter_map(|d| crate::bot_silence::bot_of(&d).map(str::to_string).map(|b| (d, b)))
+            .collect();
+        if questions.is_empty() {
+            return Ok((None, 0));
+        }
+        let settings = pr_readiness::settings_for_node(fleet, node, &self.config.data_root)?;
+        let links = fleet.read(|conn| tod_store::github::NodePrRepo::new(conn).read(node))?;
+        let Some(feed) = pr_readiness::feed_for(&self.config.data_root) else {
+            return Ok((Some(github_wait::github_look_failed(fleet, node, false, "GitHub credentials are not set up")?), 0));
+        };
+        let live = match pr_readiness::live(feed.as_ref(), &links.prs, &settings) {
+            Ok(live) => live,
+            Err(err) => return Ok((Some(github_wait::github_look_failed(fleet, node, false, &err)?), 0)),
+        };
+        let mut open = 0;
+        for (decision, bot) in questions {
+            let still = live.iter().any(|p| {
+                p.assessment.silent_bots().iter().any(|r| r.settings.name.eq_ignore_ascii_case(&bot))
+                    || p.assessment
+                        .waits()
+                        .iter()
+                        .any(|w| matches!(w, Wait::BotReview { bot: b, .. } if b.eq_ignore_ascii_case(&bot)))
+            });
+            if still {
+                open += 1;
+                continue;
+            }
+            tracing::info!(%node, %bot, "a review bot is no longer silent: withdrawing the question");
+            fleet
+                .interview("autopilot", InterviewCommand::WithdrawDecision { decision_id: decision.id })
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let title = format!("Request withdrawn: {bot} is no longer silent");
+            let detail = format!("{bot} is no longer waited for. Withdrawn: \"{}\"", decision.question);
+            let entry = TimelineEntry::new(node, KIND_NOTE, "pr_draft", title, false, detail);
+            fleet.enqueue(tod_store::fleet::FleetMutation::RecordTimeline(Box::new(entry)))?;
+            fleet.writer().flush()?;
+        }
+        Ok((None, open))
     }
 
     /// Withdraws the node's pending requests about a review bot that does

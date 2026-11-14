@@ -85,7 +85,7 @@ pub fn options(bot: &str) -> Vec<String> {
 }
 
 /// The bot a bot-silence decision is about.
-fn bot_of(decision: &Decision) -> Option<&str> {
+pub(crate) fn bot_of(decision: &Decision) -> Option<&str> {
     if decision.protocol.as_deref() != Some(PROTOCOL) {
         return None;
     }

@@ -386,8 +386,13 @@ its own words. Now:
 3. **Silent.** Asked `max_asks` times, the last one `ask_every_minutes` ago,
    and still no review: the node's one request is raised
    (`tod_core::bot_silence`; pending decision on the node, protocol
-   `bot_silence`, reason `broken`, so it shows with the other requests) and
-   the run stops on it. With no `ask` text the same patience is measured
+   `bot_silence`, reason `broken`, so it shows with the other requests). The
+   run does not stop on it and does not poll GitHub for the bot: while every
+   bot still waited on is silent with its question pending, it parks on an
+   `event` wait on the bot's review (`github:pr:<n>:bot-review:<bot>`, due at
+   the next scheduled look; the bot's review webhook satisfies it sooner;
+   `Autopilot::park_for_silent_bots`), using no turns or budget. A bot that
+   comes withdraws the question with a note (`tend_silence_questions`). With no `ask` text the same patience is measured
    from the later of the head commit and the agent's last turn
    (`rerun_after_minutes + max_asks * ask_every_minutes`). The wording is
    fixed, with what was tried:
