@@ -61,9 +61,15 @@ impl Protocol for VerificationProtocol {
 
     /// The same variables as implementation: `tod-cli tests record` needs the
     /// conversation, and the verdicts are the agent's own writes, not a
-    /// reversible change set.
+    /// reversible change set. The actor still names the conversation
+    /// (`agent:<id>`, not `conversation:<id>`), so the writer applies the
+    /// verification protocol's own rule (an obligation only a later phase can
+    /// show true may be moved there) instead of the generic one.
     fn turn_env(&self, env: &ProtocolEnv<'_>) -> Vec<(String, String)> {
         let mut vars = vec![(
+            tod_store::interview::ACTOR_ENV.to_string(),
+            tod_store::conversation::agent_actor_for(env.conversation_id),
+        ), (
             IMPLEMENT_CONVERSATION_ENV.to_string(),
             env.conversation_id.to_string(),
         )];

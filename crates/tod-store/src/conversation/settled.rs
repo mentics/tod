@@ -55,11 +55,23 @@ pub fn check_conversation_agent(
             super::types::Focus::Node(id) => Some(id),
             _ => None,
         };
-        if verify_may_retag(conn, own_node, mutation)? {
-            return Ok(());
+        match verify_may_retag(conn, own_node, mutation)? {
+            Retag::Allowed => return Ok(()),
+            Retag::NotApplicable(why) => return check_agent_noting(conn, mutation, Some(&why)),
+            Retag::NotARetag => {}
         }
     }
     check_agent(conn, mutation)
+}
+
+/// What [`verify_may_retag`] decided.
+enum Retag {
+    /// The mutation is the verification agent's permitted move.
+    Allowed,
+    /// The mutation is not a retag at all (any other change).
+    NotARetag,
+    /// It is a retag, but the exception does not cover it, for this reason.
+    NotApplicable(String),
 }
 
 /// The fewest non-space characters a retag's reason may have.
@@ -81,32 +93,57 @@ fn verify_may_retag(
     conn: &Connection,
     own_node: Option<Uuid>,
     mutation: &OutlineMutation,
-) -> Result<bool> {
+) -> Result<Retag> {
     let OutlineMutation::UpdateObligationActsIn {
         obligation_id,
         acts_in,
         reason,
     } = mutation
     else {
-        return Ok(false);
+        return Ok(Retag::NotARetag);
     };
+    let no = |why: String| Ok(Retag::NotApplicable(why));
     if acts_in != ACTS_IN_MERGED && acts_in != ACTS_IN_RELEASED {
-        return Ok(false);
+        return no(format!(
+            "a verification agent may only move an obligation to `{ACTS_IN_MERGED}` or \
+            `{ACTS_IN_RELEASED}`, not `{acts_in}`"
+        ));
     }
     let Some(obligation) = ObligationRepo::new(conn).get(*obligation_id)? else {
-        return Ok(false);
+        return Ok(Retag::NotARetag);
     };
     if own_node != Some(obligation.node_id) {
-        return Ok(false);
+        return no(match own_node {
+            Some(own) => format!(
+                "the obligation belongs to node {}, and this verification session is on node \
+                {own}: it moves only its own node's obligations",
+                obligation.node_id
+            ),
+            None => "this verification session is not focused on a node, so it has no obligations \
+                of its own to move"
+                .to_string(),
+        });
     }
     let rank = |s: &str| VALID_LIFECYCLE_STATES.iter().position(|v| *v == s);
     let (Some(from), Some(to)) = (rank(&obligation.acts_in), rank(acts_in)) else {
-        return Ok(false);
+        return no(format!(
+            "the obligation's phase `{}` or `{acts_in}` is not a lifecycle state tod knows",
+            obligation.acts_in
+        ));
     };
-    let in_verifying =
-        NodeRepo::new(conn).get_lifecycle(obligation.node_id)?.as_deref() == Some("verifying");
-    if !in_verifying || from >= to {
-        return Ok(false);
+    let state = NodeRepo::new(conn).get_lifecycle(obligation.node_id)?;
+    if state.as_deref() != Some("verifying") {
+        return no(format!(
+            "the node is in `{}`, and the move is allowed only while it is in `verifying`",
+            state.as_deref().unwrap_or("no lifecycle state")
+        ));
+    }
+    if from >= to {
+        return no(format!(
+            "the obligation already acts in `{}`, which is not earlier than `{acts_in}`: the move \
+            only goes later",
+            obligation.acts_in
+        ));
     }
     let substantive = reason
         .as_deref()
@@ -153,12 +190,22 @@ fn verify_may_retag(
             is not moved to a later phase. Leave it `failed`; implementation fixes it."
         );
     }
-    Ok(true)
+    Ok(Retag::Allowed)
 }
 
 /// Refuse `mutation`, written by an agent, when it changes an obligation of
 /// a node past `planning`.
 pub fn check_agent(conn: &Connection, mutation: &OutlineMutation) -> Result<()> {
+    check_agent_noting(conn, mutation, None)
+}
+
+/// [`check_agent`], saying in the refusal why a retag a verification agent
+/// attempted was not covered by its exception (`retag_note`).
+fn check_agent_noting(
+    conn: &Connection,
+    mutation: &OutlineMutation,
+    retag_note: Option<&str>,
+) -> Result<()> {
     for node_id in obligation_nodes(conn, mutation)? {
         let Some(state) = NodeRepo::new(conn).get_lifecycle(node_id)? else {
             continue;
@@ -175,7 +222,14 @@ pub fn check_agent(conn: &Connection, mutation: &OutlineMutation) -> Result<()> 
             of a node past {LAST_OPEN_STATE} change only with the user's approval. Ask the \
             user with `tod-cli decisions ask --node {node_id} <QUESTION>`, quoting the change \
             you propose (the obligation's id, its current text and the text you propose) and \
-            why; if they approve, they make the change themselves."
+            why; if they approve, they make the change themselves.{}",
+            match retag_note {
+                Some(why) => format!(
+                    " (The verification agent's own move to a later phase did not apply: {why}. \
+                    Do not ask the user to make that move unless that is fixed.)"
+                ),
+                None => String::new(),
+            }
         );
     }
     Ok(())
@@ -490,6 +544,61 @@ mod tests {
         let verify = conversation(&fx, ProtocolKind::Verification);
         outline(&fx, &verify, retag(&fx, "merged")).unwrap();
         assert_eq!(acts_in(&fx), "merged");
+    }
+
+    /// The route a real verification agent takes: its environment carries
+    /// `agent:<conversation id>` (its writes are not a change set), so the
+    /// writer sees an agent write, not a `conversation:` one. The retag
+    /// exception must still apply, and a plain agent stays refused.
+    #[test]
+    fn a_verification_agent_writing_as_agent_actor_may_retag() {
+        let fx = setup("verifying");
+        let c = ConversationRepo::new(&fx.conn)
+            .create(Focus::Node(fx.node), ProtocolKind::Verification, None, None, None)
+            .unwrap();
+        let actor = crate::conversation::agent_actor_for(c.id);
+        outline(&fx, &actor, retag(&fx, "merged")).unwrap();
+        assert_eq!(acts_in(&fx), "merged");
+        // Still refused without a reason, with the specific error.
+        let err = outline(
+            &fx,
+            &actor,
+            OutlineMutation::UpdateObligationActsIn {
+                obligation_id: fx.obligation,
+                acts_in: "released".to_string(),
+                reason: None,
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("needs a reason"), "{err:#}");
+        // Other changes and other protocols stay refused.
+        assert_refused("verifying", outline(&fx, &actor, edit(&fx)).unwrap_err());
+        let pr = ConversationRepo::new(&fx.conn)
+            .create(Focus::Node(fx.node), ProtocolKind::Pr, None, None, None)
+            .unwrap();
+        assert_refused(
+            "verifying",
+            outline(&fx, &crate::conversation::agent_actor_for(pr.id), retag(&fx, "released"))
+                .unwrap_err(),
+        );
+    }
+
+    /// When the retag does not apply, the refusal says why and does not
+    /// tell the agent to ask the user for the phase move.
+    #[test]
+    fn a_refused_retag_says_why_it_did_not_apply() {
+        let fx = setup("verifying");
+        let actor = {
+            let c = ConversationRepo::new(&fx.conn)
+                .create(Focus::Node(fx.node), ProtocolKind::Verification, None, None, None)
+                .unwrap();
+            crate::conversation::agent_actor_for(c.id)
+        };
+        outline(&fx, &actor, retag(&fx, "released")).unwrap();
+        // Going back is not a retag the exception covers.
+        let err = format!("{:#}", outline(&fx, &actor, retag(&fx, "merged")).unwrap_err());
+        assert!(err.contains("already acts in `released`"), "{err}");
+        assert!(err.contains("did not apply"), "{err}");
     }
 
     /// Only verification, and only while the node is in `verifying`.

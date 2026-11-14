@@ -31,6 +31,14 @@ turns, findings, run_state, node_timeline, journey records):
 
 ---
 
+## 2026-11-14: a verification agent's retag to `merged` was refused as "ask the user" (ENG-3129)
+
+- **Seen**: 1, ENG-3129, 2026-11-14 (conversation B80D61C0, two obligations that can only be shown true after merge).
+- **Symptom**: `tod-cli obligations update <id> --acts-in merged --reason ...` in a verification session was refused with the generic "obligations of a node past planning change only with the user's approval. Ask the user with `tod-cli decisions ask ...`", so the agent filed the very request the retag exception (`verify_may_retag`) exists to avoid.
+- **Cause**: the exception lives in `check_conversation_agent`, reached only for a `conversation:<id>` actor (`record_and_execute`). The verification protocol deliberately gives its agent no conversation actor (its verdicts are not a reversible change set), so its `tod-cli` writes arrive as the bare actor `agent`, go through `record_direct` and the generic `check_agent`, and the exception was unreachable outside unit tests (which wrote as `conversation:<id>`). The same on every route (local daemon, relay, sandbox, orchestrator), since they all carry the actor string unchanged to the writer.
+- **Fix**: a verification session's `TOD_INTERVIEW_ACTOR` is now `agent:<conversation id>` (`tod_store::conversation::agent_actor_for`); `record_direct` (the one place every non-conversation outline write passes, on every route) sends such an actor through `check_conversation_agent`. It is still recorded as an ordinary agent write, not in the change set. A retag the exception does not cover now says why (wrong phase, other node, not `verifying`, not later) instead of only telling the agent to ask the user. Tests: `settled::tests::{a_verification_agent_writing_as_agent_actor_may_retag, a_refused_retag_says_why_it_did_not_apply}`, and the verification turn env in `conversation::tests`.
+- **Measure**: count of pending decisions whose text proposes an `acts_in` move by a verification agent; any `decisions ask` from a verification conversation about phase placement.
+
 ## 2026-11-14: the test suite left directories in the system temp dir (disk full)
 
 - **Seen**: 2, 2026-11-14. The Mac's disk filled (ENOSPC); the system temp dir held 43,880 `tod-interview-*` directories (counted, not removed), each with a SQLite store; the count later reached 82,000 directories (110 GB). The first fix (984017b0) covered the largest offenders only; a measured run still left directories from every other crate with tests.
