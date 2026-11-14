@@ -403,3 +403,64 @@ fn a_skipped_first_capture_then_merged_and_replaced_is_never_lost() {
 fn a_node_in_pr_with_no_record_merged_and_replaced_is_never_lost() {
     pre_existing_node_replaced(false, "pr", false);
 }
+
+fn set_every_step(fx: &Fixture, status: &str) {
+    let steps: Vec<_> = fx
+        .fleet
+        .read(|c| Ok(tod_store::outline::repos::PlanStepRepo::new(c).list_for_node(fx.node)?))
+        .unwrap();
+    assert!(!steps.is_empty());
+    for step in steps {
+        fx.fleet
+            .enqueue_outline(OutlineMutation::UpdatePlanStepStatus {
+                step_id: step.id,
+                status: status.into(),
+                note: None,
+                reason: None,
+            })
+            .unwrap();
+    }
+    fx.fleet.writer().flush().unwrap();
+    fx.fleet.reload_if_stale().unwrap();
+}
+
+/// S1: a node with no implementation conversation whose steps were done through
+/// `update_status`, merged and deleted, the steps reset to pending, then the
+/// sandbox replaced at main's tip, then the steps marked verified again with no
+/// new commit. The reset must not make the birth look like the node's first.
+#[test]
+fn steps_reset_to_pending_before_a_replacement_do_not_make_it_a_first_checkout() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    let workspace = workspace_is_a_clone(&fx);
+    let conn = rusqlite::Connection::open(fx.fleet.paths().db()).unwrap();
+    conn.execute("DELETE FROM node_branch_starts", []).unwrap();
+    drop(conn);
+    set_every_step(&fx, "implemented");
+    std::fs::write(workspace.join("work"), "w").unwrap();
+    git_in(&workspace, &["add", "."]);
+    git_in(&workspace, &["commit", "-qm", "the node's work"]);
+    git_in(&workspace, &["push", "-q", "origin", "HEAD:refs/heads/task/x"]);
+    git_in(&workspace, &["checkout", "-q", "main"]);
+    git_in(&workspace, &["merge", "-q", "--ff-only", "task/x"]);
+    git_in(&workspace, &["push", "-q", "origin", "main"]);
+    git_in(&workspace, &["branch", "-q", "-D", "task/x"]);
+    git_in(&workspace, &["push", "-q", "origin", ":refs/heads/task/x"]);
+    set_every_step(&fx, "pending");
+    fx.fleet
+        .enqueue_outline(OutlineMutation::SetLifecycle { node_id: fx.node, state: "active".into() })
+        .unwrap();
+    fx.fleet.writer().flush().unwrap();
+    replace_checkout(&fx, &workspace);
+    set_every_step(&fx, "verified");
+    fx.fleet
+        .enqueue_outline(OutlineMutation::SetLifecycle { node_id: fx.node, state: "review".into() })
+        .unwrap();
+    fx.fleet.writer().flush().unwrap();
+    fx.fleet.reload_if_stale().unwrap();
+    let starts = fx.fleet.read(|c| tod_store::branch_starts::get(c, &fx.node.to_string(), "task/x")).unwrap();
+    assert!(starts.born.is_empty(), "{starts:?}");
+    let finding = crate::lost_work::reopen_if_lost(&fx.fleet, fx.node).unwrap();
+    assert!(matches!(finding, crate::lost_work::Finding::Unproven(_)), "{finding:?}");
+    assert_eq!(lifecycle::current_state(&fx.fleet, fx.node).unwrap(), "review");
+}

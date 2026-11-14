@@ -35,7 +35,20 @@ pub const CREATE_TABLE: &str = "
         recorded_at  INTEGER NOT NULL,
         replaced_sha TEXT,
         PRIMARY KEY (node_id, branch, repo)
+    );
+    CREATE TABLE IF NOT EXISTS node_worked (
+        node_id BLOB PRIMARY KEY NOT NULL REFERENCES nodes(id) ON DELETE CASCADE
     );";
+
+/// Remember, for good, that a plan step of `step_id`'s node has been past
+/// `ready` (so the node has worked). A reset of the steps does not undo it.
+pub fn mark_worked_for_step(conn: &Connection, step_id: &[u8]) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO node_worked (node_id) SELECT node_id FROM node_plan_steps WHERE id = ?1",
+        params![step_id],
+    )?;
+    Ok(())
+}
 
 /// Add `replaced_sha` to a table made before it existed.
 pub fn ensure_columns(conn: &Connection) -> Result<()> {
@@ -58,25 +71,35 @@ pub struct BranchStarts {
     pub replaced: BTreeMap<String, String>,
 }
 
-/// Whether the node has already worked: a plan step past `ready`, or an
-/// implementation conversation. Its checkout is then not provably its first,
-/// so a birth seen now says nothing about work that may have been merged and
-/// its branch deleted.
+/// Whether the node has already worked, judged from history that survives a
+/// reset of its plan steps (any one is enough): the sticky mark
+/// [`mark_worked_for_step`] leaves, a step past `ready` now or in a note's
+/// history, a verdict, a review finding, a gate/check/phase entry on its
+/// activity, a conversation that does the node's work (any protocol but plain
+/// outline chat or visual design), or a lifecycle state past `active`. Its
+/// checkout is then not provably its first, so a birth seen now says nothing
+/// about work that may have been merged and its branch deleted.
 fn has_worked(conn: &Connection, blob: &[u8]) -> Result<bool> {
-    let steps: i64 = conn.query_row(
+    let counts = [
+        "SELECT COUNT(*) FROM node_worked WHERE node_id = ?1",
         "SELECT COUNT(*) FROM node_plan_steps WHERE node_id = ?1 AND status NOT IN ('pending', 'ready')",
-        params![blob],
-        |row| row.get(0),
-    )?;
-    if steps > 0 {
-        return Ok(true);
+        "SELECT COUNT(*) FROM node_plan_step_notes n JOIN node_plan_steps s ON s.id = n.step_id
+           WHERE s.node_id = ?1 AND n.status NOT IN ('pending', 'ready')",
+        "SELECT COUNT(*) FROM obligation_verdicts WHERE node_id = ?1",
+        "SELECT COUNT(*) FROM review_findings WHERE node_id = ?1",
+        "SELECT COUNT(*) FROM node_timeline WHERE node_id = ?1 AND kind IN ('gate', 'checks', 'phase')",
+        "SELECT COUNT(*) FROM conversations WHERE (focus_node_id = ?1 OR focus_id = ?1)
+           AND protocol NOT IN ('outline', 'chat', 'visual_design')",
+        "SELECT COUNT(*) FROM node_lifecycle WHERE node_id = ?1 AND state NOT IN
+           ('proposed', 'design', 'planning', 'ready', 'active')",
+    ];
+    for sql in counts {
+        let n: i64 = conn.query_row(sql, params![blob], |row| row.get(0))?;
+        if n > 0 {
+            return Ok(true);
+        }
     }
-    let conversations: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM conversations WHERE focus_kind = 'node' AND focus_id = ?1 AND protocol = ?2",
-        params![blob, crate::conversation::ProtocolKind::Implementation.as_str()],
-        |row| row.get(0),
-    )?;
-    Ok(conversations > 0)
+    Ok(false)
 }
 
 /// Record `starts` (repository path to birth commit) for the node's `branch`.

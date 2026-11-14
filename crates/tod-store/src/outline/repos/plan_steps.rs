@@ -365,6 +365,9 @@ impl<'a> PlanStepRepo<'a> {
         if let Some(note) = note {
             self.record_note(id, status, note)?;
         }
+        if !matches!(status, STATUS_PENDING | STATUS_READY) {
+            crate::branch_starts::mark_worked_for_step(self.conn, &uuid_to_blob(id))?;
+        }
         if status == STATUS_IMPLEMENTED {
             // The code changed under whatever verification had confirmed. A
             // later phase's action (a backfill, a flag) changes no code.
