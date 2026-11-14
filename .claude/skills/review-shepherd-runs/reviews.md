@@ -1,9 +1,10 @@
-# shepherd-nodes reviews
+# Shepherd reviews
 
 ## Lessons from runs
 
-The shepherd adds here what it learned mid-run that the skill should have told
-it (it doesn't edit its own skill during a run). Each review folds these into
+The manager adds here what it, or a shepherd in its reply, learned mid-run
+that the skills should have told them (nobody edits a shepherd skill during a
+run). Older entries came from the single-session `shepherd-nodes` skill. Each review folds these into
 the skill and clears the ones it applied.
 
 (none yet)
