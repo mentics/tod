@@ -71,7 +71,11 @@ When every node you hold has a verdict and none is due:
 L wait --owner <owner> --batch <nodes_per_shepherd> --max-seconds 540
 ```
 
-One call blocks up to 9 minutes and costs almost nothing. Its JSON `reason`:
+One call blocks up to 9 minutes and costs almost nothing.
+Run it through Bash with `timeout: 600000`: the tool's default of 120 seconds
+kills the wait early, and you would come back as if it timed out.
+
+Its JSON `reason`:
 - `held_changed` / `held_recheck`: a node you hold changed or came due. Visit
   it.
 - `due_available`: a node no one holds is due (including nodes whose gap was

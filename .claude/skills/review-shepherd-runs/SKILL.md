@@ -2,7 +2,7 @@
 name: review-shepherd-runs
 description: Review past runs of the shepherd-manager skill (the manager's Claude Code transcript and its cli-shepherd and ui-shepherd subagents' transcripts, plus older shepherd-nodes runs). Analyze what the manager and each shepherd did (mistakes, self-corrections, wasted steps, unverified claims, idle time, churn, repeated errors) as well as where the user corrected them, and improve the shepherd skills and agents so the next run is more accurate, efficient and robust. Use when asked to review, learn from, audit or improve the shepherds, or to look at how past shepherd sessions went.
 user_invocable: true
-version: 2
+version: 3
 reviews_ok_from: 1
 ---
 
@@ -280,3 +280,5 @@ choose which to redo.
   counts; the "Running in parallel" lenses. Old `shepherd-nodes` runs had no
   shepherd subagents, so their v1 reviews still count (`reviews_ok_from`
   stays 1).
+- v3: `find_runs.py` also finds runs started with the Skill tool (asked in
+  words), not only by slash command.

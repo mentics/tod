@@ -17,7 +17,8 @@ For each request, decide:
   broken setup. Resolve what you can from the node (reset its environment,
   rerun), report the request itself as a gap (tod should have handled it, or
   never needed it), and once the fix is deployed answer it ("Fixed, try
-  again") so the node continues.
+  again") so the node continues. This is the one kind of request a shepherd
+  answers itself; say so in the node's verdict.
 - **Is the request unclear, or does it ask for something tod could have
   decided?** Requests must follow "Wording a request" in
   `crates/tod/media/context/stance/autonomous-session.md`. Report a gap

@@ -16,6 +16,9 @@ max_queue_delay_minutes = 15
 linger_minutes = 10
 # Node visits before a shepherd retires (its context budget).
 max_visits_per_shepherd = 40
+# Fixers and verifiers running at once. Each builds the workspace from cold
+# in its own worktree.
+max_fixers = 2
 
 # One UI shepherd drives the app over its control socket.
 ui_shepherd = true
@@ -45,5 +48,5 @@ model = "sonnet"
 effort = "medium"
 
 [verifier]
-model = "haiku"
-effort = "medium"
+model = "sonnet"
+effort = "low"
