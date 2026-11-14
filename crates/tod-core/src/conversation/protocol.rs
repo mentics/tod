@@ -105,26 +105,35 @@ pub fn cap_or_stall(turn: &TurnContext<'_>) -> Option<Next> {
     if turn.continuations >= CONTINUATION_CAP {
         return Some(Next::Done(Stop::ContinuationCap));
     }
-    // The first turn after a user message or a fresh start changing nothing
-    // is not a stall: the agent may have started a run in the background and
-    // ended its turn waiting on it. The driver sends it [`QUIET_TURN_NOTE`]
-    // with the protocol's own continuation; only a continuation that changes
-    // nothing stops the loop.
-    if !turn.progressed && turn.continuations > 0 {
+    if !turn.progressed {
         return Some(Next::Done(Stop::NoProgress));
     }
     None
 }
 
+/// How many turns in a row may change nothing the protocol tracks before the
+/// loop stops. Sized for a long run: an agent polling one across turns (each
+/// turn bounded by the tool's ~10 minute limit) gets about half an hour.
+pub const QUIET_TURN_LIMIT: u32 = 3;
+
+/// The driver's streak rule: given the quiet turns in a row before this one
+/// and whether this turn changed anything, returns the `progressed` value the
+/// protocol is told and the new streak. Any change resets the streak.
+pub fn quiet_streak_step(streak: u32, changed: bool) -> (bool, u32) {
+    (changed || streak < QUIET_TURN_LIMIT, if changed { 0 } else { streak + 1 })
+}
+
 /// Put ahead of a loop's continuation when the turn it follows changed
-/// nothing the protocol tracks (see [`cap_or_stall`]). Nothing is parsed from
-/// the reply: whatever the agent said, it is told to finish its wait in the
-/// turn and record the result.
+/// nothing the protocol tracks (see [`TurnContext::progressed`]). Nothing is
+/// parsed from the reply: whatever the agent said, it is told to finish its
+/// wait and record the result.
 pub const QUIET_TURN_NOTE: &str = "Your last turn ended without recording anything. If you were waiting on a run \
 you started (a test suite, a build, a workflow, anything in the background), do not end a turn while you wait: \
 wait for it inside this turn (run it in the foreground, or poll it until it finishes), then record the results \
-with `tod-cli`. Nothing continues on its own after you stop; a turn that ends while waiting hands the work back \
-unfinished.\n\n";
+with `tod-cli`. If the run outlasts one tool call (about ten minutes), keep polling it with further calls, and \
+if it still runs when your turn must end, say so and poll again in the next turn. Do not count on being woken \
+when it finishes: you get another turn only when the app sends one, and a few turns in a row that record nothing \
+hand the work back unfinished.\n\n";
 
 /// Something the user should hear about when a run ends.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,9 +150,12 @@ pub struct TurnContext<'a> {
     pub report: Option<&'a Value>,
     /// Continuations already sent for the user message being answered.
     pub continuations: u32,
-    /// Whether [`Protocol::progress`] changed over this turn (true when the
-    /// protocol does not track progress). A quiet first turn is not a stall:
-    /// see [`cap_or_stall`].
+    /// False when the loop is stalled: [`Protocol::progress`] did not change
+    /// over this turn *and* [`QUIET_TURN_LIMIT`] quiet turns in a row have
+    /// been used up. Quiet turns within that allowance (an agent waiting on a
+    /// run it started) count as progress; the driver sends them
+    /// [`QUIET_TURN_NOTE`]. The driver counts the streak, reset by any turn
+    /// that changed something and by a user message.
     pub progressed: bool,
 }
 
@@ -576,5 +588,29 @@ mod tests {
         assert!(super::super::verify::VerificationProtocol.loops());
         assert!(super::super::review::ReviewProtocol.loops());
         assert!(super::super::fix::FixProtocol.loops());
+    }
+}
+
+#[cfg(test)]
+mod quiet_streak_tests {
+    use super::*;
+
+    /// ENG-3129: progress, then a turn that only waits, then more waiting:
+    /// the waits are allowed up to the limit, and progress starts it over.
+    #[test]
+    fn quiet_turns_after_progress_continue_until_the_limit_and_progress_resets() {
+        let mut streak = 0;
+        let mut turn = |changed: bool| {
+            let (ok, next) = quiet_streak_step(streak, changed);
+            streak = next;
+            ok
+        };
+        assert!(turn(true));
+        for _ in 0..QUIET_TURN_LIMIT {
+            assert!(turn(false), "a quiet turn within the allowance continues");
+        }
+        assert!(!turn(false), "one more quiet turn in a row stops");
+        assert!(turn(true));
+        assert!(turn(false), "progress reset the streak");
     }
 }

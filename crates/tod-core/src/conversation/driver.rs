@@ -164,6 +164,8 @@ pub struct ConversationDriver {
     protocol: &'static dyn Protocol,
     /// Turns sent without the user since the last user message.
     continuations: u32,
+    /// Consecutive turns that changed nothing the protocol tracks.
+    quiet_streak: u32,
     /// The protocol's progress fingerprint before the turn in flight started.
     progress_before: Option<String>,
     /// `None` until the first send creates the row.
@@ -202,6 +204,7 @@ impl ConversationDriver {
             focus,
             protocol: protocol_for(protocol),
             continuations: 0,
+            quiet_streak: 0,
             progress_before: None,
             conversation_id: None,
             skill_group: 0,
@@ -519,6 +522,7 @@ impl ConversationDriver {
         )?;
         // A user message ends whatever loop the previous one started.
         self.continuations = 0;
+        self.quiet_streak = 0;
 
         let live = agent.with(|a| a.session_id(&key).is_some());
         let resumable = live || conversation.agent_session_id.is_some();
@@ -878,6 +882,7 @@ impl ConversationDriver {
             events.push(ConversationEvent::Notice(notice));
         }
         let report = fleet.read(|conn| ConversationRepo::new(conn).report_since(id, turn_seq))?;
+        let mut new_streak = self.quiet_streak;
         let mut quiet_turn = false;
         let next = {
             let env = self.env(fleet, id);
@@ -897,13 +902,18 @@ impl ConversationDriver {
                 _ => true,
             };
             quiet_turn = !progressed;
+            // A quiet turn within the allowance is not a stall (an agent
+            // waiting on a run it started); see `TurnContext::progressed`.
+            let (allowed, streak) = super::protocol::quiet_streak_step(self.quiet_streak, progressed);
+            new_streak = streak;
             self.protocol.next(&TurnContext {
                 env: &env,
                 report: report.as_ref(),
                 continuations: self.continuations,
-                progressed,
+                progressed: allowed,
             })?
         };
+        self.quiet_streak = new_streak;
         let decision = match &next {
             Next::Done(stop) => Decision::Stop {
                 stop: match stop {
@@ -933,6 +943,7 @@ impl ConversationDriver {
         match next {
             Next::Done(_) => {
                 self.continuations = 0;
+                self.quiet_streak = 0;
                 for notice in self.protocol.finish(&self.env(fleet, id)) {
                     events.push(ConversationEvent::Notice(notice));
                 }

@@ -827,14 +827,15 @@ mod tests {
         assert!(matches!(decide(&fx, false, 1, false), Next::Done(Stop::NoProgress)));
     }
 
-    /// ENG-3129: the agent started a long run, ended its first turn saying it
-    /// was waiting, and the loop stopped as "no progress" with nothing
-    /// recorded. A quiet first turn continues; a quiet continuation stops.
+    /// ENG-3129: the driver passes `progressed` true for a quiet turn within
+    /// `QUIET_TURN_LIMIT`, so the loop continues; once the allowance is used
+    /// up it passes false and the loop stops, mid-loop or not.
     #[test]
-    fn a_first_turn_that_only_waited_continues_and_a_second_one_stops() {
+    fn a_quiet_turn_after_progress_continues_and_an_exhausted_allowance_stops() {
         let fx = planned(&[STATUS_IMPLEMENTED]);
-        assert!(matches!(decide(&fx, false, 0, false), Next::Continue { .. }));
-        assert!(matches!(decide(&fx, false, 1, false), Next::Done(Stop::NoProgress)));
+        assert!(matches!(decide(&fx, false, 1, true), Next::Continue { .. }));
+        assert!(matches!(decide(&fx, false, 2, true), Next::Continue { .. }));
+        assert!(matches!(decide(&fx, false, 2, false), Next::Done(Stop::NoProgress)));
     }
 
     /// A step of a later phase (`merged`) is not owed by verification.
