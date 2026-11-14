@@ -65,7 +65,7 @@ the node's runner runs:
 | `stop-now` | Stop now | Cancels the turn in flight and stops. |
 | `check-now` | Check now | Checks the phase's gate with no agent; moves the node on when it is clear; starts the phase agent when only its work is left. A failing gate or an unreadable GitHub is the result, printed as the check's finding (`failed` in JSON), not an error. |
 | `rerun-phase` | Rerun this phase | A new stay in the current state, then the run starts in a new session. |
-| `migrate` | Migrate to... | Moves the node's files to the location `--to` names (a name or an id; `menu` lists them). Its sessions are kept, its current files are removed with each branch pushed first, nothing is started. |
+| `migrate` | Migrate to... | Moves the node's files to the location `--to` names (a name or an id; `menu` lists them, without the one the node is already in, which is refused as "already in <location>"). Its sessions are kept, its current files are removed with each branch pushed first, nothing is started. |
 | `reset-environment` | Reset environment | Sets the node's environment up again, deleting nothing. |
 | `update-workspace` | Update workspace to latest main | Brings the node's checkout up to the latest main, or says why it left it alone. |
 | `delete-sandbox` | Delete sandbox | Deletes the node's cloud sandbox after a checkpoint of its uncommitted work. |
@@ -122,6 +122,9 @@ gives free text, and at least one is required. What the panel does, this does:
 - A node that runs in a cloud sandbox is woken after the answer, replacing a sandbox
   that expired. A failure to wake it is printed to stderr; the answer stays recorded.
 - The plan steps the question held up open again.
+- A request that was already answered takes the new answer as a change of mind, as the
+  panel's Change does (the log keeps both answers, who gave each; the result says what it
+  replaced). A withdrawn request is refused.
 
 The in-app conversation that asked is not sent a message (the app delivers that); the
 answer reaches the agent's next turn, in the node's answered questions.

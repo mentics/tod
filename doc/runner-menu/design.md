@@ -250,7 +250,10 @@ supervisor is not woken.
 
 ### Migrate to…
 
-A submenu listing every location (`files_places`), the current one marked.
+A submenu listing every location (`files_places`), the current one marked and
+not pickable: migrating to where the node already is would only remove its
+files, so `runner_menu::RunnerFacts::check_migration_target` refuses it for
+every caller (`tod-cli runner migrate` says "already in location").
 **Only for a node with no children:** the operation itself (in the store,
 shared by the panel, the task editor, and any `tod-cli` path) refuses a node
 with children with "You cannot migrate a node that has children.", and the

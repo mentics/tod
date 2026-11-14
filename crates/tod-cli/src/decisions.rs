@@ -132,7 +132,8 @@ fn answer(inv: &Invocation, args: &Args, env: crate::operator::Env) -> anyhow::R
         return Ok(serde_json::to_string(&done)?);
     }
     let moved = done.moved_to.as_ref().map(|to| format!(", the task was sent back to {to}")).unwrap_or_default();
-    Ok(format!("ok {} answered {}{moved}", short_id(done.decision), done.answered))
+    let changed = done.changed_from.as_ref().map(|prev| format!(" (it was already answered {prev}; this changed the answer)")).unwrap_or_default();
+    Ok(format!("ok {} answered {}{moved}{changed}", short_id(done.decision), done.answered))
 }
 
 /// File a `broken` decision for the node this invocation runs for, so a

@@ -205,6 +205,26 @@ pub fn menu(inputs: &RunnerInputs) -> RunnerActions {
     }
 }
 
+impl RunnerFacts {
+    /// The locations "Migrate to…" can take the node to: every location but
+    /// the one it is already in (the app's submenu shows that one marked and
+    /// disabled; `tod-cli runner menu` leaves it out).
+    pub fn migration_targets(&self) -> Vec<&tod_store::fleet::FilesPlace> {
+        self.locations.iter().filter(|p| Some(p.id.as_str()) != self.current_location.as_deref()).collect()
+    }
+
+    /// Refuses a migration to the location the node is already in, saying so.
+    pub fn check_migration_target(&self, place: &tod_store::fleet::FilesPlace) -> anyhow::Result<()> {
+        if Some(place.id.as_str()) == self.current_location.as_deref() {
+            anyhow::bail!(
+                "the node is already in location `{}`: migrating there would only remove its files and start nothing",
+                place.name
+            );
+        }
+        Ok(())
+    }
+}
+
 /// What `load_runner` reads: the store half of [`RunnerLine`].
 #[derive(Debug, Default, Clone)]
 pub struct RunnerFacts {
@@ -328,7 +348,23 @@ pub fn derive_run_state(f: &RunFacts) -> RunState {
     match f.outcome {
         Some(Outcome::BudgetExhausted { .. }) => return RunState::Ended(EndedHow::Budget),
         Some(Outcome::Stopped { .. }) => return RunState::Ended(EndedHow::Stopped),
-        Some(Outcome::NeedsHuman { .. }) => return RunState::Ended(EndedHow::Request),
+        // A stop for a request is stale once none is left (the run continues
+        // by itself: `next_actor::outcome_reason`), so it says "for a
+        // request" only while who-is-next still shows one.
+        Some(Outcome::NeedsHuman { reason }) => {
+            let still_asking = !reason.is_request()
+                || !matches!(
+                    f.actor,
+                    Some(NextActor::You { .. }) | Some(NextActor::Others { .. }) | Some(NextActor::Working { .. })
+                )
+                || matches!(
+                    f.actor,
+                    Some(NextActor::You { why: YouReason::Request { .. } | YouReason::Permission { .. }, .. })
+                );
+            if still_asking {
+                return RunState::Ended(EndedHow::Request);
+            }
+        }
         Some(Outcome::Waiting { .. }) => return RunState::Ended(EndedHow::Waiting),
         Some(Outcome::Done) | None => {}
     }
@@ -646,5 +682,43 @@ mod tests {
             "Delete sandbox without a checkpoint"
         );
         assert_eq!(ResumeFreshBudget.label(), "Resume with a fresh budget");
+    }
+    fn place(id: &str, name: &str) -> tod_store::fleet::FilesPlace {
+        tod_store::fleet::FilesPlace { id: id.into(), name: name.into(), ..Default::default() }
+    }
+
+    #[test]
+    fn migrating_to_the_location_the_node_is_in_is_not_offered_and_is_refused() {
+        let facts = RunnerFacts {
+            locations: vec![place("a", "Here"), place("b", "There")],
+            current_location: Some("a".into()),
+            ..Default::default()
+        };
+        let names: Vec<&str> = facts.migration_targets().iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["There"]);
+        let err = facts.check_migration_target(&facts.locations[0]).unwrap_err().to_string();
+        assert!(err.contains("already in location `Here`"), "{err}");
+        facts.check_migration_target(&facts.locations[1]).unwrap();
+    }
+
+    #[test]
+    fn a_stop_for_a_request_is_stale_once_who_is_next_shows_none() {
+        use crate::autopilot::NeedsHuman;
+        let outcome = Outcome::NeedsHuman { reason: NeedsHuman::Decision { pending: 1 } };
+        let run = |actor: &NextActor| {
+            derive_run_state(&RunFacts {
+                done: false,
+                supervised: false,
+                runner_running: false,
+                pausing: false,
+                hand_turn: false,
+                outcome: Some(&outcome),
+                actor: Some(actor),
+                pause_asked: false,
+            })
+        };
+        let you = |why| NextActor::You { why, since: 1 };
+        assert_eq!(run(&you(YouReason::Request { count: 1 })), RunState::Ended(EndedHow::Request));
+        assert_eq!(run(&you(YouReason::NotStarted)), RunState::NeverRun);
     }
 }

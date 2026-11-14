@@ -401,7 +401,7 @@ pub fn menu_for(ctx: &Ctx, node: Uuid) -> Result<MenuReport> {
         default: g.actions.default.map(MenuEntry::of),
         entries: g.actions.menu.iter().copied().map(MenuEntry::of).collect(),
         locations: if g.actions.menu.contains(&RunnerAction::MigrateTo) {
-            g.facts.locations.iter().map(|p| p.name.clone()).collect()
+            g.facts.migration_targets().into_iter().map(|p| p.name.clone()).collect()
         } else {
             Vec::new()
         },
@@ -653,6 +653,7 @@ fn migrate(ctx: &Ctx, node: Uuid, g: &Gathered, opts: &Options, progress: &mut d
     }
     let wanted = opts.location.as_deref().context("migrate needs --to <LOCATION> (by name or id)")?;
     let place = find_place(&g.facts.locations, wanted)?;
+    g.facts.check_migration_target(place)?;
     let id = node.to_string();
     let paths = tod_store::TodPaths::at(ctx.root);
     let settings = tod_store::TodSettings::load(&paths).context("read the settings")?;
@@ -711,6 +712,9 @@ pub struct Answer {
     pub answered: String,
     /// What the answer also did to the node, when it sent it back.
     pub moved_to: Option<String>,
+    /// The request was already answered: its earlier answer, now replaced
+    /// (the task panel's "Change" does the same; the log keeps both).
+    pub changed_from: Option<String>,
     /// A problem waking the node's supervisor after the answer was recorded.
     pub wake_problem: Option<String>,
 }
@@ -757,11 +761,15 @@ pub fn answer(
     let option_index = option.map(|o| o as i64);
     let answered = crate::lifecycle::answer::describe_answer(&after.decision, option_index, text.as_deref());
     let moved_to = option_index.and_then(|o| before.decision.move_for(o)).map(str::to_string);
+    let changed_from = before
+        .answers
+        .last()
+        .map(|prev| crate::lifecycle::answer::describe_answer(&before.decision, prev.option, prev.text.as_deref()));
     let detail = format!("{}: {answered}", after.decision.question.lines().next().unwrap_or(""));
     record_note(ctx.fleet, node, &phase, title, false, detail)
         .map_err(|err| err.context("the answer was recorded, but who gave it was not"))?;
     let wake_problem = cloud_sync::wake_after_answer(ctx.fleet, ctx.root, &node.to_string()).err().map(|e| format!("{e:#}"));
-    Ok(Answer { decision: decision_id, node, answered, moved_to, wake_problem })
+    Ok(Answer { decision: decision_id, node, answered, moved_to, changed_from, wake_problem })
 }
 
 #[cfg(test)]

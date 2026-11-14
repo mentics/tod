@@ -316,6 +316,17 @@ fn an_answer_is_recorded_as_the_shepherd_or_the_operator() {
 }
 
 #[test]
+fn answering_an_answered_request_is_a_reported_change_not_a_second_first_answer() {
+    let fx = fixture();
+    let a = ask_two_options(&fx, vec![]);
+    let first = answer(&ctx(&fx, None), a, Some(1), None, &Who::Operator).unwrap();
+    assert_eq!(first.changed_from, None);
+    let second = answer(&ctx(&fx, None), a, Some(2), None, &Who::Shepherd("s1".into())).unwrap();
+    assert_eq!(second.changed_from.as_deref(), Some("\"Left\""));
+    assert_eq!(answer_actors(&fx, a), [ACTOR_USER, "shepherd:s1"]);
+}
+
+#[test]
 fn an_answer_that_moves_the_node_back_moves_it() {
     let fx = fixture();
     crate::lifecycle::set_lifecycle(&fx.fleet, fx.node, "review").unwrap();
