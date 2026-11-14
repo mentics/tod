@@ -164,6 +164,13 @@ source). The handshake returns `{ stamp, protocol }`.
 | daemon older | ask it to **drain and restart** with the new copy |
 | daemon newer | do **not** restart it (two builds would fight over one daemon); tell the user to update |
 
+`tod-cli` and the runner menu (`tod_core::direct_store`) never work through a
+daemon of a different build, in either direction: they refuse with an error
+that names both stamps and which binary to rebuild, instead of running stale
+commands or falling through to the bare lock error. A refused open also says
+why no daemon answered (`client::probe`: no info file, nothing listening, a
+listener that does not answer the hello, a stale file).
+
 **Drain.** Every run is stopped at its next boundary, the same as Pause
 (`LocalRun::pause`): never mid-write, and a turn in flight is allowed to end.
 Runs whose desired state is "run" are started again by the new daemon, so

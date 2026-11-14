@@ -253,12 +253,14 @@ impl Session {
         // which fails with "data root is not configured" in `tod-cli` unless it
         // is pinned here.
         tod_store::paths::set_data_root(root.to_path_buf());
-        let running = daemon_client::connect(&DaemonPaths::new(root)).is_some();
-        let fleet = if running {
-            tod_agentd_client::remote::open_store(root, None)
-                .with_context(|| format!("open the store through tod-agentd for {}", root.display()))?
-        } else {
-            crate::direct_store::open(root, false)?
+        let daemon_paths = DaemonPaths::new(root);
+        let (fleet, running) = match daemon_client::probe(&daemon_paths) {
+            // Explained like every other open: a daemon of another build, or
+            // one that answers the hello but not the store, names itself.
+            Ok(connection) => (crate::direct_store::through_daemon(root, connection)?, true),
+            // Nothing answers: open directly, which retries and, if the lock
+            // is held, says why the daemon could not be reached.
+            Err(_) => (crate::direct_store::open(root, false)?, false),
         };
         Ok(Self { fleet, root: root.to_path_buf(), daemon: running.then(|| AgentDaemon::new(root)) })
     }

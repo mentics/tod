@@ -115,44 +115,104 @@ impl Connection {
     }
 }
 
-/// Connect to the daemon the info file names, if one answers. A file left by
-/// a daemon that died is not an answer.
-pub fn connect(paths: &Paths) -> Option<Connection> {
-    let info = Info::read(paths)?;
-    let addr = SocketAddr::from(([127, 0, 0, 1], info.port));
-    let stream = TcpStream::connect_timeout(&addr, Duration::from_millis(1000)).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(120))).ok()?;
+/// Why no daemon answered for a data root.
+#[derive(Debug)]
+pub enum Unreachable {
+    NoInfo { path: PathBuf, err: String },
+    BadInfo { path: PathBuf, err: String },
+    NoListener { path: PathBuf, port: u16, err: String },
+    /// Something accepted the connection, but the hello got no usable reply
+    /// (a different wire format, or not tod-agentd at all).
+    HelloFailed { port: u16, err: String },
+    /// The hello was answered with an identity other than the info file's:
+    /// the file is stale and the port belongs to another process.
+    WrongIdentity { path: PathBuf, port: u16 },
+}
+
+impl std::fmt::Display for Unreachable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoInfo { path, err } => write!(f, "there is no readable {} ({err})", path.display()),
+            Self::BadInfo { path, err } => write!(
+                f,
+                "{} is not in the format this build reads ({err}): the daemon is from another version",
+                path.display()
+            ),
+            Self::NoListener { path, port, err } => {
+                write!(f, "nothing accepts connections on port {port} named by {} ({err})", path.display())
+            }
+            Self::HelloFailed { port, err } => write!(
+                f,
+                "the process on port {port} accepted the connection but did not answer the hello ({err}): \
+                 it speaks another version of the protocol, or is not tod-agentd"
+            ),
+            Self::WrongIdentity { path, port } => write!(
+                f,
+                "the process on port {port} answered the hello with an identity other than the one {} records: \
+                 the file is stale and the port belongs to another process",
+                path.display()
+            ),
+        }
+    }
+}
+
+/// Connect to the daemon the info file names, if one answers, and say why not
+/// when none does. A file left by a daemon that died is not an answer.
+pub fn probe(paths: &Paths) -> std::result::Result<Connection, Unreachable> {
+    let path = paths.info();
+    let bytes = std::fs::read(&path).map_err(|e| Unreachable::NoInfo { path: path.clone(), err: e.to_string() })?;
+    let info: Info =
+        serde_json::from_slice(&bytes).map_err(|e| Unreachable::BadInfo { path: path.clone(), err: e.to_string() })?;
+    let port = info.port;
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let hello_failed = |err: String| Unreachable::HelloFailed { port, err };
+    let stream = TcpStream::connect_timeout(&addr, Duration::from_millis(1000))
+        .map_err(|e| Unreachable::NoListener { path: path.clone(), port, err: e.to_string() })?;
+    stream.set_read_timeout(Some(Duration::from_secs(120))).map_err(|e| hello_failed(e.to_string()))?;
     let _ = stream.set_nodelay(true);
-    let writer = stream.try_clone().ok()?;
+    let writer = stream.try_clone().map_err(|e| hello_failed(e.to_string()))?;
     let mut connection = Connection { info: info.clone(), reader: BufReader::new(stream), writer };
-    let hello = connection.request(Command::Hello).ok()?;
+    let hello = connection.request(Command::Hello).map_err(|e| hello_failed(format!("{e:#}")))?;
     // The file and the process must agree, or the file is stale and the port
     // belongs to something else.
-    (hello.info.as_ref() == Some(&info)).then_some(connection)
+    if hello.info.as_ref() == Some(&info) { Ok(connection) } else { Err(Unreachable::WrongIdentity { path, port }) }
+}
+
+/// [`probe`] without the reason.
+pub fn connect(paths: &Paths) -> Option<Connection> {
+    probe(paths).ok()
 }
 
 /// Why [`connect`] gets no answer for `paths`, in words for the person who
-/// has to act on it. Only for an error message: it repeats the checks.
+/// has to act on it. Only for an error message: it repeats the check, hello
+/// included.
 pub fn why_unreachable(paths: &Paths) -> String {
-    let info_path = paths.info();
-    let bytes = match std::fs::read(&info_path) {
-        Ok(bytes) => bytes,
-        Err(err) => return format!("there is no readable {} ({err})", info_path.display()),
-    };
-    let info: Info = match serde_json::from_slice(&bytes) {
-        Ok(info) => info,
-        Err(err) => {
-            return format!("{} is not in the format this build reads ({err}): the daemon is from another version", info_path.display());
-        }
-    };
-    let addr = SocketAddr::from(([127, 0, 0, 1], info.port));
-    let stream = match TcpStream::connect_timeout(&addr, Duration::from_millis(1000)) {
-        Ok(stream) => stream,
-        Err(err) => return format!("nothing accepts connections on port {} named by {} ({err})", info.port, info_path.display()),
-    };
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-    drop(stream);
-    format!("the process on port {} did not answer the hello with the identity {} records", info.port, info_path.display())
+    match probe(paths) {
+        Ok(_) => "it answers now (it was busy or starting a moment ago)".to_string(),
+        Err(why) => why.to_string(),
+    }
+}
+
+/// What a caller built from `caller`'s source must do about a daemon it
+/// reached, or `None` when both are the same build. A program never works
+/// through a daemon of a different build (the commands it knows may not be the
+/// ones the daemon serves), the same rule a conversation applies to `tod-cli`
+/// (`tod_core::CLI_BUILD_STAMP`); and never replaces one silently.
+pub fn build_mismatch(daemon: &Info, caller: &Identity) -> Option<String> {
+    match compare(daemon, caller) {
+        Comparison::Same => None,
+        Comparison::Newer => Some(format!(
+            "this program (build {}) is older than the running tod-agentd (build {}): rebuild or reinstall \
+             this program (`cargo build -p tod-cli` for tod-cli) so it matches the daemon",
+            caller.stamp, daemon.stamp
+        )),
+        Comparison::Older => Some(format!(
+            "the running tod-agentd (pid {}, build {}) is older than this program (build {}): rebuild it \
+             (`cargo build -p tod` builds tod-agentd beside tod) and restart it (start the app, or quit the daemon \
+             and run any tod-cli command)",
+            daemon.pid, daemon.stamp, caller.stamp
+        )),
+    }
 }
 
 /// What [`ensure_running`] found or did.
