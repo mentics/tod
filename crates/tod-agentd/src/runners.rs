@@ -254,8 +254,26 @@ impl Runners {
                     }
                 }
                 Some(outcome) => {
-                    self.inner.slots.lock().expect("runner slots").entry(node).or_default().outcome =
-                        Some(outcome);
+                    // A run that ended `Done` for a node that is no longer
+                    // `done` (moved back or reopened while the daemon was
+                    // down) is desired to run: `desired` is only in memory, so
+                    // left `Unset` the reconciler would clear the stale
+                    // outcome and never start the node.
+                    let reopened = matches!(outcome, Outcome::Done)
+                        && match tod_core::lifecycle::current_state(&self.inner.store, node) {
+                            Ok(state) => state != "done",
+                            Err(err) => {
+                                tracing::error!(%node, "could not read the lifecycle state of a node whose saved run is done, so it is not started: {err:#}");
+                                false
+                            }
+                        };
+                    let mut slots = self.inner.slots.lock().expect("runner slots");
+                    let slot = slots.entry(node).or_default();
+                    slot.outcome = Some(outcome);
+                    if reopened {
+                        tracing::info!(%node, "the saved run is done but the node is not; it is desired to run");
+                        slot.desired = Desired::Run;
+                    }
                 }
             }
         }
@@ -1005,6 +1023,30 @@ mod tests {
         let err = fx.runners.reconcile().unwrap_err();
         assert!(format!("{err:#}").contains("Media bundle"), "{err:#}");
         assert!(matches!(standing_of(&fx).actor, NextActor::You { why: YouReason::Failed { .. }, .. }));
+    }
+
+    #[test]
+    fn a_saved_done_run_on_a_node_that_is_not_done_is_started_after_a_restart() {
+        let fx = fixture();
+        AutopilotState { outcome: Some(Outcome::Done), ..AutopilotState::fresh() }.save(&fx.root, fx.node).unwrap();
+        fx.runners.resume_saved();
+        // The reconciler (not a hand-set `desired`) clears the stale word and
+        // starts the run, which fails here for want of media, and says so.
+        let err = fx.runners.reconcile().unwrap_err();
+        assert!(format!("{err:#}").contains("Media bundle"), "{err:#}");
+        assert!(matches!(standing_of(&fx).actor, NextActor::You { why: YouReason::Failed { .. }, .. }));
+    }
+
+    #[test]
+    fn a_saved_done_run_on_a_done_node_is_not_started_after_a_restart() {
+        let fx = fixture();
+        tod_core::lifecycle::set_lifecycle(&fx.runners.inner.store, fx.node, "done").unwrap();
+        AutopilotState { outcome: Some(Outcome::Done), ..AutopilotState::fresh() }.save(&fx.root, fx.node).unwrap();
+        fx.runners.resume_saved();
+        fx.runners.reconcile().unwrap();
+        let slots = fx.runners.inner.slots.lock().unwrap();
+        assert!(matches!(slots[&fx.node].outcome, Some(Outcome::Done)));
+        assert_eq!(slots[&fx.node].desired, Desired::Unset);
     }
 
     #[test]
