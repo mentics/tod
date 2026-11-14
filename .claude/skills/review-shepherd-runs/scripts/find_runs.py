@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """List Claude Code transcripts that invoked a skill (default: shepherd-manager;
-pass `shepherd-nodes` for runs of the old single-session skill).
+pass `shepherd-nodes` for runs of the old single-session skill), by slash
+command or by the model's Skill tool.
 
 Usage: python3 -I find_runs.py [skill-name] [--ledger <reviews.md>]
        python3 -I find_runs.py [skill-name] --ledger <reviews.md> --mark <transcript> "<title>"
@@ -71,6 +72,18 @@ for d in os.listdir(root):
                     if ts:
                         first = first or ts
                         last = ts
+                if '"name":"Skill"' in line and f'"skill":"{skill}"' in line and '"type":"assistant"' in line:
+                    # the model invoked it with the Skill tool (asked in words, not by slash command)
+                    try:
+                        o = json.loads(line)
+                    except json.JSONDecodeError:
+                        o = {}
+                    if not o.get("isSidechain"):
+                        for c in o.get("message", {}).get("content") or []:
+                            if isinstance(c, dict) and c.get("type") == "tool_use" and c.get("name") == "Skill" \
+                                    and (c.get("input") or {}).get("skill") == skill:
+                                invocations.append((ts, str((c.get("input") or {}).get("args") or "").strip()[:120]))
+                    continue
                 if marker in line and '"type":"user"' in line:
                     try:
                         o = json.loads(line)

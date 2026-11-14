@@ -111,7 +111,9 @@ shepherd that reported it.
 
 - **One fixer per gap**, however many nodes reported it: a subagent (config
   `fixer`, Sonnet medium by default) with `isolation: "worktree"`, then
-  `L gap set <id> --status fixing`. Several run in parallel, one per independent gap.
+  `L gap set <id> --status fixing`. At most `max_fixers` fixers and verifiers
+  run at once (each worktree builds the workspace from cold); a gap past that
+  waits `open` for the next free slot.
   The brief gives:
   - the symptom, with every node, ids and evidence from the gap's reports;
   - what the shepherds already ruled out;
@@ -132,10 +134,10 @@ shepherd that reported it.
 - You don't verify fixes yourself and never report a fixer's test results as
   checked. When a fixer reports, confirm its commit is on `origin/main`
   (`L gap set <id> --status fixing --commit <sha> --note "verifying"`) and start its verifier at once: a
-  subagent (config `verifier`, Haiku medium by default) given the symptom,
-  not the fixer's conclusion. It checks the diff addresses the cause and
-  covers every path, and runs the regression test and scoped tests on
-  `origin/main`. It passes (`L gap set <id> --status verified`) or goes back to a
+  subagent (config `verifier`, Sonnet low by default) with `isolation:
+  "worktree"`, given the symptom, not the fixer's conclusion. It checks out
+  `origin/main`, checks the diff addresses the cause and covers every path,
+  and runs the regression test and scoped tests there. It passes (`L gap set <id> --status verified`) or goes back to a
   fixer.
 - A change to another repository goes on a branch and waits for the user's
   OK to push and open a PR.
@@ -153,11 +155,19 @@ or the oldest verified fix has waited 30. Deploy only verified commits; if
 you must deploy one without a pass, say so in your report.
 
 1. **Drain**: `L signal pause --all`. Each shepherd stops at its next action
-   boundary and acknowledges; wait until `L signal status` reports
-   `all_paused` (`awaiting_pause` names who hasn't) (a shepherd that never acknowledges within ~10 minutes is dead:
-   release its nodes and `L signal retire --owner <id>`).
+   boundary and acknowledges. Wait with the manager wait ("Keep going",
+   `--max-seconds 600`): it returns `all_paused` once every running shepherd
+   has. On `timeout`, `L signal status` (`awaiting_pause` names who hasn't):
+   such a shepherd is dead; release its nodes and `L signal retire --owner <id>`.
 2. Save a survey: `survey.py <root> <the items in L scope list> --save <state dir>/pre-deploy.json`.
-3. From a checkout current with `origin/main`:
+3. From the repository's **main checkout** (the first entry of `git worktree
+   list`; the live app runs from its `target/dev-fast/`), never a worktree,
+   whose build is cold and is deleted with it. Note `L status`'s `version`,
+   then `git pull --ff-only origin main` there; refuse to deploy if it has
+   local changes or cannot fast-forward, and tell the user. If `version`
+   changed with the pull (another session changed the shepherd files), the
+   running shepherds are on the old files: retire them after the deploy (see
+   below).
    1. `scripts/build.sh --data-root <root>`: builds the host binaries
       (dev-fast) and the Linux sandbox binaries, each only if stale, and
       reports whether the orchestrator and the watchdog are out of date.
@@ -197,7 +207,7 @@ you must deploy one without a pass, say so in your report.
 Running shepherds carry on after a deploy; their context is still good, since
 the change was in tod. **Retire and relaunch only when the shepherds
 themselves changed** (a shepherd skill, a shared file, or an agent
-definition): `L signal retire --all`, then sync (verdicts from the old
+definition, including through the pull in step 3): `L signal retire --all`, then sync (verdicts from the old
 version become due) and dispatch fresh shepherds, each filled to a full batch
 from due nodes.
 
@@ -218,14 +228,32 @@ your next sync; mention them in your next report.
 
 ## Keep going
 
-Never end your turn while a node in scope is not finished without something
-to bring you back: a shepherd or fixer running in the background (its return
-wakes you), or `ScheduleWakeup` set to the next due time from the ledger
-(at least 5 minutes, at most an hour; an hour while every node is parked).
-Don't poll tightly.
+Shepherds don't return when they report a gap; only the ledger shows it. So
+never end your turn while a node in scope is not finished without the
+**manager wait** running in the background (Bash, `run_in_background: true`;
+its exit wakes you):
+
+```bash
+L manager-wait --min-batch <min_batch> --queue-delay-minutes <max_queue_delay_minutes> --max-parallel <max_parallel>
+```
+
+Exactly one at a time: start the next only after the last one exited (keep
+its task id in `state.md`). It syncs every 15 seconds and exits with JSON
+`reason`:
+- `new_gap`: start its fixer ("Gaps and fixes");
+- `unclaimed_due`: due nodes the running shepherds have no room for, and a
+  slot is free: dispatch;
+- `owner_stale`: a shepherd stopped heartbeating; release its nodes and
+  `L signal retire --owner <id>`;
+- `all_paused`: the drain is done; deploy;
+- `all_finished`: every node in scope is done or held; report;
+- `timeout` (50 minutes): sync, check deploy timing, wait again.
+
+A shepherd's or fixer's return wakes you too; handle it, then start a new
+wait if none is running. Never `sleep` or poll in the foreground.
 
 Keep `.local/agent/scratchpad/shepherd/state.md` for what the ledger doesn't
-hold: fixer and verifier agent ids, commits not yet deployed, briefs given to
+hold: the manager wait's task id, fixer and verifier agent ids, commits not yet deployed, briefs given to
 the user. Read it and `L owners` first after a compaction.
 
 ## Lessons for the skills

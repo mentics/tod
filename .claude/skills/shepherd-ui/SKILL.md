@@ -118,6 +118,9 @@ The same as a CLI shepherd:
 L wait --owner <owner> --batch <nodes_per_shepherd> --max-seconds 540
 ```
 
+Run it through Bash with `timeout: 600000`: the tool's default of 120 seconds
+kills the wait early, and you would come back as if it timed out.
+
 Handle its `reason` as a CLI shepherd does (`held_changed`, `held_recheck`,
 `due_available` → `L next`, `signal` → `L gate`, `timeout`). After a deploy's
 pause ends, run `mode` and `tree` before anything else, since the app was

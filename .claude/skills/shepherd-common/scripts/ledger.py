@@ -621,6 +621,58 @@ def cmd_wait(a, conn, tod):
         time.sleep(max(0.0, min(a.poll_seconds, deadline - time.monotonic())))
 
 
+def running_owners(conn, t, stale_seconds):
+    """Owners that have not retired and whose heartbeat is fresh."""
+    return [r for r in conn.execute("SELECT * FROM owners").fetchall()
+            if r["ack"] != "retired" and t - (r["last_heartbeat"] or 0) <= stale_seconds]
+
+
+def cmd_manager_wait(a, conn, tod):
+    """The manager's wait: block until something needs it, then say what.
+    Run in the background; one at a time."""
+    deadline = time.monotonic() + a.max_seconds
+    t0 = now()
+    gap0 = conn.execute("SELECT COALESCE(MAX(id), 0) FROM gaps").fetchone()[0]
+    stale0 = {r["owner"] for r in conn.execute("SELECT owner, ack, last_heartbeat FROM owners").fetchall()
+              if r["ack"] != "retired" and t0 - (r["last_heartbeat"] or 0) > a.stale_seconds}
+    unclaimed_since = {}  # node_id -> monotonic time first seen due, unheld and unleased
+    while True:
+        counts = do_sync(conn, tod)
+        t = now()
+        if counts["in_scope"] - counts["finished"] - counts["held"] <= 0:
+            return {"reason": "all_finished", **counts}
+        new = conn.execute("SELECT * FROM gaps WHERE id > ? ORDER BY id", (gap0,)).fetchall()
+        if new:
+            return {"reason": "new_gap", "gaps": [gap_view(conn, g) for g in new]}
+        stale = [r["owner"] for r in conn.execute("SELECT owner, ack, last_heartbeat FROM owners").fetchall()
+                 if r["ack"] != "retired" and t - (r["last_heartbeat"] or 0) > a.stale_seconds and r["owner"] not in stale0]
+        if stale:
+            return {"reason": "owner_stale", "owners": stale}
+        with txn(conn):
+            sig = conn.execute("SELECT signal FROM signals WHERE owner = '*' ORDER BY id DESC LIMIT 1").fetchone()
+        if sig and sig["signal"] == "pause":
+            st = cmd_signal(argparse.Namespace(action="status"), conn, tod)
+            if st["all_paused"] or not [o for o in st["owners"] if not o["stale"] and o["ack"] != "retired"]:
+                return {"reason": "all_paused", "owners": st["owners"]}
+        else:
+            held = {r["node_id"] for r in conn.execute("SELECT node_id FROM holds")}
+            avail = [r for r in conn.execute("SELECT * FROM nodes WHERE in_scope=1 AND finished=0 AND due=1").fetchall()
+                     if r["node_id"] not in held and not is_leased(r, t)]
+            m = time.monotonic()
+            unclaimed_since = {r["node_id"]: unclaimed_since.get(r["node_id"], m) for r in avail}
+            # running shepherds with room claim due nodes within seconds; what is still unclaimed after
+            # the grace period is the manager's to dispatch, if it may start another shepherd
+            settled = [r for r in avail if m - unclaimed_since[r["node_id"]] >= a.grace_seconds]
+            oldest = max((m - unclaimed_since[r["node_id"]] for r in avail), default=0)
+            if settled and len(running_owners(conn, t, a.stale_seconds)) < a.max_parallel and (
+                    len(settled) >= a.min_batch or oldest >= a.queue_delay_minutes * 60):
+                settled.sort(key=priority_key)
+                return {"reason": "unclaimed_due", "count": len(settled), "nodes": [node_view(r) for r in settled]}
+        if time.monotonic() >= deadline:
+            return {"reason": "timeout", **counts}
+        time.sleep(max(0.0, min(a.poll_seconds, deadline - time.monotonic())))
+
+
 def cmd_signal(a, conn, tod):
     if a.action == "status":
         with txn(conn):
@@ -887,6 +939,16 @@ def build_parser():
     sp.add_argument("--batch", type=int, default=1)
     sp.add_argument("--poll-seconds", type=float, default=5)
     sp.add_argument("--lease-minutes", type=float, default=DEFAULT_LEASE_MINUTES)
+    sp = add("manager-wait", cmd_manager_wait)
+    sp.add_argument("--max-seconds", type=float, default=3000)
+    sp.add_argument("--poll-seconds", type=float, default=15)
+    sp.add_argument("--grace-seconds", type=float, default=60,
+                    help="how long a due node may sit unclaimed before running shepherds are taken to have no room")
+    sp.add_argument("--min-batch", type=int, default=3)
+    sp.add_argument("--queue-delay-minutes", type=float, default=15)
+    sp.add_argument("--max-parallel", type=int, default=5)
+    sp.add_argument("--stale-seconds", type=float, default=DEFAULT_LEASE_MINUTES * 60,
+                    help="a shepherd whose heartbeat (next, gate, wait, verdict) is older than this, as old as a lease, is dead")
     sp = add("signal", cmd_signal)
     sp.add_argument("action", choices=["pause", "resume", "retire", "status"])
     sp.add_argument("--owner")

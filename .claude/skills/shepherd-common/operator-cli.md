@@ -129,8 +129,10 @@ gives free text, and at least one is required. What the panel does, this does:
 The in-app conversation that asked is not sent a message (the app delivers that); the
 answer reaches the agent's next turn, in the node's answered questions.
 
-Answering is the user's decision. A shepherd answers only what it was told it may,
-and says so in its report.
+Answering is the user's decision. A shepherd answers only a request that tod
+should never have asked (a plumbing or setup failure, once its fix is deployed:
+see triage.md), and says so in its report. Anything only the user can decide is
+left for them.
 
 ## Checking your work
 

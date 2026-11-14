@@ -510,6 +510,64 @@ class Wait(Base):
         self.assertEqual(self.wait("--owner", "o")["signal"], "retire")
 
 
+class ManagerWait(Base):
+    def mwait(self, *extra):
+        return self.cli("manager-wait", "--max-seconds", "1", "--poll-seconds", "0.05", "--grace-seconds", "0.2", *extra)
+
+    def test_timeout_when_nothing_happens(self):
+        self.setup_nodes("a")
+        self.lease("o")
+        self.assertEqual(self.mwait()["reason"], "timeout")
+
+    def test_new_gap(self):
+        self.setup_nodes("a")
+        self.lease("o")
+        self.cli("gap", "report", "--owner", "o", "--signature", "bug:x:old", "--summary", "s")
+        threading.Timer(0.2, lambda: self.cli("gap", "report", "--owner", "o", "--signature", "bug:x:new", "--summary", "s")).start()
+        out = self.mwait()
+        self.assertEqual((out["reason"], [g["signature"] for g in out["gaps"]]), ("new_gap", ["bug:x:new"]))
+
+    def test_unclaimed_due_after_grace_by_min_batch(self):
+        self.setup_nodes("a", "b", "c")
+        out = self.mwait("--min-batch", "3")
+        self.assertEqual((out["reason"], out["count"]), ("unclaimed_due", 3))
+
+    def test_too_few_unclaimed_wait_for_queue_delay(self):
+        self.setup_nodes("a")
+        self.assertEqual(self.mwait("--min-batch", "3")["reason"], "timeout")
+        out = self.mwait("--min-batch", "3", "--queue-delay-minutes", "0.005")
+        self.assertEqual(out["reason"], "unclaimed_due")
+
+    def test_no_unclaimed_due_at_max_parallel(self):
+        self.setup_nodes("a", "b", "c", "d")
+        self.lease("o", 1)
+        self.assertEqual(self.mwait("--min-batch", "1", "--max-parallel", "1")["reason"], "timeout")
+
+    def test_owner_going_stale(self):
+        self.setup_nodes("a")
+        self.lease("o")
+        self.clock[0] += 10
+        self.assertEqual(self.mwait("--stale-seconds", "5")["reason"], "timeout")  # already stale at the start
+        self.lease("p")
+        def age():
+            self.clock[0] += 10
+        threading.Timer(0.2, age).start()
+        out = self.mwait("--stale-seconds", "5")
+        self.assertEqual((out["reason"], out["owners"]), ("owner_stale", ["p"]))
+
+    def test_all_paused(self):
+        self.setup_nodes("a")
+        self.lease("o")
+        self.cli("signal", "pause", "--all")
+        threading.Timer(0.2, lambda: self.cli("gate", "--owner", "o", expect=10)).start()
+        self.assertEqual(self.mwait()["reason"], "all_paused")
+
+    def test_all_finished(self):
+        self.setup_nodes("a")
+        self.tod.state("a", "done")
+        self.assertEqual(self.mwait()["reason"], "all_finished")
+
+
 class Version(Base):
     def test_real_version_hashes_files(self):
         ledger.shepherd_version = self._orig[1]
