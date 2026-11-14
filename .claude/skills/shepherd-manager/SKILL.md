@@ -120,8 +120,10 @@ shepherd that reported it.
   (`git push origin HEAD:main`; tod has no PRs).
 - A `cli-parity` gap's fix is a new verb in the shepherd tier of `tod-cli`
   (hidden from agents, refused in agent sessions) plus its line in
-  `shepherd-common/operator-cli.md`. A `ui-target` gap's fix gives the
-  element an id and a role.
+  `shepherd-common/operator-cli.md`. A `ui-target` gap's fix is at the
+  lowest shared point when it can be (the default roles, labels and
+  synthetic nodes in the patched gpui under `vendor/gpui-pre`, `TOD PATCH`
+  markers), and otherwise gives that element a stable `.id()` and a label.
 - You don't verify fixes yourself and never report a fixer's test results as
   checked. When a fixer reports, confirm its commit is on `origin/main`
   (`L gap set <id> --status fixing --commit <sha> --note "verifying"`) and start its verifier at once: a

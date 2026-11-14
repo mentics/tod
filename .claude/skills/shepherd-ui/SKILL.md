@@ -27,33 +27,42 @@ Below, `L` is `python3 -I .claude/skills/shepherd-common/scripts/ledger.py <root
 
 ## Driving the app
 
-Send one command per call and read its one-line reply:
+Send one command per call; this prints the whole reply (exit 1 on `err`):
 
 ```bash
-python3 -c "import socket,sys;s=socket.create_connection(('127.0.0.1',int(sys.argv[1])));s.sendall((sys.argv[2]+'\n').encode());print(s.makefile().readline().rstrip())" <port> '<command>'
+python3 -I .claude/skills/shepherd-common/scripts/sock.py <port> '<command>'
 ```
 
 Find and act on elements through the app's accessibility tree, never by
 coordinates:
-- `tree [<selector>]`: the elements under a selector (role, label, id path,
-  enabled, bounds). Start every screen with it.
-- `act <selector> [click|focus|…]`: act on one element. A selector matching
-  none or several is an error naming what it saw.
-- `wait-for <selector> [<ms>]`: returns when the element exists (after a
-  click that opens a panel or menu, or while "Reading GitHub…" clears).
-- Selectors: `#a/b/c` (the element's id path), `role:label`
-  (`button:Resume`), and `a >> b` (b inside a).
+- `tree [--role R] [--label S] [--within SEL] [--json]`: the elements on
+  screen, one line each: selector, role, label, value, bounds, actions,
+  focused/disabled. Start every screen with it, narrowed with `--within` or
+  `--role`.
+- `act <selector> [click|focus|set-value <text>|scroll-into-view]` (default
+  click): acts through the element's own handler. A reply saying it fell back
+  to a synthetic click is fine.
+- `wait-for <selector> [--gone] [--timeout-ms N]` (default 5000): after a
+  click that opens a panel or menu, or until "Reading GitHub…" clears.
+- Selectors: `#<id-path-suffix>` (`#unified-task-panel`), `role:label`
+  (`button:Resume`, `menuitem:Check now`; a case-insensitive substring of the
+  label or value), and `a >> b` (b inside a). Prefer `role:label` for
+  elements whose selector is `#~file.rs:LINE`: those move when the code does.
 - `text …`, `key enter`, `key ctrl-enter` type into the focused field.
-- `shot2 <png>` only to check how something looks; read every screenshot you
-  take. Read content from `tree`, never from a picture.
+- `shot2 <png>` only to check how something looks (`shot` can come back
+  blank); read every screenshot you take. Read content from `tree`, never
+  from a picture.
 
 Replies you must handle:
 - `err user-conflict: …`: the user used the app while you waited, and what
   you expected changed (named in the reply). Your command did not run. Run
   `tree`, `L check` the node, and re-decide.
 - `err user-mode`: the user still has the app. Send the command again.
-- `err no-target …` for an element you know should be there: a `ui-target`
-  gap, unless the screen is simply not where you thought (run `tree`).
+- `err ambiguous <n> matches: …`: narrow the selector (`>>`, a longer label).
+- `err no-match <selector>` for an element you know should be there: a
+  `ui-target` gap, unless the screen is simply not where you thought (run
+  `tree`). An element with an empty label you had to reach by id path is a
+  `ui-target` gap too: it needs a label.
 
 The user may take over at any moment. You never need to ask or wait for
 them: commands block while they have it and resume when they leave, with the
