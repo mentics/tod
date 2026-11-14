@@ -22,6 +22,10 @@ mod learn;
 mod lifecycle;
 mod interview;
 mod node;
+mod operator;
+#[cfg(test)]
+mod operator_tests;
+mod runner;
 mod obligations;
 mod phase;
 mod plan;
@@ -243,8 +247,16 @@ impl Invocation {
 }
 
 fn run(args: &[String]) -> anyhow::Result<String> {
+    run_with(args, &operator::process_env)
+}
+
+/// [`run`] with the environment given, so a test can turn the hidden operator
+/// tier on (`TOD_OPERATOR=shepherd`) or play an agent session.
+fn run_with(args: &[String], env: operator::Env) -> anyhow::Result<String> {
+    let operator = operator::enabled(env);
+    let top = operator::top_usage(USAGE, operator);
     if args.is_empty() || args.iter().any(|a| a == "-h" || a == "--help") && args.len() == 1 {
-        return Ok(USAGE.trim_end().to_string());
+        return Ok(top.trim_end().to_string());
     }
 
     let mut data_root: Option<PathBuf> = None;
@@ -274,10 +286,10 @@ fn run(args: &[String]) -> anyhow::Result<String> {
     }
 
     if rest.is_empty() {
-        return Ok(USAGE.trim_end().to_string());
+        return Ok(top.trim_end().to_string());
     }
     match rest[0].as_str() {
-        "help" => return Ok(help::run(&rest[1..], USAGE)),
+        "help" => return Ok(help::run(&rest[1..], &top, operator)),
         "--build-stamp" => return Ok(tod_core::CLI_BUILD_STAMP.to_string()),
         _ => {}
     }
@@ -288,9 +300,9 @@ fn run(args: &[String]) -> anyhow::Result<String> {
         .take_while(|a| a.as_str() != "--")
         .any(|a| a == "-h" || a == "--help");
     if wants_help {
-        return match NOUNS.iter().find(|(noun, _)| *noun == rest[0]) {
-            Some((_, usage)) => Ok(usage.trim_end().to_string()),
-            None => Ok(USAGE.trim_end().to_string()),
+        return match operator::noun_usage(&rest[0], operator) {
+            Some(usage) => Ok(usage.trim_end().to_string()),
+            None => Ok(top.trim_end().to_string()),
         };
     }
 
@@ -338,7 +350,8 @@ fn run(args: &[String]) -> anyhow::Result<String> {
         "lifecycle" => lifecycle::run(invocation),
         "secrets" => secrets::run(invocation),
         "environment" => environment::run(invocation),
-        "decisions" => decisions::run(invocation),
+        "decisions" => decisions::run_with(invocation, env),
+        "runner" if operator => runner::run(invocation, env),
         "phase" => phase::run(invocation),
         "wait" => wait::run(invocation),
         "batch" => batch::run(invocation),

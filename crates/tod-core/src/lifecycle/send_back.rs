@@ -119,6 +119,7 @@ pub fn answer_decision_as(
 
 /// [`answer_decision`] with the recording of the answer, and of the reopening,
 /// given, so a test can fail them after the move.
+#[cfg(test)]
 fn answer_with(
     fleet: &FleetStore,
     decision_id: Uuid,

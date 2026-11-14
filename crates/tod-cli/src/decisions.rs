@@ -2,9 +2,11 @@
 //! question, with options or for a free-text answer, and evidence, and the
 //! app queues it for the user.
 //!
-//! Agents only `ask`; there is no answer command here on purpose —
-//! answering is the user's, from the task panel
-//! (`doc/ui/unified-view.md` "Decisions"). Inside a conversation
+//! Agents only `ask`; there is no answer command in what they are told on
+//! purpose — answering is the user's, from the task panel
+//! (`doc/ui/unified-view.md` "Decisions"). The operator tier
+//! (`TOD_OPERATOR=shepherd`, `operator.rs`) adds a hidden `answer` for a
+//! shepherd that stands in for the panel; it is not in `USAGE`. Inside a conversation
 //! `TOD_IMPLEMENT_NODE` / `TOD_IMPLEMENT_CONVERSATION` supply `--node` and
 //! the asking conversation when they are not given explicitly.
 
@@ -80,10 +82,13 @@ fn asking_conversation(inv: &Invocation) -> anyhow::Result<(Option<Uuid>, Option
     Ok((Some(conversation_id), protocol))
 }
 
-pub fn run(inv: Invocation) -> anyhow::Result<String> {
+/// [`run`] with the environment given, so a test can turn the operator tier on
+/// or play an agent session.
+pub(crate) fn run_with(inv: Invocation, env: crate::operator::Env) -> anyhow::Result<String> {
     let mut rest = inv.rest.clone();
+    let operator = crate::operator::enabled(env);
     if rest.is_empty() || rest.iter().any(|a| a == "-h" || a == "--help") {
-        return Ok(USAGE.trim_end().to_string());
+        return Ok(crate::operator::decisions_usage(USAGE, operator).trim_end().to_string());
     }
     let command = rest.remove(0);
     let args = Args::parse(&rest)?;
@@ -91,8 +96,43 @@ pub fn run(inv: Invocation) -> anyhow::Result<String> {
         "ask" => ask(&inv, &args),
         "list" => list(&inv, &args),
         "show" => show(&inv, &args),
-        other => anyhow::bail!("unknown command `{other}`\n\n{}", USAGE.trim_end()),
+        "answer" if operator => answer(&inv, &args, env),
+        other => anyhow::bail!(
+            "unknown command `{other}`\n\n{}",
+            crate::operator::decisions_usage(USAGE, operator).trim_end()
+        ),
     }
+}
+
+/// `answer` (operator tier): the task panel's answer
+/// (`tod_core::runner_operator::answer`), recorded as the operator or the
+/// shepherd named by `TOD_ACTOR`.
+fn answer(inv: &Invocation, args: &Args, env: crate::operator::Env) -> anyhow::Result<String> {
+    crate::operator::refuse_agent_session("answering a request", env)?;
+    let who = tod_core::runner_operator::Who::from_env(env)?;
+    let raw = args.target("a decision id")?;
+    let id = inv.client().read(|conn| DecisionRepo::new(conn).resolve(raw))?;
+    let option = match args.get("--option") {
+        Some(raw) => match raw.trim().parse::<usize>() {
+            Ok(n) if n >= 1 => Some(n),
+            _ => anyhow::bail!("--option must be an option number from 1 (got `{raw}`)"),
+        },
+        None => None,
+    };
+    let text = args.get("--text").map(str::to_string);
+    if option.is_none() && text.as_deref().is_none_or(|t| t.trim().is_empty()) {
+        anyhow::bail!("an answer needs --option <N> or --text <TEXT>");
+    }
+    let session = tod_core::runner_operator::Session::open(&inv.data_root)?;
+    let done = tod_core::runner_operator::answer(&session.ctx(), id, option, text, &who)?;
+    if let Some(problem) = &done.wake_problem {
+        eprintln!("the answer was recorded, but waking the node failed: {problem}");
+    }
+    if inv.json {
+        return Ok(serde_json::to_string(&done)?);
+    }
+    let moved = done.moved_to.as_ref().map(|to| format!(", the task was sent back to {to}")).unwrap_or_default();
+    Ok(format!("ok {} answered {}{moved}", short_id(done.decision), done.answered))
 }
 
 /// File a `broken` decision for the node this invocation runs for, so a
