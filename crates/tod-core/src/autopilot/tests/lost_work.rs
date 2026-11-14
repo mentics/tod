@@ -336,3 +336,70 @@ fn the_first_birth_is_kept_and_a_later_different_one_is_kept_apart() {
     assert_ne!(after.replaced.get("."), first.born.get("."));
     assert!(after.replaced.contains_key("."));
 }
+
+/// A node made before the record existed (no row), its work done, merged and
+/// the branch deleted everywhere, then its sandbox replaced at main's tip: the
+/// birth seen now is not the node's first, so it is never a stub to trust.
+fn pre_existing_node_replaced(squash: bool, state: &str, skipped_first_capture: bool) {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    let workspace = workspace_is_a_clone(&fx);
+    // No row: made before the table existed, or the first capture skipped
+    // because origin already had the branch.
+    let conn = rusqlite::Connection::open(fx.fleet.paths().db()).unwrap();
+    conn.execute("DELETE FROM node_branch_starts", []).unwrap();
+    drop(conn);
+    if skipped_first_capture {
+        git_in(&workspace, &["push", "-q", "origin", "HEAD:refs/heads/task/x"]);
+        git_in(&workspace, &["fetch", "-q", "origin"]);
+        let skipped = tod_store::fleet::checkout_start::capture(&tod_store::fleet::Workdir::host(&workspace), "task/x").unwrap();
+        assert!(!skipped.contains_key("."), "{skipped:?}");
+        git_in(&workspace, &["push", "-q", "origin", ":refs/heads/task/x"]);
+    }
+    std::fs::write(workspace.join("work"), "w").unwrap();
+    git_in(&workspace, &["add", "."]);
+    git_in(&workspace, &["commit", "-qm", "the node's work"]);
+    git_in(&workspace, &["push", "-q", "origin", "HEAD:refs/heads/task/x"]);
+    git_in(&workspace, &["checkout", "-q", "main"]);
+    if squash {
+        std::fs::write(workspace.join("work"), "w").unwrap();
+        git_in(&workspace, &["add", "."]);
+        git_in(&workspace, &["commit", "-qm", "squashed"]);
+    } else {
+        git_in(&workspace, &["merge", "-q", "--ff-only", "task/x"]);
+    }
+    git_in(&workspace, &["push", "-q", "origin", "main"]);
+    git_in(&workspace, &["branch", "-q", "-D", "task/x"]);
+    git_in(&workspace, &["push", "-q", "origin", ":refs/heads/task/x"]);
+    in_review_with_done_steps(&fx);
+    if state != "review" {
+        fx.fleet
+            .enqueue_outline(OutlineMutation::SetLifecycle { node_id: fx.node, state: state.into() })
+            .unwrap();
+        fx.fleet.writer().flush().unwrap();
+        fx.fleet.reload_if_stale().unwrap();
+    }
+    replace_checkout(&fx, &workspace);
+    let finding = crate::lost_work::reopen_if_lost(&fx.fleet, fx.node).unwrap();
+    assert!(matches!(finding, crate::lost_work::Finding::Unproven(_)), "{finding:?}");
+    assert_eq!(lifecycle::current_state(&fx.fleet, fx.node).unwrap(), state);
+    let starts = fx.fleet.read(|c| tod_store::branch_starts::get(c, &fx.node.to_string(), "task/x")).unwrap();
+    assert!(starts.born.is_empty(), "{starts:?}");
+}
+
+#[test]
+fn a_node_with_no_record_and_done_work_merged_and_replaced_is_never_lost() {
+    for squash in [false, true] {
+        pre_existing_node_replaced(squash, "review", false);
+    }
+}
+
+#[test]
+fn a_skipped_first_capture_then_merged_and_replaced_is_never_lost() {
+    pre_existing_node_replaced(false, "review", true);
+}
+
+#[test]
+fn a_node_in_pr_with_no_record_merged_and_replaced_is_never_lost() {
+    pre_existing_node_replaced(false, "pr", false);
+}

@@ -23,7 +23,7 @@
 
 use crate::outline::uuid_blob::now_ms;
 use anyhow::Result;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::BTreeMap;
 
 pub const CREATE_TABLE: &str = "
@@ -58,19 +58,69 @@ pub struct BranchStarts {
     pub replaced: BTreeMap<String, String>,
 }
 
+/// Whether the node has already worked: a plan step past `ready`, or an
+/// implementation conversation. Its checkout is then not provably its first,
+/// so a birth seen now says nothing about work that may have been merged and
+/// its branch deleted.
+fn has_worked(conn: &Connection, blob: &[u8]) -> Result<bool> {
+    let steps: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM node_plan_steps WHERE node_id = ?1 AND status NOT IN ('pending', 'ready')",
+        params![blob],
+        |row| row.get(0),
+    )?;
+    if steps > 0 {
+        return Ok(true);
+    }
+    let conversations: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM conversations WHERE focus_kind = 'node' AND focus_id = ?1 AND protocol = ?2",
+        params![blob, crate::conversation::ProtocolKind::Implementation.as_str()],
+        |row| row.get(0),
+    )?;
+    Ok(conversations > 0)
+}
+
 /// Record `starts` (repository path to birth commit) for the node's `branch`.
-/// The first birth for a repository is kept. A later, different one is not a
-/// stub to trust: it is kept apart as `replaced`, so a branch recreated at a
-/// newer base (whose earlier work may have been merged and deleted) is never
-/// taken for one that never held work.
+///
+/// A birth becomes `born` (the stub to trust) only when it is provably the
+/// node's first: no row for that repository yet, and the node has not worked
+/// ([`has_worked`]; a node made before this table existed, whose work may have
+/// been merged and its branch deleted before the sandbox was replaced, has).
+/// Otherwise it is kept apart as `replaced` (with no `born`, an empty `sha`),
+/// so a tip there is unproven, never lost. A later different birth over a
+/// recorded one is also kept as `replaced`; the first `born` stays.
 pub fn record(conn: &Connection, node_id: &str, branch: &str, starts: &BTreeMap<String, String>) -> Result<()> {
     let blob = crate::fleet::repos::node_id_blob(node_id)?;
+    let worked = has_worked(conn, &blob)?;
     for (repo, sha) in starts {
-        conn.execute(
-            "INSERT INTO node_branch_starts (node_id, branch, repo, sha, recorded_at) VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(node_id, branch, repo) DO UPDATE SET replaced_sha = CASE WHEN sha = excluded.sha THEN replaced_sha ELSE excluded.sha END",
-            params![blob, branch, repo, sha, now_ms()],
-        )?;
+        let existing: Option<(String, Option<String>)> = conn
+            .query_row(
+                "SELECT sha, replaced_sha FROM node_branch_starts WHERE node_id = ?1 AND branch = ?2 AND repo = ?3",
+                params![blob, branch, repo],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        match existing {
+            None if !worked => {
+                conn.execute(
+                    "INSERT INTO node_branch_starts (node_id, branch, repo, sha, recorded_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![blob, branch, repo, sha, now_ms()],
+                )?;
+            }
+            None => {
+                conn.execute(
+                    "INSERT INTO node_branch_starts (node_id, branch, repo, sha, recorded_at, replaced_sha) VALUES (?1, ?2, ?3, '', ?4, ?5)",
+                    params![blob, branch, repo, now_ms(), sha],
+                )?;
+            }
+            Some((born, replaced)) => {
+                if born != *sha && replaced.as_deref() != Some(sha.as_str()) {
+                    conn.execute(
+                        "UPDATE node_branch_starts SET replaced_sha = ?4 WHERE node_id = ?1 AND branch = ?2 AND repo = ?3",
+                        params![blob, branch, repo, sha],
+                    )?;
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -88,7 +138,9 @@ pub fn get(conn: &Connection, node_id: &str, branch: &str) -> Result<BranchStart
         if let Some(replaced) = replaced {
             out.replaced.insert(repo.clone(), replaced);
         }
-        out.born.insert(repo, sha);
+        if !sha.is_empty() {
+            out.born.insert(repo, sha);
+        }
     }
     Ok(out)
 }

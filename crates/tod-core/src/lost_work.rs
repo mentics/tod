@@ -46,7 +46,6 @@
 
 use crate::lifecycle;
 use anyhow::{Context, Result};
-use std::collections::BTreeMap;
 use tod_store::branch_starts::BranchStarts;
 use tod_store::decisions::{DecisionRepo, REASON_BROKEN};
 use tod_store::fleet::{FleetMutation, FleetStore, Workdir};
@@ -558,6 +557,7 @@ pub fn reopen_if_lost(fleet: &FleetStore, node: Uuid) -> Result<Finding> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
