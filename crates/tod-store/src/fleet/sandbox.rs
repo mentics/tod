@@ -370,10 +370,11 @@ impl Sandboxes {
             }
             NewSandboxSource::Fork(source) => {
                 validate_name(source)?;
-                let image = bx
-                    .get(source)?
-                    .ok_or_else(|| anyhow!("no sandbox named {source} to fork"))?
-                    .image;
+                let source_info = bx.get(source)?.ok_or_else(|| anyhow!("no sandbox named {source} to fork"))?;
+                if let Some(why) = provision::fork_source_refusal(source, source_info.label("tod-kind")) {
+                    bail!("{why}");
+                }
+                let image = source_info.image;
                 progress(&format!("forking {source} into {name}…"));
                 // A fork's proxy variables come back as an unresolved
                 // `{{file(..)}}` template that curl, git, and npm reject; the
@@ -387,7 +388,19 @@ impl Sandboxes {
                 image
             }
         };
-        let info = bx.wait_deployed(name, Duration::from_secs(300))?;
+        let mut info = bx.wait_deployed(name, Duration::from_secs(300))?;
+        if matches!(source, NewSandboxSource::Fork(_)) {
+            // Blaxel copied the source's labels (a golden's kind and its
+            // keep-when-idle=true); this is neither. Before anything uses it.
+            if let Err(err) = bx.set_labels(name, &provision::plain_fork_labels()) {
+                let removed = match bx.delete_waiting_not_ready(name, tod_sandbox::blaxel::NOT_READY_WAIT) {
+                    Ok(()) => format!("{name} was deleted"),
+                    Err(del) => format!("{name} could not be deleted either ({del:#}); `tod-sandbox delete {name}` removes it"),
+                };
+                return Err(err.context(format!("relabel the fork {name} ({removed})")));
+            }
+            info = bx.wait_deployed(name, Duration::from_secs(300))?;
+        }
         progress(&format!("{name}: deployed in {:.1}s", started.elapsed().as_secs_f64()));
         self.config.upsert(Sandbox { name: name.to_string(), image, url: info.url, agents });
         self.save()?;

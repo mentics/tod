@@ -265,6 +265,34 @@ pub fn fork_needs_tod_files(golden_has_tod_files: bool, reported: Option<&str>, 
     !golden_has_tod_files || reported.map(str::trim) != Some(expected_node_manifest)
 }
 
+/// `tod-kind` of a sandbox made by a plain `tod-sandbox fork`: neither a golden
+/// nor a node's.
+pub const KIND_FORK: &str = "fork";
+
+/// The labels a plain fork gets over the ones Blaxel copied from its source.
+/// A fork of a golden would otherwise stay `tod-kind=golden` (a claim to be
+/// one, and a candidate for tod's golden pruning) and `keep-when-idle=true`
+/// (exempt from the idle prune, so experiment forks pile up). Labels can only
+/// be set, not removed, so the golden-only flags are set to `false`. Not for a
+/// golden refresh's fork, which is meant to keep them, nor a node's
+/// (`node::fork_golden` sets its own).
+pub fn plain_fork_labels() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("tod-kind", KIND_FORK),
+        (crate::blaxel::LABEL_KEEP_WHEN_IDLE, crate::blaxel::KEEP_WHEN_IDLE_NO),
+        (crate::golden::LABEL_READY, "false"),
+        (crate::golden::LABEL_ORIGIN, "false"),
+    ]
+}
+
+/// Why a plain fork of `source` is refused: a node's sandbox holds the node's
+/// work and credentials, and a copy of it is not something to hand out.
+pub fn fork_source_refusal(source: &str, kind_label: Option<&str>) -> Option<String> {
+    is_node_kind(kind_label).then(|| {
+        format!("{source} is a node's sandbox (tod-kind={}); fork the repository's golden instead", kind_label.unwrap_or_default())
+    })
+}
+
 /// Whether a node manifest on the sandbox means "a node's, leave it". Not for
 /// [`Mode::Fork`]: that is a sandbox just forked, and a tod golden carries
 /// tod's files with the node manifest ([`node_manifest`], written by
@@ -621,6 +649,25 @@ mod tests {
         assert!(is_node_kind(Some("node")) && is_node_kind(Some("node-base")));
         assert!(!is_node_kind(Some("golden")) && !is_node_kind(None));
         assert!(node_sandbox_refusal("tod-x-1").contains("tod-x-1"));
+    }
+
+    #[test]
+    fn a_plain_fork_does_not_keep_the_goldens_identity_or_idle_exemption() {
+        let l = plain_fork_labels();
+        let get = |k: &str| l.iter().find(|(key, _)| *key == k).map(|(_, v)| *v);
+        assert_eq!(get("tod-kind"), Some("fork"));
+        assert_ne!(get("tod-kind"), Some(crate::golden::KIND_GOLDEN));
+        assert_eq!(get("keep-when-idle"), Some("false"));
+        assert_eq!(get("ready"), Some("false"));
+        assert_eq!(get("tod-origin"), Some("false"));
+    }
+
+    #[test]
+    fn a_node_sandbox_is_not_forked_plainly() {
+        assert!(fork_source_refusal("tod-x-1", Some("node")).unwrap().contains("tod-x-1"));
+        assert!(fork_source_refusal("b", Some("node-base")).is_some());
+        assert!(fork_source_refusal("g", Some("golden")).is_none());
+        assert!(fork_source_refusal("w", None).is_none());
     }
 
     #[test]
