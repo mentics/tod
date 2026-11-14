@@ -388,6 +388,24 @@ impl Runners {
                 Err(err) => errors.push(format!("{node}: {err:#}")),
             }
         }
+        // A run that ended `Done` says so only while the node is `done`. A
+        // node that is in any other state again (moved back, or reopened) has
+        // no run that ended: keeping the old word would leave it reading
+        // "not started" with nothing to start it, in whatever phase it is in.
+        for node in self.stale_done_nodes() {
+            match tod_core::lifecycle::current_state(store, node) {
+                Ok(state) if state != "done" => {
+                    tracing::info!(%node, %state, "the node left done; its finished run no longer counts");
+                    if let Some(slot) = self.inner.slots.lock().expect("runner slots").get_mut(&node)
+                        && matches!(slot.outcome, Some(Outcome::Done))
+                    {
+                        slot.outcome = None;
+                    }
+                }
+                Ok(_) => {}
+                Err(err) => errors.push(format!("{node}: read the lifecycle state: {err:#}")),
+            }
+        }
         let mut leases: HashMap<Uuid, Vec<Lease>> = HashMap::new();
         for lease in store
             .read(|conn| ActivityRepo::new(conn).list_for_nodes(&nodes))
@@ -416,6 +434,18 @@ impl Runners {
         actor_journey::record(&changes);
 
         if errors.is_empty() { Ok(()) } else { Err(anyhow!("{}", errors.join("; "))) }
+    }
+
+    /// Nodes whose idle slot holds a `Done` outcome.
+    fn stale_done_nodes(&self) -> Vec<Uuid> {
+        self.inner
+            .slots
+            .lock()
+            .expect("runner slots")
+            .iter()
+            .filter(|(_, s)| s.run.is_none() && !s.starting && matches!(s.outcome, Some(Outcome::Done)))
+            .map(|(n, _)| *n)
+            .collect()
     }
 
     fn view(slot: &Slot, place: RunnerPlace) -> SlotView {
@@ -958,6 +988,38 @@ mod tests {
         assert!(matches!(standing_of(&fx).actor, NextActor::You { why: YouReason::Failed { .. }, .. }));
         // Now it has an outcome: the next tick leaves it be.
         fx.runners.reconcile().unwrap();
+    }
+
+    #[test]
+    fn a_finished_run_does_not_hold_a_node_that_is_no_longer_done() {
+        let fx = fixture();
+        {
+            let mut slots = fx.runners.inner.slots.lock().unwrap();
+            let slot = slots.entry(fx.node).or_default();
+            slot.desired = Desired::Run;
+            slot.outcome = Some(Outcome::Done);
+        }
+        // Still `done`-or-not is the lifecycle's word: the node is in its
+        // first state, so the old "done" is stale and the reconciler starts
+        // it (which fails here for want of media, and says so).
+        let err = fx.runners.reconcile().unwrap_err();
+        assert!(format!("{err:#}").contains("Media bundle"), "{err:#}");
+        assert!(matches!(standing_of(&fx).actor, NextActor::You { why: YouReason::Failed { .. }, .. }));
+    }
+
+    #[test]
+    fn a_finished_run_still_holds_a_node_that_is_done() {
+        let fx = fixture();
+        tod_core::lifecycle::set_lifecycle(&fx.runners.inner.store, fx.node, "done").unwrap();
+        {
+            let mut slots = fx.runners.inner.slots.lock().unwrap();
+            let slot = slots.entry(fx.node).or_default();
+            slot.desired = Desired::Run;
+            slot.outcome = Some(Outcome::Done);
+        }
+        fx.runners.reconcile().unwrap();
+        let slots = fx.runners.inner.slots.lock().unwrap();
+        assert!(matches!(slots[&fx.node].outcome, Some(Outcome::Done)));
     }
 
     #[test]
