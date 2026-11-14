@@ -270,7 +270,14 @@ pub fn record_direct(
     media_root: &Path,
 ) -> Result<Applied> {
     if direct_actor(writer_actor) == ActionActor::Agent {
-        super::settled::check_agent(conn, mutation)?;
+        match super::agent_actor_conversation(writer_actor) {
+            // A conversation's agent whose writes are not its change set
+            // (verification): its protocol's own rules apply.
+            Some(conversation_id) => {
+                super::settled::check_conversation_agent(conn, conversation_id, mutation)?
+            }
+            None => super::settled::check_agent(conn, mutation)?,
+        }
     }
     let Some((kind, entity, entity_id)) = classify(mutation) else {
         let archive_id = mutation.execute(conn, media_root)?;

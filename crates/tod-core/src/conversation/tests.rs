@@ -1330,6 +1330,14 @@ fn a_verification_loops_until_every_step_has_a_verdict() {
 ");
     assert!(opening.contains("verification session"), "{opening}");
     assert!(opening.contains("Lifecycle state: verifying"), "{opening}");
+    assert!(
+        agent.last().env.contains(&(
+            ACTOR_ENV.to_string(),
+            tod_store::conversation::agent_actor_for(id)
+        )),
+        "a verification agent writes as `agent:<conversation>`, so the writer applies the \
+         verification protocol's own retag rule"
+    );
 
     assert_eq!(
         driver.tick(&fx.fleet, &mut agent),

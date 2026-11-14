@@ -48,3 +48,25 @@ pub fn actor_conversation(actor: &str) -> Option<uuid::Uuid> {
 pub fn actor_for(conversation_id: uuid::Uuid) -> String {
     format!("{ACTOR_PREFIX}{conversation_id}")
 }
+
+/// Prefix of the actor an agent writes as when it belongs to a conversation
+/// but its writes are its own, not that conversation's reversible change set
+/// (a verification agent). The writer checks it against the conversation's
+/// protocol ([`settled::check_conversation_agent`]) and records it as an
+/// ordinary agent write. It is the actor string itself that carries the
+/// conversation, so every route to the writer (daemon, relay, orchestrator,
+/// the store directly) carries it unchanged.
+pub const AGENT_ACTOR_PREFIX: &str = "agent:";
+
+/// The conversation an actor string names, if it is `agent:<uuid>`.
+pub fn agent_actor_conversation(actor: &str) -> Option<uuid::Uuid> {
+    actor
+        .strip_prefix(AGENT_ACTOR_PREFIX)
+        .and_then(|id| uuid::Uuid::parse_str(id).ok())
+}
+
+/// The actor string for a conversation's agent writes that are not recorded
+/// in its change set.
+pub fn agent_actor_for(conversation_id: uuid::Uuid) -> String {
+    format!("{AGENT_ACTOR_PREFIX}{conversation_id}")
+}
