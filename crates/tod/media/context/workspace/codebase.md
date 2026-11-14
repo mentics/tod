@@ -40,3 +40,20 @@ the site's data. Record a request for the user (an access request) that names
 the host and says to sign in to Cloudflare from the app (Settings → Cloud
 sandboxes → Cloudflare Access → Sign in), then carry on with whatever does not
 need that site.
+
+## A cloud sandbox's disk is memory
+
+In a cloud sandbox the root filesystem, `/tmp` included, lives in RAM and
+counts against the sandbox's memory (about 8 GB, no swap). Filling it does not
+only fail a write: the kernel kills processes, your own session among them,
+and the task stops with an error that says only that the agent exited. So:
+
+- Make large scratch work in a directory you remove when you are done: temp
+  checkouts or copies of a module or repository, `.terraform` directories,
+  `node_modules`, build outputs and caches. Do not leave several copies behind
+  between attempts; reuse one and delete it when the check is finished.
+- Terraform providers are shared through `TF_PLUGIN_CACHE_DIR`, which is
+  already set, so `terraform init` in a copy links to one download instead of
+  fetching ~750 MB again. Keep it set; do not unset it or point it elsewhere.
+- Before starting something that downloads or builds a lot, look at `df -h /`
+  and `free -m`. If the filesystem is more than about 70% full, clean up first.

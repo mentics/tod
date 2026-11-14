@@ -225,6 +225,22 @@ pub fn credentials_fingerprint(creds: &NodeCredentials, claude_via: ClaudeTokenV
     rules_fingerprint(&credential_rules(creds, claude_via))
 }
 
+/// Where Terraform keeps downloaded providers in every node sandbox. A
+/// sandbox's disk is RAM, and each `terraform init` in a fresh copy of a
+/// module otherwise downloads ~750 MB of providers into it; with the cache,
+/// copies link to one download. `assets/sandbox/bootstrap.sh` creates it.
+pub const TF_PLUGIN_CACHE_DIR: &str = "/root/.terraform.d/plugin-cache";
+
+/// The Terraform provider-cache environment for every process in a node's
+/// sandbox ([`TF_PLUGIN_CACHE_DIR`]). `MAY_BREAK_DEPENDENCY_LOCK_FILE` lets a
+/// module whose lock file lacks this platform's hashes use the cache.
+pub fn terraform_cache_env() -> Vec<(&'static str, String)> {
+    vec![
+        ("TF_PLUGIN_CACHE_DIR", TF_PLUGIN_CACHE_DIR.to_string()),
+        ("TF_PLUGIN_CACHE_MAY_BREAK_DEPENDENCY_LOCK_FILE", "1".to_string()),
+    ]
+}
+
 /// The environment an agent launched by the app in a node's sandbox (not a
 /// supervised node) needs to use [`credential_rules`]: `NODE_USE_ENV_PROXY`
 /// (Node's fetch otherwise ignores the proxy), the GitHub placeholders, and
@@ -232,7 +248,8 @@ pub fn credentials_fingerprint(creds: &NodeCredentials, claude_via: ClaudeTokenV
 /// token with [`ClaudeTokenVia::Env`]. Passed to the agent process alone
 /// (`tod-sandbox agent --env`), never stored in the sandbox.
 pub fn agent_env(creds: &NodeCredentials, claude_via: ClaudeTokenVia) -> Vec<(String, String)> {
-    let mut env = Vec::new();
+    let mut env: Vec<(String, String)> =
+        terraform_cache_env().into_iter().map(|(k, v)| (k.to_string(), v)).collect();
     if !credential_rules(creds, claude_via).is_empty() {
         env.push(("NODE_USE_ENV_PROXY".to_string(), "1".to_string()));
         env.push((PROXY_AUTH_ENV.to_string(), "1".to_string()));
@@ -431,6 +448,7 @@ pub fn node_env(spec: &NodeSandboxSpec, claude_placeholder: bool, github_via_pro
         (SCHEDULER_ENV, spec.scheduler.as_str().to_string()),
         (BLAXEL_WORKSPACE_ENV, spec.workspace.to_string()),
     ];
+    env.extend(terraform_cache_env());
     if let Some(agent) = spec.agent.filter(|a| !a.is_empty()) {
         env.push(("TOD_SUPERVISOR_AGENT", agent.to_string()));
     }
@@ -1722,7 +1740,18 @@ mod tests {
         assert!(!proxy.iter().any(|(_, v)| v.contains("real") || v == "ghp_x"));
         let env = agent_env(&creds(), ClaudeTokenVia::Env);
         assert_eq!(get(&env, CLAUDE_TOKEN_ENV).as_deref(), Some("sk-ant-oat01-real"));
-        assert!(agent_env(&NodeCredentials::default(), ClaudeTokenVia::Proxy).is_empty());
+        // No credentials: only the provider cache, which every sandbox process gets.
+        let bare = agent_env(&NodeCredentials::default(), ClaudeTokenVia::Proxy);
+        assert_eq!(get(&bare, "TF_PLUGIN_CACHE_DIR").as_deref(), Some(TF_PLUGIN_CACHE_DIR));
+        assert_eq!(bare.len(), terraform_cache_env().len());
+        assert_eq!(get(&proxy, "TF_PLUGIN_CACHE_MAY_BREAK_DEPENDENCY_LOCK_FILE").as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn the_supervised_node_env_shares_terraform_providers() {
+        let body = create_body(&spec(ClaudeTokenVia::Proxy), &creds());
+        assert_eq!(env_value(&body, "TF_PLUGIN_CACHE_DIR").as_deref(), Some(TF_PLUGIN_CACHE_DIR));
+        assert_eq!(env_value(&body, "TF_PLUGIN_CACHE_MAY_BREAK_DEPENDENCY_LOCK_FILE").as_deref(), Some("1"));
     }
 
     #[test]

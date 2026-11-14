@@ -1018,11 +1018,18 @@ pub struct AgentLost {
     pub said: Option<String>,
     /// Whether the agent was in a cloud sandbox or dev container.
     pub remote: bool,
+    /// Why it died, found by looking where it ran
+    /// ([`crate::exit_diagnosis`]): an out-of-memory kill, say.
+    pub diagnosis: Option<String>,
 }
 
 impl std::fmt::Display for AgentLost {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let said = self.said.as_deref().map(|s| format!(" ({s})")).unwrap_or_default();
+        let said = match &self.diagnosis {
+            Some(why) => format!("{said} [{why}]"),
+            None => said,
+        };
         if self.remote {
             write!(
                 f,
@@ -1138,6 +1145,7 @@ fn run_acp_session(
         sign_in_hint: sign_in_hint(host, environment),
         stderr_tail,
         remote: !matches!(environment, AgentEnvironment::Host),
+        environment: environment.clone(),
     };
 
     let client_name = host.client_name();
@@ -1287,6 +1295,8 @@ struct AcpClient {
     stderr_tail: StderrTail,
     /// Whether the agent runs in a sandbox or container, for [`AgentLost`].
     remote: bool,
+    /// Where the agent runs, so a lost agent can be looked into.
+    environment: AgentEnvironment,
 }
 
 impl AcpClient {
@@ -1383,7 +1393,12 @@ impl AcpClient {
         // The logger thread may not have read the last line yet.
         thread::sleep(Duration::from_millis(200));
         let said = self.stderr_tail.lock().unwrap_or_else(|e| e.into_inner()).last().cloned();
-        AgentLost { said, remote: self.remote }
+        AgentLost { said, remote: self.remote, diagnosis: self.diagnose_exit() }
+    }
+
+    /// Why the agent died, looked up where it ran (one bounded probe).
+    fn diagnose_exit(&self) -> Option<String> {
+        crate::exit_diagnosis::probe(&self.environment)
     }
 
     fn send_request(&mut self, method: &str, params: Value) -> Result<i64> {
@@ -1449,13 +1464,20 @@ impl AcpClient {
                     if is_auth_required(code, &message) {
                         bail!("{} (ACP: {message})", self.sign_in_hint);
                     }
+                    // The bridge reporting that the agent process died: say why,
+                    // after the bridge's own words.
+                    let why = if is_agent_exit(&message) {
+                        self.diagnose_exit().map(|why| format!(" [{why}]")).unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
                     match (code, data) {
                         (Some(code), Some(data)) => {
-                            bail!("ACP error {code}: {message} ({data})")
+                            bail!("ACP error {code}: {message} ({data}){why}")
                         }
-                        (Some(code), None) => bail!("ACP error {code}: {message}"),
-                        (None, Some(data)) => bail!("ACP error: {message} ({data})"),
-                        (None, None) => bail!("ACP error: {message}"),
+                        (Some(code), None) => bail!("ACP error {code}: {message}{why}"),
+                        (None, Some(data)) => bail!("ACP error: {message} ({data}){why}"),
+                        (None, None) => bail!("ACP error: {message}{why}"),
                     }
                 }
                 Ok(AcpRequest::Notification { method, params }) => {
@@ -1774,6 +1796,12 @@ fn spawn_agent(
             })
         }
     }
+}
+
+/// Whether an ACP error message says the agent process itself died (the
+/// Claude bridge: "The Claude Agent process exited unexpectedly").
+fn is_agent_exit(message: &str) -> bool {
+    message.to_ascii_lowercase().contains("process exited")
 }
 
 /// ACP's `auth_required` error: the agent CLI where it runs is not signed in.
@@ -2326,6 +2354,7 @@ impl PersistentAcpSession {
             sign_in_hint: sign_in_hint(host, environment),
             stderr_tail,
             remote: !matches!(environment, AgentEnvironment::Host),
+            environment: environment.clone(),
         };
 
         let client_name = host.client_name();
@@ -2763,11 +2792,24 @@ while True:
 
     #[test]
     fn a_lost_agent_says_what_to_do() {
-        let host = AgentLost { said: Some("relay restarted".into()), remote: false };
+        let host = AgentLost { said: Some("relay restarted".into()), remote: false, diagnosis: None };
         let text = host.to_string();
         assert!(text.contains("relay restarted") && text.contains("What to do: send your message again"), "{text}");
-        let remote = AgentLost { said: None, remote: true }.to_string();
+        let remote = AgentLost { said: None, remote: true, diagnosis: None }.to_string();
         assert!(remote.contains("sandbox or container may have restarted"), "{remote}");
+        let oom = AgentLost {
+            said: Some("bridge closed".into()),
+            remote: true,
+            diagnosis: Some("the agent was killed: the machine ran out of memory".into()),
+        }
+        .to_string();
+        assert!(oom.contains("(bridge closed) [the agent was killed: the machine ran out of memory]"), "{oom}");
+    }
+
+    #[test]
+    fn the_bridges_agent_exit_error_is_recognised() {
+        assert!(is_agent_exit("Internal error: The Claude Agent process exited unexpectedly. Please start a new session."));
+        assert!(!is_agent_exit("Internal error: session not found"));
     }
 
     #[test]

@@ -29,6 +29,19 @@ done
 
 mkdir -p "$TOD/bin" "$TOD/logs"
 
+# Terraform providers are shared across every copy of a module: this sandbox's
+# disk is RAM, and each `terraform init` otherwise downloads ~750 MB into its
+# own copy. Agents launched by tod get the same two variables in their
+# environment (tod_sandbox::node::terraform_cache_env); this covers shells.
+TF_CACHE=/root/.terraform.d/plugin-cache
+mkdir -p "$TF_CACHE"
+if [ -d /etc/profile.d ]; then
+    cat > /etc/profile.d/tod-terraform.sh <<EOF
+export TF_PLUGIN_CACHE_DIR=$TF_CACHE
+export TF_PLUGIN_CACHE_MAY_BREAK_DEPENDENCY_LOCK_FILE=1
+EOF
+fi
+
 have() { command -v "$1" >/dev/null 2>&1; }
 
 if have apk; then PM=apk

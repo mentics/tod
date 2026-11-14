@@ -31,6 +31,14 @@ turns, findings, run_state, node_timeline, journey records):
 
 ---
 
+## 2026-11-14: agent OOM-killed in a node sandbox, reported only as "exited unexpectedly" (ENG-2504)
+
+- **Seen**: 1, ENG-2504 (sandbox `tod-add-independent-validity-and-coverage-2e8b5d`), 2026-11-14.
+- **Symptom**: Review/Fix stopped with `ACP error -32603: Internal error: The Claude Agent process exited unexpectedly` and "The agent process stopped unexpectedly ([session/create] ... phase=prepare-query)", retried 5 times over 20 minutes with the same result. Nobody was told it was out of memory.
+- **Cause**: a node sandbox has 8 GB RAM, no swap, and its root filesystem lives in RAM. The agents validated Terraform in fresh copies (`mktemp -d`, `/tmp/tfcheck`, `/tmp/tfv`); each `terraform init` downloaded ~755 MB of providers and nothing was removed. Five copies filled `/` to 96% with 184 MB available, and the kernel OOM-killed the agent. Every path that reports an agent exit (`AgentLost` for a dropped connection, the bridge's `-32603` "process exited" response) said only what the bridge said.
+- **Fix**: `tod_agent::exit_diagnosis` probes where the agent ran (one bounded `sh -c`: `dmesg` OOM line, cgroup `oom_kill`, `/proc/meminfo`, `df /`, `du` of the largest `/tmp` entries) and appends the finding to the original error, in both places in `cursor_acp.rs` (`AgentLost::diagnosis`, and the `ResponseError` path when the message says the process exited), for sandboxes and dev containers; the host is not probed. Prevention: `TF_PLUGIN_CACHE_DIR` (`/root/.terraform.d/plugin-cache`) and `TF_PLUGIN_CACHE_MAY_BREAK_DEPENDENCY_LOCK_FILE=1` in the supervised node env (`node_env`) and in agents the app launches (`agent_env`), created with a profile.d file for shells by `assets/sandbox/bootstrap.sh`; `workspace/codebase.md` tells agents the sandbox disk is RAM and to remove scratch copies. Tests: `exit_diagnosis::tests`, `cursor_acp::tests::{a_lost_agent_says_what_to_do, the_bridges_agent_exit_error_is_recognised}`, `node::tests::{an_interactive_agent_gets_placeholders_or_the_token_by_mode, the_supervised_node_env_shares_terraform_providers}`.
+- **Measure**: count of agent-exit errors carrying "ran out of memory" per node; peak root-filesystem use per node sandbox. Open: sandboxes made before this change need a re-bootstrap for the profile.d file (the app-launched and supervised envs apply on the next launch/restart).
+
 ## 2026-11-14: a verification agent's retag to `merged` was refused as "ask the user" (ENG-3129)
 
 - **Seen**: 1, ENG-3129, 2026-11-14 (conversation B80D61C0, two obligations that can only be shown true after merge).

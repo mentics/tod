@@ -11,6 +11,7 @@ pub mod agent_launch;
 pub mod agent_traffic;
 mod cursor_acp;
 pub mod devcontainer;
+pub mod exit_diagnosis;
 mod mock;
 pub mod platform;
 mod process_tree;

@@ -118,6 +118,24 @@ impl SandboxLaunch {
             .map(str::to_string))
     }
 
+    /// Runs `script` with `sh -c` in the sandbox and returns its stdout,
+    /// within `limit`. A script that exits non-zero is still an answer (its
+    /// parts may fail on their own); only failing to reach the sandbox is an
+    /// error, with the launcher's own words.
+    pub fn run_script(&self, script: &str, limit: Duration) -> Result<String> {
+        let what = format!("{} exec in sandbox {}", self.launcher.display(), self.sandbox);
+        let mut command = self.launcher_command();
+        command
+            .args(["exec", &self.sandbox, "--", "sh", "-c", script])
+            .stdin(Stdio::null());
+        let out = output_within(command, limit, &what)?;
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        if stdout.trim().is_empty() && !out.status.success() {
+            bail!("could not reach sandbox {}: {}", self.sandbox, String::from_utf8_lossy(&out.stderr).trim());
+        }
+        Ok(stdout)
+    }
+
     /// `program args…` in the sandbox, over stdio, as `tod-sandbox agent`
     /// runs it: it outlives a dropped connection and lets the sandbox sleep
     /// between requests. `env` is added to [`Self::env`] (a host `PATH` is
