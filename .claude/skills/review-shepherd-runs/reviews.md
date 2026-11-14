@@ -10,8 +10,8 @@ the skill and clears the ones it applied.
 
 ## Transcripts reviewed
 
-- `fec2b2b0-45ba-43a3-bacb-1d4613e56139` reviewed through 2026-11-12T23:12:20Z — Shepherd nodes for Eng tasks (1st run)
-- `027bd068-2c83-43fb-b125-7ee5d6a22dff` reviewed through 2026-11-13T02:04:42Z — Shepherd nodes for Eng tasks (2nd run)
+- `fec2b2b0-45ba-43a3-bacb-1d4613e56139` reviewed through 2026-11-12T23:12:20Z by v1 — Shepherd nodes for Eng tasks (1st run)
+- `027bd068-2c83-43fb-b125-7ee5d6a22dff` reviewed through 2026-11-13T02:04:42Z by v1 — Shepherd nodes for Eng tasks (2nd run)
 
 ## 2026-11-13: the two "Eng tasks" runs
 

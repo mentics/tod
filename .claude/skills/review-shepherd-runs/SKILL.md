@@ -2,6 +2,8 @@
 name: review-shepherd-runs
 description: Review past runs of the shepherd-nodes skill (its Claude Code transcripts). Analyze what the shepherd agent itself did (its mistakes, self-corrections, wasted steps, unverified claims, idle time, repeated errors) as well as where the user corrected it, and improve .claude/skills/shepherd-nodes/SKILL.md so the next run is more accurate, efficient and robust. Use when asked to review, learn from, audit or improve shepherd-nodes, or to look at how past shepherd sessions went.
 user_invocable: true
+version: 1
+reviews_ok_from: 1
 ---
 
 ## The goal
@@ -173,11 +175,12 @@ answers. Commit it to main when they agree (tod has no PRs).
 
 ## 5. Update the ledger
 
-In `reviews.md`, add one line per transcript reviewed, in this exact form
-(`find_runs.py` reads it):
+In `reviews.md`, record each transcript reviewed with the script, never by
+hand; it writes the line in the form `find_runs.py` reads, with the current
+version:
 
-```
-- `<transcript uuid>` reviewed through <last timestamp reviewed> — <session title>
+```bash
+python3 -I .claude/skills/review-shepherd-runs/scripts/find_runs.py shepherd-nodes --ledger .claude/skills/review-shepherd-runs/reviews.md --mark <transcript path> "<session title>"
 ```
 
 Then one section for this review: the date, the run profiles (wall time,
@@ -185,3 +188,20 @@ compactions, errors, idle), the findings (each with evidence, cost, and where
 it went: skill, tooling, tod, or neither), and what was applied. Findings you
 didn't apply stay listed as open, so the next review starts from them, and a
 finding that comes back in a later run gets its count bumped.
+
+## Versions
+
+`version` in the frontmatter says which release of this skill reviewed a run;
+the ledger records it on every line. Bump it on any change to this skill or
+its scripts that could find something new, and add a line below.
+
+`reviews_ok_from` is the oldest version whose reviews still count. A minor
+change bumps `version` and leaves it alone, so runs reviewed by earlier
+versions stay done. A major change (a new lens, a new source of evidence) also
+raises `reviews_ok_from`: runs reviewed by an older version then show as
+`STALE` in `find_runs.py` and get a full review, from the start of the
+transcript. Tell the user how many runs that is before starting, and let them
+choose which to redo.
+
+- v1: lenses on the agent's own behavior and on the user's interventions,
+  tooling and tod gaps, the ledger.
