@@ -3531,6 +3531,45 @@ fn clean_reviews_of_a_change_do_not_count_toward_its_round_limit() {
     assert_eq!(since(Some(made_at)), 0);
 }
 
+/// A review of `pr_draft` whose agent died: no report, nothing recorded.
+fn seed_killed_review(fx: &Fixture) {
+    let id = Uuid::new_v4();
+    let conversation = |command| fx.fleet.interview(ACTOR_USER, command).unwrap();
+    conversation(InterviewCommand::CreateConversation {
+        id,
+        focus: Focus::Node(fx.node),
+        protocol: ProtocolKind::Review,
+        platform: None,
+        model: None,
+        effort: None,
+    });
+    conversation(InterviewCommand::SetConversationTransition {
+        conversation_id: id,
+        from_state: "pr_draft".into(),
+        to_state: "pr_review".into(),
+    });
+    std::thread::sleep(Duration::from_millis(3));
+}
+
+#[test]
+fn killed_reviews_in_pr_draft_are_not_rounds() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    with_pr_draft_review(&fx);
+    linked_to_prs(&fx, "pr_draft", &["https://github.com/acme/app/pull/42"]);
+    let made_at = chrono::Utc::now().timestamp_millis();
+    std::thread::sleep(Duration::from_millis(3));
+    let since = |ms| fx.fleet.read(|conn| crate::pr_draft_review::unconverged_rounds_since(conn, fx.node, ms)).unwrap();
+    for _ in 0..2 * REVIEW_ROUND_LIMIT {
+        seed_killed_review(&fx);
+    }
+    assert_eq!(since(Some(made_at)), 0);
+    seed_unclean_review(&fx, 0);
+    assert_eq!(since(Some(made_at)), 1, "killed attempts plus one real round is one round");
+    seed_killed_review(&fx);
+    assert_eq!(since(None), 1);
+}
+
 /// A finished review of `pr_draft` that recorded one finding the fixer
 /// then claimed fixed: a round that did not come back clean.
 fn seed_unclean_review(fx: &Fixture, n: usize) {

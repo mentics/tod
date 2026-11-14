@@ -80,7 +80,8 @@ pub fn latest_review(conn: &Connection, node: Uuid) -> Result<Option<Conversatio
 /// recording nothing that stands, as [`round_clean`]) resets the count, since
 /// a review is owed every time the head changes (a merge of the base, a CI
 /// fix, an answer to a bot) and clean ones prove convergence, not the
-/// opposite. A review's round is its findings up to the next review.
+/// opposite. A review's round is its findings up to the next review. Only a
+/// review that finished (recorded done) is a round: one whose agent died is not.
 pub fn unconverged_rounds(conn: &Connection, node: Uuid) -> Result<u32> {
     unconverged_rounds_since(conn, node, None)
 }
@@ -108,11 +109,15 @@ pub fn unconverged_rounds_since(conn: &Connection, node: Uuid, since_ms: Option<
             .iter()
             .filter(|f| f.created_at >= review.created_at && f.created_at < next_start)
             .any(|f| !matches!(f.status.as_str(), FINDING_OUT_OF_SCOPE | FINDING_DECLINED));
-        if done && !stands {
+        next_start = review.created_at;
+        // A review the agent never finished (killed, crashed) is not a round.
+        if !done {
+            continue;
+        }
+        if !stands {
             break;
         }
         count += 1;
-        next_start = review.created_at;
     }
     Ok(count)
 }
