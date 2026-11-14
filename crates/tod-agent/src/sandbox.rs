@@ -57,6 +57,16 @@ fn output_within(mut command: Command, limit: Duration, what: &str) -> Result<Ou
     })
 }
 
+/// Runs `script` with `sh -c` on this machine and returns its stdout, within
+/// `limit` (for diagnosing an agent that ran here). As [`SandboxLaunch::run_script`],
+/// only failing to run it is an error.
+pub(crate) fn run_local_script(script: &str, limit: Duration) -> Result<String> {
+    let mut command = Command::new("sh");
+    command.args(["-c", script]).stdin(Stdio::null());
+    let out = output_within(command, limit, "sh -c diagnosis")?;
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 /// How to start a process in a cloud sandbox.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxLaunch {

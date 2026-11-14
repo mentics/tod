@@ -8,7 +8,7 @@
 use crate::fleet::cli_relay;
 use crate::fleet::node_actions::ResolvedFiles;
 use crate::fleet::workdir::Workdir;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::Path;
 use tod_agent::AgentEnvironment;
 use tod_agent::devcontainer::{ContainerFile, DevContainerLaunch};
@@ -104,9 +104,9 @@ pub fn sandbox_launch_for(cwd: &Workdir, data_root: &Path) -> Result<Option<Sand
         return Ok(None);
     };
     let relay = cli_relay::ensure_started(data_root)?;
-    let env = crate::fleet::sandbox::Sandboxes::load(data_root)
-        .map(|sandboxes| tod_sandbox::node::agent_env(&sandboxes.node_credentials(Vec::new()), sandboxes.claude_token_via()))
-        .unwrap_or_default();
+    let sandboxes = crate::fleet::sandbox::Sandboxes::load(data_root)
+        .context("load the sandbox settings for the agent's environment")?;
+    let env = tod_sandbox::node::agent_env(&sandboxes.node_credentials(Vec::new()), sandboxes.claude_token_via());
     Ok(Some(SandboxLaunch {
         launcher: crate::fleet::sandbox::sibling_exe("tod-sandbox"),
         data_root: data_root.to_path_buf(),

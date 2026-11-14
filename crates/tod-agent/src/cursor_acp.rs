@@ -1146,6 +1146,7 @@ fn run_acp_session(
         stderr_tail,
         remote: !matches!(environment, AgentEnvironment::Host),
         environment: environment.clone(),
+        started: std::time::Instant::now(),
     };
 
     let client_name = host.client_name();
@@ -1297,6 +1298,8 @@ struct AcpClient {
     remote: bool,
     /// Where the agent runs, so a lost agent can be looked into.
     environment: AgentEnvironment,
+    /// When the agent was started, to tell a kill of it from an earlier one.
+    started: std::time::Instant,
 }
 
 impl AcpClient {
@@ -1398,7 +1401,7 @@ impl AcpClient {
 
     /// Why the agent died, looked up where it ran (one bounded probe).
     fn diagnose_exit(&self) -> Option<String> {
-        crate::exit_diagnosis::probe(&self.environment)
+        crate::exit_diagnosis::probe(&self.environment, Some(self.started.elapsed()))
     }
 
     fn send_request(&mut self, method: &str, params: Value) -> Result<i64> {
@@ -2355,6 +2358,7 @@ impl PersistentAcpSession {
             stderr_tail,
             remote: !matches!(environment, AgentEnvironment::Host),
             environment: environment.clone(),
+            started: std::time::Instant::now(),
         };
 
         let client_name = host.client_name();

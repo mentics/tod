@@ -322,12 +322,16 @@ fn claude_token(creds: &NodeCredentials) -> Option<&str> {
     creds.claude_oauth_token.as_deref().map(str::trim).filter(|t| !t.is_empty())
 }
 
-/// What the supervisor's environment adds to the sandbox's: the Claude
+/// What the supervisor's environment adds to the sandbox's: the Terraform
+/// provider cache ([`terraform_cache_env`]) and the Claude
 /// token with [`ClaudeTokenVia::Env`] (Claude Code, the supervisor's child,
 /// inherits it); nothing with the proxy, or without a token. The relay is
 /// given these as `TOD_SUPERVISOR_ENV_<NAME>` ([`relay_env`]).
 pub fn supervisor_env(creds: &NodeCredentials, claude_via: ClaudeTokenVia) -> Vec<(String, String)> {
-    let mut out = Vec::new();
+    // Explicit, not left to the sandbox's own environment: the relay hands
+    // this to the supervisor, whose agents inherit it.
+    let mut out: Vec<(String, String)> =
+        terraform_cache_env().into_iter().map(|(k, v)| (k.to_string(), v)).collect();
     if let (ClaudeTokenVia::Env, Some(token)) = (claude_via, claude_token(creds)) {
         out.push((CLAUDE_TOKEN_ENV.to_string(), token.to_string()));
     }
@@ -1608,7 +1612,7 @@ mod tests {
         // A blank Claude token is no token.
         let creds = NodeCredentials { claude_oauth_token: Some("  ".into()), ..creds };
         assert_eq!(proxy_rules(&creds, "o.bl.run", ClaudeTokenVia::Proxy).len(), 2);
-        assert!(supervisor_env(&creds, ClaudeTokenVia::Env).is_empty());
+        assert_eq!(supervisor_env(&creds, ClaudeTokenVia::Env), tf_only());
     }
 
     #[test]
@@ -1666,7 +1670,7 @@ mod tests {
         assert_eq!(claude["headers"]["Authorization"], "Bearer {{SECRET:claude}}");
         assert_eq!(claude["secrets"]["claude"], "sk-ant-oat01-real");
         // Nothing goes to the supervisor beyond the sandbox's environment.
-        assert!(supervisor_env(&creds(), ClaudeTokenVia::Proxy).is_empty());
+        assert_eq!(supervisor_env(&creds(), ClaudeTokenVia::Proxy), tf_only());
     }
 
     #[test]
@@ -1678,11 +1682,25 @@ mod tests {
         assert!(!body.to_string().contains("sk-ant-oat01-real"));
         assert!(!body.to_string().contains("api.anthropic.com"));
         let sup = supervisor_env(&creds(), ClaudeTokenVia::Env);
-        assert_eq!(sup, [(CLAUDE_TOKEN_ENV.to_string(), "sk-ant-oat01-real".to_string())]);
-        assert_eq!(
-            relay_env(&sup),
-            [("TOD_SUPERVISOR_ENV_CLAUDE_CODE_OAUTH_TOKEN".to_string(), "sk-ant-oat01-real".to_string())]
-        );
+        assert_eq!(sup[sup.len() - 1], (CLAUDE_TOKEN_ENV.to_string(), "sk-ant-oat01-real".to_string()));
+        assert!(sup.iter().any(|(k, _)| k == "TF_PLUGIN_CACHE_DIR"));
+        assert!(relay_env(&sup).contains(&(
+            "TOD_SUPERVISOR_ENV_CLAUDE_CODE_OAUTH_TOKEN".to_string(),
+            "sk-ant-oat01-real".to_string()
+        )));
+    }
+
+    fn tf_only() -> Vec<(String, String)> {
+        terraform_cache_env().into_iter().map(|(k, v)| (k.to_string(), v)).collect()
+    }
+
+    #[test]
+    fn the_supervisor_and_so_its_agents_get_the_terraform_cache_through_the_relay() {
+        // The relay takes `TOD_SUPERVISOR_ENV_<NAME>` and gives `<NAME>` to the
+        // supervisor alone, whose agents inherit it.
+        let relay = relay_env(&supervisor_env(&NodeCredentials::default(), ClaudeTokenVia::Proxy));
+        assert!(relay.contains(&("TOD_SUPERVISOR_ENV_TF_PLUGIN_CACHE_DIR".to_string(), TF_PLUGIN_CACHE_DIR.to_string())));
+        assert!(relay.iter().any(|(k, v)| k == "TOD_SUPERVISOR_ENV_TF_PLUGIN_CACHE_MAY_BREAK_DEPENDENCY_LOCK_FILE" && v == "1"));
     }
 
     #[test]
@@ -1801,7 +1819,7 @@ mod tests {
         assert_eq!(r.value, "Bearer {{SECRET:env_grow_book}}");
         assert_eq!(r.secret_value, "gb_secret");
         let sup = supervisor_env(&creds, ClaudeTokenVia::Proxy);
-        assert!(sup.is_empty());
+        assert_eq!(sup, tf_only());
     }
 
     #[test]
@@ -1811,7 +1829,7 @@ mod tests {
             let body = create_body(&spec(via), &creds);
             assert_eq!(env_value(&body, CLAUDE_TOKEN_ENV), None);
             assert!(!body.to_string().contains("api.anthropic.com"));
-            assert!(supervisor_env(&creds, via).is_empty());
+            assert_eq!(supervisor_env(&creds, via), tf_only());
         }
     }
 
