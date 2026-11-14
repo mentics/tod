@@ -471,6 +471,40 @@ its own words. Now:
    Cofactr/flagship#6640 the bot only went silent, so `silent_after_minutes`
    covers that. A bot's own review on push is outside tod's control.
 
+9. **A bot that does not review drafts is not part of a draft.** While the
+   pull request is a draft, a bot that does not review drafts is left out
+   of its assessment (`Assessment::of_with`, the one point every reader
+   uses): it is not waited for, asked, or raised as a silence question,
+   `Work::BotReviewMissing` is not produced, and `pr-approved.review-current`
+   / `.review-score` do not count it. Nothing a person does not do (marking
+   the PR ready) can make it review, so waiting would never end. The status
+   line says it ("greptile reviews only ready pull requests; its review is
+   required after you mark the pull request ready") and a note on the node's
+   activity records it once. Once the PR is ready the bot is waited for,
+   asked and required as in items 1-8. How tod knows, per bot:
+
+   ```yaml
+   pr_readiness:
+     bots:
+       - name: greptile
+         reviews_drafts: false   # true: always on drafts; unset: detect
+   ```
+
+   Unset, `pr_readiness::reviews_drafts` reads the repository's last 40 pull
+   requests with one GraphQL query (cached 30 minutes; a failed read is the
+   assessment's error, never a guess). Let D be the last time the bot spoke
+   (review or comment) on a pull request that is a draft now. It is taken
+   not to review drafts when **at least 3** drafts opened after D, over 2
+   hours ago and within the last 14 days, got nothing from it, **and** it has
+   spoken on a ready pull request after D (so it is alive and only drafts
+   are skipped). Fewer drafts, a bot silent everywhere, or a draft it
+   reviewed since leave it as reviewing drafts, so a bot is not dropped on
+   thin evidence. A request already pending about such a bot on a draft
+   (protocol `pr` or `bot_silence`, reason `broken`, naming it) is withdrawn
+   by the autopilot with a note on the node's activity
+   (`Autopilot::withdraw_draft_bot_requests`), and the node goes on. No
+   prompt or code names a bot: it comes from the configuration.
+
 ## What is built where
 
 - `tod-store`: PR thread, review, check and comment reads (GraphQL for

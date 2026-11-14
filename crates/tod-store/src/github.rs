@@ -625,6 +625,36 @@ impl Github {
             .collect())
     }
 
+    /// The repository's most recently opened pull requests (the last 40),
+    /// with who commented or reviewed on each: what tells whether a review
+    /// bot reviews drafts (`tod_core::pr_readiness::reviews_drafts`). One
+    /// query; the caller caches it.
+    pub fn recent_pr_activity(&self, owner: &str, repo: &str) -> Result<Vec<RecentPr>, GithubError> {
+        const QUERY: &str = "query($owner: String!, $repo: String!) { repository(owner: $owner, name: $repo) { pullRequests(last: 40, orderBy: {field: CREATED_AT, direction: ASC}) { nodes { number isDraft createdAt reviews(last: 20) { nodes { submittedAt author { login } } } comments(last: 20) { nodes { createdAt author { login } } } } } } }";
+        let data: RecentData =
+            self.graphql(QUERY, serde_json::json!({ "owner": owner, "repo": repo }), Some((owner, repo)))?;
+        let repository = data.repository.ok_or(GithubError::NotFound)?;
+        Ok(repository
+            .pull_requests
+            .nodes
+            .into_iter()
+            .map(|p| {
+                let mut activity: Vec<(String, String)> = Vec::new();
+                for r in p.reviews.nodes {
+                    if let (Some(a), Some(at)) = (r.author, r.submitted_at) {
+                        activity.push((a.login, at));
+                    }
+                }
+                for c in p.comments.nodes {
+                    if let Some(a) = c.author {
+                        activity.push((a.login, c.created_at));
+                    }
+                }
+                RecentPr { number: p.number, draft: p.is_draft, created_at: p.created_at, activity }
+            })
+            .collect())
+    }
+
     /// Reply in a review thread (by the thread's GraphQL id).
     pub fn reply_to_thread(&self, thread_id: &str, body: &str) -> Result<(), GithubError> {
         const MUTATION: &str = "mutation($thread: ID!, $body: String!) { addPullRequestReviewThreadReply(input: {pullRequestReviewThreadId: $thread, body: $body}) { comment { id } } }";
@@ -1091,6 +1121,64 @@ struct GraphqlReply<T> {
 #[derive(Debug, Deserialize)]
 struct GraphqlError {
     message: String,
+}
+
+/// A recently opened pull request and who spoke on it
+/// ([`Github::recent_pr_activity`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecentPr {
+    pub number: i64,
+    /// Whether it is a draft now.
+    pub draft: bool,
+    pub created_at: String,
+    /// `(login, time)` of each review and top-level comment on it.
+    pub activity: Vec<(String, String)>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RecentData {
+    repository: Option<RecentRepo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RecentRepo {
+    #[serde(rename = "pullRequests")]
+    pull_requests: RecentNodes<RecentPull>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RecentNodes<T> {
+    nodes: Vec<T>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RecentPull {
+    number: i64,
+    #[serde(rename = "isDraft")]
+    is_draft: bool,
+    #[serde(rename = "createdAt")]
+    created_at: String,
+    reviews: RecentNodes<RecentReview>,
+    comments: RecentNodes<RecentComment>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RecentReview {
+    #[serde(rename = "submittedAt")]
+    submitted_at: Option<String>,
+    author: Option<RecentAuthor>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RecentComment {
+    #[serde(rename = "createdAt")]
+    created_at: String,
+    author: Option<RecentAuthor>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RecentAuthor {
+    login: String,
 }
 
 #[derive(Debug, Deserialize)]

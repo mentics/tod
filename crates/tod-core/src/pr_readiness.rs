@@ -153,6 +153,28 @@ pub struct BotReport {
     pub own_review_held: bool,
 }
 
+/// A bot left out of a draft pull request's assessment because it does not
+/// review drafts (`PrReviewBotSettings::reviews_drafts`, else
+/// [`reviews_drafts`]). Its review is required once the pull request is
+/// ready, which only a person does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DraftSkipped {
+    pub bot: String,
+    /// Found from the repository's history, not set in the settings.
+    pub detected: bool,
+}
+
+impl DraftSkipped {
+    /// The line the task panel shows.
+    pub fn note(&self) -> String {
+        format!(
+            "{} reviews only ready pull requests{}; its review is required after you mark the pull request ready",
+            self.bot,
+            if self.detected { " (seen in this repository's recent history)" } else { "" }
+        )
+    }
+}
+
 /// A bot given up on for a head, by its `fallback`: the gate relies on tod's
 /// own review of that head instead. Never silent: the task panel says so and
 /// the node's timeline records it ([`Self::note`]).
@@ -242,6 +264,10 @@ pub struct Assessment {
     /// Bots given up on for this head ([`FallbackApplied`]): not in `bots`,
     /// so nothing waits for, asks, or requires them.
     pub fallbacks: Vec<FallbackApplied>,
+    /// Bots that do not review drafts, while this pull request is one
+    /// ([`DraftSkipped`]): not in `bots`, so nothing waits for, asks, or
+    /// requires them until it is ready.
+    pub draft_skipped: Vec<DraftSkipped>,
     pub human_review: HumanReview,
     /// Who GitHub still waits on for a review (logins, teams as `org/team`);
     /// empty when nobody was asked.
@@ -376,9 +402,21 @@ impl Assessment {
         let sha = snapshot.status.head_sha.as_deref();
         let mut bots = Vec::new();
         let mut fallbacks = Vec::new();
+        let mut draft_skipped = Vec::new();
         let own = &settings.own_review;
         for configured in &settings.bots {
             let Some(bot) = builtin_bot(&configured.name) else { continue };
+            // A bot that does not review drafts is no part of a draft's
+            // readiness: nothing can make it review before a person marks the
+            // pull request ready.
+            if snapshot.status.draft && !snapshot.status.merged {
+                let detected = configured.reviews_drafts.is_none()
+                    && settings.draft_blind.iter().any(|b| b.eq_ignore_ascii_case(&configured.name));
+                if configured.reviews_drafts == Some(false) || detected {
+                    draft_skipped.push(DraftSkipped { bot: configured.name.clone(), detected });
+                    continue;
+                }
+            }
             {
                 let standing = bot_standing(bot, snapshot, sha, head_at, same_change)?;
                 let overdue = head_at.is_none_or(|h| {
@@ -460,6 +498,7 @@ impl Assessment {
             open_threads: snapshot.threads.iter().filter(|t| wants_answer(t)).map(open_thread).collect(),
             bots,
             fallbacks,
+            draft_skipped,
             human_review: human_review(snapshot, head_at),
             requested_reviewers: snapshot.status.reviewers.clone(),
             review_comments: review_comments(
@@ -1448,6 +1487,103 @@ Not safe.
     }
 
     #[test]
+    fn a_bot_that_skips_drafts_is_no_part_of_a_drafts_readiness() {
+        let mut st = status("draft", "success");
+        st.draft = true;
+        let s = snap(st.clone(), vec![], vec![]);
+        // Unset: reviewed as before.
+        assert_eq!(Assessment::of(&s, &settings(), now()).waits(), vec![Wait::BotReview { bot: "greptile".into() }]);
+        // Set false, or found blind for this pull request: left out, said so.
+        let mut never = settings();
+        never.bots[0].reviews_drafts = Some(false);
+        let a = Assessment::of(&s, &never, now());
+        assert!(a.bots.is_empty() && a.silent_bots().is_empty() && a.asks_due().is_empty());
+        assert_eq!(a.next(), Next::Clear);
+        assert_eq!(a.draft_skipped, vec![DraftSkipped { bot: "greptile".into(), detected: false }]);
+        assert!(a.draft_skipped[0].note().contains("required after you mark the pull request ready"));
+        let mut blind = settings();
+        blind.draft_blind = vec!["greptile".into()];
+        let a = Assessment::of(&s, &blind, now());
+        assert_eq!(a.next(), Next::Clear);
+        assert!(a.draft_skipped[0].detected);
+        // `true` overrides the finding.
+        blind.bots[0].reviews_drafts = Some(true);
+        assert_eq!(Assessment::of(&s, &blind, now()).waits().len(), 1);
+        // Ready: required whatever was found.
+        let mut ready = st;
+        ready.draft = false;
+        ready.mergeable_state = Some("blocked".into());
+        let mut blind = settings();
+        blind.draft_blind = vec!["greptile".into()];
+        blind.bots[0].reviews_drafts = Some(false);
+        let a = Assessment::of(&snap(ready, vec![], vec![]), &blind, now());
+        assert_eq!(a.waits(), vec![Wait::BotReview { bot: "greptile".into() }]);
+        assert!(a.draft_skipped.is_empty());
+    }
+
+    fn recent(number: i64, draft: bool, hours_ago: i64, bot_hours_ago: Option<i64>) -> tod_store::github::RecentPr {
+        let t = |h: i64| (now() - chrono::Duration::hours(h)).to_rfc3339();
+        tod_store::github::RecentPr {
+            number,
+            draft,
+            created_at: t(hours_ago),
+            activity: bot_hours_ago.map(|h| vec![("greptile-apps[bot]".to_string(), t(h))]).unwrap_or_default(),
+        }
+    }
+
+    #[test]
+    fn the_history_rule_needs_a_live_bot_and_three_drafts_it_passed_over() {
+        let bot = &GREPTILE;
+        // Seen live: it reviewed a draft until the 11th, then only ready
+        // pull requests, and passed over every draft since.
+        let blind = vec![
+            recent(1, true, 100, Some(99)),
+            recent(2, false, 30, Some(29)),
+            recent(3, true, 20, None),
+            recent(4, true, 10, None),
+            recent(5, true, 5, None),
+        ];
+        assert!(!reviews_drafts(&blind, bot, now()));
+        // Two drafts are too few.
+        assert!(reviews_drafts(&blind[..4], bot, now()));
+        // A bot silent everywhere is silent, not blind to drafts.
+        let silent: Vec<_> = (0..6).map(|n| recent(n, n % 2 == 0, 10 + n, None)).collect();
+        assert!(reviews_drafts(&silent, bot, now()));
+        // It reviewed a draft after the others were passed over.
+        let mut back = blind.clone();
+        back.push(recent(6, true, 4, Some(3)));
+        assert!(reviews_drafts(&back, bot, now()));
+        // Drafts under two hours old may just not have been reached.
+        let fresh = vec![recent(1, false, 30, Some(29)), recent(2, true, 1, None), recent(3, true, 1, None), recent(4, true, 1, None)];
+        assert!(reviews_drafts(&fresh, bot, now()));
+        // Nothing known: as before.
+        assert!(reviews_drafts(&[], bot, now()));
+    }
+
+    #[test]
+    fn a_failed_history_read_is_the_assessments_error_not_a_guess() {
+        struct Failing;
+        impl PrFeed for Failing {
+            fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<PrSnapshot, String> {
+                unreachable!()
+            }
+            fn recent_prs(&self, _: &tod_store::github::NodePr) -> Result<Vec<tod_store::github::RecentPr>, String> {
+                Err("GitHub is down".into())
+            }
+        }
+        let mut st = status("draft", "success");
+        st.draft = true;
+        let s = snap(st, vec![], vec![]);
+        let pr = tod_store::github::NodePr::new("o", "r", 1);
+        let err = assess(&Failing, &pr, &s, &settings(), now()).unwrap_err();
+        assert!(err.contains("GitHub is down"), "{err}");
+        // Settings that already say it need no history.
+        let mut never = settings();
+        never.bots[0].reviews_drafts = Some(false);
+        assert!(assess(&Failing, &pr, &s, &never, now()).is_ok());
+    }
+
+    #[test]
     fn a_fresh_head_is_given_time_before_the_agent_is_told() {
         let mut st = status("blocked", "success");
         st.head_committed_at = Some("2026-01-01T11:55:00Z".into());
@@ -2129,6 +2265,12 @@ pub trait PrFeed: Send + Sync {
     ) -> Result<bool, String> {
         Err("this feed does not compare commits".to_string())
     }
+    /// The repository's recent pull requests and who spoke on them, for
+    /// [`reviews_drafts`]. A feed with no such history says none, which counts
+    /// as "no evidence the bot skips drafts".
+    fn recent_prs(&self, _pr: &tod_store::github::NodePr) -> Result<Vec<tod_store::github::RecentPr>, String> {
+        Ok(Vec::new())
+    }
     /// Post a top-level comment on the pull request (the ask for a bot's
     /// review, `PrReviewBotSettings::ask`).
     fn post_comment(&self, _pr: &tod_store::github::NodePr, _body: &str) -> Result<(), String> {
@@ -2206,6 +2348,24 @@ impl PrFeed for GithubFeed {
         }
         map.insert(key, same);
         Ok(same)
+    }
+
+    fn recent_prs(&self, pr: &tod_store::github::NodePr) -> Result<Vec<tod_store::github::RecentPr>, String> {
+        static CACHE: std::sync::Mutex<
+            Option<std::collections::HashMap<String, (std::time::Instant, Vec<tod_store::github::RecentPr>)>>,
+        > = std::sync::Mutex::new(None);
+        let key = format!("{}/{}", pr.owner, pr.repo);
+        if let Some((at, prs)) = CACHE.lock().unwrap().as_ref().and_then(|m| m.get(&key))
+            && at.elapsed() < RECENT_TTL
+        {
+            return Ok(prs.clone());
+        }
+        let prs = self
+            .0
+            .recent_pr_activity(&pr.owner, &pr.repo)
+            .map_err(|err| format!("reading {}/{}'s recent pull requests to see whether a review bot reviews drafts: {err}", pr.owner, pr.repo))?;
+        CACHE.lock().unwrap().get_or_insert_with(Default::default).insert(key, (std::time::Instant::now(), prs.clone()));
+        Ok(prs)
     }
 
     fn post_comment(&self, pr: &tod_store::github::NodePr, body: &str) -> Result<(), String> {
@@ -2364,6 +2524,9 @@ impl LivePr {
         for fallback in &self.assessment.fallbacks {
             parts.push(fallback.note());
         }
+        for skipped in &self.assessment.draft_skipped {
+            parts.push(skipped.note());
+        }
         parts.join(", ")
     }
 }
@@ -2393,12 +2556,73 @@ pub fn assess(
     now: DateTime<Utc>,
 ) -> Result<Assessment, String> {
     let base = snapshot.status.base_ref.clone();
+    let detected;
+    let settings = if snapshot.status.draft && !snapshot.status.merged {
+        // Which bots skip drafts, found from the repository's history for
+        // those the settings leave open. A failed read is the assessment's
+        // error, never "reviews drafts".
+        let open: Vec<(&PrReviewBotSettings, &'static ReviewBot)> = settings
+            .bots
+            .iter()
+            .filter(|b| b.reviews_drafts.is_none())
+            .filter_map(|b| builtin_bot(&b.name).map(|bot| (b, bot)))
+            .collect();
+        let history = if open.is_empty() { Vec::new() } else { feed.recent_prs(pr)? };
+        let mut with_blind = settings.clone();
+        for (configured, bot) in open {
+            if !reviews_drafts(&history, bot, now) {
+                with_blind.draft_blind.push(configured.name.to_ascii_lowercase());
+            }
+        }
+        detected = with_blind;
+        &detected
+    } else {
+        settings
+    };
     Assessment::of_with(snapshot, settings, now, &mut |reviewed, head| {
         let base = base.as_deref().ok_or_else(|| {
             format!("{}: the base branch is unknown, so the bot's review of {reviewed} cannot be compared with head {head}", pr.url)
         })?;
         feed.same_change(pr, base, reviewed, head).map_err(|err| format!("{}: {err}", pr.url))
     })
+}
+
+/// How long a repository's recent pull requests are reused.
+const RECENT_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+/// Pull requests older than this say nothing about how the bot reviews now.
+const DRAFT_HISTORY_DAYS: i64 = 14;
+/// A draft younger than this may simply not have been reached yet.
+const DRAFT_MIN_AGE_HOURS: i64 = 2;
+/// Drafts the bot passed over, with no review of a draft since, that show it
+/// does not review them.
+const DRAFT_EVIDENCE: usize = 3;
+
+/// Whether `bot` reviews pull requests that are drafts, from the repository's
+/// recent pull requests (`history`, as [`PrFeed::recent_prs`] reads them).
+/// The rule, in `doc/lifecycle/pr-readiness.md`: let D be the latest time the
+/// bot spoke on a pull request that is a draft now. The bot is taken not to
+/// review drafts when **at least three** drafts opened after D, over two hours
+/// ago, within the last 14 days, got nothing from it, **and** it has spoken
+/// on some pull request that is ready after D (so it is alive, and only drafts
+/// are skipped). Anything less (too few drafts, a bot silent everywhere, a
+/// draft it reviewed since) leaves it as reviewing drafts, so a bot is never
+/// dropped on thin evidence.
+pub fn reviews_drafts(history: &[tod_store::github::RecentPr], bot: &ReviewBot, now: DateTime<Utc>) -> bool {
+    let window = now - chrono::Duration::days(DRAFT_HISTORY_DAYS);
+    let settled = now - chrono::Duration::hours(DRAFT_MIN_AGE_HOURS);
+    let spoke = |p: &tod_store::github::RecentPr| -> Vec<DateTime<Utc>> {
+        p.activity.iter().filter(|(who, _)| bot.is_author(who)).filter_map(|(_, at)| parse_time(at)).collect()
+    };
+    let last_on_draft = history.iter().filter(|p| p.draft).flat_map(spoke).max();
+    let after = |at: DateTime<Utc>| last_on_draft.is_none_or(|d| at > d);
+    let alive = history.iter().filter(|p| !p.draft).flat_map(spoke).any(after);
+    let passed_over = history
+        .iter()
+        .filter(|p| p.draft && spoke(p).is_empty())
+        .filter_map(|p| parse_time(&p.created_at))
+        .filter(|created| *created >= window && *created <= settled && after(*created))
+        .count();
+    !(alive && passed_over >= DRAFT_EVIDENCE)
 }
 
 /// [`live`], with reviews up to `answered_at` counted as answered (see

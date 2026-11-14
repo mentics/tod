@@ -353,6 +353,9 @@ pub(super) fn review_wait_of(live: &[crate::pr_readiness::LivePr]) -> (String, S
         for note in live.iter().flat_map(|p| p.assessment.fallbacks.iter().map(|f| f.note())) {
             what.push_str(&format!("; {note}"));
         }
+        for note in live.iter().flat_map(|p| p.assessment.draft_skipped.iter().map(|d| d.note())) {
+            what.push_str(&format!("; {note}"));
+        }
     }
     (spec, what)
 }
@@ -384,6 +387,7 @@ fn check_in_review(fleet: &FleetStore, node: uuid::Uuid, data_root: &std::path::
         Ok(live) => live,
         Err(err) => return Ok(GithubCheck::Unreadable(err)),
     };
+    super::note_draft_skipped(fleet, node, &live, "pr_review")?;
     match crate::pr_readiness::overall(&live) {
         Next::Merged | Next::Clear => {
             cancel_github_waits(fleet, node)?;

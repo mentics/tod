@@ -685,9 +685,19 @@ impl Autopilot {
                 }
                 ChecksStep::Stop(outcome) => return self.finish(outcome),
             }
-            let pending = fleet
+            let mut pending = fleet
                 .read(|conn| Ok(DecisionRepo::new(conn).list_pending_for_node(self.node)?))?
                 .len();
+            if pending > 0 && matches!(lifecycle.as_str(), "pr_draft" | "pr_review") {
+                // A request about a bot that does not review drafts, on a
+                // pull request that is still one, has nothing to ask.
+                if let Some(outcome) = self.withdraw_draft_bot_requests(fleet)? {
+                    return self.finish(outcome);
+                }
+                pending = fleet
+                    .read(|conn| Ok(DecisionRepo::new(conn).list_pending_for_node(self.node)?))?
+                    .len();
+            }
             if pending > 0 {
                 return self.finish(Outcome::NeedsHuman {
                     reason: NeedsHuman::Decision { pending },
@@ -1212,9 +1222,20 @@ impl Autopilot {
                 hook.waiting(None, None);
                 return Ok(Some(Outcome::BudgetExhausted { limit }));
             }
-            let pending = fleet
+            let mut pending = fleet
                 .read(|conn| Ok(DecisionRepo::new(conn).list_pending_for_node(self.node)?))?
                 .len();
+            if pending > 0 {
+                // A request about a bot that does not review drafts, on a
+                // pull request that is still one, has nothing to ask.
+                if let Some(outcome) = self.withdraw_draft_bot_requests(fleet)? {
+                    hook.waiting(None, None);
+                    return Ok(Some(outcome));
+                }
+                pending = fleet
+                    .read(|conn| Ok(DecisionRepo::new(conn).list_pending_for_node(self.node)?))?
+                    .len();
+            }
             if pending > 0 {
                 hook.waiting(None, None);
                 return Ok(Some(Outcome::NeedsHuman {
@@ -1254,6 +1275,7 @@ impl Autopilot {
                 }
             };
             self.note_fallbacks(fleet, &live, phase_key)?;
+            note_draft_skipped(fleet, node, &live, phase_key)?;
             let mut overall = pr_readiness::overall(&live);
             // A change the agent made and tod has not reviewed or pushed yet
             // (the run stopped in between) is finished first, whatever the
@@ -1477,6 +1499,9 @@ impl Autopilot {
                     for note in live.iter().flat_map(|p| p.assessment.fallbacks.iter().map(|f| f.note())) {
                         what.push_str(&format!("; {note}"));
                     }
+                    for note in live.iter().flat_map(|p| p.assessment.draft_skipped.iter().map(|d| d.note())) {
+                        what.push_str(&format!("; {note}"));
+                    }
                     let interval = if since.elapsed() >= PR_SLOW_AFTER {
                         self.pr_poll * PR_SLOW_FACTOR
                     } else {
@@ -1619,6 +1644,75 @@ impl Autopilot {
             }
         }
         Ok(())
+    }
+
+    /// Withdraws the node's pending requests about a review bot that does
+    /// not review drafts while every pull request it is waiting on is a draft
+    /// (the agent's "check why it is not reviewing", or tod's own silence
+    /// question): there is nothing to fix and nothing to wait for until a
+    /// person marks the pull request ready. A note on the node's activity says
+    /// what was withdrawn and why. `Some` when GitHub could not be read, which
+    /// is a failed look like any other.
+    fn withdraw_draft_bot_requests(&self, fleet: &FleetStore) -> Result<Option<Outcome>> {
+        use crate::pr_readiness;
+        use tod_store::decisions::REASON_BROKEN;
+        use tod_store::node_timeline::{KIND_NOTE, TimelineEntry};
+        let node = self.node;
+        let settings = pr_readiness::settings_for_node(fleet, node, &self.config.data_root)?;
+        if settings.bots.is_empty() {
+            return Ok(None);
+        }
+        let candidates: Vec<(tod_store::decisions::Decision, String)> = fleet
+            .read(|conn| Ok(DecisionRepo::new(conn).list_pending_for_node(node)?))?
+            .into_iter()
+            .filter(|d| {
+                d.reason == REASON_BROKEN
+                    && matches!(d.protocol.as_deref(), Some("pr") | Some(crate::bot_silence::PROTOCOL))
+            })
+            .filter_map(|d| {
+                let question = d.question.to_ascii_lowercase();
+                let bot = settings.bots.iter().find(|b| question.contains(&b.name.to_ascii_lowercase()))?.name.clone();
+                Some((d, bot))
+            })
+            .collect();
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+        let links = fleet.read(|conn| tod_store::github::NodePrRepo::new(conn).read(node))?;
+        if links.prs.is_empty() {
+            return Ok(None);
+        }
+        let Some(feed) = pr_readiness::feed_for(&self.config.data_root) else {
+            return Ok(Some(github_wait::github_look_failed(fleet, node, false, "GitHub credentials are not set up")?));
+        };
+        let live = match pr_readiness::live(feed.as_ref(), &links.prs, &settings) {
+            Ok(live) => live,
+            Err(err) => return Ok(Some(github_wait::github_look_failed(fleet, node, false, &err)?)),
+        };
+        for (decision, bot) in candidates {
+            let skipped = live.iter().any(|p| p.assessment.draft_skipped.iter().any(|d| d.bot.eq_ignore_ascii_case(&bot)));
+            let still_needed =
+                live.iter().any(|p| p.assessment.bots.iter().any(|r| r.settings.name.eq_ignore_ascii_case(&bot)));
+            if !skipped || still_needed {
+                continue;
+            }
+            let note = live
+                .iter()
+                .flat_map(|p| p.assessment.draft_skipped.iter())
+                .find(|d| d.bot.eq_ignore_ascii_case(&bot))
+                .map(|d| d.note())
+                .unwrap_or_default();
+            tracing::info!(%node, %bot, "withdrawing a request about a bot that does not review drafts");
+            fleet
+                .interview("autopilot", InterviewCommand::WithdrawDecision { decision_id: decision.id })
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let title = format!("Request withdrawn: {bot} does not review drafts");
+            let detail = format!("{note}. Withdrawn: \"{}\"", decision.question);
+            let entry = TimelineEntry::new(node, KIND_NOTE, "pr_draft", title, false, detail);
+            fleet.enqueue(tod_store::fleet::FleetMutation::RecordTimeline(Box::new(entry)))?;
+            fleet.writer().flush()?;
+        }
+        Ok(None)
     }
 
     /// One round of work on the pull request's feedback in `pr_draft` with the
@@ -2349,6 +2443,39 @@ fn short_waits(waits: Vec<crate::pr_readiness::Wait>) -> Vec<crate::pr_readiness
         }
     }
     short
+}
+
+/// Records, once per bot and pull request, that a bot is left out of a
+/// draft because it does not review drafts: a note on the node's
+/// activity ([`crate::pr_readiness::DraftSkipped::note`] says it in the
+/// task panel's status too).
+pub(crate) fn note_draft_skipped(
+    fleet: &FleetStore,
+    node: Uuid,
+    live: &[crate::pr_readiness::LivePr],
+    phase: &str,
+) -> Result<()> {
+    use tod_store::node_timeline::{KIND_NOTE, TimelineEntry, TimelineRepo};
+    for p in live {
+        for skipped in &p.assessment.draft_skipped {
+            let title = format!(
+                "{} is not waited for on the draft {}: it reviews only ready pull requests",
+                skipped.bot,
+                crate::pr_readiness::pr_label(&p.pr)
+            );
+            let known = fleet.read(|conn| {
+                Ok(TimelineRepo::new(conn).list(node)?.iter().any(|e| e.kind == KIND_NOTE && e.title == title))
+            })?;
+            if known {
+                continue;
+            }
+            tracing::info!(%node, bot = %skipped.bot, pr = %p.pr.url, "a review bot skips drafts: {}", skipped.note());
+            let entry = TimelineEntry::new(node, KIND_NOTE, phase, title, false, skipped.note());
+            fleet.enqueue(tod_store::fleet::FleetMutation::RecordTimeline(Box::new(entry)))?;
+            fleet.writer().flush()?;
+        }
+    }
+    Ok(())
 }
 
 fn wait_description(waits: &[crate::pr_readiness::Wait]) -> String {

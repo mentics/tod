@@ -238,6 +238,14 @@ pub struct PrReviewBotSettings {
     /// `fallback`, or the question to the user when there is none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exhausted_pattern: Option<ExhaustedPattern>,
+    /// Whether the bot reviews a pull request that is still a draft. Unset
+    /// (the default), tod finds out from the repository's recent pull
+    /// requests (`tod_core::pr_readiness::reviews_drafts`); `true` always
+    /// waits for and asks it on a draft, `false` never does. A bot that does
+    /// not review drafts is not waited for, asked, or required while the pull
+    /// request is a draft; its review is required once it is ready.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviews_drafts: Option<bool>,
 }
 
 /// What stands in for a review bot that stayed silent.
@@ -326,6 +334,7 @@ impl PrReviewBotSettings {
             silent_after_minutes: None,
             fallback: None,
             exhausted_pattern: None,
+            reviews_drafts: None,
         }
     }
 
@@ -404,6 +413,12 @@ pub struct PrReadinessSettings {
     /// (`tod_core::bot_silence::settings_for_node`); never saved.
     #[serde(skip)]
     pub own_review: OwnReviewState,
+    /// Bots (lowercase names) found, for the pull request being assessed, not
+    /// to review drafts (`PrReviewBotSettings::reviews_drafts` unset and the
+    /// repository's recent history says so). Filled per pull request by
+    /// `tod_core::pr_readiness::assess`; never saved.
+    #[serde(skip)]
+    pub draft_blind: Vec<String>,
 }
 
 /// What tod's own review of a node's pull requests says, for the bots' asks
@@ -468,6 +483,7 @@ impl Default for PrReadinessSettings {
             review_schedule: ReviewSchedule::default(),
             waived_asks: Vec::new(),
             own_review: OwnReviewState::default(),
+            draft_blind: Vec::new(),
         }
     }
 }
@@ -1238,6 +1254,15 @@ mod tests {
     use std::fs;
 
     #[test]
+    fn reviews_drafts_is_unset_by_default_and_parses_either_way() {
+        let plain: PrReadinessSettings = serde_yaml::from_str("bots:\n  - name: greptile\n").unwrap();
+        assert_eq!(plain.bots[0].reviews_drafts, None);
+        let no: PrReadinessSettings = serde_yaml::from_str("bots:\n  - name: greptile\n    reviews_drafts: false\n").unwrap();
+        assert_eq!(no.bots[0].reviews_drafts, Some(false));
+        assert!(!serde_yaml::to_string(&plain).unwrap().contains("reviews_drafts"));
+    }
+
+    #[test]
     fn a_bot_fallback_parses_defaults_to_none_and_is_validated() {
         let plain = PrReviewBotSettings::new("greptile", 4, 10);
         assert!((plain.silent_after_minutes, plain.fallback.clone(), plain.exhausted_pattern.clone()) == (None, None, None));
@@ -1433,6 +1458,7 @@ mod tests {
                 review_schedule: ReviewSchedule { start_hour: 9, ..ReviewSchedule::default() },
                 waived_asks: Vec::new(),
                 own_review: OwnReviewState::default(),
+                draft_blind: Vec::new(),
             },
             sandbox_idle: SandboxIdleSettings::default(),
             credentials_file_only: true,

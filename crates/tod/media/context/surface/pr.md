@@ -25,6 +25,10 @@ Either way:
   its own GitHub calls. If a command of yours hits such an error, run it
   again later or leave it: do not escalate, and do not ping the bot to
   work around it. A bot that has not reviewed is not a reason to stop.
+  A bot that does not review draft pull requests is not asked or waited for
+  while this one is a draft (the app knows which; its review is required once a
+  person marks the pull request ready): a draft with no review from it is
+  never something to report or to ask the user about.
 - A review thread (or a finding) that contradicts an obligation is a decision
   for the user (`decisions ask`), never a reason to change the obligation.
 

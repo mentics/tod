@@ -3627,18 +3627,50 @@ struct BotFeed {
     /// The bot reviews on this read (counting from 1); never when `None`.
     comes_on_read: Option<usize>,
     post_error: std::sync::Mutex<Option<String>>,
+    /// The pull request is a draft.
+    draft: bool,
+    /// The repository's recent pull requests, as GitHub shows them.
+    recent: Vec<tod_store::github::RecentPr>,
 }
 
 impl BotFeed {
     fn new(head_at: &str, comes_on_read: Option<usize>) -> Arc<Self> {
+        Self::drafted(head_at, comes_on_read, false, Vec::new())
+    }
+
+    fn drafted(
+        head_at: &str,
+        comes_on_read: Option<usize>,
+        draft: bool,
+        recent: Vec<tod_store::github::RecentPr>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             head_at: head_at.to_string(),
             posted: Default::default(),
             reads: Default::default(),
             comes_on_read,
             post_error: Default::default(),
+            draft,
+            recent,
         })
     }
+}
+
+/// A repository whose bot reviews ready pull requests and has passed over
+/// four drafts since: what GitHub showed on 2026-11-13.
+fn drafts_passed_over() -> Vec<tod_store::github::RecentPr> {
+    let ago = |hours: i64| (chrono::Utc::now() - chrono::Duration::hours(hours)).to_rfc3339();
+    let pr = |number, draft, hours: i64, bot: bool| tod_store::github::RecentPr {
+        number,
+        draft,
+        created_at: ago(hours),
+        activity: if bot { vec![("greptile-apps".to_string(), ago(hours - 1))] } else { Vec::new() },
+    };
+    // 1: an old draft the bot reviewed before it stopped; 2-4: ready pull
+    // requests it reviews; 5-8: the drafts since, which it passed over.
+    let mut out = vec![pr(1, true, 100, true), pr(2, false, 30, true), pr(3, false, 20, true), pr(4, false, 10, true)];
+    out.extend((5..9).map(|n| pr(n, true, 3, false)));
+    out
 }
 
 impl crate::pr_readiness::PrFeed for BotFeed {
@@ -3679,6 +3711,7 @@ impl crate::pr_readiness::PrFeed for BotFeed {
                 head_sha: Some("0000001".into()),
                 head_committed_at: Some(self.head_at.clone()),
                 open: true,
+                draft: self.draft,
                 reviewers: vec!["maria".into()],
                 base_ref: Some("main".into()),
                 ..Default::default()
@@ -3687,6 +3720,10 @@ impl crate::pr_readiness::PrFeed for BotFeed {
             comments,
             reviews: vec![],
         })
+    }
+
+    fn recent_prs(&self, _: &tod_store::github::NodePr) -> Result<Vec<tod_store::github::RecentPr>, String> {
+        Ok(self.recent.clone())
     }
 
     fn post_comment(&self, _: &tod_store::github::NodePr, body: &str) -> Result<(), String> {
@@ -3768,6 +3805,124 @@ fn a_silent_bot_is_asked_a_bounded_number_of_times_by_tod_then_the_user_is_asked
     assert_eq!(agent.turns, 0);
     let settings = crate::pr_readiness::settings_for_node(&fx.fleet, fx.node, &fx.root).unwrap();
     assert!(settings.bots.is_empty(), "{settings:?}");
+}
+
+const SILENT_BOT: &str =
+    "      rerun_after_minutes: 0\n      ask: \"@greptileai please review\"\n      ask_every_minutes: 0\n      max_asks: 3\n";
+
+fn pending_requests(fx: &Fixture) -> Vec<tod_store::decisions::Decision> {
+    fx.fleet.read(|conn| Ok(DecisionRepo::new(conn).list_pending_for_node(fx.node)?)).unwrap()
+}
+
+#[test]
+fn a_bot_that_skips_drafts_is_not_asked_waited_for_or_questioned_on_a_draft() {
+    let feed = BotFeed::drafted("2020-01-01T00:00:00Z", None, true, drafts_passed_over());
+    let (fx, mut agent) = bot_node(feed.clone(), SILENT_BOT);
+    let outcome = autopilot(&fx, Budget::default())
+        .with_pr_poll_interval(Duration::ZERO)
+        .run(&fx.fleet, &mut agent)
+        .unwrap();
+    // Nothing asked the bot, no silence request, the agent never sent.
+    assert!(feed.posted.lock().unwrap().is_empty(), "{:?}", feed.posted.lock().unwrap());
+    assert!(bot_decisions(&fx).is_empty());
+    assert!(pending_requests(&fx).is_empty());
+    assert_eq!(agent.turns, 0);
+    assert!(!matches!(outcome, Outcome::NeedsHuman { .. }), "{outcome:?}");
+    // The truth is on the node's activity.
+    let notes = fx.fleet.read(|conn| Ok(tod_store::node_timeline::TimelineRepo::new(conn).list(fx.node)?)).unwrap();
+    assert!(
+        notes.iter().any(|e| e.detail.contains("reviews only ready pull requests")
+            && e.detail.contains("required after you mark the pull request ready")),
+        "{notes:?}"
+    );
+}
+
+#[test]
+fn the_same_bot_is_still_asked_on_a_draft_with_no_evidence_it_skips_them() {
+    let feed = BotFeed::drafted("2020-01-01T00:00:00Z", None, true, Vec::new());
+    let (fx, mut agent) = bot_node(feed.clone(), SILENT_BOT);
+    let outcome = autopilot(&fx, Budget::default())
+        .with_pr_poll_interval(Duration::ZERO)
+        .run(&fx.fleet, &mut agent)
+        .unwrap();
+    assert_eq!(outcome, Outcome::NeedsHuman { reason: NeedsHuman::Decision { pending: 1 } });
+    assert_eq!(feed.posted.lock().unwrap().len(), 3);
+}
+
+#[test]
+fn reviews_drafts_false_in_the_settings_skips_the_bot_on_a_draft_without_reading_history() {
+    let feed = BotFeed::drafted("2020-01-01T00:00:00Z", None, true, Vec::new());
+    let (fx, mut agent) = bot_node(feed.clone(), &format!("{SILENT_BOT}      reviews_drafts: false\n"));
+    let outcome = autopilot(&fx, Budget::default())
+        .with_pr_poll_interval(Duration::ZERO)
+        .run(&fx.fleet, &mut agent)
+        .unwrap();
+    assert!(!matches!(outcome, Outcome::NeedsHuman { .. }), "{outcome:?}");
+    assert!(feed.posted.lock().unwrap().is_empty());
+    assert!(bot_decisions(&fx).is_empty());
+}
+
+#[test]
+fn a_bot_that_skips_drafts_is_still_required_once_the_pull_request_is_ready() {
+    let feed = BotFeed::drafted("2020-01-01T00:00:00Z", None, false, drafts_passed_over());
+    let (fx, mut agent) = bot_node(feed.clone(), SILENT_BOT);
+    let outcome = autopilot(&fx, Budget::default())
+        .with_pr_poll_interval(Duration::ZERO)
+        .run(&fx.fleet, &mut agent)
+        .unwrap();
+    assert_eq!(outcome, Outcome::NeedsHuman { reason: NeedsHuman::Decision { pending: 1 } });
+    assert_eq!(feed.posted.lock().unwrap().len(), 3);
+}
+
+#[test]
+fn requests_about_a_bot_that_skips_drafts_are_withdrawn_with_a_note_and_the_run_goes_on() {
+    let feed = BotFeed::drafted("2020-01-01T00:00:00Z", None, true, drafts_passed_over());
+    let (fx, mut agent) = bot_node(feed.clone(), SILENT_BOT);
+    let ask = |protocol: &str, reason: &str, question: &str, options: Vec<String>| {
+        fx.fleet
+            .interview(
+                "autopilot",
+                InterviewCommand::AskDecision {
+                    node_id: fx.node,
+                    conversation_id: None,
+                    protocol: Some(protocol.into()),
+                    decision: NewDecision {
+                        question: question.into(),
+                        options,
+                        reason: reason.into(),
+                        ..Default::default()
+                    },
+                },
+            )
+            .unwrap();
+    };
+    ask(
+        "pr",
+        "broken",
+        "Check why Greptile is not reviewing flagship#6640",
+        vec!["Fixed, try again".into(), "Carry on without Greptile".into()],
+    );
+    ask(
+        crate::bot_silence::PROTOCOL,
+        "broken",
+        "greptile has not reviewed acme/app#42 after 0 asks for a review",
+        crate::bot_silence::options("greptile"),
+    );
+    // An unrelated request stays.
+    ask("pr", "broken", "The build is broken", vec!["Fixed, try again".into()]);
+    assert_eq!(pending_requests(&fx).len(), 3);
+
+    let outcome = autopilot(&fx, Budget::default())
+        .with_pr_poll_interval(Duration::ZERO)
+        .run(&fx.fleet, &mut agent)
+        .unwrap();
+    let left = pending_requests(&fx);
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert_eq!(left[0].question, "The build is broken");
+    assert_eq!(outcome, Outcome::NeedsHuman { reason: NeedsHuman::Decision { pending: 1 } });
+    assert!(feed.posted.lock().unwrap().is_empty());
+    let notes = fx.fleet.read(|conn| Ok(tod_store::node_timeline::TimelineRepo::new(conn).list(fx.node)?)).unwrap();
+    assert_eq!(notes.iter().filter(|e| e.title.starts_with("Request withdrawn: greptile")).count(), 2, "{notes:?}");
 }
 
 #[test]
