@@ -5,6 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
+tempfile = "3.10"
 base64 = "0.22"
 tod-agent = { path = "../tod-agent" }
 tod-journey = { path = "../tod-journey" }
@@ -42,4 +43,4 @@ windows = { version = "0.57", features = [
 
 [dev-dependencies]
 tod-test-util = { path = "../tod-test-util" }
-tempfile = "3.10"
+

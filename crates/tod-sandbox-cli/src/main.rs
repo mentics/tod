@@ -829,12 +829,13 @@ fn watchdog(ctx: &Ctx, mut args: Args) -> Result<i32> {
                     // The job's image: the Linux tod-watchdog as its entrypoint.
                     let bin = sandbox_binary("tod-watchdog")
                         .context("build it with scripts/build-sandbox-binaries.sh, or pass --image")?;
-                    let dir = sandboxes::build_dir(wd::JOB_NAME)?;
+                    let build = sandboxes::build_dir(wd::JOB_NAME)?;
+                    let dir = build.path();
                     std::fs::copy(&bin, dir.join("tod-watchdog")).with_context(|| format!("copy {}", bin.display()))?;
                     std::fs::write(dir.join("Dockerfile"), wd::job_dockerfile())?;
                     std::fs::write(dir.join("blaxel.toml"), wd::job_blaxel_toml())?;
                     eprintln!("building {} from {}…", wd::JOB_IMAGE, bin.display());
-                    ctx.bl_push(&dir, true, &mut |m| eprintln!("{m}"))?;
+                    ctx.bl_push(dir, true, &mut |m| eprintln!("{m}"))?;
                     wd::JOB_IMAGE.to_string()
                 }
             };

@@ -432,10 +432,11 @@ impl Sandboxes {
         progress(&format!(
             "{image} is not built for Blaxel; wrapping it as sandbox/{wrapped} (adds Blaxel's sandbox API)…"
         ));
-        let dir = build_dir(&wrapped)?;
+        let build = build_dir(&wrapped)?;
+        let dir = build.path();
         std::fs::write(dir.join("Dockerfile"), provision::wrap_dockerfile(image))?;
         std::fs::write(dir.join("blaxel.toml"), provision::blaxel_toml(&wrapped, acct.memory_mb))?;
-        self.bl_push(&dir, inherit_output, progress)?;
+        self.bl_push(dir, inherit_output, progress)?;
         Ok(format!("sandbox/{wrapped}:latest"))
     }
 
@@ -491,7 +492,8 @@ impl Sandboxes {
         let acct = self.account()?;
         let relay_bin = relay_binary()?;
         let payload = payload(&relay_bin, agents);
-        let dir = build_dir(name)?;
+        let build = build_dir(name)?;
+        let dir = build.path();
         std::fs::write(dir.join("Dockerfile"), provision::bake_dockerfile_with_repos(base_image, &payload, repos))?;
         std::fs::write(dir.join("bootstrap.sh"), bootstrap())?;
         std::fs::write(dir.join("tod-relay"), &relay_bin)?;
@@ -503,7 +505,7 @@ impl Sandboxes {
             n => format!(" and {n} repositories"),
         };
         progress(&format!("baking {base_image} with tod's dependencies{with} into sandbox/{name}…"));
-        self.bl_push(&dir, inherit_output, progress)?;
+        self.bl_push(dir, inherit_output, progress)?;
         Ok(format!("sandbox/{name}:latest"))
     }
 
@@ -627,12 +629,14 @@ pub fn proxy_is_current(info: &tod_sandbox::blaxel::SandboxInfo, custom: &[tod_s
     info.label(tod_sandbox::node::ENV_LABEL).unwrap_or("none") == tod_sandbox::node::env_fingerprint(custom)
 }
 
-/// A fresh directory to build an image in.
-pub fn build_dir(name: &str) -> Result<PathBuf> {
-    let dir = std::env::temp_dir().join(format!("tod-sandbox-build-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir)?;
-    Ok(dir)
+/// A fresh directory to build an image in. It is removed, with everything in
+/// it, when the returned guard is dropped, so the caller holds it for the
+/// build's duration (success or error).
+pub fn build_dir(name: &str) -> Result<tempfile::TempDir> {
+    tempfile::Builder::new()
+        .prefix(&format!("tod-sandbox-build-{name}-"))
+        .tempdir()
+        .with_context(|| format!("make a build directory for {name}"))
 }
 
 /// A label value Blaxel accepts: lowercase alphanumerics and dashes.

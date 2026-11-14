@@ -1292,7 +1292,7 @@ mod abandoned_tests {
     }
 
     fn test_relay(cmd: &str) -> Arc<Relay> {
-        unsafe { std::env::set_var("TOD_PROBLEMS_DIR", std::env::temp_dir().join("tod-relay-test-problems")) };
+        unsafe { std::env::set_var("TOD_PROBLEMS_DIR", tod_test_util::scratch_dir("tod-relay-test-problems-")) };
         Arc::new(Relay {
             sessions: Mutex::new(HashMap::new()),
             agents: Mutex::new(HashMap::new()),
