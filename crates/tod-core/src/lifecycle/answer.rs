@@ -128,3 +128,50 @@ pub fn record_decision_answer_as(
     Ok(Some((conversation_id, format!("{message}{released}{}", moved.unwrap_or_default()))))
 }
 
+/// Records the user's answer to a plan step the agent handed back (Keep,
+/// Choose, Retry) as an answered decision on the step's node, and returns
+/// the message that tells the agent. A request answered through
+/// [`record_decision_answer`] is recorded; this answer is the same kind of
+/// fact and is recorded the same way, so
+/// [`crate::node_context::render_recent_answers`] carries it into the next
+/// session wherever the node runs (a cloud node's supervisor reads the same
+/// store), and a session that is resumed is told once
+/// (`ConversationDriver`'s unsent answers). Without it the answer lived only
+/// in the message sent to the old conversation, and a run that started a new
+/// session handed the same step back again. Blocks on the store: run it off
+/// the UI thread, before the message is sent (a message sent first would be
+/// older than the answer and the answer would be told twice).
+pub fn record_plan_step_handoff_answer(
+    fleet: &FleetStore,
+    step: &tod_store::outline::PlanStep,
+    answer: &crate::conversation::implement::HandoffAnswer,
+) -> anyhow::Result<String> {
+    use tod_store::decisions::NewDecision;
+    use tod_store::interview::InterviewCommand;
+    let message = crate::conversation::implement::handoff_answer_message(step, answer);
+    let id = tod_store::interview::short_id(step.id);
+    let body = step.body.lines().next().unwrap_or("");
+    let why = step.reason.as_ref().map_or("handed back", |r| r.label());
+    let decision = fleet.interview(
+        ACTOR_USER,
+        InterviewCommand::AskDecision {
+            node_id: step.node_id,
+            conversation_id: None,
+            protocol: None,
+            decision: NewDecision {
+                question: format!("Plan step [{id}] \"{body}\" was handed back ({why}). How should it go on?"),
+                ..Default::default()
+            },
+        },
+    )?;
+    let decision_id = decision["id"]
+        .as_str()
+        .and_then(|raw| Uuid::parse_str(raw).ok())
+        .context("the recorded plan step question has no id")?;
+    fleet.interview(
+        ACTOR_USER,
+        InterviewCommand::AnswerDecision { decision_id, option: None, text: Some(message.clone()) },
+    )?;
+    Ok(message)
+}
+

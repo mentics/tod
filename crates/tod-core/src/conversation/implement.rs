@@ -248,17 +248,10 @@ impl Protocol for ImplementationProtocol {
         if let Some(done) = cap_or_stall(turn) {
             return Ok(done);
         }
-        let answered = turn
-            .env
-            .fleet
-            .read(|conn| Ok(crate::node_context::render_recent_answers(conn, node)?))?;
-        let mut message = continuation_message(&open, tests.as_ref());
-        if !answered.is_empty() {
-            message.push_str("\n\n");
-            message.push_str(&answered);
-        }
+        // An answer given while the run was going is added by the driver to
+        // every protocol's continuation (`ConversationDriver::unsent_answers`).
         Ok(Next::Continue {
-            message,
+            message: continuation_message(&open, tests.as_ref()),
             reason: continuation_reason(&open, tests.as_ref()),
         })
     }

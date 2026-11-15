@@ -466,6 +466,202 @@ fn a_fresh_session_opens_with_what_the_user_answered_on_the_node() {
     }
 }
 
+/// The user answers `question` on the node, as the task panel records it.
+fn answer_on_node(fx: &Fixture, question: &str, text: &str) {
+    use tod_store::decisions::NewDecision;
+    let asked = fx.user(InterviewCommand::AskDecision {
+        node_id: fx.node,
+        conversation_id: None,
+        protocol: None,
+        decision: NewDecision { question: question.into(), ..Default::default() },
+    });
+    let decision_id = Uuid::parse_str(asked["id"].as_str().unwrap()).unwrap();
+    fx.user(InterviewCommand::AnswerDecision { decision_id, option: None, text: Some(text.into()) });
+}
+
+/// Everything the agent was sent on `turn`: the opening context, then the message.
+fn everything_sent(turn: &SessionTurn) -> String {
+    let context = turn.opening.as_ref().and_then(|o| o.context.clone()).unwrap_or_default();
+    format!("{context}\n{}", turn.message)
+}
+
+/// A node with Files and two plan steps, so an Implementation conversation can run.
+fn implementation_fixture() -> Fixture {
+    let fx = fixture();
+    let workspace = fx.root.join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    fx.fleet
+        .enqueue_outline(OutlineMutation::EnableCapabilities {
+            node_id: fx.node,
+            capabilities: vec![tod_store::outline::Capability::Files],
+        })
+        .unwrap();
+    fx.fleet.writer().flush().unwrap();
+    tod_store::fleet::places::pick_matching(
+        &fx.fleet,
+        &fx.node.to_string(),
+        &tod_store::fleet::FilesPlace {
+            repo: Some(workspace.display().to_string()),
+            use_worktree: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    for n in 0..2 {
+        fx.fleet
+            .enqueue_outline(OutlineMutation::CreatePlanStep {
+                step_id: None,
+                node_id: fx.node,
+                after_id: None,
+                before: false,
+                body: format!("Step {n}"),
+            })
+            .unwrap();
+    }
+    fx.fleet.writer().flush().unwrap();
+    fx
+}
+
+const ANSWER_TEXT: &str = "mark it implemented, the PR checks judge it";
+const ANSWER_QUESTION: &str = "Judge the terraform plan step by the PR checks?";
+
+#[test]
+fn a_rotated_session_opens_with_the_answer_exactly_once() {
+    let fx = fixture();
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut driver = ConversationDriver::new(config(&fx, 100_000), Focus::Node(fx.node), ProtocolKind::Outline);
+    say(&mut driver, &fx, &mut agent, "ask Hello?");
+    let id = driver.conversation_id().unwrap();
+    answer_on_node(&fx, ANSWER_QUESTION, ANSWER_TEXT);
+
+    // The recorded session cannot be resumed: the driver rotates to a fresh one.
+    let mut agent = FakeAgent::new(&fx.fleet);
+    agent.fail_resume = true;
+    let mut driver = ConversationDriver::open(config(&fx, 100_000), &fx.fleet, id).unwrap();
+    say(&mut driver, &fx, &mut agent, "ask Are you back?");
+    let rotated = agent.last();
+    assert!(rotated.opening.is_some(), "a fresh session");
+    let sent = everything_sent(rotated);
+    assert_eq!(sent.matches(ANSWER_TEXT).count(), 1, "{sent}");
+}
+
+#[test]
+fn a_session_that_goes_on_is_told_a_new_answer_once() {
+    let fx = fixture();
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut driver = ConversationDriver::new(config(&fx, 100_000), Focus::Node(fx.node), ProtocolKind::Outline);
+    say(&mut driver, &fx, &mut agent, "ask Hello?");
+    // Answered with nothing sent to the agent (as in the cloud, or by `tod-cli`).
+    answer_on_node(&fx, ANSWER_QUESTION, ANSWER_TEXT);
+
+    say(&mut driver, &fx, &mut agent, "ask Anything new?");
+    let resumed = agent.last();
+    assert!(resumed.opening.is_none(), "the live session is reused");
+    assert_eq!(everything_sent(resumed).matches(ANSWER_TEXT).count(), 1, "{}", resumed.message);
+
+    say(&mut driver, &fx, &mut agent, "ask And now?");
+    assert_eq!(everything_sent(agent.last()).matches(ANSWER_TEXT).count(), 0, "told once only");
+}
+
+/// The autopilot reopens the conversation from the store and sends its
+/// resume message: the answer is in that turn when the session is resumed by
+/// id, not live.
+#[test]
+fn a_session_resumed_by_id_is_told_the_answer_once() {
+    let fx = fixture();
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut driver = ConversationDriver::new(config(&fx, 100_000), Focus::Node(fx.node), ProtocolKind::Outline);
+    say(&mut driver, &fx, &mut agent, "ask Hello?");
+    let id = driver.conversation_id().unwrap();
+    answer_on_node(&fx, ANSWER_QUESTION, ANSWER_TEXT);
+
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut driver = ConversationDriver::open(config(&fx, 100_000), &fx.fleet, id).unwrap();
+    say(&mut driver, &fx, &mut agent, "Continue where you left off.");
+    let resumed = agent.last();
+    assert!(resumed.resume_session_id.is_some(), "resumed by id");
+    assert!(resumed.opening.is_none());
+    assert_eq!(everything_sent(resumed).matches(ANSWER_TEXT).count(), 1, "{}", resumed.message);
+
+    let mut driver = ConversationDriver::open(config(&fx, 100_000), &fx.fleet, id).unwrap();
+    say(&mut driver, &fx, &mut agent, "Continue where you left off.");
+    assert_eq!(everything_sent(agent.last()).matches(ANSWER_TEXT).count(), 0, "told once only");
+}
+
+/// An answer delivered to the session as a message (the app's own path) is
+/// not told again by the next turn.
+#[test]
+fn an_answer_already_delivered_as_a_message_is_not_repeated() {
+    let fx = fixture();
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut driver = ConversationDriver::new(config(&fx, 100_000), Focus::Node(fx.node), ProtocolKind::Outline);
+    say(&mut driver, &fx, &mut agent, "ask Hello?");
+    answer_on_node(&fx, ANSWER_QUESTION, ANSWER_TEXT);
+    say(&mut driver, &fx, &mut agent, &format!("Decision answered: {ANSWER_QUESTION} {ANSWER_TEXT}"));
+    say(&mut driver, &fx, &mut agent, "ask Next?");
+    assert_eq!(everything_sent(agent.last()).matches(ANSWER_TEXT).count(), 0);
+}
+
+#[test]
+fn an_implementation_session_opens_and_continues_with_the_answer_once() {
+    let fx = implementation_fixture();
+    answer_on_node(&fx, ANSWER_QUESTION, ANSWER_TEXT);
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut driver =
+        ConversationDriver::new(config(&fx, 100_000), Focus::Node(fx.node), ProtocolKind::Implementation);
+    driver.send(&fx.fleet, &mut agent, "Implement the plan.").unwrap();
+    let opening = everything_sent(agent.last());
+    assert_eq!(opening.matches(ANSWER_TEXT).count(), 1, "{opening}");
+
+    // Answered while the run goes on: the continuation carries it once.
+    answer_on_node(&fx, "Is the key in the vault?", "yes, in the vault");
+    assert_eq!(driver.tick(&fx.fleet, &mut agent), [ConversationEvent::Continued]);
+    let continuation = agent.last().message.clone();
+    assert_eq!(continuation.matches("yes, in the vault").count(), 1, "{continuation}");
+    assert_eq!(continuation.matches(ANSWER_TEXT).count(), 0, "{continuation}");
+}
+
+/// An answer to a plan step the agent handed back is recorded like any
+/// request's answer, so a later fresh session reads it, once.
+#[test]
+fn an_answer_to_a_handed_back_plan_step_reaches_the_next_session() {
+    use super::implement::HandoffAnswer;
+    use tod_store::outline::repos::PlanStepRepo;
+    use tod_store::outline::repos::plan_steps::HandoffReason;
+    let fx = fixture();
+    let step_id = Uuid::new_v4();
+    fx.fleet
+        .enqueue_outline(OutlineMutation::CreatePlanStep {
+            step_id: Some(step_id),
+            node_id: fx.node,
+            after_id: None,
+            before: false,
+            body: "Apply the terraform plan".into(),
+        })
+        .unwrap();
+    fx.fleet
+        .enqueue_outline(OutlineMutation::UpdatePlanStepStatus {
+            step_id,
+            status: "blocked".into(),
+            note: Some("Needs the AWS key".into()),
+            reason: Some(HandoffReason::Access { needs: "the AWS key".into(), tried: "plan, got 403".into() }),
+        })
+        .unwrap();
+    fx.fleet.writer().flush().unwrap();
+    let step = fx.fleet.read(|conn| PlanStepRepo::new(conn).get(step_id)).unwrap().unwrap();
+    let message =
+        crate::lifecycle::answer::record_plan_step_handoff_answer(&fx.fleet, &step, &HandoffAnswer::Retry).unwrap();
+    assert!(message.contains("the access it needed is in place now"), "{message}");
+
+    // A new run starts a session of its own (no conversation to resume).
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut driver = ConversationDriver::new(config(&fx, 100_000), Focus::Node(fx.node), ProtocolKind::Outline);
+    say(&mut driver, &fx, &mut agent, "go");
+    let sent = everything_sent(agent.last());
+    assert_eq!(sent.matches("the access it needed is in place now").count(), 1, "{sent}");
+    assert!(sent.contains("Apply the terraform plan"), "{sent}");
+}
+
 #[test]
 fn after_a_reversal_the_next_send_carries_a_delta_and_resumes_the_session() {
     let fx = fixture();

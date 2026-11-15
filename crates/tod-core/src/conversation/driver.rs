@@ -510,7 +510,11 @@ impl ConversationDriver {
             }
             None => String::new(),
         };
-        let sent_context = (!changes.is_empty()).then(|| changes.clone());
+        // What the user answered since the last turn went out, for a session
+        // that goes on (a rotation's snapshot carries it already). Read before
+        // this turn is appended, which is what marks it as sent.
+        let answers = self.unsent_answers(fleet, id)?;
+        let sent_context = Some(join_sections(&changes, &answers)).filter(|c| !c.is_empty());
         let user_seq = self.append_with_parts_and_context(
             fleet,
             id,
@@ -540,7 +544,7 @@ impl ConversationDriver {
             let text_now = format!("{text}{note}");
             let text = text_now.as_str();
             let attempt = if resumable && !over_budget {
-                let message = join(&changes, text);
+                let message = join(&join_sections(&changes, &answers), text);
                 self.start(
                     fleet,
                     agent,
@@ -954,6 +958,10 @@ impl ConversationDriver {
             }
             Next::Continue { message, .. } => {
                 self.continuations += 1;
+                // An answer given while the run was going reaches it here,
+                // once, whatever the protocol.
+                let answers = self.unsent_answers(fleet, id)?;
+                let message = join_sections(&message, &answers);
                 let message = if quiet_turn {
                     format!("{}{message}", super::protocol::QUIET_TURN_NOTE)
                 } else {
@@ -1078,10 +1086,6 @@ impl ConversationDriver {
         value["seq"].as_i64().context("turn seq missing")
     }
 
-    /// Mark the rotation, forget the old session, and send `text` to a fresh
-    /// one that gets the conversation's snapshot. `reason` is recorded to the
-    /// journey ("over budget" | "not resumable" | "cold resume failed").
-    #[allow(clippy::too_many_arguments)]
     /// `context` followed by the answers the user gave on this node lately
     /// (`node_context::render_recent_answers`). Every fresh session gets
     /// them, whatever its protocol: answering a request reopens the step it
@@ -1103,6 +1107,24 @@ impl ConversationDriver {
         Ok(context)
     }
 
+    /// The answers the user gave on this node since this conversation last
+    /// sent its agent anything (`node_context::render_unsent_answers`): what a
+    /// session that is being resumed or continued has not been told. A fresh
+    /// session gets them through [`Self::with_recent_answers`] instead, so a
+    /// turn never carries both. Empty for a conversation without a node.
+    fn unsent_answers(&self, fleet: &FleetStore, id: Uuid) -> Result<String> {
+        let Some(node) = self.focus.node_id() else {
+            return Ok(String::new());
+        };
+        fleet
+            .read(|conn| Ok(crate::node_context::render_unsent_answers(conn, node, id)?))
+            .context("could not read the user's recent answers")
+    }
+
+    /// Mark the rotation, forget the old session, and send `text` to a fresh
+    /// one that gets the conversation's snapshot. `reason` is recorded to the
+    /// journey ("over budget" | "not resumable" | "cold resume failed").
+    #[allow(clippy::too_many_arguments)]
     fn rotate_and_start<A: AgentAccess + ?Sized>(
         &mut self,
         fleet: &FleetStore,
@@ -1442,6 +1464,15 @@ const IMAGE_TOKENS: i64 = 1_600;
 
 /// What an agent without image support says (`tod_agent`'s ACP provider).
 const IMAGES_REFUSED: &str = "does not accept images";
+
+/// `first`, then `second`, as paragraphs; whichever is empty is left out.
+fn join_sections(first: &str, second: &str) -> String {
+    match (first.trim_end(), second.trim_end()) {
+        ("", second) => second.to_string(),
+        (first, "") => first.to_string(),
+        (first, second) => format!("{first}\n\n{second}"),
+    }
+}
 
 /// The delta (if any), then the user's message.
 fn join(changes: &str, text: &str) -> String {

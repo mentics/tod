@@ -20,7 +20,7 @@ use crate::interview::{TodPaths, TodSettings};
 use anyhow::Context as _;
 use gpui::Context;
 use std::sync::Arc;
-use tod_core::conversation::implement::{HandoffAnswer, handoff_answer_message};
+use tod_core::conversation::implement::HandoffAnswer;
 use tod_core::conversation::{ConversationConfig, ConversationDriver, ConversationStatus, SharedAgentAccess};
 use tod_store::conversation::{Conversation, ConversationRepo, Focus, ProtocolKind};
 use tod_store::decisions::DecisionRepo;
@@ -793,7 +793,13 @@ impl AgentRuns {
                             agent to send the answer to. Start one, or change the step yourself in the \
                             Plan panel.",
                         )?;
-                    anyhow::Ok((conversation_id, handoff_answer_message(&step, &answer)))
+                    // Recorded before anything is sent, wherever the node runs:
+                    // the next session, local or in the cloud, reads it from
+                    // the store (`render_recent_answers`). A failure to record
+                    // it stops the answer here, with the error.
+                    let message =
+                        tod_core::lifecycle::answer::record_plan_step_handoff_answer(&prepare_fleet, &step, &answer)?;
+                    anyhow::Ok((conversation_id, message))
                 })
                 .await;
             let result = match prepared {
@@ -804,6 +810,10 @@ impl AgentRuns {
                     let sent = this
                         .update(cx, |this, cx| {
                             if Self::conversation_runs_in_cloud(&this.fleet, conversation_id)? {
+                                // The supervisor there owns the agent; the
+                                // answer is recorded and the step reopened,
+                                // which is what it reads (the decision, the
+                                // step), not a message from this machine.
                                 return Ok(());
                             }
                             this.ensure_for_conversation(conversation_id)?;

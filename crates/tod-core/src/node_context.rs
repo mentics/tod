@@ -458,9 +458,32 @@ fn lowercase_first(s: &str) -> String {
 /// permission (a standing grant) and a credential request (never to echo)
 /// are left out.
 pub fn render_recent_answers(conn: &Connection, node_id: Uuid) -> Result<String> {
-    use tod_store::decisions::{DECISION_ANSWERED, DecisionRepo, REASK_WINDOW_MS};
+    let since = tod_store::outline::uuid_blob::now_ms() - tod_store::decisions::REASK_WINDOW_MS;
+    render_answers_since(conn, node_id, since)
+}
+
+/// The answers [`render_recent_answers`] would show that were given after
+/// `conversation_id` last sent its agent anything (a user turn or a
+/// continuation), and within the same window: what a running session has not
+/// been told. A session that was told (the answer delivered as a user turn,
+/// or carried by an earlier turn) has a later turn than the answer, so an
+/// answer reaches it once.
+pub fn render_unsent_answers(conn: &Connection, node_id: Uuid, conversation_id: Uuid) -> Result<String> {
+    use tod_store::conversation::{ConversationRepo, TurnRole};
+    let window = tod_store::outline::uuid_blob::now_ms() - tod_store::decisions::REASK_WINDOW_MS;
+    let last_sent = ConversationRepo::new(conn)
+        .turns(conversation_id)?
+        .iter()
+        .rev()
+        .find(|t| matches!(t.role, TurnRole::User | TurnRole::Continuation))
+        .map_or(0, |t| t.created_at);
+    render_answers_since(conn, node_id, window.max(last_sent))
+}
+
+/// The user's answers on the node given strictly after `since` (ms).
+fn render_answers_since(conn: &Connection, node_id: Uuid, since: i64) -> Result<String> {
+    use tod_store::decisions::{DECISION_ANSWERED, DecisionRepo};
     let repo = DecisionRepo::new(conn);
-    let since = tod_store::outline::uuid_blob::now_ms() - REASK_WINDOW_MS;
     let mut out = String::new();
     for decision in repo.list_for_node(node_id)? {
         if decision.status != DECISION_ANSWERED
@@ -474,7 +497,7 @@ pub fn render_recent_answers(conn: &Connection, node_id: Uuid) -> Result<String>
             .answers
             .iter()
             .rev()
-            .find(|a| a.answered_at >= since && a.actor != tod_store::decisions::SETTLED_BY)
+            .find(|a| a.answered_at > since && a.actor != tod_store::decisions::SETTLED_BY)
         else {
             continue;
         };
