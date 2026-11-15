@@ -227,6 +227,19 @@ impl Runners {
     pub fn resume_saved(&self) {
         let root = self.inner.store.paths().root().to_path_buf();
         for (node, state) in load_saved(&root) {
+            // A node deleted from the store holds no slot: its saved run file
+            // is left on disk (not ours to delete), noted once here.
+            match self.node_exists(node) {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::info!(%node, "the node of this saved run no longer exists; the run is not resumed and holds no slot");
+                    continue;
+                }
+                Err(err) => {
+                    tracing::error!(%node, "could not tell whether the node of a saved run exists, so it is not resumed: {err:#}");
+                    continue;
+                }
+            }
             match RunnerPlace::of(&self.inner.store, node) {
                 Ok(RunnerPlace::Local) => {}
                 Ok(RunnerPlace::Supervisor) => {
@@ -395,6 +408,7 @@ impl Runners {
             }
         }
 
+        self.drop_deleted_slots(&mut errors);
         let nodes: Vec<Uuid> = self.inner.slots.lock().expect("runner slots").keys().copied().collect();
         let mut places: HashMap<Uuid, RunnerPlace> = HashMap::new();
         for node in &nodes {
@@ -455,6 +469,36 @@ impl Runners {
     }
 
     /// Nodes whose idle slot holds a `Done` outcome.
+    /// Whether the store still has `node`; a read failure is an error, never
+    /// "absent".
+    fn node_exists(&self, node: Uuid) -> Result<bool> {
+        Ok(self.inner.store.get_node(&node.to_string())?.is_some())
+    }
+
+    /// Drop idle slots of nodes deleted from the store (once each, as the
+    /// slot is gone afterwards). A read failure is collected, the slot kept.
+    fn drop_deleted_slots(&self, errors: &mut Vec<String>) {
+        let idle: Vec<Uuid> = self
+            .inner
+            .slots
+            .lock()
+            .expect("runner slots")
+            .iter()
+            .filter(|(_, s)| s.run.is_none() && !s.starting)
+            .map(|(n, _)| *n)
+            .collect();
+        for node in idle {
+            match self.node_exists(node) {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::warn!(%node, "the node no longer exists; its runner slot is dropped");
+                    self.inner.slots.lock().expect("runner slots").remove(&node);
+                }
+                Err(err) => errors.push(format!("{node}: look the node up: {err:#}")),
+            }
+        }
+    }
+
     fn stale_done_nodes(&self) -> Vec<Uuid> {
         self.inner
             .slots
@@ -1023,6 +1067,22 @@ mod tests {
         let err = fx.runners.reconcile().unwrap_err();
         assert!(format!("{err:#}").contains("Media bundle"), "{err:#}");
         assert!(matches!(standing_of(&fx).actor, NextActor::You { why: YouReason::Failed { .. }, .. }));
+    }
+
+    #[test]
+    fn a_saved_done_run_for_a_node_absent_from_the_store_holds_no_slot_and_is_no_error() {
+        let fx = fixture();
+        let ghost = Uuid::new_v4();
+        AutopilotState { outcome: Some(Outcome::Done), ..AutopilotState::fresh() }.save(&fx.root, ghost).unwrap();
+        fx.runners.resume_saved();
+        assert!(!fx.runners.inner.slots.lock().unwrap().contains_key(&ghost));
+        // A slot made before the node vanished is dropped, with no error.
+        fx.runners.inner.slots.lock().unwrap().entry(ghost).or_default().outcome = Some(Outcome::Done);
+        fx.runners.reconcile().unwrap();
+        fx.runners.reconcile().unwrap();
+        assert!(!fx.runners.inner.slots.lock().unwrap().contains_key(&ghost));
+        // The saved file is left alone.
+        assert!(fx.root.join("autopilot").join(format!("{ghost}.json")).exists());
     }
 
     #[test]
