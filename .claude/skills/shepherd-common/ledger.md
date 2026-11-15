@@ -30,7 +30,10 @@ pause, `11` `gate` says retire.
 ## Fingerprint and version
 
 A node's **fingerprint** hashes what changes when something meaningful
-happens: lifecycle state; run state (`phase`, `reason_kind`, `reason_text`);
+happens: lifecycle state; run state (`phase`, `reason_kind`, and `reason_text` except for a
+`waiting_outside` run, whose text is only wording for what `waits` already
+holds and flips between event and sentence forms; a stopped run's text carries
+the error and stays in);
 ids of pending requests; pending waits (`match_spec|state`); `linked_prs`; the
 PR heads tod's pr_draft review last reviewed (tod.db has no live PR head);
 the sandbox name. Heartbeats, `updated_at`, `since`, wait due times and lease

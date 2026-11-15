@@ -590,6 +590,41 @@ class Fingerprint(Base):
         self.tod.set("INSERT INTO node_files_locations VALUES (?, 'sb')", self.tod.ids["a"])
         self.assertNotEqual(self.cli("check", "a", "--owner", "o", "--fingerprint", fp1, expect=3)["fingerprint"], fp1)
 
+    def _parked(self, kind, text):
+        self.setup_nodes("a")
+        self.tod.run("a", "waiting", kind, text)
+        self.lease("o")
+        self.verdict("a", "o", "parked")
+        self.assertEqual(self.cli("sync")["due"], 0)
+
+    def test_waiting_outside_wording_flip_is_not_a_change(self):
+        self._parked("waiting_outside", "event github:pr:6663:ready_for_review")
+        self.tod.run("a", "waiting", "waiting_outside", "https://github.com/o/r/pull/6663 to be marked ready (still a draft)")
+        self.assertEqual(self.cli("sync")["due"], 0)
+
+    def test_waiting_outside_kind_change_is_a_change(self):
+        self._parked("waiting_outside", "x")
+        self.tod.run("a", "waiting", "other", "x")
+        self.assertEqual(self.cli("sync")["due"], 1)
+
+    def test_stopped_text_change_is_a_change(self):
+        self._parked("failed", "boom")
+        self.tod.run("a", "stopped", "failed", "boom")
+        self.assertEqual(self.cli("sync")["due"], 1)
+        self.lease("o")
+        self.verdict("a", "o", "parked")
+        self.tod.run("a", "stopped", "failed", "a different error")
+        self.assertEqual(self.cli("sync")["due"], 1)
+
+    def test_request_and_head_on_waiting_outside_are_changes(self):
+        self._parked("waiting_outside", "x")
+        self.tod.decide("a")
+        self.assertEqual(self.cli("sync")["due"], 1)
+        self.lease("o")
+        self.verdict("a", "o", "parked")
+        self.tod.set("UPDATE node_fields SET linked_prs = '[\"o/r#2\"]' WHERE node_id = ?", self.tod.ids["a"])
+        self.assertEqual(self.cli("sync")["due"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

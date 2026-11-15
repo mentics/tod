@@ -113,6 +113,17 @@ def snapshot(db, nid):
     )
 
 
+# A waiting_outside run's text is free wording for what it waits on, and the
+# babysitter alternates it between an event id and a sentence for the SAME wait
+# (gap 23). reason_kind already says why and `waits` says what, so the text is
+# left out there. A stopped or failed run's text carries the error: kept.
+WORDING_ONLY_KINDS = ("waiting_outside",)
+
+
+def stable_reason_text(kind, text):
+    return "" if kind in WORDING_ONLY_KINDS else text
+
+
 def fingerprint_parts(snap):
     """The fields that change when something meaningful happens. Left out on
     purpose: updated_at, `since`, wait due times and attempt counters, leases
@@ -121,7 +132,7 @@ def fingerprint_parts(snap):
         "state": snap["state"],
         "run.phase": snap["phase"],
         "run.reason_kind": snap["kind"],
-        "run.reason_text": snap["text"],
+        "run.reason_text": stable_reason_text(snap["kind"], snap["text"]),
         "decisions": sorted(d for d, _ in snap["decisions"]),
         "waits": sorted(f"{spec}|{st}" for spec, st, _ in snap["waits"]),
         "linked_prs": snap["linked_prs"],
