@@ -261,7 +261,7 @@ fn handle_client(stream: TcpStream, tx: async_channel::Sender<Pending>, shared: 
         let mut note: Option<String> = None;
         let parsed = match parsed {
             Ok(cmd)
-                if mode::classify(&cmd) == Kind::Input
+                if matches!(mode::classify(&cmd), Kind::Input | Kind::Observe)
                     && !matches!(cmd, Command::Resize { .. }) =>
             {
                 ensure_size(&tx).map(|n| {
@@ -361,20 +361,17 @@ fn ensure_size(tx: &async_channel::Sender<Pending>) -> Result<Option<String>, St
 /// waits for the user to be done, a screenshot is refused while they are in
 /// control. `Err` is the text after `err `.
 fn gate(command: &Command, shared: &Shared) -> Result<(), String> {
-    match mode::classify(command) {
-        Kind::Input => shared.gate_input(),
-        Kind::Shot => {
-            if shared.mode() == Mode::User {
-                Err("user-mode: the screen shows the user's view; retry when `mode` says driven"
-                    .into())
-            } else {
-                Ok(())
+    let kind = mode::classify(command);
+    let activity = mode::counts_as_activity(kind);
+    match kind {
+        Kind::Input | Kind::Observe => shared.gate_wait(activity),
+        Kind::Shot if shared.mode() == Mode::User => Err(
+            "user-mode: the screen shows the user's view; retry when `mode` says driven".into(),
+        ),
+        Kind::Shot | Kind::Seam | Kind::Read | Kind::Other => {
+            if activity {
+                shared.with(|m, now| m.note_command(now));
             }
-        }
-        Kind::Seam => Ok(()),
-        Kind::Read => Ok(()),
-        Kind::Other => {
-            shared.with(|m, now| m.note_command(now));
             Ok(())
         }
     }
@@ -720,6 +717,86 @@ fn apply_text(cx: &mut AsyncApp, window: AnyWindowHandle, text: String) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The gate on a clock the test owns: what the socket threads call.
+    fn gated() -> (Shared, std::sync::Arc<std::sync::atomic::AtomicU64>) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let clock = std::sync::Arc::new(AtomicU64::new(0));
+        let c = clock.clone();
+        let shared = Shared::with_clock(mode::Config::default(), move || c.load(Ordering::SeqCst));
+        assert_eq!(shared.mode(), Mode::Idle);
+        (shared, clock)
+    }
+
+    fn send(shared: &Shared, line: &str) -> Result<(), String> {
+        gate(&parse_line(line).unwrap(), shared)
+    }
+
+    /// A client sends `line` every 10 s for five minutes after one input
+    /// command; returns the mode when it stops (ticking as the app does).
+    fn poll_for_five_minutes(line: &str) -> Mode {
+        use std::sync::atomic::Ordering;
+        let (shared, clock) = gated();
+        send(&shared, "click 1 1").unwrap();
+        assert_eq!(shared.mode(), Mode::Driven);
+        let mut t = 10_000;
+        while t <= 300_000 {
+            clock.store(t, Ordering::SeqCst);
+            send(&shared, line).unwrap();
+            shared.with(|m, now| m.tick(now));
+            t += 10_000;
+        }
+        shared.mode()
+    }
+
+    #[test]
+    fn a_client_polling_observations_goes_idle_through_the_gate() {
+        for line in ["tree", "wait-for button:Go --timeout-ms 10", "coverage", "mode", "sync", "size", "shot /x.png"]
+        {
+            // `wait-for` is gated once on arrival; the poll itself is not.
+            assert_eq!(poll_for_five_minutes(line), Mode::Idle, "{line}");
+        }
+    }
+
+    #[test]
+    fn a_client_acting_stays_driven_through_the_gate() {
+        for line in ["act button:Go", "key a", "text hi", "click 1 1", "quit"] {
+            assert_eq!(poll_for_five_minutes(line), Mode::Driven, "{line}");
+        }
+    }
+
+    #[test]
+    fn observing_from_idle_does_not_start_driving() {
+        let (shared, _) = gated();
+        for line in ["tree", "wait-for button:Go", "coverage"] {
+            send(&shared, line).unwrap();
+            assert_eq!(shared.mode(), Mode::Idle, "{line}");
+        }
+        send(&shared, "act button:Go").unwrap();
+        assert_eq!(shared.mode(), Mode::Driven);
+    }
+
+    #[test]
+    fn observing_waits_while_the_user_has_the_app() {
+        use std::sync::atomic::Ordering;
+        let (shared, clock) = gated();
+        let shared = std::sync::Arc::new(shared);
+        send(&shared, "click 1 1").unwrap();
+        clock.store(1_000, Ordering::SeqCst);
+        shared.with(|m, now| m.on_real_input(now, mode::RealInput::Key));
+        assert_eq!(shared.mode(), Mode::User);
+        let waiter = {
+            let shared = shared.clone();
+            std::thread::spawn(move || send(&shared, "tree"))
+        };
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(!waiter.is_finished(), "tree must wait in user mode");
+        // The user goes quiet; driven mode resumes and the view is restored.
+        clock.store(7_000, Ordering::SeqCst);
+        assert!(shared.with(|m, now| m.tick(now)).is_some());
+        shared.with(|m, _| m.restored(vec![]));
+        assert_eq!(waiter.join().unwrap(), Ok(()));
+    }
 
     #[test]
     fn bind_fails_when_port_in_use() {

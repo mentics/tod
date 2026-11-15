@@ -37,6 +37,15 @@ pub enum Kind {
     /// Changes what the window shows or holds: waits while the user has the
     /// app (see [`Ticket`]) and starts driving.
     Input,
+    /// Reads the accessibility tree (`tree`, `wait-for`, `coverage`): the tree
+    /// describes the screen, which in user mode is the user's view, so it waits
+    /// for the agent's view to be restored exactly as [`Kind::Input`] does. But
+    /// it only observes, so it neither keeps the agent "driving" nor starts
+    /// driving from `Idle`: a client polling `tree`/`wait-for` goes quiet like
+    /// one polling `mode`. (`wait-for` only polls the tree's match count; it
+    /// never acts. `act` is the one tree command that changes the app and is
+    /// an `Input`.)
+    Observe,
     /// Looks at the screen: refused while the user has the app, since the
     /// screen shows their view.
     Shot,
@@ -62,21 +71,20 @@ pub fn classify(command: &Command) -> Kind {
         | Command::Close
         | Command::Transcripts(_)
         | Command::AgentPlatform(_) => Kind::Other,
-        // The tree describes the screen, which in user mode is the user's
-        // view: these wait for the agent's view to be restored, as input does.
-        Command::Tree(_) | Command::WaitFor { .. } | Command::Coverage { .. } | Command::Act { .. } => {
-            Kind::Input
-        }
+        Command::Tree(_) | Command::WaitFor { .. } | Command::Coverage { .. } => Kind::Observe,
+        Command::Act { .. } => Kind::Input,
         _ => Kind::Input,
     }
 }
 
 /// Whether a command of this kind keeps the agent "driving". Looking at the
-/// app (`mode`, `sync`, `size`, `shot`) does not: a client polling `mode` to
-/// ask whether the agent has gone quiet would otherwise keep it from ever
-/// going quiet (the app read `driven` over four minutes after the last input).
-/// Input commands (including `tree`, `wait-for`, `act`) and the commands that
-/// act on the app do.
+/// app (`mode`, `sync`, `size`, `shot`, and the tree reads `tree`, `wait-for`,
+/// `coverage`) does not: a client polling to ask whether the agent has gone
+/// quiet, or waiting for the screen between actions, would otherwise keep it
+/// from ever going quiet (the app read `driven` over four minutes after the
+/// last input). Input commands (including `act`) and the commands that act on
+/// the app do. `mod.rs::gate` is the only caller: the rule lives here, the
+/// gate applies it to every command.
 pub fn counts_as_activity(kind: Kind) -> bool {
     matches!(kind, Kind::Input | Kind::Other)
 }
@@ -161,6 +169,9 @@ pub enum Effect {
 pub struct Ticket {
     arrived: Ms,
     generation: u64,
+    /// Only observing: waits like an input but never notes activity or starts
+    /// driving.
+    observe: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -221,20 +232,35 @@ impl Machine {
     /// An input command arrived. From `Idle` this starts driving. Poll the
     /// ticket until it says what to do.
     pub fn begin_input(&mut self, now: Ms) -> Ticket {
-        self.note_command(now);
-        if self.mode == Mode::Idle {
-            self.mode = Mode::Driven;
+        self.begin(now, false)
+    }
+
+    /// An observing command (`tree`, `wait-for`, `coverage`) arrived: it waits
+    /// for its turn as an input does, but is not agent activity.
+    pub fn begin_observe(&mut self, now: Ms) -> Ticket {
+        self.begin(now, true)
+    }
+
+    fn begin(&mut self, now: Ms, observe: bool) -> Ticket {
+        if !observe {
+            self.note_command(now);
+            if self.mode == Mode::Idle {
+                self.mode = Mode::Driven;
+            }
         }
         Ticket {
             arrived: now,
             generation: self.generation,
+            observe,
         }
     }
 
     pub fn poll(&mut self, ticket: Ticket, now: Ms) -> Poll {
         if self.mode == Mode::User {
             if now.saturating_sub(ticket.arrived) >= self.cfg.block_cap_ms {
-                self.note_command(now);
+                if !ticket.observe {
+                    self.note_command(now);
+                }
                 return Poll::UserMode;
             }
             return Poll::Pending;
@@ -242,9 +268,11 @@ impl Machine {
         if self.restoring {
             return Poll::Pending;
         }
-        self.note_command(now);
-        if self.mode == Mode::Idle {
-            self.mode = Mode::Driven;
+        if !ticket.observe {
+            self.note_command(now);
+            if self.mode == Mode::Idle {
+                self.mode = Mode::Driven;
+            }
         }
         let mut conflicts: Vec<String> = Vec::new();
         for (generation, found) in &self.restore_log {
@@ -367,19 +395,25 @@ impl Machine {
 /// socket threads (commands), with a real clock.
 pub struct Shared {
     machine: std::sync::Mutex<Machine>,
-    epoch: std::time::Instant,
+    clock: Box<dyn Fn() -> Ms + Send + Sync>,
 }
 
 impl Shared {
     pub fn new(cfg: Config) -> Self {
+        let epoch = std::time::Instant::now();
+        Self::with_clock(cfg, move || epoch.elapsed().as_millis() as Ms)
+    }
+
+    /// A shared machine on a clock the caller owns (tests drive time by hand).
+    pub fn with_clock(cfg: Config, clock: impl Fn() -> Ms + Send + Sync + 'static) -> Self {
         Self {
             machine: std::sync::Mutex::new(Machine::new(cfg)),
-            epoch: std::time::Instant::now(),
+            clock: Box::new(clock),
         }
     }
 
     pub fn now(&self) -> Ms {
-        self.epoch.elapsed().as_millis() as Ms
+        (self.clock)()
     }
 
     pub fn with<R>(&self, f: impl FnOnce(&mut Machine, Ms) -> R) -> R {
@@ -394,8 +428,14 @@ impl Shared {
 
     /// Wait for the turn of an input command. `Ok` means run it; the error
     /// is the text after `err `.
-    pub fn gate_input(&self) -> Result<(), String> {
-        let ticket = self.with(|m, now| m.begin_input(now));
+    pub fn gate_wait(&self, activity: bool) -> Result<(), String> {
+        let ticket = self.with(|m, now| {
+            if activity {
+                m.begin_input(now)
+            } else {
+                m.begin_observe(now)
+            }
+        });
         loop {
             match self.with(|m, now| m.poll(ticket, now)) {
                 Poll::Run => return Ok(()),
@@ -655,9 +695,14 @@ mod tests {
         for line in ["sync", "size", "shot /x.png"] {
             assert!(!counts_as_activity(classify(&parse_line(line).unwrap())), "{line}");
         }
-        for line in ["tree", "quit"] {
+        for line in ["quit", "key a", "act button:Go"] {
             assert!(counts_as_activity(classify(&parse_line(line).unwrap())), "{line}");
         }
+        for line in ["tree", "wait-for button:Go", "coverage"] {
+            assert_eq!(classify(&parse_line(line).unwrap()), Kind::Observe, "{line}");
+            assert!(!counts_as_activity(Kind::Observe), "{line}");
+        }
+        assert_eq!(classify(&parse_line("act button:Go").unwrap()), Kind::Input);
     }
 
     #[test]

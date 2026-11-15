@@ -222,8 +222,12 @@ the two apart. The socket marks its own injected events; any other input is
 the user's (`agent_socket/driver.rs`).
 
 - **driven**: a socket client is driving, from its first input command until no
-  command for 2 minutes (then `idle`: no indicator, no snapshots). The title bar
-  is violet and says "Shepherd driving".
+  command for 2 minutes (then `idle`: no indicator, no snapshots). Only a
+  command that acts on the app counts: input, `act`, `quit`/`close`, the transcripts
+  and agent-platform commands. Observing does not: `mode`, `sync`, `size`, `shot`,
+  `shot2`, `tree`, `wait-for` and `coverage` neither keep the agent driven nor
+  start driving from `idle`, so a client that polls them between actions goes
+  idle on schedule. The title bar is violet and says "Shepherd driving".
 - **user**: the user pressed a key or a mouse button, scrolled, or moved the
   pointer. Focus gained, or the pointer merely over the window, does not count
   (swiping through the macOS Space the window is on must not interrupt driven
@@ -245,6 +249,9 @@ its pending request ids, and each open panel still applying) it runs and replies
 pr_draft→approved` (what changed) without running. After 60 s it replies `err
 user-mode` and the agent resends. `shot`/`shot2` in user mode reply `err
 user-mode: …` since the screen shows the user's view.
+`tree`, `wait-for` and `coverage` read the screen the user may be changing, so
+they wait in user mode exactly as input does (same conflict and 60 s rules), but
+they are not agent activity (see driven, above).
 
 **Window size.** While driven the app owns the content size: what the agent's
 `resize` set, or what the last restore put back. A size change the app did not
