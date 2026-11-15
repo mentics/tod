@@ -364,7 +364,6 @@ fn gate(command: &Command, shared: &Shared) -> Result<(), String> {
     match mode::classify(command) {
         Kind::Input => shared.gate_input(),
         Kind::Shot => {
-            shared.with(|m, now| m.note_command(now));
             if shared.mode() == Mode::User {
                 Err("user-mode: the screen shows the user's view; retry when `mode` says driven"
                     .into())
@@ -373,7 +372,8 @@ fn gate(command: &Command, shared: &Shared) -> Result<(), String> {
             }
         }
         Kind::Seam => Ok(()),
-        Kind::Read | Kind::Other => {
+        Kind::Read => Ok(()),
+        Kind::Other => {
             shared.with(|m, now| m.note_command(now));
             Ok(())
         }

@@ -71,6 +71,16 @@ pub fn classify(command: &Command) -> Kind {
     }
 }
 
+/// Whether a command of this kind keeps the agent "driving". Looking at the
+/// app (`mode`, `sync`, `size`, `shot`) does not: a client polling `mode` to
+/// ask whether the agent has gone quiet would otherwise keep it from ever
+/// going quiet (the app read `driven` over four minutes after the last input).
+/// Input commands (including `tree`, `wait-for`, `act`) and the commands that
+/// act on the app do.
+pub fn counts_as_activity(kind: Kind) -> bool {
+    matches!(kind, Kind::Input | Kind::Other)
+}
+
 /// A pointer move counts as the user's only when it is at least this far
 /// (logical pixels) from where the pointer last counted; a mouse sitting
 /// still, or sensor jitter, never switches.
@@ -622,6 +632,32 @@ mod tests {
         assert_eq!(m.mode(), Mode::Idle);
         // Nothing is consumed from then on.
         assert_eq!(m.on_real_input(130_000, RealInput::Key), (false, None));
+    }
+
+    #[test]
+    fn polling_mode_does_not_keep_the_agent_driving() {
+        use super::super::commands::parse_line;
+        let mut m = driven();
+        // The client reads `mode` every 10s, as the shepherd does; the gate
+        // notes a command only when its kind counts as activity.
+        let mut effect = None;
+        let mut t = 10_000;
+        while t <= 300_000 && effect.is_none() {
+            let kind = classify(&parse_line("mode").unwrap());
+            if counts_as_activity(kind) {
+                m.note_command(t);
+            }
+            effect = m.tick(t);
+            t += 10_000;
+        }
+        assert_eq!(effect, Some(Effect::EnterIdle));
+        assert_eq!(m.mode(), Mode::Idle);
+        for line in ["sync", "size", "shot /x.png"] {
+            assert!(!counts_as_activity(classify(&parse_line(line).unwrap())), "{line}");
+        }
+        for line in ["tree", "quit"] {
+            assert!(counts_as_activity(classify(&parse_line(line).unwrap())), "{line}");
+        }
     }
 
     #[test]
