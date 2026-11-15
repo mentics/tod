@@ -50,6 +50,7 @@ pub fn compute(lifecycle: &str, runs: &[NodeRun]) -> (String, Direction) {
 /// Renders `compute`'s result as text: `state`, `state →`, or `→ state`.
 pub fn text(lifecycle: &str, runs: &[NodeRun]) -> SharedString {
     let (state, direction) = compute(lifecycle, runs);
+    let state = tod_store::settings::lifecycle_display_name(&state);
     SharedString::from(match direction {
         Direction::None => state,
         Direction::Leaving => format!("{state} \u{2192}"),
@@ -88,33 +89,33 @@ mod tests {
 
     #[test]
     fn plain_state_with_no_runs() {
-        assert_eq!(text("verifying", &[]), SharedString::from("verifying"));
+        assert_eq!(text("verifying", &[]), SharedString::from("Verifying"));
     }
 
     #[test]
     fn gate_check_running_shows_a_trailing_arrow() {
         let runs = vec![run(ProtocolKind::GateCheck, true)];
-        assert_eq!(text("verifying", &runs), SharedString::from("verifying \u{2192}"));
+        assert_eq!(text("verifying", &runs), SharedString::from("Verifying \u{2192}"));
         assert_eq!(compute("verifying", &runs).1, Direction::Leaving);
     }
 
     #[test]
     fn on_entry_running_shows_a_leading_arrow() {
         let runs = vec![run(ProtocolKind::OnEntry, true)];
-        assert_eq!(text("verifying", &runs), SharedString::from("\u{2192} verifying"));
+        assert_eq!(text("verifying", &runs), SharedString::from("\u{2192} Verifying"));
         assert_eq!(compute("verifying", &runs).1, Direction::Entering);
     }
 
     #[test]
     fn a_finished_gate_check_run_does_not_add_an_arrow() {
         let runs = vec![run(ProtocolKind::GateCheck, false)];
-        assert_eq!(text("verifying", &runs), SharedString::from("verifying"));
+        assert_eq!(text("verifying", &runs), SharedString::from("Verifying"));
     }
 
     #[test]
     fn an_unrelated_protocol_running_does_not_add_an_arrow() {
         let runs = vec![run(ProtocolKind::Fix, true)];
-        assert_eq!(text("verifying", &runs), SharedString::from("verifying"));
+        assert_eq!(text("verifying", &runs), SharedString::from("Verifying"));
     }
 
     #[test]

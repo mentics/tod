@@ -378,7 +378,7 @@ fn plan_verified_outcome(conn: &Connection, node_id: Uuid, state: &str) -> Resul
     {
         return Ok(DerivedOutcome {
             outcome: OUTCOME_PASS,
-            detail: format!("Nothing belongs to the {state} phase."),
+            detail: format!("Nothing belongs to the {} phase.", tod_store::settings::lifecycle_display_name(&state)),
         });
     }
     if state == "verifying" && steps.is_empty() {
@@ -409,7 +409,7 @@ fn plan_verified_outcome(conn: &Connection, node_id: Uuid, state: &str) -> Resul
         let redo = if state == "verifying" {
             "Move the node back to active and implement again".to_string()
         } else {
-            format!("Run the {state} phase again")
+            format!("Run the {} phase again", tod_store::settings::lifecycle_display_name(&state))
         };
         parts.push(format!(
             "{} failed verification: {}. {redo} — each failed step's note says what to fix.",

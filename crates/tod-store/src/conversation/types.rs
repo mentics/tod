@@ -464,17 +464,18 @@ impl Conversation {
     /// transition it checks, or the state it sets up. `None` for other kinds.
     pub fn transition_label(&self) -> Option<String> {
         let (from, to) = (self.from_state.as_deref()?, self.to_state.as_deref()?);
+        use crate::settings::lifecycle_display_name as name;
         Some(match self.protocol {
-            ProtocolKind::OnEntry => format!("on entry to {to}"),
-            ProtocolKind::Phase => format!("{from} phase"),
-            ProtocolKind::Evaluate => format!("evaluating {from}"),
-            ProtocolKind::Review => format!("code review in {from}"),
+            ProtocolKind::OnEntry => format!("on entry to {}", name(to)),
+            ProtocolKind::Phase => format!("{} phase", name(from)),
+            ProtocolKind::Evaluate => format!("evaluating {}", name(from)),
+            ProtocolKind::Review => format!("code review in {}", name(from)),
             ProtocolKind::Pr => match from {
                 "pr_draft" => "Pull request (draft)".to_string(),
                 "pr_review" => "Pull request (review)".to_string(),
                 _ => "Pull request".to_string(),
             },
-            _ => format!("{from} \u{2192} {to}"),
+            _ => format!("{} \u{2192} {}", name(from), name(to)),
         })
     }
 }

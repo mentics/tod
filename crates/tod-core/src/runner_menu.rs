@@ -394,7 +394,7 @@ pub fn describe_check(found: &crate::lifecycle::CheckNow) -> (String, bool) {
     use crate::autopilot::GithubCheck;
     let mut failed = false;
     let mut text = if let Some(state) = found.advanced {
-        format!("Checked: the gate is clear; moved to {state}")
+        format!("Checked: the gate is clear; moved to {}", tod_store::settings::lifecycle_display_name(state))
     } else if found.gate.to.is_none() {
         format!("Checked: {} has no gate", found.gate.from)
     } else if found.gate.clear() {

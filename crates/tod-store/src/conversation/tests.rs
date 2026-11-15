@@ -1779,11 +1779,11 @@ fn a_gate_check_and_an_on_entry_run_name_the_transition_they_belong_to() {
     assert_eq!(gate.to_state.as_deref(), Some("review"));
     assert_eq!(
         gate.transition_label().as_deref(),
-        Some("verifying \u{2192} review")
+        Some("Verifying \u{2192} Review")
     );
     assert_eq!(
         repo.get(entry.id).unwrap().unwrap().transition_label().as_deref(),
-        Some("on entry to review")
+        Some("on entry to Review")
     );
     // Other kinds carry none.
     let plain = repo.get(fx.conv).unwrap().unwrap();
@@ -1980,4 +1980,16 @@ fn writes_outside_a_conversation_stay_out_of_its_projections() {
     assert_eq!(changes.len(), 1);
     assert_eq!(changes[0].id, ours);
     assert!(fx.reverse(vec![direct[0].id], false, false).is_err());
+}
+
+#[test]
+fn a_pr_phase_session_is_labelled_with_the_acronym_not_a_raw_state_name() {
+    let fx = setup();
+    let repo = ConversationRepo::new(&fx.conn);
+    let phase = repo.create(Focus::Node(fx.n1), ProtocolKind::Phase, None, None, None).unwrap();
+    repo.set_transition(phase.id, "pr_draft", "pr_review").unwrap();
+    assert_eq!(repo.get(phase.id).unwrap().unwrap().transition_label().as_deref(), Some("PR draft phase"));
+    let eval = repo.create(Focus::Node(fx.n1), ProtocolKind::Evaluate, None, None, None).unwrap();
+    repo.set_transition(eval.id, "pr", "pr_draft").unwrap();
+    assert_eq!(repo.get(eval.id).unwrap().unwrap().transition_label().as_deref(), Some("evaluating PR"));
 }

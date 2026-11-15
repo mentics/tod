@@ -1299,7 +1299,7 @@ impl Render for AgentConversationPanel {
                     style::panel_footer(v_flex())
                         .child(
                             style::text_dense_muted(div()).child(match &self.lifecycle_state {
-                                Some(state) => format!("Lifecycle: {state}"),
+                                Some(state) => format!("Lifecycle: {}", tod_store::settings::lifecycle_display_name(state)),
                                 None => "Lifecycle".to_string(),
                             }),
                         )

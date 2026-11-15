@@ -65,10 +65,7 @@ pub struct Group {
 impl Group {
     /// `Active`, `Active (user)`: the phase and, when the user chose it, who.
     pub fn title(&self) -> String {
-        let mut name = self.phase.replace('_', " ");
-        if let Some(first) = name.chars().next() {
-            name = first.to_uppercase().collect::<String>() + &name[first.len_utf8()..];
-        }
+        let name = tod_store::settings::lifecycle_display_name(&self.phase);
         if self.by_user { format!("{name} (user)") } else { name }
     }
 }
@@ -219,7 +216,7 @@ mod tests {
         let shape: Vec<_> = groups.iter().map(|g| (g.title(), g.items.len())).collect();
         assert_eq!(
             shape,
-            vec![("Proposed".into(), 2), ("Design".into(), 2), ("Planning".into(), 1), ("Design".into(), 1), ("Pr draft".into(), 1)]
+            vec![("Proposed".into(), 2), ("Design".into(), 2), ("Planning".into(), 1), ("Design".into(), 1), ("PR draft".into(), 1)]
         );
     }
 
@@ -234,7 +231,9 @@ mod tests {
 
     #[test]
     fn a_pr_draft_phase_reads_as_words() {
-        let g = Group { key: 0, phase: "pr_draft".into(), by_user: false, items: Vec::new() };
-        assert_eq!(g.title(), "Pr draft");
+        for (phase, title) in [("pr", "PR"), ("pr_draft", "PR draft"), ("pr_review", "PR review")] {
+            let g = Group { key: 0, phase: phase.into(), by_user: false, items: Vec::new() };
+            assert_eq!(g.title(), title);
+        }
     }
 }

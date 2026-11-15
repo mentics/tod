@@ -22,6 +22,51 @@ pub const VALID_LIFECYCLE_STATES: [&str; 15] = [
     "pr_draft", "pr_review", "approved", "merged", "released", "learn", "done",
 ];
 
+/// A lifecycle state's name as people read it: `Active`, `PR`, `PR draft`.
+/// The one display-name function: every heading, chip, label, or sentence
+/// that shows a state's name goes through it (a stored name is for code).
+/// `PR` is the acronym, so the generic capitalization (`Pr draft`) is wrong
+/// for the three pull-request states. A name that is not a state (a phase
+/// key like `implement`) is capitalized the same way.
+pub fn lifecycle_display_name(state: &str) -> String {
+    let words = state.replace('_', " ");
+    let (first, rest) = match words.split_once(' ') {
+        Some((a, b)) => (a, Some(b)),
+        None => (words.as_str(), None),
+    };
+    let head = if first == "pr" {
+        "PR".to_string()
+    } else {
+        let mut chars = first.chars();
+        match chars.next() {
+            Some(c) => c.to_uppercase().chain(chars).collect(),
+            None => String::new(),
+        }
+    };
+    match rest {
+        Some(rest) => format!("{head} {rest}"),
+        None => head,
+    }
+}
+
+#[cfg(test)]
+mod display_name_tests {
+    use super::*;
+
+    #[test]
+    fn every_state_reads_as_words_and_pr_is_an_acronym() {
+        assert_eq!(lifecycle_display_name("pr"), "PR");
+        assert_eq!(lifecycle_display_name("pr_draft"), "PR draft");
+        assert_eq!(lifecycle_display_name("pr_review"), "PR review");
+        assert_eq!(lifecycle_display_name("active"), "Active");
+        for state in VALID_LIFECYCLE_STATES {
+            let name = lifecycle_display_name(state);
+            assert!(!name.contains('_'), "{name}");
+            assert!(name != "Pr" && !name.starts_with("Pr "), "{name}");
+        }
+    }
+}
+
 fn default_journey_milestone_states() -> Vec<String> {
     vec![
         "active".to_string(),

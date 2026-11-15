@@ -1308,7 +1308,7 @@ impl TaskPanel {
         let menu_current = current.clone();
         let recorded_current = current.clone();
         let chip = Button::new("unified-task-phase")
-            .label(current)
+            .label(tod_store::settings::lifecycle_display_name(&current))
             .outline()
             .xsmall()
             .rounded(gpui::px(999.))
@@ -1319,7 +1319,7 @@ impl TaskPanel {
                         continue;
                     }
                     let weak = weak.clone();
-                    popup = popup.item(PopupMenuItem::new(state).on_click(move |_, _, cx| {
+                    popup = popup.item(PopupMenuItem::new(tod_store::settings::lifecycle_display_name(state)).on_click(move |_, _, cx| {
                         let _ = weak.update(cx, |this: &mut TaskPanel, cx| this.set_phase(state, cx));
                     }));
                 }
@@ -1999,7 +1999,7 @@ mod tests {
         use tod_core::phase::GateCheck;
         let gate = |to: Option<&str>| GateCheck { from: "pr_draft".into(), to: to.map(str::to_string), criteria: Vec::new() };
         let moved = CheckNow { gate: gate(Some("pr_review")), advanced: Some("pr_review"), github: None, held: None, needs_agent: false };
-        assert_eq!(describe_check(&moved), ("Checked: the gate is clear; moved to pr_review".to_string(), false));
+        assert_eq!(describe_check(&moved), ("Checked: the gate is clear; moved to PR review".to_string(), false));
         let held = CheckNow {
             gate: gate(Some("pr_review")),
             advanced: None,

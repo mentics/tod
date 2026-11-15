@@ -875,13 +875,9 @@ impl ListDelegate for TaskListDelegate {
     }
 }
 
-/// The header text for a lifecycle state: its name, capitalized.
+/// The header text for a lifecycle state.
 fn group_label(state: &str) -> String {
-    let mut chars = state.chars();
-    match chars.next() {
-        Some(first) => first.to_uppercase().chain(chars).collect(),
-        None => String::new(),
-    }
+    tod_store::settings::lifecycle_display_name(state)
 }
 
 /// The fixed-width cell at the left of a row: one glyph for who is next
