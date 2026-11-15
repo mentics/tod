@@ -5114,6 +5114,7 @@ impl TaskEditView {
             } else {
                 self.loaded_lifecycle.clone()
             };
+            let lifecycle = tod_store::settings::lifecycle_display_name(&lifecycle);
             Some(
                 h_flex()
                     .items_center()

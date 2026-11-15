@@ -649,7 +649,7 @@ impl UnifiedView {
             }
             match self.fleet.get_node(&id) {
                 Ok(Some(task)) => {
-                    map.insert(id, format!("{} · waiting", task.lifecycle));
+                    map.insert(id, format!("{} · waiting", tod_store::settings::lifecycle_display_name(&task.lifecycle)));
                 }
                 Ok(None) => {}
                 Err(err) => {

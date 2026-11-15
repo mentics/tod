@@ -176,7 +176,11 @@ fn record_gate_timeline(fleet: &FleetStore, node: Uuid, gate: &GateCheck) -> Res
         node,
         tod_store::node_timeline::KIND_GATE,
         &gate.from,
-        format!("Gate check: {} \u{2192} {to}", gate.from),
+        format!(
+            "Gate check: {} \u{2192} {}",
+            tod_store::settings::lifecycle_display_name(&gate.from),
+            tod_store::settings::lifecycle_display_name(to)
+        ),
         !gate.clear(),
         serde_json::to_string(&lines)?,
     );

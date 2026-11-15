@@ -188,7 +188,7 @@ fn collect_running_work(
     match tod_core::cloud_sync::working_in_cloud(fleet) {
         Ok(work) => continuing.extend(
             work.into_iter()
-                .map(|w| format!("{} ({}): running in the cloud", w.title, w.lifecycle)),
+                .map(|w| format!("{} ({}): running in the cloud", w.title, tod_store::settings::lifecycle_display_name(&w.lifecycle))),
         ),
         Err(err) => continuing.push(format!("could not read the cloud nodes: {err:#}")),
     }

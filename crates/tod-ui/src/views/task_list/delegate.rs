@@ -553,7 +553,7 @@ impl ListDelegate for TaskListDelegate {
                 // Tasks view never calls it, so `status_override` stays
                 // `None` there and this chip shows the plain lifecycle name
                 // exactly as before.
-                let lifecycle = item.status_override.clone().unwrap_or_else(|| item.lifecycle.clone());
+                let lifecycle = lifecycle_chip_label(&item);
                 let task_id_lc = item.id.clone();
                 chips = chips.child(action_chip(
                     cx,
@@ -873,6 +873,15 @@ impl ListDelegate for TaskListDelegate {
         _cx: &mut Context<ListState<Self>>,
     ) {
     }
+}
+
+/// The lifecycle chip's text: the host's status label while a run is
+/// working the node (`PR draft →`, already words), else the stored state
+/// read as words (`PR draft`), so a node reads the same at rest and mid-run.
+fn lifecycle_chip_label(item: &TaskItem) -> String {
+    item.status_override
+        .clone()
+        .unwrap_or_else(|| tod_store::settings::lifecycle_display_name(&item.lifecycle))
 }
 
 /// The header text for a lifecycle state.
@@ -1332,6 +1341,25 @@ mod hover_tests {
     use super::*;
     use crate::views::task_list::model::PrMark;
     use tod_store::github::PullState;
+
+    #[test]
+    fn lifecycle_chip_reads_the_same_at_rest_and_mid_run() {
+        use crate::ui::agent_runs::NodeRun;
+        use tod_store::conversation::ProtocolKind;
+        let mut item = crate::views::task_list::fixtures::large_fixture_set(1).remove(0);
+        item.lifecycle = "pr_draft".into();
+        item.status_override = None;
+        assert_eq!(lifecycle_chip_label(&item), "PR draft");
+        let run = NodeRun {
+            conversation_id: Some(uuid::Uuid::new_v4()),
+            protocol: ProtocolKind::GateCheck,
+            running: true,
+            from_state: None,
+            to_state: None,
+        };
+        item.status_override = Some(crate::unified::status_label::text("pr_draft", &[run]).to_string());
+        assert_eq!(lifecycle_chip_label(&item), "PR draft \u{2192}");
+    }
 
     // What the status glyph's hover says is `standing::tooltip_lines`'s,
     // tested there.

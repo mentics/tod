@@ -528,7 +528,10 @@ pub fn reopen(fleet: &FleetStore, node: Uuid, state: &str, proof: &Proof) -> Res
     for (decision_id, _) in &about {
         fleet.interview(ACTOR, InterviewCommand::WithdrawDecision { decision_id: *decision_id })?;
     }
-    let mut detail = format!("From {state}. {why}");
+    // The node's activity reads the state as words; the plan steps' notes (an
+    // agent reads those) keep the stored name.
+    let shown = tod_store::settings::lifecycle_display_name(state);
+    let mut detail = format!("From {shown}. {}", proof.why(&shown));
     if !about.is_empty() {
         detail.push_str(&format!(" Withdrawn, as about this: {}.", about.iter().map(|(_, q)| format!("\"{q}\"")).collect::<Vec<_>>().join("; ")));
     }

@@ -886,7 +886,7 @@ impl Autopilot {
             crate::lost_work::Finding::Unproven(reasons) => {
                 // Nothing is reopened on a guess: the run goes on, and the
                 // node's activity says once per state that it could not tell.
-                let detail = format!("In {lifecycle}: {}", reasons.join("; "));
+                let detail = format!("In {}: {}", tod_store::settings::lifecycle_display_name(lifecycle), reasons.join("; "));
                 tracing::info!("lost work not proven for node {}: {detail}", self.node);
                 if first_look {
                     let entry = tod_store::node_timeline::TimelineEntry::new(self.node, tod_store::node_timeline::KIND_NOTE, lifecycle, "Lost work: not proven either way", false, detail);

@@ -1446,7 +1446,7 @@ impl TaskListView {
         cx.emit(TaskListEvent::OpenLifecycle {
             lifecycle: lifecycle.to_string(),
         });
-        self.set_status_line(format!("Lifecycle panel: {lifecycle}"), cx);
+        self.set_status_line(format!("Lifecycle panel: {}", tod_store::settings::lifecycle_display_name(lifecycle)), cx);
     }
 
     pub(super) fn focus_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
