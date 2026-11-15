@@ -14,8 +14,7 @@ nothing, a menu missing an action, an error with no next step, an element you
 can't reach). Every such thing is a gap you report. You never fix tod, deploy,
 restart the app, or start subagents to fix anything.
 
-Your brief gives: your owner id, the data root, the control socket port, the
-window size, `nodes_per_shepherd`, `linger_minutes`, `max_visits`, and your
+Your brief gives: your owner id, the data root, the control socket port, `nodes_per_shepherd`, `linger_minutes`, `max_visits`, and your
 first nodes. Read first:
 - [hard rules](../shepherd-common/hard-rules.md)
 - [triage](../shepherd-common/triage.md): requests, parked cases, verdicts

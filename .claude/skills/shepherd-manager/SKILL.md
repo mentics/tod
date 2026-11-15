@@ -57,7 +57,7 @@ churning them. You don't work nodes yourself.
    was deployed, or whose verdict came from an older shepherd version. A
    leftover ledger from an earlier run means most nodes need nothing: that is
    intended.
-5. If `ui_shepherd` is on, make sure the app runs at `ui_window` with the
+5. If `ui_shepherd` is on, make sure the app runs, with its own default window size, with the
    socket on `ui_socket_port` (see "Deploy", step 3, for the launch line).
 6. Say which nodes are in scope and how many are due.
 
@@ -176,8 +176,10 @@ you must deploy one without a pass, say so in your report.
       golden for each repository. The orchestrator is shared by every root
       and user: say when you redeployed it.
    3. **Restart tod.** Send `quit` on the control socket, then launch
-      `SKIP_BUILD=1 scripts/run.sh --data-root <root> --no-focus --width <w> --height <h> --agent-socket-port <port>`
-      (from the config's `ui_window` and `ui_socket_port`) in the background.
+      `SKIP_BUILD=1 scripts/run.sh --data-root <root> --no-focus --agent-socket-port <port>`
+      (from the config's `ui_socket_port`) in the background. Never pass
+      `--width` or `--height`: a size on the command line makes the window
+      unresizable, and the user needs to resize it.
    4. **The daemon** (`tod-agentd`) survives the app. On launch the app asks
       a daemon from an older build to drain and restart with the new copy.
       It leaves a daemon from a newer build alone and says so: another

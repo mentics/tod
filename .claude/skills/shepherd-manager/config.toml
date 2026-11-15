@@ -22,7 +22,6 @@ max_fixers = 2
 
 # One UI shepherd drives the app over its control socket.
 ui_shepherd = true
-ui_window = { width = 1800, height = 1000 }
 ui_socket_port = 47621
 
 # Minutes until a node in motion is looked at again, by what it waits on.
