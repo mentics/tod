@@ -432,6 +432,41 @@ fn the_opening_context_is_recorded_as_sent() {
 }
 
 #[test]
+fn a_fresh_session_opens_with_what_the_user_answered_on_the_node() {
+    use tod_store::decisions::{DecisionRepo, NewDecision};
+    let fx = fixture();
+    fx.user(InterviewCommand::AskDecision {
+        node_id: fx.node,
+        conversation_id: None,
+        protocol: None,
+        decision: NewDecision {
+            question: "Judge the terraform plan step by the PR checks?".into(),
+            ..Default::default()
+        },
+    });
+    let decision = fx
+        .fleet
+        .read(|conn| DecisionRepo::new(conn).list_pending_for_node(fx.node))
+        .unwrap()
+        .remove(0);
+    fx.user(InterviewCommand::AnswerDecision {
+        decision_id: decision.id,
+        option: None,
+        text: Some("mark it implemented, the PR checks judge it".into()),
+    });
+    // The driver adds it to any protocol's first turn, not only a loop's
+    // continuation (an Implement run needs Files; Outline stands for them).
+    for kind in [ProtocolKind::Outline] {
+        let mut agent = FakeAgent::new(&fx.fleet);
+        let mut driver = ConversationDriver::new(config(&fx, 100_000), Focus::Node(fx.node), kind);
+        say(&mut driver, &fx, &mut agent, "go");
+        let sent = agent.last().opening.as_ref().unwrap().context.clone().unwrap();
+        assert!(sent.contains("Act on the answers"), "{kind:?}: {sent}");
+        assert!(sent.contains("the PR checks judge it"), "{kind:?}: {sent}");
+    }
+}
+
+#[test]
 fn after_a_reversal_the_next_send_carries_a_delta_and_resumes_the_session() {
     let fx = fixture();
     let mut agent = FakeAgent::new(&fx.fleet);

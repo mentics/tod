@@ -203,14 +203,6 @@ impl Protocol for ImplementationProtocol {
              carry its progress: work the ones that are not yet `implemented` \
              or `verified`.\n",
         );
-        let node = node_id(env)?;
-        let answered = env
-            .fleet
-            .read(|conn| Ok(crate::node_context::render_recent_answers(conn, node)?))?;
-        if !answered.is_empty() {
-            out.push('\n');
-            out.push_str(&answered);
-        }
         Ok(out)
     }
 

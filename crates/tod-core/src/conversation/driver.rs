@@ -572,7 +572,10 @@ impl ConversationDriver {
                 )
             } else {
                 // The first turn: the opening context, then the message.
-                let context = self.protocol.opening(&self.env(fleet, id))?;
+                let context = self.with_recent_answers(
+                    fleet,
+                    self.protocol.opening(&self.env(fleet, id))?,
+                )?;
                 // Kept so the user can read what the agent was given.
                 fleet.interview(
                     ACTOR_USER,
@@ -1079,6 +1082,27 @@ impl ConversationDriver {
     /// one that gets the conversation's snapshot. `reason` is recorded to the
     /// journey ("over budget" | "not resumable" | "cold resume failed").
     #[allow(clippy::too_many_arguments)]
+    /// `context` followed by the answers the user gave on this node lately
+    /// (`node_context::render_recent_answers`). Every fresh session gets
+    /// them, whatever its protocol: answering a request reopens the step it
+    /// held up, and the next run is a new session that sees only the step,
+    /// so without this it never learns the answer and hands the step back
+    /// again (ENG-2072 was answered three times). Nothing is added for a
+    /// conversation without a node.
+    fn with_recent_answers(&self, fleet: &FleetStore, mut context: String) -> Result<String> {
+        let Some(node) = self.focus.node_id() else {
+            return Ok(context);
+        };
+        let answered = fleet
+            .read(|conn| Ok(crate::node_context::render_recent_answers(conn, node)?))
+            .context("could not read the user's recent answers")?;
+        if !answered.is_empty() {
+            context.push_str("\n\n");
+            context.push_str(&answered);
+        }
+        Ok(context)
+    }
+
     fn rotate_and_start<A: AgentAccess + ?Sized>(
         &mut self,
         fleet: &FleetStore,
@@ -1113,9 +1137,11 @@ impl ConversationDriver {
             },
         )?;
         let budget = self.config.context.context_budget_tokens as i64;
-        let context =
+        let context = self.with_recent_answers(
+            fleet,
             self.protocol
-                .resume_snapshot(&self.env(fleet, id), budget, Some(user_seq))?;
+                .resume_snapshot(&self.env(fleet, id), budget, Some(user_seq))?,
+        )?;
         self.session_tokens = Some(0);
         self.start(
             fleet,
