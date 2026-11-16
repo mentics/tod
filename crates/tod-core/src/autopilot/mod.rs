@@ -1496,6 +1496,18 @@ impl Autopilot {
                         .any(|(_, pr, _, _)| {
                             links.prs.iter().any(|p| pr_readiness::pr_label(p).eq_ignore_ascii_case(pr))
                         });
+                    // A round that ended in a question to the user is not a
+                    // round of fixing: the agent did what it could, and asking
+                    // is not the pull request failing to converge. Counting it
+                    // meant that a question withdrawn for a new head (which
+                    // sends the agent back, to ask again) spent the budget
+                    // while nobody was waiting on anything, and the node
+                    // stopped `pr_stuck` for a person with nothing to answer.
+                    // A stop for real rounds of fixing is unchanged.
+                    if asked && works.iter().any(pr_readiness::Work::is_feedback) {
+                        self.state.loops.pr_rounds = self.state.loops.pr_rounds.saturating_sub(1);
+                        self.save()?;
+                    }
                     if !asked && works.iter().any(pr_readiness::Work::agent_can_fix) {
                         self.state.loops.pr_unchanged = if same { self.state.loops.pr_unchanged + 1 } else { 0 };
                         self.save()?;

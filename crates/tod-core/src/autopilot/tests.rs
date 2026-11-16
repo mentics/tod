@@ -4647,6 +4647,28 @@ fn a_question_for_an_earlier_head_is_withdrawn_by_a_new_commit() {
     assert!(agent.turns >= 2);
 }
 
+/// Seen live (ENG-2504, gap 40): the agent asked about a failing check, a push
+/// withdrew the question for the old head, the agent was sent back and asked
+/// again, and so on; the rounds spent asking ran the budget out and the node
+/// stopped `pr_stuck` with nothing for the user to answer. A round that ends in
+/// a question is not a round of fixing.
+#[test]
+fn questions_withdrawn_for_new_heads_never_spend_the_round_budget() {
+    let (fx, feed, mut agent, _) = failing_check_node(true);
+    feed.repeats.store(true, std::sync::atomic::Ordering::SeqCst);
+    // max_rounds is 2: more ask / new head / withdraw cycles than that.
+    for n in 0..5 {
+        let outcome = run_babysitter(&fx, &mut agent);
+        assert!(
+            matches!(&outcome, Outcome::NeedsHuman { reason: NeedsHuman::Decision { pending: 1 } }),
+            "cycle {n}: {outcome:?}"
+        );
+        feed.new_head(&format!("def567{n}"));
+    }
+    let withdrawn = unrelated_decisions(&fx).iter().filter(|d| d.status == "withdrawn").count();
+    assert!(withdrawn >= 3, "questions were withdrawn: {withdrawn}");
+}
+
 /// Seen live (ENG-2504, 2026-11): five rounds, each finding one or two new
 /// problems the fixer fixed, none repeating, stopped as "not converging".
 #[test]
