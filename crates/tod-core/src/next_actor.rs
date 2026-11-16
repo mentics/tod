@@ -759,7 +759,11 @@ fn actor_for(facts: &Facts<'_>) -> (NextActor, i64) {
             && run_state.is_some_and(|r| r.phase == Phase::Waiting)
             && w.expired_by(facts.now_ms, facts.cloud.is_some()).is_none()
     };
-    if let Some(wait) = waits.iter().copied().find(|w| w.exhausted() && !wake_keeps_looking(w)) {
+    // A spent GitHub rate limit is never the user's: it ends by itself at the
+    // reset the error names, however many looks it has refused.
+    let rate_limited =
+        |w: &Wait| w.last_error.as_deref().is_some_and(tod_store::github::is_rate_limited_message);
+    if let Some(wait) = waits.iter().copied().find(|w| w.exhausted() && !wake_keeps_looking(w) && !rate_limited(w)) {
         return (
             NextActor::You {
                 why: YouReason::Failed {
@@ -1237,6 +1241,24 @@ mod tests {
         c.run_state = Some(waiting_row());
         c.waits[0].last_error = Some("https://github.com/o/r/pull/1: pull request not found".into());
         assert!(matches!(standing(&c).actor, NextActor::You { why: YouReason::Failed { .. }, .. }));
+    }
+
+    #[test]
+    fn a_github_rate_limit_is_others_never_failed_even_with_no_word_from_the_runner() {
+        let mut c = case("pr_draft");
+        let mut read = wait("github:pr:read", NOW + 3_600_000, NOW - 5);
+        read.attempt = 5;
+        read.max_attempts = Some(5);
+        read.last_error = Some(
+            "https://github.com/o/r/pull/1: GitHub rate limit reached (primary limit core 0/5000: API rate limit exceeded); \
+             the token and its access are fine, GitHub refuses calls until the quota resets at 2026-11-16T18:28:00Z (epoch 1763317680); \
+             refused: GET /repos/o/r/pulls/1"
+                .into(),
+        );
+        c.waits = vec![read];
+        c.run_state = None;
+        let NextActor::Others { wait } = standing(&c).actor else { panic!("{:?}", standing(&c).actor) };
+        assert!(wait.retry.is_some(), "the error is still shown");
     }
 
     #[test]

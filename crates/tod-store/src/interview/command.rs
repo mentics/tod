@@ -405,6 +405,9 @@ pub enum InterviewCommand {
         wait_id: Uuid,
         error: String,
         retry_due_at: Option<i64>,
+        /// False: the failure spends none of the retry budget.
+        #[serde(default = "default_true")]
+        spend_attempt: bool,
     },
     /// End the waits nothing can serve any more (`crate::waits::sweep`), and,
     /// with `expire_grace_ms`, those long past due that nothing is looking
@@ -1342,8 +1345,8 @@ pub fn execute(
                 "expired": expired.iter().map(|s| format!("{} ({})", s.spec, s.reason)).collect::<Vec<_>>(),
             }))
         }
-        InterviewCommand::WaitFailed { wait_id, error, retry_due_at } => {
-            let wait = crate::waits::WaitRepo::new(conn).record_failure(*wait_id, error, *retry_due_at)?;
+        InterviewCommand::WaitFailed { wait_id, error, retry_due_at, spend_attempt } => {
+            let wait = crate::waits::WaitRepo::new(conn).record_failure_with(*wait_id, error, *retry_due_at, *spend_attempt)?;
             Ok(json!({ "attempt": wait.attempt, "max_attempts": wait.max_attempts, "exhausted": wait.exhausted() }))
         }
     }
@@ -2168,4 +2171,8 @@ mod tests {
         assert_eq!(PlanStepRepo::new(&conn).get(step).unwrap().unwrap().status, "blocked");
         assert_eq!(crate::decisions::DecisionRepo::new(&conn).get(d.id).unwrap().unwrap().blocks, vec![step]);
     }
+}
+
+fn default_true() -> bool {
+    true
 }

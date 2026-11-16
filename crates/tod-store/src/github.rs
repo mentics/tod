@@ -56,10 +56,32 @@ pub enum GithubError {
     PullRequestGone(String),
     #[error("GitHub API error: {0}")]
     Api(String),
-    /// HTTP 429 or 5xx: GitHub is rate limiting or down. Asking again later is
-    /// expected to work.
+    /// HTTP 5xx: GitHub is down. Asking again later is expected to work.
     #[error("GitHub is unavailable ({0})")]
     Unavailable(String),
+    /// GitHub refused the call because the token's quota is spent (HTTP 429, or
+    /// 403 with `X-RateLimit-Remaining: 0`, `Retry-After`, or a body saying
+    /// "rate limit"; primary or secondary). Nothing is wrong with the token or
+    /// its access; asking again after `reset_epoch_secs` works. The text
+    /// carries `(epoch N)` so a message can be turned back into the time
+    /// ([`rate_limit_reset_ms`]).
+    #[error(
+        "GitHub rate limit reached ({detail}); the token and its access are fine, GitHub refuses calls until the \
+         quota resets at {} (epoch {reset_epoch_secs}); refused: {request} ({refused} refused in this process); {quota}",
+        reset_rfc3339(*reset_epoch_secs)
+    )]
+    RateLimited {
+        /// When the quota resets, seconds since the epoch.
+        reset_epoch_secs: i64,
+        /// GitHub's own words (or which limit it was).
+        detail: String,
+        /// The call refused, `METHOD path`.
+        request: String,
+        /// How many calls this process has had refused so far.
+        refused: u64,
+        /// The quota as last seen, for the reader.
+        quota: String,
+    },
     /// Proxy authentication was chosen ([`GITHUB_AUTH_ENV`]) but no proxy is
     /// configured, so a request would go out with no credential at all.
     #[error(
@@ -77,7 +99,7 @@ impl GithubError {
     /// until the user fixes it.
     pub fn is_transient(&self) -> bool {
         match self {
-            Self::Http(_) | Self::Unavailable(_) => true,
+            Self::Http(_) | Self::Unavailable(_) | Self::RateLimited { .. } => true,
             Self::Api(message) => is_transient_graphql(message),
             _ => false,
         }
@@ -88,7 +110,162 @@ impl GithubError {
 /// (`tod_core::pr_readiness::PrFeed` reports `String`s), possibly with a
 /// prefix. Pinned to the variants' own messages by a test.
 pub fn is_transient_message(message: &str) -> bool {
-    message.contains("HTTP request failed:") || message.contains("GitHub is unavailable (") || is_transient_graphql(message)
+    message.contains("HTTP request failed:")
+        || message.contains("GitHub is unavailable (")
+        || is_rate_limited_message(message)
+        || is_transient_graphql(message)
+}
+
+/// Whether `message` (an error turned into text, maybe with a prefix) is
+/// [`GithubError::RateLimited`]'s.
+pub fn is_rate_limited_message(message: &str) -> bool {
+    message.contains("GitHub rate limit reached (")
+}
+
+/// When the rate limit in `message` resets, in ms since the epoch, if it is
+/// [`GithubError::RateLimited`]'s text.
+pub fn rate_limit_reset_ms(message: &str) -> Option<i64> {
+    let rest = &message[message.find("(epoch ")? + "(epoch ".len()..];
+    let end = rest.find(')')?;
+    rest[..end].trim().parse::<i64>().ok().map(|secs| secs * 1000)
+}
+
+fn reset_rfc3339(epoch_secs: i64) -> String {
+    chrono::DateTime::from_timestamp(epoch_secs, 0)
+        .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_else(|| format!("epoch {epoch_secs}"))
+}
+
+fn now_secs() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+/// Whether `text` is GitHub saying a quota is spent.
+fn says_rate_limit(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    t.contains("rate limit") || t.contains("abuse detection")
+}
+
+/// The longest a call waits inside itself for a rate limit to reset. A limit
+/// further off than this ends the call with [`GithubError::RateLimited`], whose
+/// reset time the caller schedules its next look at, rather than hold a thread
+/// for an hour.
+pub const MAX_INLINE_RATE_WAIT_SECS: i64 = 90;
+
+/// Counts of what this process asked GitHub, and the quota GitHub last
+/// reported, so that a spent quota can say who spent it
+/// ([`usage_summary`]).
+#[derive(Default)]
+struct Usage {
+    calls: std::collections::BTreeMap<String, u64>,
+    refused: u64,
+    /// By resource (`core`, `graphql`, `search`): limit, remaining, reset (epoch secs).
+    quota: std::collections::BTreeMap<String, (i64, i64, i64)>,
+    /// Calls are not made while a limit is known to be spent: keyed by the
+    /// API and credential, the epoch second it resets.
+    blocked_until: std::collections::HashMap<String, i64>,
+}
+
+fn usage() -> &'static std::sync::Mutex<Usage> {
+    static USAGE: std::sync::OnceLock<std::sync::Mutex<Usage>> = std::sync::OnceLock::new();
+    USAGE.get_or_init(Default::default)
+}
+
+fn with_usage<R>(f: impl FnOnce(&mut Usage) -> R) -> R {
+    // A poisoned lock only means another thread panicked holding it; the counts are still counts.
+    f(&mut usage().lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// `GET /repos/o/r/pulls/12/comments` as `GET /repos/:o/:r/pulls/:n/comments`:
+/// the kind of call, so counts group.
+fn endpoint_class(method: &str, path: &str) -> String {
+    let path = path.split('?').next().unwrap_or(path);
+    let mut out = String::new();
+    let mut after_repos = 0;
+    for seg in path.split('/').filter(|s| !s.is_empty()) {
+        out.push('/');
+        if after_repos == 1 {
+            out.push_str(":o");
+            after_repos = 2;
+        } else if after_repos == 2 {
+            out.push_str(":r");
+            after_repos = 3;
+        } else if seg.bytes().all(|b| b.is_ascii_digit()) {
+            out.push_str(":n");
+        } else if seg.len() >= 20 && seg.bytes().all(|b| b.is_ascii_hexdigit()) {
+            out.push_str(":sha");
+        } else {
+            out.push_str(seg);
+        }
+        if seg == "repos" && after_repos == 0 {
+            after_repos = 1;
+        }
+    }
+    format!("{method} {out}")
+}
+
+/// What this process has asked GitHub, most-called first, and the quota last
+/// seen: "quota core 0/5000 (resets 2026-11-16T18:28:00Z); this process made
+/// N calls, M refused: GET /repos/:o/:r/pulls/:n xK, ...".
+pub fn usage_summary() -> String {
+    with_usage(|u| usage_summary_of(u))
+}
+
+fn usage_summary_of(u: &Usage) -> String {
+    let quota: Vec<String> = u
+        .quota
+        .iter()
+        .map(|(res, (limit, remaining, reset))| format!("{res} {remaining}/{limit} (resets {})", reset_rfc3339(*reset)))
+        .collect();
+    let mut calls: Vec<(&String, &u64)> = u.calls.iter().collect();
+    calls.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+    let top: Vec<String> = calls.iter().take(8).map(|(k, n)| format!("{k} x{n}")).collect();
+    let total: u64 = u.calls.values().sum();
+    format!(
+        "quota {}; this process made {total} calls, {} refused{}",
+        if quota.is_empty() { "not seen yet".to_string() } else { quota.join(", ") },
+        u.refused,
+        if top.is_empty() { String::new() } else { format!(": {}", top.join(", ")) }
+    )
+}
+
+/// Records the call and the quota headers of its answer.
+fn note_response(class: &str, headers: &ureq::http::HeaderMap) {
+    let num = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).and_then(|v| v.trim().parse::<i64>().ok());
+    let quota = match (num("x-ratelimit-limit"), num("x-ratelimit-remaining"), num("x-ratelimit-reset")) {
+        (Some(l), Some(r), Some(reset)) => Some((
+            headers.get("x-ratelimit-resource").and_then(|v| v.to_str().ok()).unwrap_or("core").to_string(),
+            (l, r, reset),
+        )),
+        _ => None,
+    };
+    with_usage(|u| {
+        *u.calls.entry(class.to_string()).or_insert(0) += 1;
+        if let Some((res, q)) = quota {
+            u.quota.insert(res, q);
+        }
+    });
+}
+
+/// The error for a call GitHub refused for its quota, logging the quota and
+/// who spent it.
+fn rate_limited(request: &str, reset_epoch_secs: i64, detail: String) -> GithubError {
+    let (refused, quota) = with_usage(|u| {
+        u.refused += 1;
+        (u.refused, usage_summary_of(u))
+    });
+    tracing::warn!(target: "tod::github", "GitHub rate limit: {detail}; refused {request}; resets {}; {quota}", reset_rfc3339(reset_epoch_secs));
+    GithubError::RateLimited { reset_epoch_secs, detail, request: request.to_string(), refused, quota }
+}
+
+impl GithubError {
+    /// For a rate limit: how long until it resets, in ms (0 when past).
+    pub fn rate_limit_wait_ms(&self) -> Option<i64> {
+        match self {
+            Self::RateLimited { reset_epoch_secs, .. } => Some(((reset_epoch_secs - now_secs()).max(0)) * 1000),
+            _ => None,
+        }
+    }
 }
 
 /// GitHub's GraphQL answers an internal hiccup with HTTP 200 and this text
@@ -111,8 +288,21 @@ pub fn with_retries<T>(
     mut call: impl FnMut() -> Result<T, GithubError>,
 ) -> Result<T, GithubError> {
     let mut delays = delays_ms.iter();
+    let mut rate_waits = 0;
     loop {
         match call() {
+            // A spent quota is waited out until its reset (one second past,
+            // since GitHub gives whole seconds), which spends none of the
+            // retries: they are for hiccups. A reset further off than
+            // [`MAX_INLINE_RATE_WAIT_SECS`] is the caller's to schedule.
+            Err(err) if retry(&err) && err.rate_limit_wait_ms().is_some() => {
+                let wait_ms = err.rate_limit_wait_ms().unwrap_or(0);
+                if rate_waits >= 2 || wait_ms > MAX_INLINE_RATE_WAIT_SECS * 1000 {
+                    return Err(err);
+                }
+                rate_waits += 1;
+                std::thread::sleep(std::time::Duration::from_millis(wait_ms as u64 + 1_000));
+            }
             Err(err) if retry(&err) => match delays.next() {
                 Some(ms) => std::thread::sleep(std::time::Duration::from_millis(*ms)),
                 None => return Err(err),
@@ -311,8 +501,9 @@ impl Github {
         if self.proxy_missing {
             return Err(GithubError::ProxyMissing);
         }
+        self.check_quota_gate("GET", path, None)?;
         let response = self.authorize(self.agent.get(&format!("{}{path}", self.api)), path, None).call();
-        match read_json(response) {
+        match self.read("GET", path, None, response) {
             Err(GithubError::NotFound) => Err(self.explain_pull_not_found(path)),
             other => other,
         }
@@ -334,8 +525,11 @@ impl Github {
             }
         }
         let probe = format!("/repos/{owner}/{repo}");
+        if self.check_quota_gate("GET", &probe, None).is_err() {
+            return GithubError::NotFound;
+        }
         let response = self.authorize(self.agent.get(&format!("{}{probe}", self.api)), &probe, None).call();
-        match read_json::<serde_json::Value>(response) {
+        match self.read::<serde_json::Value>("GET", &probe, None, response) {
             Ok(_) => GithubError::PullRequestGone(name),
             Err(GithubError::NotFound) => GithubError::RepoNotVisible(name),
             Err(_) => GithubError::NotFound,
@@ -357,8 +551,9 @@ impl Github {
         if self.proxy_missing {
             return Err(GithubError::ProxyMissing);
         }
+        self.check_quota_gate("POST", path, repo)?;
         let response = self.authorize(self.agent.post(&format!("{}{path}", self.api)), path, repo).send_json(body);
-        read_json(response)
+        self.read("POST", path, repo, response)
     }
 
     /// `PUT <api><path>` with a JSON body, the reply as JSON.
@@ -366,8 +561,77 @@ impl Github {
         if self.proxy_missing {
             return Err(GithubError::ProxyMissing);
         }
+        self.check_quota_gate("PUT", path, None)?;
         let response = self.authorize(self.agent.put(&format!("{}{path}", self.api)), path, None).send_json(body);
-        read_json(response)
+        self.read("PUT", path, None, response)
+    }
+
+    /// Which quota a call spends: the API and the credential it carries.
+    fn quota_key(&self, path: &str, repo: Option<(&str, &str)>) -> String {
+        use std::hash::{Hash, Hasher};
+        let who = match &self.auth {
+            GithubAuth::Token(token) => {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                token.hash(&mut h);
+                format!("token-{:x}", h.finish())
+            }
+            GithubAuth::Proxy => "proxy".to_string(),
+            GithubAuth::Routed(routes) => crate::github_routes::repo_of_path(path)
+                .or(repo)
+                .and_then(|(owner, repo)| routes.secret_for(owner, repo))
+                .map(|name| format!("routed-{name}"))
+                .unwrap_or_else(|| "unrouted".to_string()),
+        };
+        format!("{}|{who}", self.api)
+    }
+
+    /// While this process has been told the quota its call would spend is
+    /// gone, the call is not made (more calls while limited only extend a
+    /// secondary limit and burn nothing useful): it fails as GitHub would.
+    fn check_quota_gate(&self, method: &str, path: &str, repo: Option<(&str, &str)>) -> Result<(), GithubError> {
+        let key = self.quota_key(path, repo);
+        let blocked = with_usage(|u| match u.blocked_until.get(&key) {
+            Some(&reset) if reset > now_secs() => Some(reset),
+            Some(_) => {
+                u.blocked_until.remove(&key);
+                None
+            }
+            None => None,
+        });
+        match blocked {
+            Some(reset) => Err(rate_limited(
+                &format!("{method} {path}"),
+                reset,
+                "not asked: GitHub already said this quota is spent".to_string(),
+            )),
+            None => Ok(()),
+        }
+    }
+
+    /// [`read_json`] for this client's call: counts it, notes the quota GitHub
+    /// reports, and remembers a spent one.
+    fn read<T: serde::de::DeserializeOwned>(
+        &self,
+        method: &str,
+        path: &str,
+        repo: Option<(&str, &str)>,
+        response: Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+    ) -> Result<T, GithubError> {
+        let request = format!("{method} {path}");
+        let class = endpoint_class(method, path);
+        if let Ok(r) = &response {
+            note_response(&class, r.headers());
+        } else {
+            with_usage(|u| *u.calls.entry(class.clone()).or_insert(0) += 1);
+        }
+        let result = read_json_for(&request, response);
+        if let Err(GithubError::RateLimited { reset_epoch_secs, .. }) = &result {
+            let key = self.quota_key(path, repo);
+            with_usage(|u| {
+                u.blocked_until.insert(key, *reset_epoch_secs);
+            });
+        }
+        result
     }
 
     /// The signed-in user's login: whether authentication works at all.
@@ -540,7 +804,7 @@ impl Github {
     /// posted then. A dropped connection is not retried, since the comment
     /// may have gone through.
     pub fn post_issue_comment(&self, owner: &str, repo: &str, number: i64, body: &str) -> Result<(), GithubError> {
-        with_retries(&self.retry_delays_ms, |e| matches!(e, GithubError::Unavailable(_)), || {
+        with_retries(&self.retry_delays_ms, |e| matches!(e, GithubError::Unavailable(_) | GithubError::RateLimited { .. }), || {
             self.post_json::<serde_json::Value>(
                 &format!("/repos/{owner}/{repo}/issues/{number}/comments"),
                 serde_json::json!({ "body": body }),
@@ -568,6 +832,19 @@ impl Github {
             )?;
             if let Some(errors) = reply.errors.filter(|e| !e.is_empty()) {
                 let message = errors.into_iter().map(|e| e.message).collect::<Vec<_>>().join("; ");
+                if says_rate_limit(&message) {
+                    // GraphQL answers a spent quota with 200 and an error; the
+                    // reset is the one its headers last gave, else a minute.
+                    let reset = with_usage(|u| u.quota.get("graphql").map(|q| q.2))
+                        .filter(|reset| *reset > now_secs())
+                        .unwrap_or_else(|| now_secs() + 60);
+                    let err = rate_limited("POST /graphql", reset, message);
+                    let key = self.quota_key("/graphql", repo);
+                    with_usage(|u| {
+                        u.blocked_until.insert(key, reset);
+                    });
+                    return Err(err);
+                }
                 return Err(GithubError::Api(message));
             }
             reply.data.ok_or_else(|| GithubError::Api("GitHub returned no data".into()))
@@ -1367,13 +1644,14 @@ struct CommitterRaw {
 }
 
 /// The reply's JSON, or the error its status says.
-fn read_json<T: serde::de::DeserializeOwned>(
+fn read_json_for<T: serde::de::DeserializeOwned>(
+    request: &str,
     response: Result<ureq::http::Response<ureq::Body>, ureq::Error>,
 ) -> Result<T, GithubError> {
     let mut response = response.map_err(|err| GithubError::Http(err.to_string()))?;
     let status = response.status().as_u16();
     if status >= 400 {
-        return Err(api_error(status, &mut response));
+        return Err(api_error(request, status, &mut response));
     }
     response
         .body_mut()
@@ -1492,27 +1770,45 @@ fn query_encode(value: &str) -> String {
     out
 }
 
-fn api_error(status: u16, response: &mut ureq::http::Response<ureq::Body>) -> GithubError {
+fn api_error(request: &str, status: u16, response: &mut ureq::http::Response<ureq::Body>) -> GithubError {
     if status == 401 {
         return GithubError::Unauthorized;
     }
-    if status == 403 {
-        let detail = response
-            .body_mut()
-            .read_json::<ErrorRaw>()
-            .ok()
-            .map(ErrorRaw::describe)
-            .unwrap_or_default();
+    if status == 403 || status == 429 {
+        let header = |name: &str| response.headers().get(name).and_then(|v| v.to_str().ok()).map(|v| v.trim().to_string());
+        let retry_after = header("retry-after").and_then(|v| v.parse::<i64>().ok());
+        let remaining = header("x-ratelimit-remaining").and_then(|v| v.parse::<i64>().ok());
+        let reset = header("x-ratelimit-reset").and_then(|v| v.parse::<i64>().ok());
+        let limit = header("x-ratelimit-limit");
+        let resource = header("x-ratelimit-resource");
+        let text = response.body_mut().read_to_string().unwrap_or_default();
+        let detail = serde_json::from_str::<ErrorRaw>(&text).ok().map(ErrorRaw::describe).unwrap_or_else(|| text.trim().to_string());
+        if status == 429 || retry_after.is_some() || remaining == Some(0) || says_rate_limit(&detail) {
+            // Retry-After (secondary limits) is seconds from now; the reset
+            // header (primary) is the epoch second the quota comes back.
+            let reset_at = match (retry_after, reset) {
+                (Some(secs), _) => now_secs() + secs.max(0),
+                (None, Some(reset)) if reset >= now_secs() => reset,
+                _ => now_secs() + 60,
+            };
+            let kind = if retry_after.is_some() || detail.to_ascii_lowercase().contains("secondary") { "secondary limit" } else { "primary limit" };
+            let quota = match (&limit, remaining, &resource) {
+                (Some(l), Some(r), res) => format!(" {} {r}/{l}", res.as_deref().unwrap_or("core")),
+                _ => String::new(),
+            };
+            let detail = if detail.is_empty() { format!("HTTP {status}") } else { detail };
+            return rate_limited(request, reset_at, format!("{kind}{quota}: {detail}"));
+        }
         return GithubError::Api(format!(
             "GitHub refused the request (HTTP 403){}: the token lacks access to this \
-             repository or its scope (`repo`) is missing, or a rate limit was hit",
+             repository or its scope (`repo`) is missing",
             if detail.is_empty() { String::new() } else { format!(": {detail}") }
         ));
     }
     if status == 404 {
         return GithubError::NotFound;
     }
-    if status == 429 || status >= 500 {
+    if status >= 500 {
         return GithubError::Unavailable(format!("HTTP {status}"));
     }
     let message = response
@@ -2328,6 +2624,116 @@ mod tests {
         let err = client(&url, &[1, 1]).post_issue_comment("o", "r", 1, "hi").unwrap_err();
         assert!(!err.is_transient(), "{err}");
         assert_eq!(handle.join().unwrap(), 1, "a refused comment is not posted again");
+    }
+
+    fn rl_headers(reset: i64) -> String {
+        format!("x-ratelimit-limit: 5000\r\nx-ratelimit-remaining: 0\r\nx-ratelimit-reset: {reset}\r\nx-ratelimit-resource: core")
+    }
+
+    /// A reply whose status line carries extra headers (they are written raw).
+    fn with_headers(status: &str, headers: &str) -> &'static str {
+        Box::leak(format!("{status}\r\n{headers}").into_boxed_str())
+    }
+
+    #[test]
+    fn a_403_with_an_exhausted_quota_is_rate_limited_with_its_reset_not_a_lack_of_access() {
+        let reset = now_secs() + 3_000;
+        let (url, handle) = serve_canned(vec![(
+            with_headers("403 Forbidden", &rl_headers(reset)),
+            r#"{"message":"API rate limit exceeded for user ID 175632955."}"#,
+        )]);
+        let err = client(&url, &[]).get_pr_status("o", "r", 1).unwrap_err();
+        let GithubError::RateLimited { reset_epoch_secs, .. } = &err else { panic!("{err}") };
+        assert_eq!(*reset_epoch_secs, reset);
+        let text = err.to_string();
+        assert!(err.is_transient() && is_transient_message(&text) && is_rate_limited_message(&text), "{text}");
+        assert!(!text.contains("lacks access") && !text.contains("scope"), "{text}");
+        assert!(text.contains("API rate limit exceeded") && text.contains("GET /repos/o/r/pulls/1"), "{text}");
+        assert_eq!(rate_limit_reset_ms(&format!("o/r#1: {text}")), Some(reset * 1000));
+        assert!(usage_summary().contains("core 0/5000"), "{}", usage_summary());
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn a_429_or_secondary_limit_uses_retry_after_and_a_plain_403_is_still_access() {
+        let (url, handle) = serve_canned(vec![(
+            with_headers("403 Forbidden", "retry-after: 3000"),
+            r#"{"message":"You have exceeded a secondary rate limit."}"#,
+        )]);
+        let err = client(&url, &[]).get_pr_status("o", "r", 1).unwrap_err();
+        let GithubError::RateLimited { reset_epoch_secs, detail, .. } = &err else { panic!("{err}") };
+        assert!((*reset_epoch_secs - now_secs() - 3_000).abs() <= 2 && detail.contains("secondary"), "{err}");
+        handle.join().unwrap();
+
+        let (url, handle) = serve_canned(vec![("429 Too Many Requests", r#"{"message":"slow down"}"#)]);
+        let err = client(&url, &[]).get_pr_status("o", "r", 1).unwrap_err();
+        assert!(matches!(err, GithubError::RateLimited { .. }), "{err}");
+        handle.join().unwrap();
+
+        let (url, handle) = serve_canned(vec![("403 Forbidden", r#"{"message":"Resource not accessible by integration"}"#)]);
+        let err = client(&url, &[]).get_pr_status("o", "r", 1).unwrap_err();
+        assert!(matches!(err, GithubError::Api(_)) && !err.is_transient(), "{err}");
+        assert!(err.to_string().contains("lacks access") && !err.to_string().contains("rate limit"), "{err}");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn once_limited_no_more_calls_are_made_until_the_reset() {
+        let reset = now_secs() + 3_000;
+        let (url, handle) = serve_canned(vec![(with_headers("403 Forbidden", &rl_headers(reset)), r#"{"message":"API rate limit exceeded"}"#)]);
+        let gh = client(&url, &[]);
+        assert!(gh.get_pr_status("o", "r", 1).is_err());
+        let again = gh.get_pr_status("o", "r", 2).unwrap_err();
+        assert!(matches!(&again, GithubError::RateLimited { reset_epoch_secs, .. } if *reset_epoch_secs == reset), "{again}");
+        assert_eq!(handle.join().unwrap(), 1, "the second call never reached GitHub");
+    }
+
+    #[test]
+    fn a_retry_waits_until_the_reset_and_spends_no_retry_budget() {
+        let reset = now_secs() + 1;
+        let (url, handle) = serve_canned(vec![
+            (with_headers("403 Forbidden", &rl_headers(reset)), r#"{"message":"API rate limit exceeded"}"#),
+            ("201 Created", r#"{"id":1}"#),
+        ]);
+        let started = std::time::Instant::now();
+        // No retries at all: only the rate-limit wait can make this succeed.
+        client(&url, &[]).post_issue_comment("o", "r", 1, "hi").unwrap();
+        assert!(started.elapsed() >= std::time::Duration::from_secs(1), "{:?}", started.elapsed());
+        assert_eq!(handle.join().unwrap(), 2);
+    }
+
+    #[test]
+    fn a_reset_too_far_off_is_returned_at_once_not_slept_on() {
+        let (url, handle) = serve_canned(vec![(
+            with_headers("403 Forbidden", &rl_headers(now_secs() + 3_000)),
+            r#"{"message":"API rate limit exceeded"}"#,
+        )]);
+        let started = std::time::Instant::now();
+        let err = client(&url, &[1, 1, 1]).post_issue_comment("o", "r", 1, "hi").unwrap_err();
+        assert!(matches!(err, GithubError::RateLimited { .. }) && started.elapsed().as_secs() < 5, "{err}");
+        assert_eq!(handle.join().unwrap(), 1);
+    }
+
+    #[test]
+    fn a_graphql_rate_limit_in_a_200_reply_is_rate_limited() {
+        let headers = format!(
+            "x-ratelimit-limit: 5000\r\nx-ratelimit-remaining: 0\r\nx-ratelimit-reset: {}\r\nx-ratelimit-resource: graphql",
+            now_secs() + 3_000
+        );
+        let (url, handle) = serve_canned(vec![(
+            // The reset comes from the quota headers of the same reply.
+            with_headers("200 OK", &headers),
+            r#"{"errors":[{"type":"RATE_LIMITED","message":"API rate limit exceeded for user ID 1."}]}"#,
+        )]);
+        let err = client(&url, &[]).graphql::<serde_json::Value>("query { x }", serde_json::json!({}), None).unwrap_err();
+        assert!(matches!(err, GithubError::RateLimited { .. }) && err.is_transient(), "{err}");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn endpoint_classes_group_calls_by_kind() {
+        assert_eq!(endpoint_class("GET", "/repos/acme/app/pulls/42/comments?per_page=100"), "GET /repos/:o/:r/pulls/:n/comments");
+        assert_eq!(endpoint_class("POST", "/graphql"), "POST /graphql");
     }
 
     /// Serves `count` requests on loopback, returning each one's `Authorization` header.

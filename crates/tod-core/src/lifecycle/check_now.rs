@@ -295,6 +295,37 @@ mod tests {
         crate::pr_readiness::set_feed_override(None);
     }
 
+    /// A spent GitHub rate limit is waited out until its reset: the run
+    /// waits (never stops), the next look is at the reset, and no retry is
+    /// spent however many looks it refuses.
+    #[test]
+    fn a_rate_limited_look_waits_for_the_reset_and_spends_no_retries() {
+        let fx = fixture();
+        enable_lifecycle(&fx, "pr_draft");
+        let reset_secs = 4_000_000_000i64; // far in the future
+        let error = tod_store::github::GithubError::RateLimited {
+            reset_epoch_secs: reset_secs,
+            detail: "primary limit core 0/5000: API rate limit exceeded for user ID 1".into(),
+            request: "GET /repos/o/r/pulls/1".into(),
+            refused: 1,
+            quota: "quota core 0/5000".into(),
+        }
+        .to_string();
+        assert!(!error.contains("lacks access") && error.contains("rate limit"), "{error}");
+        let now = 1_000_000;
+        for _ in 0..12 {
+            let at = crate::autopilot::look_failed_next_look(&fx.fleet, fx.node, false, &error, now).unwrap();
+            assert_eq!(at, reset_secs * 1000 + 5_000, "the next look is at the reset");
+        }
+        let waits = fx.fleet.read(|conn| tod_store::waits::WaitRepo::new(conn).list_pending_for_node(fx.node)).unwrap();
+        let read = waits.iter().find(|w| w.match_spec == "github:pr:read").expect("recorded");
+        assert!(!read.exhausted(), "12 refused looks spent no retries: {read:?}");
+        assert_eq!(read.attempt, 0);
+        assert!(read.last_error.as_deref().is_some_and(|e| e.contains("rate limit")), "the error stays visible");
+        let outcome = crate::autopilot::github_look_failed(&fx.fleet, fx.node, false, &error).unwrap();
+        assert!(matches!(outcome, crate::autopilot::Outcome::Waiting { .. }), "{outcome:?}");
+    }
+
     /// A pull request as the feed shows it: ready for review (not a draft),
     /// with the review threads given.
     struct Ready(Vec<tod_store::github::ReviewThread>);

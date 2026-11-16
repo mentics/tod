@@ -436,12 +436,21 @@ impl<'a> WaitRepo<'a> {
     /// is exhausted at once. Either way the error stays on the wait until a
     /// look succeeds, so it is always visible (`tod_core::next_actor`).
     pub fn record_failure(&self, id: Uuid, error: &str, retry_due_at: Option<i64>) -> Result<Wait> {
+        self.record_failure_with(id, error, retry_due_at, true)
+    }
+
+    /// [`Self::record_failure`], where `spend_attempt` false leaves the retry
+    /// budget alone: a failure that is not the look's fault (GitHub's rate
+    /// limit, with its reset known) is shown and waited out, never counted
+    /// toward giving up.
+    pub fn record_failure_with(&self, id: Uuid, error: &str, retry_due_at: Option<i64>, spend_attempt: bool) -> Result<Wait> {
         let wait = self.get(id)?.ok_or_else(|| anyhow::anyhow!("wait {id} not found"))?;
         if wait.state != WAIT_PENDING {
             bail!("wait {id} is {}, not pending", wait.state);
         }
         let max = wait.max_attempts.unwrap_or(DEFAULT_MAX_ATTEMPTS);
         let attempt = match retry_due_at {
+            Some(_) if !spend_attempt => wait.attempt.min(max.saturating_sub(1)),
             Some(_) => (wait.attempt + 1).min(max),
             None => max,
         };

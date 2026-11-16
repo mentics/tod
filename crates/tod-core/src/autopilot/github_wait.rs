@@ -92,6 +92,10 @@ pub fn read_wait_spec(releasing: bool) -> &'static str {
 
 /// How long to wait before looking again after the `attempt`th failure in a
 /// row: 30 s, doubling, up to 10 minutes.
+/// How long after a rate limit's reset the next look is made, so that it is
+/// not at the very second every other process on the token wakes.
+const RATE_LIMIT_SLACK_MS: i64 = 5_000;
+
 pub fn retry_delay_ms(attempt: u32) -> i64 {
     (30_000i64 << attempt.min(6)).min(10 * 60 * 1000)
 }
@@ -138,15 +142,26 @@ pub fn github_look_failed(
         }
     };
     let transient = tod_store::github::is_transient_message(error);
-    let retry_due_at = transient.then(|| now + retry_delay_ms(attempt));
+    // A spent rate limit is waited out until its reset, which GitHub told us:
+    // looking sooner only fails again, so it spends none of the retry budget
+    // and never stops the run.
+    let limited = tod_store::github::is_rate_limited_message(error);
+    let retry_due_at = transient.then(|| match tod_store::github::rate_limit_reset_ms(error).filter(|_| limited) {
+        Some(reset_ms) => (reset_ms + RATE_LIMIT_SLACK_MS).max(now + retry_delay_ms(0)),
+        None => now + retry_delay_ms(attempt),
+    });
     let result = fleet
         .interview(
             ACTOR,
-            InterviewCommand::WaitFailed { wait_id, error: error.to_string(), retry_due_at },
+            InterviewCommand::WaitFailed { wait_id, error: error.to_string(), retry_due_at, spend_attempt: !limited },
         )
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let exhausted = result["exhausted"].as_bool().unwrap_or(true);
     match (exhausted, retry_due_at) {
+        (false, Some(due_at_ms)) if limited => Ok(Outcome::Waiting {
+            what: format!("GitHub's rate limit; looking again when it resets: {error}"),
+            due_at_ms,
+        }),
         (false, Some(due_at_ms)) => {
             let attempt = result["attempt"].as_u64().unwrap_or(1);
             let max = result["max_attempts"].as_u64().unwrap_or(0);
