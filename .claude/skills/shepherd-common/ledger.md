@@ -16,8 +16,9 @@ python3 -I .claude/skills/shepherd-common/scripts/ledger.py <data-root> <command
   signal. Everything else goes to `history.jsonl` next to it, one JSON record
   per line, and leaves the ledger: every verdict as it is recorded, a gap
   when it is `deployed` or `wontfix`, a node when it reaches `done` or leaves
-  the scope, a shepherd 10 minutes after it retired or 30 minutes after it went
-  silent (with its visit counts), and every signal. Read it with `history`.
+  the scope, a shepherd that holds no node, 10 minutes after it was sent `retire` (whether or
+  not it ever acknowledged it) or 30 minutes after it went silent (`manager-wait`
+  uses its `--stale-seconds` instead; with its visit counts), and every signal. Read it with `history`.
 - `tod.db` is only ever read, read-only. The ledger never writes it.
 - Output is JSON; `--text` (anywhere on the line) prints it readably. Errors go
   to stderr with a non-zero exit; nothing is swallowed.
@@ -61,7 +62,7 @@ stale, or the gap it waits on was deployed. A node that reached `done` is
 | `renew --owner ID [--lease-minutes M]` | Heartbeat; extends all your leases (default 20 minutes). |
 | `release NODE… --owner ID` | Give nodes back without a verdict (they stay due). |
 | `gate --owner ID` | Call at the top of every loop. Renews, prints `ok` (0), `pause` (10) or `retire` (11). On `pause`, go to `wait`; on `retire`, release and stop. |
-| `wait --owner ID [--max-seconds N] [--batch K]` | Block (default 540 s, under a 10-minute tool timeout) until: a node you hold changed fingerprint (`held_changed`) or reached `recheck_at` (`held_recheck`); an unleased due node exists and you hold fewer than K (`due_available`; it is not leased, call `next`); a signal for you changed (`signal`); or `timeout`. While a `pause` is set it keeps blocking until `resume`/`retire`. Renews your leases while it waits. |
+| `wait --owner ID [--max-seconds N] [--batch K]` | Block (default 540 s, under a 10-minute tool timeout) until: a node you hold changed fingerprint (`held_changed`) or reached `recheck_at` (`held_recheck`); an unleased due node exists and you have room (`due_available`; room is fewer than K nodes held plus nodes you gave a verdict whose own recheck time is still ahead, so a shepherd with a verdict on all its nodes waits for its rechecks; it is not leased, call `next`); a signal for you changed (`signal`); or `timeout`. While a `pause` is set it keeps blocking until `resume`/`retire`. Renews your leases while it waits. |
 | `gap report --owner ID [--node N] --signature S --summary T` | Report a tod gap. An open gap with the same signature is reused: you get its id, and the node and owner are added. A new one whose signature was closed before carries `recurrence` (how many times) and `closed_before` (ids, commits): the fix did not hold. Pick a short, stable signature. `--node` may be left out for a gap no node shows (a `measure`). |
 | `gap list` / `gap show ID` | Open gaps only (closed ones are history); `gap show` of a closed id reads it from the history. |
 
@@ -78,7 +79,7 @@ Nodes under `hold` are the user's: never leased, never touched.
 | `gap set ID --status open\|fixing\|verified\|deployed\|wontfix [--commit SHA] [--note T]` | `deployed` makes every node `blocked_on_gap` on it due, with the reason "fix for gap ID deployed". `deployed` and `wontfix` move the gap to the history. |
 | `hold NODE… [--reason T]` / `unhold NODE…` | The user's own controls. |
 | `clear (--all \| --node N \| --verdict V \| --reason-like S)` | Void verdicts; the nodes become due. |
-| `manager-wait [--min-batch K] [--queue-delay-minutes M] [--max-parallel P] [--max-seconds N]` | The manager's wait, run in the background (default 3000 s). Syncs every 15 s and exits on: a gap created since it started (`new_gap`); due nodes left unclaimed past a 60 s grace, at least K of them or one waiting M minutes, while fewer than P shepherds run (`unclaimed_due`); a shepherd whose heartbeat went older than a lease while it waited (`owner_stale`); a pause to all that every running shepherd acknowledged (`all_paused`); nothing in scope left to do (`all_finished`); or `timeout`. |
+| `manager-wait [--min-batch K] [--queue-delay-minutes M] [--max-parallel P] [--max-seconds N]` | The manager's wait, run in the background (default 3000 s). Syncs every 15 s and exits on: a gap created since it started (`new_gap`); due nodes left unclaimed past a 60 s grace, at least K of them or one waiting M minutes, while fewer than P shepherds run (`unclaimed_due`); a shepherd that still holds nodes, was not sent `retire`, and whose heartbeat went older than `--stale-seconds` while it waited (`owner_stale`; one holding nothing is removed instead, never reported); a pause to all that every running shepherd acknowledged (`all_paused`); nothing in scope left to do (`all_finished`); or `timeout`. |
 | `status` | Counts by verdict, due, leased, held, open gaps, owners, version. Does not sync. |
 | `owners` | Each running owner: heartbeat age, held nodes, visits, empty visits, signal, ack. |
 | `history [--event E] [--node N] [--owner ID] [--signature S] [--since-hours H] [--limit N]` | Past records, oldest first (the last 50 by default, `--limit 0` for all). `E` is `verdict`, `gap_closed`, `node_done`, `node_left_scope`, `owner_gone` or `signal`. For reports and diagnosis, never for deciding what to do next: that is the ledger's. |

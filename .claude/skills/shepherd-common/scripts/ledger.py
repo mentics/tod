@@ -187,8 +187,20 @@ def node_record(r):
                 gap=r["gap_id"], first_seen=r["first_seen"])
 
 
-def housekeep(conn):
-    """Inside a transaction: move what is no longer current to the history."""
+def holds_nodes(conn, owner, t):
+    return conn.execute("SELECT 1 FROM nodes WHERE lease_owner = ? AND lease_expires > ?", (owner, t)).fetchone() is not None
+
+
+def owner_retiring(conn, r):
+    """The owner acknowledged a retire, or one is addressed to it (it may have exited before it ever looked)."""
+    return r["ack"] == "retired" or effective_signal(conn, r["owner"])[1] == "retire"
+
+
+def housekeep(conn, stale_seconds=None):
+    """Inside a transaction: move what is no longer current to the history.
+    An owner holding no node leaves once it was told to retire (10 minutes after
+    its last heartbeat) or its heartbeat is `stale_seconds` old."""
+    stale_seconds = STALE_OWNER_SECONDS if stale_seconds is None else stale_seconds
     t = now()
     for g in conn.execute(f"SELECT * FROM gaps WHERE status IN {GAP_CLOSED}").fetchall():
         to_history("gap_closed", **gap_record(conn, g))
@@ -198,11 +210,11 @@ def housekeep(conn):
         to_history("node_done" if r["finished"] else "node_left_scope", **node_record(r))
         conn.execute("DELETE FROM nodes WHERE node_id = ?", (r["node_id"],))
     for r in conn.execute("SELECT * FROM owners").fetchall():
-        if conn.execute("SELECT 1 FROM nodes WHERE lease_owner = ? AND lease_expires > ?", (r["owner"], t)).fetchone():
+        if holds_nodes(conn, r["owner"], t):
             continue
         age = t - (r["last_heartbeat"] or 0)
-        how = "retired" if r["ack"] == "retired" and age > RETIRED_OWNER_SECONDS else (
-            "went_silent" if age > STALE_OWNER_SECONDS else None)
+        how = "retired" if owner_retiring(conn, r) and age > RETIRED_OWNER_SECONDS else (
+            "went_silent" if age > stale_seconds else None)
         if how:
             to_history("owner_gone", owner=r["owner"], kind=r["kind"], how=how, visits=r["visits"],
                        empty_visits=r["empty_visits"], first_seen=r["first_seen"], last_heartbeat=r["last_heartbeat"])
@@ -257,7 +269,7 @@ def sync_read(conn, tod):
     return snaps, warnings
 
 
-def sync_apply(conn, snaps, warnings, version):
+def sync_apply(conn, snaps, warnings, version, stale_seconds=None):
     """Inside a transaction: upsert nodes, finish done ones, recompute due."""
     t = now()
     seen = set()
@@ -282,7 +294,7 @@ def sync_apply(conn, snaps, warnings, version):
         if r["node_id"] not in seen:
             conn.execute("UPDATE nodes SET in_scope = 0, due = 0, due_reason = NULL WHERE node_id = ?", (r["node_id"],))
     conn.execute("INSERT OR REPLACE INTO meta(k, v) VALUES ('finished_in_scope', ?)", (str(finished),))
-    housekeep(conn)
+    housekeep(conn, stale_seconds)
     for r in conn.execute("SELECT * FROM nodes WHERE in_scope = 1").fetchall():
         reason = None
         if not r["finished"]:
@@ -301,10 +313,10 @@ def sync_apply(conn, snaps, warnings, version):
     return warnings
 
 
-def do_sync(conn, tod):
+def do_sync(conn, tod, stale_seconds=None):
     snaps, warnings = sync_read(conn, tod)
     with txn(conn):
-        sync_apply(conn, snaps, warnings, shepherd_version())
+        sync_apply(conn, snaps, warnings, shepherd_version(), stale_seconds)
         conn.execute("INSERT OR REPLACE INTO meta(k, v) VALUES ('synced_at', ?)", (str(now()),))
         counts = summary(conn)
     counts["warnings"] = warnings
@@ -609,7 +621,12 @@ def cmd_wait(a, conn, tod):
             rech = [r for r in mine if r["recheck_at"] and r["lease_at"] and r["lease_at"] < r["recheck_at"] <= t]
             if rech:
                 return {"reason": "held_recheck", "nodes": [node_view(r) for r in rech]}
-            if len(mine) < a.batch:
+            # nodes this shepherd gave a verdict (which released the lease) and that are waiting for their
+            # own recheck time still fill its batch: it waits for them rather than taking more
+            pending = conn.execute(
+                "SELECT COUNT(*) FROM nodes WHERE verdict_owner = ? AND in_scope = 1 AND finished = 0 AND due = 0"
+                " AND recheck_at > ? AND (lease_owner IS NULL OR lease_expires <= ?)", (a.owner, t, t)).fetchone()[0]
+            if len(mine) + pending < a.batch:
                 held = {r["node_id"] for r in conn.execute("SELECT node_id FROM holds")}
                 avail = [r for r in conn.execute("SELECT * FROM nodes WHERE in_scope=1 AND finished=0 AND due=1").fetchall()
                          if r["node_id"] not in held and not is_leased(r, t)]
@@ -624,7 +641,15 @@ def cmd_wait(a, conn, tod):
 def running_owners(conn, t, stale_seconds):
     """Owners that have not retired and whose heartbeat is fresh."""
     return [r for r in conn.execute("SELECT * FROM owners").fetchall()
-            if r["ack"] != "retired" and t - (r["last_heartbeat"] or 0) <= stale_seconds]
+            if not owner_retiring(conn, r) and t - (r["last_heartbeat"] or 0) <= stale_seconds]
+
+
+def late_owners(conn, t, stale_seconds):
+    """Owners worth waking the manager for: still holding nodes, not retiring, heartbeat late.
+    One that holds nothing is only waiting to be removed (housekeep), never news."""
+    return [r for r in conn.execute("SELECT * FROM owners").fetchall()
+            if not owner_retiring(conn, r) and t - (r["last_heartbeat"] or 0) > stale_seconds
+            and holds_nodes(conn, r["owner"], t)]
 
 
 def cmd_manager_wait(a, conn, tod):
@@ -633,26 +658,24 @@ def cmd_manager_wait(a, conn, tod):
     deadline = time.monotonic() + a.max_seconds
     t0 = now()
     gap0 = conn.execute("SELECT COALESCE(MAX(id), 0) FROM gaps").fetchone()[0]
-    stale0 = {r["owner"] for r in conn.execute("SELECT owner, ack, last_heartbeat FROM owners").fetchall()
-              if r["ack"] != "retired" and t0 - (r["last_heartbeat"] or 0) > a.stale_seconds}
+    stale0 = {r["owner"] for r in late_owners(conn, t0, a.stale_seconds)}
     unclaimed_since = {}  # node_id -> monotonic time first seen due, unheld and unleased
     while True:
-        counts = do_sync(conn, tod)
+        counts = do_sync(conn, tod, a.stale_seconds)
         t = now()
         if counts["in_scope"] - counts["finished"] - counts["held"] <= 0:
             return {"reason": "all_finished", **counts}
         new = conn.execute("SELECT * FROM gaps WHERE id > ? ORDER BY id", (gap0,)).fetchall()
         if new:
             return {"reason": "new_gap", "gaps": [gap_view(conn, g) for g in new]}
-        stale = [r["owner"] for r in conn.execute("SELECT owner, ack, last_heartbeat FROM owners").fetchall()
-                 if r["ack"] != "retired" and t - (r["last_heartbeat"] or 0) > a.stale_seconds and r["owner"] not in stale0]
+        stale = [r["owner"] for r in late_owners(conn, t, a.stale_seconds) if r["owner"] not in stale0]
         if stale:
             return {"reason": "owner_stale", "owners": stale}
         with txn(conn):
             sig = conn.execute("SELECT signal FROM signals WHERE owner = '*' ORDER BY id DESC LIMIT 1").fetchone()
         if sig and sig["signal"] == "pause":
             st = cmd_signal(argparse.Namespace(action="status"), conn, tod)
-            if st["all_paused"] or not [o for o in st["owners"] if not o["stale"] and o["ack"] != "retired"]:
+            if st["all_paused"] or not [o for o in st["owners"] if not o["stale"] and not o["retiring"]]:
                 return {"reason": "all_paused", "owners": st["owners"]}
         else:
             held = {r["node_id"] for r in conn.execute("SELECT node_id FROM holds")}
@@ -684,10 +707,10 @@ def cmd_signal(a, conn, tod):
                 stale = t - (r["last_heartbeat"] or 0) > STALE_OWNER_SECONDS and not conn.execute(
                     "SELECT 1 FROM nodes WHERE lease_owner = ? AND lease_expires > ?", (r["owner"], t)).fetchone()
                 out.append(dict(owner=r["owner"], kind=r["kind"], signal=sig, ack=r["ack"], stale=stale,
-                                heartbeat_age_s=round(t - (r["last_heartbeat"] or 0))))
-                if sig == "pause" and r["ack"] != "paused" and not stale and r["ack"] != "retired":
+                                heartbeat_age_s=round(t - (r["last_heartbeat"] or 0)), retiring=owner_retiring(conn, r)))
+                if sig == "pause" and r["ack"] != "paused" and not stale and not owner_retiring(conn, r):
                     pending.append(r["owner"])
-            active = [o for o in out if not o["stale"] and o["ack"] != "retired"]
+            active = [o for o in out if not o["stale"] and not o["retiring"]]
         return {"owners": out, "all_paused": bool(active) and all(o["ack"] == "paused" for o in active),
                 "awaiting_pause": pending}
     if bool(a.owner) == bool(a.all):

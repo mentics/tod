@@ -457,6 +457,15 @@ class Wait(Base):
         # not leased by wait
         self.assertEqual(len(self.lease("o")), 1)
 
+    def test_verdicts_on_all_held_nodes_keep_waiting_for_own_recheck(self):
+        self.setup_nodes("a", "b")
+        self.lease("o", 1)
+        self.verdict("a", "o", "in_motion", "--recheck-minutes", "30")  # lease released, held count 0
+        out = self.wait("--owner", "o", "--batch", "1")
+        self.assertEqual(out["reason"], "timeout")  # b is due, but o's batch is its own pending recheck
+        self.clock[0] += 31 * 60
+        self.assertEqual(self.wait("--owner", "o", "--batch", "1")["reason"], "due_available")
+
     def test_batch_full_does_not_return_due(self):
         self.setup_nodes("a", "b")
         self.lease("o", 1)
@@ -548,12 +557,36 @@ class ManagerWait(Base):
         self.lease("o")
         self.clock[0] += 10
         self.assertEqual(self.mwait("--stale-seconds", "5")["reason"], "timeout")  # already stale at the start
+        self.tod.node("b")
+        self.cli("scope", "add", "b")
         self.lease("p")
         def age():
             self.clock[0] += 10
         threading.Timer(0.2, age).start()
         out = self.mwait("--stale-seconds", "5")
         self.assertEqual((out["reason"], out["owners"]), ("owner_stale", ["p"]))
+
+    def test_retired_or_empty_owners_are_removed_not_stale(self):
+        self.setup_nodes("a", "b")
+        self.lease("r", 1)
+        self.verdict("a", "r")  # holds nothing now
+        self.lease("e", 1)
+        self.verdict("b", "e")
+        self.cli("signal", "retire", "--owner", "r")  # never calls gate again: ack stays running
+        self.clock[0] += 2000
+        self.assertEqual(self.mwait("--stale-seconds", "5")["reason"], "timeout")
+        names = [o["owner"] for o in self.cli("owners")["owners"]]
+        self.assertNotIn("r", names)
+        self.assertNotIn("e", names)
+        self.assertEqual({r["owner"]: r["how"] for r in self.cli("history", "--limit", "0", "--event", "owner_gone")["history"]},
+                         {"r": "retired", "e": "went_silent"})
+
+    def test_owner_holding_nodes_still_goes_stale(self):
+        self.setup_nodes("a")
+        self.lease("p")
+        self.clock[0] += 10
+        self.assertEqual([o["owner"] for o in self.cli("owners")["owners"]], ["p"])
+        self.assertEqual(self.mwait("--stale-seconds", "5")["reason"], "timeout")  # stale at the start
 
     def test_all_paused(self):
         self.setup_nodes("a")
