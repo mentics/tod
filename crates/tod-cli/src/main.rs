@@ -34,6 +34,7 @@ mod pr;
 mod review;
 mod environment;
 mod secrets;
+mod access;
 mod db;
 mod test_runs;
 mod verdicts;
@@ -109,6 +110,7 @@ const NOUNS: &[(&str, &str)] = &[
     ("lifecycle", crate::lifecycle::USAGE),
     ("secrets", crate::secrets::USAGE),
     ("db", crate::db::USAGE),
+    ("access", crate::access::USAGE),
     ("environment", crate::environment::USAGE),
     ("decisions", crate::decisions::USAGE),
     ("phase", crate::phase::USAGE),
@@ -312,6 +314,11 @@ fn run_with(args: &[String], env: operator::Env) -> anyhow::Result<String> {
     if rest[0] == "db" {
         rest.remove(0);
         return db::run(&rest, json);
+    }
+    // `access` is the same: the user's machine makes the call.
+    if rest[0] == "access" {
+        rest.remove(0);
+        return access::run(&rest, json);
     }
 
     let data_root = data_root.ok_or_else(|| {

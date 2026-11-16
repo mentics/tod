@@ -110,7 +110,7 @@ const NOT_CONNECTED_RETRIES: u32 = 3;
 const NOT_CONNECTED_PAUSE: Duration = Duration::from_secs(10);
 
 /// The orchestrator's broker, from the node's environment.
-struct Broker {
+pub(crate) struct Broker {
     url: String,
     user: String,
     node: String,
@@ -120,7 +120,7 @@ struct Broker {
 }
 
 impl Broker {
-    fn from_env() -> Result<Self> {
+    pub(crate) fn from_env() -> Result<Self> {
         let var = |name: &str| {
             std::env::var(name).map_err(|_| {
                 anyhow!("{name} is not set: `db` works only in the sandbox of a node running in the cloud (the user's machine does the login)")
@@ -140,7 +140,7 @@ impl Broker {
     }
 
     /// The reply to `request`; an error carries the user's machine's reason.
-    fn ask(&self, request: &serde_json::Value) -> Result<serde_json::Value> {
+    pub(crate) fn ask(&self, request: &serde_json::Value) -> Result<serde_json::Value> {
         let mut last = None;
         let mut not_connected = 0u32;
         let mut attempt = 0u64;

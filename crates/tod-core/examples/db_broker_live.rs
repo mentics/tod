@@ -33,9 +33,14 @@ fn main() -> Result<()> {
     let (sandbox, url, user) = (sandbox.context("--sandbox")?, url.context("--orchestrator-url")?, user.context("--user")?);
     let token = tod_store::fleet::sandbox::Sandboxes::load(&root)?.token()?;
     tod_sandbox::relay::init_tls();
+    let services_file = databases.clone();
+    let token_root = root.clone();
     spawn(Service {
         root,
         databases: Box::new(move || Config::load(&databases)?.databases()),
+        services: Box::new(move || Config::load(&services_file)?.services()),
+        service_token: Box::new(move |svc| tod_core::db_broker::service_token(&token_root, svc)),
+        service_call: Box::new(|svc, token, action, args| svc.call(token, action, args)),
         sandbox_of: Box::new(move |_| Some(sandbox.clone())),
         orchestrator: Box::new(move || Ok((HttpOrchestrator::new(url.clone(), Some(token.clone())), user.clone()))),
     });

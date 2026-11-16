@@ -36,6 +36,12 @@ pub fn bootstrap() -> &'static [u8] {
 /// The file that caches a `bl login` token.
 const TOKEN_CACHE: &str = "sandbox-token.json";
 
+/// The named credential a read-only service's token is kept under
+/// (`tod-sandbox service token <name>`).
+pub fn service_credential_account(name: &str) -> String {
+    format!("service/{name}")
+}
+
 /// The account and sandboxes of one data root.
 pub struct Sandboxes {
     pub root: PathBuf,
@@ -95,6 +101,44 @@ impl Sandboxes {
     pub fn replace_databases(&mut self, databases: Vec<tod_sandbox::database::Database>) -> Result<()> {
         self.config.set_databases(databases)?;
         self.save()
+    }
+
+    /// Whether a credential was saved on this machine for the service.
+    pub fn has_service_token(&self, name: &str) -> bool {
+        self.credentials().has_named(&service_credential_account(name))
+    }
+
+    /// Keeps the service's credential, encrypted, on this machine.
+    pub fn set_service_token(&self, name: &str, secret: &str) -> Result<()> {
+        self.credentials()
+            .set_named(&service_credential_account(name), secret)
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("save the credential for service {name}: {e}"))
+    }
+
+    /// Forgets the credential saved for the service.
+    pub fn delete_service_token(&self, name: &str) {
+        self.credentials().delete_named(&service_credential_account(name));
+    }
+
+    /// The read-only services nodes may use through this machine, as declared.
+    pub fn services(&self) -> Result<Vec<tod_sandbox::service::Service>> {
+        self.config.services()
+    }
+
+    /// Declares `service` (replacing the one of its name) and saves.
+    pub fn set_service(&mut self, service: tod_sandbox::service::Service) -> Result<()> {
+        self.config.upsert_service(service)?;
+        self.save()
+    }
+
+    /// Forgets the service of that name and saves; whether there was one.
+    pub fn remove_service(&mut self, name: &str) -> Result<bool> {
+        let removed = self.config.remove_service(name);
+        if removed {
+            self.save()?;
+        }
+        Ok(removed)
     }
 
     /// Forgets the database of that name and saves; whether there was one.

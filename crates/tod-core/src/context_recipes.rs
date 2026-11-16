@@ -73,6 +73,13 @@ pub fn build_message_with(
     {
         layers.insert(at, "cli/db");
     }
+    // The same for the read-only services of `tod-cli access`.
+    if recipe.blocks.contains(&DynamicBlock::Databases)
+        && !crate::access_context::declared(ctx.data_root).is_empty()
+        && !layers.contains(&"cli/access")
+    {
+        layers.insert(at, "cli/access");
+    }
     let extra: Vec<&str> = extra_cli
         .iter()
         .copied()
@@ -947,5 +954,30 @@ missing"),
         let with = build(&dir);
         assert!(with.contains("## Databases") && with.contains("`prod`: database `monolith`"));
         assert!(with.contains("db psql <NAME>"), "the how-to comes with it");
+    }
+
+    /// `tod-cli access` is described, with the services named, only where the
+    /// user has set one up; the intro always says it is where such access comes from.
+    #[test]
+    fn access_is_described_only_when_services_are_declared() {
+        let media = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("tod").join("media");
+        let paths = MediaPaths::from_media_root(media).unwrap();
+        let dir = tod_test_util::scratch_dir(format!("tod-recipe-access-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let build = |root: &std::path::Path| {
+            let ctx = DynamicContext { data_root: Some(root), ..Default::default() };
+            build_message(&paths, &IMPLEMENT_SESSION, None, &ctx, "").unwrap()
+        };
+        let without = build(&dir);
+        assert!(!without.contains("## Brokered access"), "no services, no block");
+        assert!(without.contains("tod-cli access list"), "the intro still points at it");
+        std::fs::write(
+            dir.join(crate::access_context::FILE),
+            r#"[{"name":"hatchet-prod","kind":"hatchet","actions":["runs-list","run-get"]}]"#,
+        )
+        .unwrap();
+        let with = build(&dir);
+        assert!(with.contains("## Brokered access") && with.contains("`hatchet-prod` (hatchet): runs-list, run-get"));
+        assert!(with.contains("access call <SERVICE> <ACTION>"), "the how-to comes with it");
     }
 }

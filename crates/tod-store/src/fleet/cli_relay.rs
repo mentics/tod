@@ -134,7 +134,7 @@ pub const LOCAL_CLI_DEFAULT: &str = tod_sandbox::node::LOCAL_CLI_PATH;
 pub const SUPERVISOR_STATE_ROOT: &str = tod_sandbox::node::SUPERVISOR_STATE_ROOT;
 /// The nouns [`HTTP_SHIM_SCRIPT`] runs in the sandbox, not on the
 /// orchestrator.
-pub const LOCAL_NOUNS: &[&str] = &["pr", "secrets", "db"];
+pub const LOCAL_NOUNS: &[&str] = &["pr", "secrets", "db", "access"];
 
 /// The `tod-cli` an autonomous node's sandbox runs: [`SHIM_SCRIPT`]'s request
 /// body (with an empty token) sent with `curl` to the orchestrator, retried
@@ -150,7 +150,7 @@ pub const LOCAL_NOUNS: &[&str] = &["pr", "secrets", "db"];
 /// the orchestrator after each step, as it does its own writes. An agent tod
 /// started from the user's machine instead sends `pr` and `secrets` through
 /// its tunnel there (`TOD_CLI_RELAY_*`, as [`SHIM_SCRIPT`] does): no
-/// supervisor runs for it, so there is no copy. `db` reads no database, so
+/// supervisor runs for it, so there is no copy. `db` and `access` read no database, so
 /// it runs with no data root and needs no copy.
 pub const HTTP_SHIM_SCRIPT: &str = concat!(
     r#"#!/usr/bin/env bash
@@ -184,8 +184,8 @@ for arg in "$@"; do
   esac
 done
 case "$noun" in
-  db)
-    # db reads no database (the user's machine answers it through the
+  db|access)
+    # db and access read no database (the user's machine answers it through the
     # orchestrator's broker), so it needs no copy: a node an interactive
     # conversation drives has no supervisor and so none.
     if [ ! -x "$local_cli" ]; then
@@ -802,8 +802,8 @@ mod tests {
         let s = HTTP_SHIM_SCRIPT;
         assert!(s.contains(&format!("${{TOD_LOCAL_CLI:-{LOCAL_CLI_DEFAULT}}}")));
         assert!(s.contains(&format!("${{TOD_LOCAL_DATA_ROOT:-{SUPERVISOR_STATE_ROOT}/$node}}")));
-        assert!(s.contains("  db)\n"));
-        let copied: Vec<_> = LOCAL_NOUNS.iter().filter(|n| **n != "db").copied().collect();
+        assert!(s.contains("  db|access)\n"));
+        let copied: Vec<_> = LOCAL_NOUNS.iter().filter(|n| !matches!(**n, "db" | "access")).copied().collect();
         assert!(s.contains(&format!("  {})", copied.join("|"))));
     }
 
@@ -866,6 +866,10 @@ mod tests {
         let (out, remote) = run(&["--data-root", "/elsewhere", "db", "psql", "prod", "--", "-c", "select 1"]);
         assert!(!remote);
         assert_eq!(out, "local:db\nlocal:psql\nlocal:prod\nlocal:--\nlocal:-c\nlocal:select 1\n");
+        // `access` the same: the user's machine makes the call.
+        let (out, remote) = run(&["--data-root", "/elsewhere", "access", "call", "redis-prod", "get", "key=claim:1"]);
+        assert!(!remote);
+        assert_eq!(out, "local:access\nlocal:call\nlocal:redis-prod\nlocal:get\nlocal:key=claim:1\n");
         let (out, _) = run(&["pr", "status"]);
         assert_eq!(out, "", "pr still needs the copy");
 

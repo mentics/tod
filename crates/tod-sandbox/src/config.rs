@@ -182,6 +182,33 @@ impl Config {
         Ok(self.databases.clone())
     }
 
+    /// The configured services; an invalid or repeated one is an error.
+    pub fn services(&self) -> Result<Vec<crate::service::Service>> {
+        let mut seen = std::collections::HashSet::new();
+        for svc in &self.services {
+            svc.validate()?;
+            anyhow::ensure!(seen.insert(svc.name.as_str()), "service {} is declared twice", svc.name);
+        }
+        Ok(self.services.clone())
+    }
+
+    /// Adds `service`, or replaces the one of its name; refuses one that could not work.
+    pub fn upsert_service(&mut self, service: crate::service::Service) -> Result<()> {
+        service.validate()?;
+        match self.services.iter_mut().find(|s| s.name == service.name) {
+            Some(existing) => *existing = service,
+            None => self.services.push(service),
+        }
+        Ok(())
+    }
+
+    /// Removes the service of that name; whether there was one.
+    pub fn remove_service(&mut self, name: &str) -> bool {
+        let before = self.services.len();
+        self.services.retain(|s| s.name != name);
+        self.services.len() != before
+    }
+
     /// Adds `database`, or replaces the one of its name. Refuses one that
     /// could not work, or that takes another's sandbox port.
     pub fn upsert_database(&mut self, database: crate::database::Database) -> Result<()> {
@@ -399,6 +426,10 @@ pub struct Config {
     /// Databases sandboxes log in to through this machine (`[[database]]`).
     #[serde(default, rename = "database", skip_serializing_if = "Vec::is_empty")]
     pub databases: Vec<crate::database::Database>,
+    /// Read-only services (Hatchet, Redis, a web API) sandboxes use through
+    /// this machine (`[[service]]`); see [`crate::service`].
+    #[serde(default, rename = "service", skip_serializing_if = "Vec::is_empty")]
+    pub services: Vec<crate::service::Service>,
 }
 
 impl Config {
@@ -493,6 +524,19 @@ impl Config {
         for d in &base.databases {
             if !mine.databases.iter().any(|m| m.name == d.name) {
                 self.databases.retain(|f| f.name != d.name);
+            }
+        }
+        for d in &mine.services {
+            if !base.services.contains(d) {
+                match self.services.iter_mut().find(|f| f.name == d.name) {
+                    Some(f) => *f = d.clone(),
+                    None => self.services.push(d.clone()),
+                }
+            }
+        }
+        for d in &base.services {
+            if !mine.services.iter().any(|m| m.name == d.name) {
+                self.services.retain(|f| f.name != d.name);
             }
         }
         if mine.blaxel == base.blaxel {
@@ -778,6 +822,43 @@ claude_token_via = \"env\"
         let mut c = Config::default();
         c.blaxel = Some(Account { forwards: vec!["5432=a:1".into(), "5432=b:2".into()], ..Account::new("w") });
         assert!(c.forwards().is_err());
+    }
+
+    #[test]
+    fn services_load_validate_and_save_changes_without_clobbering() {
+        let dir = tod_test_util::scratch_dir(format!("tod-svc-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sandboxes.toml");
+        std::fs::write(
+            &path,
+            "[[service]]\nname = \"hatchet-prod\"\nkind = \"hatchet\"\nurl = \"https://h.example\"\ntenant = \"707d0855-80ab-4e1f-a156-f1c4546cbf57\"\n\n[[service]]\nname = \"redis-prod\"\nkind = \"redis\"\nurl = \"rediss://r.example:6379\"\n",
+        )
+        .unwrap();
+        let base = Config::load(&path).unwrap();
+        assert_eq!(base.services().unwrap().len(), 2);
+        // Another writer adds a service while this one removes a different one.
+        let mut other = Config::load(&path).unwrap();
+        other.upsert_service(crate::service::Service {
+            name: "flagship-qa".into(),
+            kind: crate::service::Kind::Api,
+            url: "https://f.example".into(),
+            tenant: None,
+            username: None,
+            db: None,
+            allow: vec!["/api/v1/orgs/*".into()],
+            auth_header: None,
+            token_command: None,
+        })
+        .unwrap();
+        other.save(&path).unwrap();
+        let mut mine = base.clone();
+        assert!(mine.remove_service("redis-prod"));
+        mine.save_changes(&base, &path).unwrap();
+        let names: Vec<String> = Config::load(&path).unwrap().services.into_iter().map(|s| s.name).collect();
+        assert_eq!(names, ["hatchet-prod", "flagship-qa"]);
+        // An unreachable-by-design api service is refused, not loaded half-open.
+        std::fs::write(&path, "[[service]]\nname = \"f\"\nkind = \"api\"\nurl = \"https://f.example\"\n").unwrap();
+        assert!(Config::load(&path).unwrap().services().unwrap_err().to_string().contains("allow"));
     }
 
     #[test]

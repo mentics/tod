@@ -230,7 +230,7 @@ fn retire_pass(store: &tod_store::fleet::FleetStore) {
 /// minute. The reason is logged at info.
 fn watch_lifetime(shared: Arc<Shared>, root: std::path::PathBuf, port: u16) {
     let idle = lifetime::idle_limit();
-    let polls_broker = tod_core::db_broker::declares_databases(&root);
+    let polls_broker = tod_core::db_broker::declares_access(&root);
     let spawned = std::thread::Builder::new().name("tod-agentd-lifetime".into()).spawn(move || loop {
         std::thread::sleep(lifetime::CHECK_EVERY);
         if shared.quit.load(Ordering::SeqCst) {
@@ -243,8 +243,8 @@ fn watch_lifetime(shared: Arc<Shared>, root: std::path::PathBuf, port: u16) {
         } else {
             *shared.last_client.lock().unwrap_or_else(|e| e.into_inner())
         };
-        // Re-read: a database may have been declared since the daemon started.
-        let polls = polls_broker || tod_core::db_broker::declares_databases(&root);
+        // Re-read: a database or service may have been declared since the daemon started.
+        let polls = polls_broker || tod_core::db_broker::declares_access(&root);
         if let Some(reason) = lifetime::should_exit(Instant::now(), last, runs, polls, root.exists(), idle) {
             tracing::info!("tod-agentd: exiting: {reason}");
             shared.quit.store(true, Ordering::SeqCst);

@@ -92,6 +92,18 @@ database list | remove <name> | test <name>
                          server's own name (for RDS, the instance endpoint). --check
                          tests it first; `test` signs a login and connects to the
                          host from here, and sends nothing to it.
+service add <name> --kind hatchet|redis|api --url U [--tenant T] [--username U]
+      [--db N] [--allow PATH]... [--auth-header H] [--token-command C] [--check]
+service list | remove <name> | test <name> | token <name>
+                         The read-only services a node running in the cloud may use
+                         through this machine with `tod-cli access` (Hatchet runs,
+                         Redis keys, a web API's GET paths); the call is made here
+                         with the credential kept here. --url is the base URL (redis:
+                         redis[s]://host:port); hatchet needs --tenant; api needs
+                         --allow (a path, or a prefix ending in *; repeat it).
+                         `token` reads the credential from stdin and keeps it
+                         encrypted on this machine (or give --token-command, which
+                         prints it). `test` makes one harmless read from here.
 status <name> [--json]   Whether a sandbox is running or in standby, and its
                          deployment status (does not wake it).
 exec <name> [--keep-awake] [--cwd DIR] -- <command...>
@@ -260,6 +272,7 @@ fn run() -> Result<i32> {
         "fork" => fork(&mut ctx, args),
         "golden" => golden(&mut ctx, args),
         "database" => database(&mut ctx, args),
+        "service" => service(&mut ctx, args),
         "cloudflare" => cloudflare(&mut ctx, args),
         "ensure" => {
             let install = args.flag("--install");
@@ -575,6 +588,128 @@ fn database(ctx: &mut Ctx, mut args: Args) -> Result<i32> {
         }
         other => bail!("unknown database command {other:?}: add, list, remove, or test"),
     }
+}
+
+/// `service add|list|remove|test|token`: the read-only services a cloud node may
+/// use through this machine (`doc/cloud-sandboxes/brokered-access.md`).
+fn service(ctx: &mut Ctx, mut args: Args) -> Result<i32> {
+    use tod_sandbox::service::{Args as CallArgs, Kind, Service};
+    if args.0.is_empty() {
+        bail!("usage: tod-sandbox service add|list|remove|test|token (see `tod-sandbox help`)");
+    }
+    let verb = args.0.remove(0);
+    let find = |ctx: &Ctx, name: &str| -> Result<Service> {
+        ctx.services()?.into_iter().find(|s| s.name == name).ok_or_else(|| anyhow!("no service named {name}"))
+    };
+    // One harmless read that proves the credential and the way in.
+    let check = |ctx: &Ctx, svc: &Service| -> Result<String> {
+        let token = tod_core::db_broker::service_token(&ctx.root, svc)?;
+        let kv = |pairs: &[(&str, &str)]| -> CallArgs { pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect() };
+        let (action, args) = match svc.kind {
+            Kind::Hatchet => ("workflows-list", kv(&[])),
+            Kind::Redis => ("exists", kv(&[("keys", "tod-service-check")])),
+            Kind::Api => match svc.allow.iter().find(|a| !a.ends_with('*')) {
+                Some(path) => ("get", kv(&[("path", path)])),
+                None => return Ok(format!("{}: nothing to test: every allowed path is a prefix, and a call needs a full path", svc.name)),
+            },
+        };
+        svc.call(token.as_deref(), action, &args)?;
+        Ok(format!("ok: {} answered {action} from this machine", svc.name))
+    };
+    match verb.as_str() {
+        "list" => {
+            args.done()?;
+            let services = ctx.services()?;
+            if services.is_empty() {
+                println!("(none) add one with `tod-sandbox service add`");
+            }
+            for s in services {
+                let saved = ctx.has_service_token(&s.name);
+                let source = if saved {
+                    "credential saved here"
+                } else if s.token_command.is_some() {
+                    "credential from token_command"
+                } else if s.needs_token() {
+                    "NO CREDENTIAL (run `tod-sandbox service token`)"
+                } else {
+                    "no credential"
+                };
+                println!(
+                    "{}: {} at {} ({source}); actions: {}",
+                    s.name,
+                    s.kind.name(),
+                    s.url,
+                    s.actions().iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", ")
+                );
+            }
+            Ok(0)
+        }
+        "add" => {
+            let name = args.positional("service name")?;
+            let kind = match args.opt("--kind").ok_or_else(|| anyhow!("--kind is required: hatchet, redis or api"))?.as_str() {
+                "hatchet" => Kind::Hatchet,
+                "redis" => Kind::Redis,
+                "api" => Kind::Api,
+                other => bail!("--kind {other:?}: hatchet, redis or api"),
+            };
+            let url = args.opt("--url").ok_or_else(|| anyhow!("--url is required"))?;
+            let tenant = args.opt("--tenant");
+            let username = args.opt("--username");
+            let db = args.opt("--db").map(|d| d.parse()).transpose().context("--db is a number")?;
+            let mut allow = Vec::new();
+            while let Some(a) = args.opt("--allow") {
+                allow.push(a);
+            }
+            let auth_header = args.opt("--auth-header");
+            let token_command = args.opt("--token-command");
+            let check_now = args.flag("--check");
+            args.done()?;
+            let svc = Service { name: name.clone(), kind, url, tenant, username, db, allow, auth_header, token_command };
+            svc.validate()?;
+            if check_now {
+                println!("{}", check(ctx, &svc)?);
+            }
+            ctx.set_service(svc)?;
+            println!("{name}: saved. Nodes running in the cloud can now use it with `tod-cli access`.");
+            Ok(0)
+        }
+        "remove" => {
+            let name = args.positional("service name")?;
+            args.done()?;
+            if !ctx.remove_service(&name)? {
+                bail!("no service named {name}");
+            }
+            ctx.delete_service_token(&name);
+            println!("{name}: removed");
+            Ok(0)
+        }
+        "test" => {
+            let name = args.positional("service name")?;
+            args.done()?;
+            println!("{}", check(ctx, &find(ctx, &name)?)?);
+            Ok(0)
+        }
+        "token" => {
+            let name = args.positional("service name")?;
+            args.done()?;
+            find(ctx, &name)?;
+            let secret = if std::io::stdin().is_terminal() {
+                prompt(&format!("credential for {name} (kept encrypted on this machine)"))?
+            } else {
+                read_stdin_line()?
+            };
+            ctx.set_service_token(&name, &secret)?;
+            println!("{name}: credential saved on this machine; it is never sent to a sandbox");
+            Ok(0)
+        }
+        other => bail!("unknown service command {other:?}: add, list, remove, test or token"),
+    }
+}
+
+fn read_stdin_line() -> Result<String> {
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line)?;
+    Ok(line.trim().to_string())
 }
 
 fn golden(ctx: &mut Ctx, mut args: Args) -> Result<i32> {

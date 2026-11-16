@@ -513,6 +513,7 @@ fn render_block(block: DynamicBlock, ctx: &DynamicContext<'_>, out: &mut String)
 
         DynamicBlock::Databases => {
             out.push_str(&crate::databases_context::render(&crate::databases_context::declared(ctx.data_root)));
+            out.push_str(&crate::access_context::render(&crate::access_context::declared(ctx.data_root)));
         }
 
         DynamicBlock::Workspace => {

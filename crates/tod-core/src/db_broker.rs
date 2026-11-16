@@ -14,6 +14,12 @@
 //! 3. signs a 15-minute login token with the user's AWS profile,
 //! 4. replies. The sandbox never holds an AWS credential.
 //!
+//! The same transport carries read-only **services** (`op: services` and
+//! `op: service`, [`tod_sandbox::service`]): a Hatchet's runs, a Redis's keys,
+//! a web API's GET endpoints. They need no forward: this machine makes the
+//! call itself, with a credential it holds ([`service_token`]), and replies
+//! with the result.
+//!
 //! A failure is the reply: the agent sees why (the profile has expired, the
 //! machine cannot reach the database, the node is unknown), never a hang.
 
@@ -27,6 +33,7 @@ use std::time::{Duration, Instant};
 use tod_sandbox::config::{self, Config, Forward};
 use tod_sandbox::database::Database;
 use tod_sandbox::hold::{Held, hold};
+use tod_sandbox::service::{Args, Service as Declared};
 use tod_store::fleet::FleetStore;
 
 /// How long a sandbox's forwards stay open after the node last asked.
@@ -40,6 +47,12 @@ pub struct Service {
     pub root: PathBuf,
     /// The declared databases.
     pub databases: Box<dyn Fn() -> Result<Vec<Database>> + Send + Sync>,
+    /// The declared read-only services.
+    pub services: Box<dyn Fn() -> Result<Vec<Declared>> + Send + Sync>,
+    /// The credential this machine holds for a service, if it has one.
+    pub service_token: Box<dyn Fn(&Declared) -> Result<Option<String>> + Send + Sync>,
+    /// Makes one service call (the real one, or a test's).
+    pub service_call: Box<dyn Fn(&Declared, Option<&str>, &str, &Args) -> Result<Value> + Send + Sync>,
     /// The sandbox a node runs in, if it is a cloud node this machine knows.
     pub sandbox_of: Box<dyn Fn(&str) -> Option<String> + Send + Sync>,
     /// The orchestrator to answer for, and the user's name there.
@@ -52,9 +65,13 @@ impl Service {
     pub fn for_store(fleet: Arc<FleetStore>) -> Self {
         let root = fleet.paths().root().to_path_buf();
         let (databases_root, orchestrator_root) = (root.clone(), root.clone());
+        let (services_root, token_root) = (root.clone(), root.clone());
         Self {
             root,
             databases: Box::new(move || databases(&databases_root)),
+            services: Box::new(move || services(&services_root)),
+            service_token: Box::new(move |svc| service_token(&token_root, svc)),
+            service_call: Box::new(|svc, token, action, args| svc.call(token, action, args)),
             // The node's Files location is the one record of its sandbox: a
             // node this machine has no location for is not this machine's to
             // answer for (the `cloud_nodes` copy is not read). Nor is its
@@ -105,11 +122,52 @@ fn databases(root: &Path) -> Result<Vec<Database>> {
     Config::load(&root.join(config::FILE_NAME))?.databases()
 }
 
-/// Whether this data root declares any `[[database]]`, so that its daemon
-/// must keep polling the broker while the app is closed. A `sandboxes.toml`
-/// that cannot be read counts as declaring them: the poll retries it.
-pub fn declares_databases(root: &Path) -> bool {
-    databases(root).map(|d| !d.is_empty()).unwrap_or(true)
+fn services(root: &Path) -> Result<Vec<Declared>> {
+    Config::load(&root.join(config::FILE_NAME))?.services()
+}
+
+/// Whether this data root declares any `[[database]]` or `[[service]]`, so
+/// that its daemon must keep polling the broker while the app is closed. A
+/// `sandboxes.toml` that cannot be read counts as declaring them: the poll
+/// retries it.
+pub fn declares_access(root: &Path) -> bool {
+    match (databases(root), services(root)) {
+        (Ok(d), Ok(s)) => !d.is_empty() || !s.is_empty(),
+        _ => true,
+    }
+}
+
+/// The named credential a service's token is saved under
+/// (`tod-sandbox service token <name>`).
+pub fn service_credential_account(name: &str) -> String {
+    tod_store::fleet::sandbox::service_credential_account(name)
+}
+
+/// The credential for `svc`: the one saved for it on this machine, else what
+/// its `token_command` prints. `None` when it has neither (some services
+/// need none). A command that fails is an error naming it, never "no token".
+pub fn service_token(root: &Path, svc: &Declared) -> Result<Option<String>> {
+    let store = tod_store::credentials::CredentialStore::from_data_root(root);
+    if let Some(saved) = store.get_named(&service_credential_account(&svc.name)) {
+        return Ok(Some(saved));
+    }
+    let Some(command) = svc.token_command.as_deref() else { return Ok(None) };
+    let output = if cfg!(windows) {
+        std::process::Command::new("cmd").args(["/C", command]).output()
+    } else {
+        std::process::Command::new("sh").args(["-c", command]).output()
+    }
+    .with_context(|| format!("run service {}'s token_command", svc.name))?;
+    anyhow::ensure!(
+        output.status.success(),
+        "service {}'s token_command failed ({}): {}",
+        svc.name,
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim().chars().take(300).collect::<String>()
+    );
+    let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    anyhow::ensure!(!token.is_empty(), "service {}'s token_command printed nothing", svc.name);
+    Ok(Some(token))
 }
 
 fn run(service: Arc<Service>) {
@@ -118,8 +176,8 @@ fn run(service: Arc<Service>) {
     let mut quiet = Quiet::default();
     let mut orchestrator: Option<(Arc<HttpOrchestrator>, String)> = None;
     loop {
-        match (service.databases)() {
-            Ok(dbs) if dbs.is_empty() => {
+        match (service.databases)().and_then(|dbs| Ok((dbs, (service.services)()?))) {
+            Ok((dbs, svcs)) if dbs.is_empty() && svcs.is_empty() => {
                 std::thread::sleep(Duration::from_secs(30));
                 continue;
             }
@@ -199,8 +257,11 @@ fn answer(service: &Service, tunnels: &Tunnels, node: &str, request: &Value) -> 
     // its own database list holds or fails to load. Once it is the node's root,
     // every error below is final.
     let sandbox = (service.sandbox_of)(node).ok_or(NotMine)?;
-    let dbs = (service.databases)()?;
     let op = request["op"].as_str().unwrap_or_default();
+    if op == "services" || op == "service" {
+        return answer_service(service, op, request);
+    }
+    let dbs = (service.databases)()?;
     if op == "list" {
         let list: Vec<Value> = dbs.iter().map(|d| json!({"name": d.name, "dbname": d.dbname, "user": d.user})).collect();
         return Ok(json!({"ok": true, "databases": list}));
@@ -219,6 +280,36 @@ fn answer(service: &Service, tunnels: &Tunnels, node: &str, request: &Value) -> 
         }
         other => Err(anyhow!("unknown request {other:?}")),
     }
+}
+
+/// `services` lists what is declared (names, kinds and actions, never a URL
+/// or a credential). `service` is `{"name", "action", "args": {...}}`: the
+/// call is made here and its result is the reply.
+fn answer_service(service: &Service, op: &str, request: &Value) -> Result<Value> {
+    let declared = (service.services)()?;
+    if op == "services" {
+        let list: Vec<Value> = declared
+            .iter()
+            .map(|s| json!({"name": s.name, "kind": s.kind.name(), "actions": s.actions()}))
+            .collect();
+        return Ok(json!({"ok": true, "services": list}));
+    }
+    let name = request["name"].as_str().context("the request names no service")?;
+    let svc = declared.iter().find(|s| s.name == name).ok_or_else(|| {
+        let known: Vec<&str> = declared.iter().map(|s| s.name.as_str()).collect();
+        anyhow!("no service named {name:?} is set up on the user's machine (it has: {})", if known.is_empty() { "none".to_string() } else { known.join(", ") })
+    })?;
+    let action = request["action"].as_str().context("the request names no action")?;
+    let mut args = Args::new();
+    if let Some(map) = request["args"].as_object() {
+        for (k, v) in map {
+            let text = v.as_str().ok_or_else(|| anyhow!("argument {k} is not text"))?;
+            args.insert(k.clone(), text.to_string());
+        }
+    }
+    let token = (service.service_token)(svc)?;
+    let result = (service.service_call)(svc, token.as_deref(), action, &args)?;
+    Ok(json!({"ok": true, "result": result}))
 }
 
 struct Entry {
@@ -276,6 +367,20 @@ fn endpoint(root: &Path, sandbox: &str) -> Result<(String, String)> {
 mod tests {
     use super::*;
 
+    fn redis_decl() -> Declared {
+        Declared {
+            name: "redis-prod".into(),
+            kind: tod_sandbox::service::Kind::Redis,
+            url: "rediss://r.example:6379".into(),
+            tenant: None,
+            username: None,
+            db: None,
+            allow: vec![],
+            auth_header: None,
+            token_command: None,
+        }
+    }
+
     fn service(nodes: &'static [(&'static str, &'static str)]) -> Service {
         let db = Database {
             name: "prod".into(),
@@ -290,6 +395,11 @@ mod tests {
         Service {
             root: std::env::temp_dir(),
             databases: Box::new(move || Ok(vec![db.clone()])),
+            services: Box::new(|| Ok(vec![redis_decl()])),
+            service_token: Box::new(|_| Ok(Some("sekrit".into()))),
+            service_call: Box::new(|svc, token, action, args| {
+                Ok(json!({"service": svc.name, "token_seen": token, "action": action, "args": args}))
+            }),
             sandbox_of: Box::new(move |node| nodes.iter().find(|(n, _)| *n == node).map(|(_, s)| s.to_string())),
             orchestrator: Box::new(|| Err(anyhow!("not used"))),
         }
@@ -338,5 +448,52 @@ mod tests {
         assert_eq!(reply_for(Err(anyhow!("boom")))["error"], "boom");
         let no_name = answer(&svc, &tunnels, "known", &json!({"op": "token"})).unwrap_err();
         assert!(format!("{no_name:#}").contains("names no database"));
+    }
+
+    #[test]
+    fn services_are_listed_by_name_and_action_never_by_url_or_credential() {
+        let reply = answer(&service(&[("n", "sbx")]), &Tunnels::default(), "n", &json!({"op": "services"})).unwrap();
+        assert_eq!(reply["services"][0]["name"], "redis-prod");
+        assert_eq!(reply["services"][0]["kind"], "redis");
+        assert!(reply["services"][0]["actions"].as_array().unwrap().iter().any(|a| a["name"] == "get"));
+        assert!(!reply.to_string().contains("r.example") && !reply.to_string().contains("sekrit"), "{reply}");
+    }
+
+    #[test]
+    fn a_service_call_is_made_here_for_a_known_node_and_a_declared_service_only() {
+        let svc = service(&[("n", "sbx")]);
+        let ok = answer(&svc, &Tunnels::default(), "n", &json!({"op": "service", "name": "redis-prod", "action": "get", "args": {"key": "claim:1"}})).unwrap();
+        assert_eq!(ok["result"]["args"]["key"], "claim:1");
+        assert_eq!(ok["result"]["token_seen"], "sekrit", "the daemon, not the sandbox, holds the credential");
+        let unknown = answer(&svc, &Tunnels::default(), "n", &json!({"op": "service", "name": "nope", "action": "get"})).unwrap_err();
+        assert!(format!("{unknown:#}").contains("no service named") && format!("{unknown:#}").contains("redis-prod"), "{unknown:#}");
+        let stranger = answer(&svc, &Tunnels::default(), "x", &json!({"op": "service", "name": "redis-prod", "action": "get"})).unwrap_err();
+        assert_eq!(reply_for(Err(stranger)), json!({"ok": false, "not_mine": true}));
+        let not_text = answer(&svc, &Tunnels::default(), "n", &json!({"op": "service", "name": "redis-prod", "action": "get", "args": {"key": 1}})).unwrap_err();
+        assert!(format!("{not_text:#}").contains("not text"));
+    }
+
+    #[test]
+    fn a_failing_adapter_reaches_the_agent_as_the_error() {
+        let mut svc = service(&[("n", "sbx")]);
+        svc.service_call = Box::new(|_, _, _, _| Err(anyhow!("redis get on redis-prod: connect refused")));
+        let reply = reply_for(answer(&svc, &Tunnels::default(), "n", &json!({"op": "service", "name": "redis-prod", "action": "get"})));
+        assert_eq!(reply["ok"], false);
+        assert!(reply["error"].as_str().unwrap().contains("connect refused"), "{reply}");
+    }
+
+    #[test]
+    fn a_token_command_that_fails_is_an_error_not_no_token() {
+        let dir = tod_test_util::scratch_dir(format!("tod-svc-token-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut svc = redis_decl();
+        svc.name = "tok-test-unsaved".into();
+        svc.token_command = Some("echo from-command".into());
+        assert_eq!(service_token(&dir, &svc).unwrap().as_deref(), Some("from-command"));
+        svc.token_command = Some("echo nope >&2; exit 3".into());
+        let err = service_token(&dir, &svc).unwrap_err().to_string();
+        assert!(err.contains("token_command failed") && err.contains("nope"), "{err}");
+        svc.token_command = None;
+        assert_eq!(service_token(&dir, &svc).unwrap(), None);
     }
 }
