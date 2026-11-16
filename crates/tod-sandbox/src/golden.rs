@@ -25,6 +25,9 @@ pub const LABEL_SCHEMA: &str = "tod-schema";
 pub const LABEL_WIRE: &str = "tod-wire";
 /// `tod-built=<commit time, unix seconds, of the build that made it>`.
 pub const LABEL_BUILT: &str = "tod-built";
+/// `tod-main=<true|false>`: whether the build that made it was on main (absent
+/// on a golden made before this label, or by a build git could not place).
+pub const LABEL_MAIN: &str = "tod-main";
 /// `tod-kind=golden`: marks a sandbox tod made as a golden (and so one it may
 /// delete when it makes a newer one).
 pub const KIND_GOLDEN: &str = "golden";
@@ -54,6 +57,9 @@ pub struct GoldenStamp {
     pub wire: u32,
     /// The commit time of that build, unix seconds.
     pub built: u64,
+    /// Whether that build's commit is on main: `None` when not known (a golden
+    /// made before the label, or a build git could not place).
+    pub on_main: Option<bool>,
 }
 
 impl GoldenStamp {
@@ -75,12 +81,16 @@ impl GoldenStamp {
 
     /// The labels that say it (without `ready`, which is set last).
     pub fn labels(&self) -> Vec<(&'static str, String)> {
-        vec![
+        let mut labels = vec![
             (LABEL_INSTALL, self.install.clone()),
             (LABEL_SCHEMA, self.schema.to_string()),
             (LABEL_WIRE, self.wire.to_string()),
             (LABEL_BUILT, self.built.to_string()),
-        ]
+        ];
+        if let Some(on_main) = self.on_main {
+            labels.push((LABEL_MAIN, on_main.to_string()));
+        }
+        labels
     }
 
     /// Reads a sandbox's labels. `None` when it carries no `tod-install`
@@ -95,11 +105,18 @@ impl GoldenStamp {
             let text = info.label(key).ok_or_else(|| anyhow::anyhow!("{} has {LABEL_INSTALL} but no {key} label", info.name))?;
             text.parse::<u64>().map_err(|_| anyhow::anyhow!("{}'s {key} label is {text:?}, not a number", info.name))
         };
+        let on_main = match info.label(LABEL_MAIN) {
+            None | Some("") => None,
+            Some("true") => Some(true),
+            Some("false") => Some(false),
+            Some(other) => bail!("{}'s {LABEL_MAIN} label is {other:?}, not true or false", info.name),
+        };
         Ok(Some(Self {
             install: install.to_string(),
             schema: u32::try_from(number(LABEL_SCHEMA)?)?,
             wire: u32::try_from(number(LABEL_WIRE)?)?,
             built: number(LABEL_BUILT)?,
+            on_main,
         }))
     }
 }
@@ -182,6 +199,19 @@ pub fn plan(mine: &GoldenStamp, golden: Option<&GoldenStamp>) -> Plan {
         std::cmp::Ordering::Equal => Plan::Refresh {
             why: format!(
                 "it holds different files from this tod's, of the same schema, wire, and commit ({} against {}): a build with local changes",
+                theirs.describe(),
+                mine.describe()
+            ),
+        },
+        // Newer by order only means "built later", not "built from main": a
+        // build nobody merged (another session's) can be the newest. It must
+        // not block a build that is on main, the line every node's start
+        // follows, so a golden an unmerged build made is refreshed forward.
+        // An unknown line (an older golden) is still refused: nothing says it
+        // is not main's.
+        std::cmp::Ordering::Greater if mine.on_main == Some(true) && theirs.on_main == Some(false) => Plan::Refresh {
+            why: format!(
+                "it was made by a build that is not on main ({}); this tod is on main ({})",
                 theirs.describe(),
                 mine.describe()
             ),
@@ -472,6 +502,42 @@ mod tests {
         assert!(!retry_from_new_source(Some(false), true, true), "only once");
     }
 
+    fn line_stamp(schema: u32, built: u64, on_main: Option<bool>) -> GoldenStamp {
+        GoldenStamp { install: format!("i{schema}-{built}"), schema, wire: 1, built, on_main }
+    }
+
+    /// Seen live (2026-11-11): another session's build, not on main, refreshed the
+    /// golden every root shares, and main's build then refused it as "newer",
+    /// blocking Start for every node.
+    #[test]
+    fn a_golden_an_unmerged_build_made_never_blocks_a_build_on_main() {
+        let main = line_stamp(93, 100, Some(true));
+        let unmerged_newer = line_stamp(94, 200, Some(false));
+        assert!(matches!(plan(&main, Some(&unmerged_newer)), Plan::Refresh { .. }));
+        assert!(decide("a/b", &main, Some(&unmerged_newer)).is_ok());
+        // A newer golden from main (or of unknown line) is still never refreshed back.
+        assert_eq!(plan(&main, Some(&line_stamp(94, 200, Some(true)))), Plan::Refuse);
+        assert_eq!(plan(&main, Some(&line_stamp(94, 200, None))), Plan::Refuse);
+        // An unmerged build does not get this: it is refused by a newer golden as before.
+        assert_eq!(plan(&line_stamp(93, 100, Some(false)), Some(&line_stamp(94, 200, Some(false)))), Plan::Refuse);
+        assert_eq!(plan(&line_stamp(93, 100, None), Some(&unmerged_newer)), Plan::Refuse);
+    }
+
+    #[test]
+    fn the_line_a_golden_was_built_on_round_trips_through_its_labels() {
+        for on_main in [Some(true), Some(false), None] {
+            let s = line_stamp(93, 100, on_main);
+            let owned = s.labels();
+            let labels: Vec<(&str, &str)> = owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            let info = info_named("g", &labels);
+            assert_eq!(GoldenStamp::from_info(&info).unwrap(), Some(s));
+        }
+        let mut bad = line_stamp(93, 100, None).labels().into_iter().map(|(k, v)| (k.to_string(), v)).collect::<Vec<_>>();
+        bad.push((LABEL_MAIN.to_string(), "maybe".to_string()));
+        let bad: Vec<(&str, &str)> = bad.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        assert!(GoldenStamp::from_info(&info_named("g", &bad)).is_err());
+    }
+
     fn info_named(name: &str, labels: &[(&str, &str)]) -> SandboxInfo {
         SandboxInfo {
             name: name.into(),
@@ -587,7 +653,7 @@ mod tests {
     }
 
     fn stamp(install: &str, schema: u32, wire: u32, built: u64) -> GoldenStamp {
-        GoldenStamp { install: install.into(), schema, wire, built }
+        GoldenStamp { install: install.into(), schema, wire, built, on_main: None }
     }
 
     #[test]

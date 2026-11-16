@@ -80,7 +80,7 @@ fn the_install_trusts_the_ca_before_it_installs_curl() {
     let node = include_str!("node.rs");
     let at = node.find("pub fn install(bx").unwrap();
     let body = &node[at..at + 700];
-    assert!(body.find("trust_proxy_ca(").unwrap() < body.find("ensure_curl(").unwrap());
+    assert!(body.find("prepare_shell(").unwrap() < body.find("ensure_curl(").unwrap());
 }
 
 #[test]
@@ -124,4 +124,30 @@ fn the_ca_is_installed_python_is_pointed_at_the_bundle_and_a_rerun_is_idempotent
     let profile = std::fs::read_to_string(fs.join("etc/profile.d/tod-ca.sh")).unwrap();
     assert!(profile.contains("REQUESTS_CA_BUNDLE=") && profile.contains("PIP_CERT="));
     assert!(std::fs::read_to_string(fs.join("etc/pip.conf")).unwrap().contains("cert = "));
+}
+
+#[test]
+fn prepare_shell_runs_both_the_ca_and_the_terraform_cache() {
+    let node = include_str!("node.rs");
+    let at = node.find("pub fn prepare_shell(").unwrap();
+    let body = &node[at..at + 300];
+    assert!(body.contains("trust_proxy_ca(") && body.contains("ensure_terraform_cache("));
+}
+
+#[test]
+fn the_terraform_cache_script_writes_the_profile_file_idempotently_and_bootstrap_inlines_it() {
+    let t = tempfile::tempdir().unwrap();
+    let script = t.path().join("tf.sh");
+    std::fs::write(&script, crate::node::TERRAFORM_CACHE_SCRIPT).unwrap();
+    for _ in 0..2 {
+        let o = Command::new("sh").arg(&script).env("TOD_TF_ROOT", t.path().join("fs")).output().unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    }
+    let profile = std::fs::read_to_string(t.path().join("fs/etc/profile.d/tod-terraform.sh")).unwrap();
+    for (k, v) in crate::node::terraform_cache_env() {
+        assert!(profile.contains(&format!("export {k}={v}\n")), "{profile}");
+    }
+    assert!(t.path().join("fs").join(crate::node::TF_PLUGIN_CACHE_DIR.trim_start_matches('/')).is_dir());
+    let bootstrap = String::from_utf8(crate::provision::bootstrap_script().to_vec()).unwrap();
+    assert!(!bootstrap.contains("#@terraform-cache@") && bootstrap.contains("tod-terraform.sh"));
 }

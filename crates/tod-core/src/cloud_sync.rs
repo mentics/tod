@@ -1640,7 +1640,7 @@ pub fn ensure_supervisor(
     bx.wait_reachable(&url, tod_sandbox::blaxel::WAKE_CEILING).with_context(|| format!("wake {name}"))?;
     // Every readying, the Current case included (Start, reinstall, Reset
     // environment): the system trust store holds the proxy's CA. Idempotent.
-    node::trust_proxy_ca(&bx, &url, progress).with_context(|| format!("{name}: system-wide trust of the proxy CA"))?;
+    node::prepare_shell(&bx, &url, progress).with_context(|| format!("{name}: system-wide shell setup (proxy CA, Terraform cache)"))?;
 
     let files = refresh::install_files(root)?;
     let current = files.install();

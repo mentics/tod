@@ -679,7 +679,7 @@ pub fn checkout_script(repo_url: &str, branch: &str, identity: &GitIdentity, all
 pub fn install(bx: &Blaxel, url: &str, payload: &NodePayload, progress: &mut dyn FnMut(&str)) -> Result<()> {
     upload_tod_files(bx, url, payload, progress)?;
     // Before any package manager runs (ensure_curl uses apt), the proxy CA is trusted.
-    trust_proxy_ca(bx, url, progress)?;
+    prepare_shell(bx, url, progress)?;
     ensure_curl(bx, url, progress)?;
     ensure_claude_adapter(bx, url, progress)?;
     install_bundles(bx, url, payload, progress)
@@ -699,6 +699,32 @@ pub fn trust_proxy_ca(bx: &Blaxel, url: &str, progress: &mut dyn FnMut(&str)) ->
         bail!("trusting the proxy CA failed (exit {}): {}", res.exit_code, res.output().trim());
     }
     Ok(())
+}
+
+/// The script that shares Terraform providers across copies of a module.
+pub const TERRAFORM_CACHE_SCRIPT: &str = include_str!("../../../assets/sandbox/terraform-cache.sh");
+
+/// Writes the profile.d file that gives interactive shells the Terraform
+/// provider cache ([`terraform_cache_env`]). A sandbox made before the cache
+/// existed has none, and its shells would fill the RAM-backed root again.
+pub fn ensure_terraform_cache(bx: &Blaxel, url: &str, progress: &mut dyn FnMut(&str)) -> Result<()> {
+    progress("sharing Terraform providers across copies in shells…");
+    let res = bx.run(url, &format!("sh -c {} 2>&1", shell_quote(TERRAFORM_CACHE_SCRIPT)), 60)?;
+    if res.exit_code != 0 {
+        bail!("setting up the Terraform provider cache failed (exit {}): {}", res.exit_code, res.output().trim());
+    }
+    Ok(())
+}
+
+/// What every sandbox's shells need set up system-wide, on every install,
+/// fork, adoption and readying (the one call all of them make): the proxy's
+/// CA ([`trust_proxy_ca`]) and the Terraform provider cache
+/// ([`ensure_terraform_cache`]). Add a new system-wide shell setup here, and
+/// to the install stamp (`cloud_sync::refresh::install_of`) so existing
+/// sandboxes get it.
+pub fn prepare_shell(bx: &Blaxel, url: &str, progress: &mut dyn FnMut(&str)) -> Result<()> {
+    trust_proxy_ca(bx, url, progress)?;
+    ensure_terraform_cache(bx, url, progress)
 }
 
 /// Free space an install needs on the sandbox's root filesystem, at least.
@@ -868,7 +894,7 @@ pub fn install_into_fork(bx: &Blaxel, url: &str, payload: &NodePayload, progress
     crate::provision::check_relay_arch(payload.relay)?;
     crate::provision::require_fork_prerequisites(bx, url, true, progress)?;
     upload_tod_files(bx, url, payload, progress)?;
-    trust_proxy_ca(bx, url, progress)?;
+    prepare_shell(bx, url, progress)?;
     install_bundles(bx, url, payload, progress)
 }
 

@@ -18,6 +18,12 @@ pub const GIT_COMMIT: &str = env!("TOD_GIT_COMMIT");
 /// (`tod_sandbox::golden`). See `build.rs`.
 pub const GIT_COMMIT_TIME: &str = env!("TOD_GIT_COMMIT_TIME");
 
+/// Whether the commit is an ancestor of `main` / `origin/main` at build time:
+/// `"true"`, `"false"`, or `"unknown"` when git cannot say. A golden sandbox
+/// made by a build that is not on main never blocks one that is
+/// (`tod_sandbox::golden::plan`). See `build.rs`.
+pub const GIT_ON_MAIN: &str = env!("TOD_GIT_ON_MAIN");
+
 /// Whether the working tree had uncommitted changes at build time
 /// (`git status --porcelain`), as `"true"` / `"false"`, or `"unknown"` when
 /// git or the repository is missing. See `build.rs`.

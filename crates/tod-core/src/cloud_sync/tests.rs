@@ -10,18 +10,18 @@ use tod_store::outline::OutlineMutation;
 #[test]
 fn every_path_that_readies_a_node_sandbox_trusts_the_proxy_ca() {
     let ensure = include_str!("../cloud_sync.rs");
-    let trust = ensure.find("node::trust_proxy_ca(&bx").expect("ensure_supervisor trusts the CA");
+    let trust = ensure.find("node::prepare_shell(&bx").expect("ensure_supervisor trusts the CA");
     let split = ensure.find("match supervisor_state(made_now").unwrap();
     assert!(trust < split, "trust must come before the Current/Install split");
     let provision = include_str!("../../../tod-store/src/fleet/provision.rs");
     let fork = provision.find("} else if golden_has_tod_files {").unwrap();
     let relay = fork + provision[fork..].find("node::start_relay").unwrap();
-    assert!(provision[fork..relay].contains("node::trust_proxy_ca"), "the golden-has-files fork path trusts the CA");
-    assert!(include_str!("adopt.rs").contains("node::trust_proxy_ca"), "adoption trusts the CA");
+    assert!(provision[fork..relay].contains("node::prepare_shell"), "the golden-has-files fork path trusts the CA");
+    assert!(include_str!("adopt.rs").contains("node::prepare_shell"), "adoption trusts the CA");
     let node = include_str!("../../../tod-sandbox/src/node.rs");
     for f in ["pub fn install(", "pub fn install_into_fork("] {
         let at = node.find(f).unwrap();
-        assert!(node[at..at + 600].contains("trust_proxy_ca"), "{f} trusts the CA");
+        assert!(node[at..at + 600].contains("prepare_shell"), "{f} trusts the CA");
     }
 }
 

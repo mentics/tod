@@ -40,6 +40,8 @@ pub fn relay_command() -> String {
 
 /// Marker line in `assets/sandbox/bootstrap.sh` where the proxy-CA script goes.
 const TRUST_MARKER: &str = "#@trust-proxy-ca@";
+/// Marker line in `assets/sandbox/bootstrap.sh` where the Terraform-cache script goes.
+const TERRAFORM_MARKER: &str = "#@terraform-cache@";
 
 /// `bootstrap.sh` with `trust-proxy-ca.sh` inlined (in a subshell) ahead of its
 /// first package-manager call, so every bootstrap path (first connect,
@@ -47,13 +49,17 @@ const TRUST_MARKER: &str = "#@trust-proxy-ca@";
 /// proxy's CA before any `apt-get`. One source for the bytes everyone uploads.
 pub fn bootstrap_script() -> &'static [u8] {
     static SCRIPT: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
-    SCRIPT.get_or_init(|| compose_bootstrap(include_str!("../../../assets/sandbox/bootstrap.sh"), crate::node::TRUST_PROXY_CA_SCRIPT)).as_slice()
+    SCRIPT.get_or_init(|| compose_bootstrap(include_str!("../../../assets/sandbox/bootstrap.sh"), crate::node::TRUST_PROXY_CA_SCRIPT, crate::node::TERRAFORM_CACHE_SCRIPT)).as_slice()
 }
 
-fn compose_bootstrap(bootstrap: &str, trust: &str) -> Vec<u8> {
+fn compose_bootstrap(bootstrap: &str, trust: &str, terraform: &str) -> Vec<u8> {
+    let inline = |script: &str| -> String {
+        let body: String = script.lines().filter(|l| !l.starts_with("#!")).collect::<Vec<_>>().join("\n");
+        format!("(\n{body}\n)")
+    };
     assert!(bootstrap.contains(TRUST_MARKER), "assets/sandbox/bootstrap.sh lost its {TRUST_MARKER} line");
-    let body: String = trust.lines().filter(|l| !l.starts_with("#!")).collect::<Vec<_>>().join("\n");
-    bootstrap.replacen(TRUST_MARKER, &format!("(\n{body}\n)"), 1).into_bytes()
+    assert!(bootstrap.contains(TERRAFORM_MARKER), "assets/sandbox/bootstrap.sh lost its {TERRAFORM_MARKER} line");
+    bootstrap.replacen(TRUST_MARKER, &inline(trust), 1).replacen(TERRAFORM_MARKER, &inline(terraform), 1).into_bytes()
 }
 
 /// What gets installed into a sandbox.

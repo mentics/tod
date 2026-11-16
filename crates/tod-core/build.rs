@@ -61,7 +61,32 @@ fn emit_git_identity(manifest_dir: &Path) {
         .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
         .unwrap_or_else(|| "unknown".to_string());
 
+    // Whether the commit is on main (an ancestor of `main` or `origin/main`),
+    // so a golden sandbox made by an unmerged build never blocks a build on
+    // main (`tod_sandbox::golden::plan`). "unknown" when git cannot say.
+    let on_main = {
+        let ancestor_of = |reference: &str| -> Option<bool> {
+            let status = std::process::Command::new("git")
+                .args(["merge-base", "--is-ancestor", "HEAD", reference])
+                .current_dir(manifest_dir)
+                .output()
+                .ok()?
+                .status;
+            match status.code() {
+                Some(0) => Some(true),
+                Some(1) => Some(false),
+                _ => None,
+            }
+        };
+        match (ancestor_of("origin/main"), ancestor_of("main")) {
+            (Some(true), _) | (_, Some(true)) => "true",
+            (Some(false), _) | (_, Some(false)) => "false",
+            (None, None) => "unknown",
+        }
+    };
+
     println!("cargo:rustc-env=TOD_GIT_COMMIT={commit}");
+    println!("cargo:rustc-env=TOD_GIT_ON_MAIN={on_main}");
     println!("cargo:rustc-env=TOD_GIT_COMMIT_TIME={commit_time}");
     println!("cargo:rustc-env=TOD_GIT_DIRTY={dirty}");
 

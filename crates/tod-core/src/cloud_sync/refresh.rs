@@ -67,6 +67,11 @@ pub fn install_of(relay: &[u8], supervisor: Option<&[u8]>, tod_cli: Option<&[u8]
     let trust = tod_sandbox::node::TRUST_PROXY_CA_SCRIPT.as_bytes();
     part("trust-ca", trust);
     parts.insert("trust-ca".to_string(), hex(Sha256::digest(trust)));
+    // Likewise the Terraform-cache script: a sandbox made before it existed
+    // has no profile.d file, and its shells fill the RAM-backed root (ENG-2504).
+    let tf = tod_sandbox::node::TERRAFORM_CACHE_SCRIPT.as_bytes();
+    part("terraform-cache", tf);
+    parts.insert("terraform-cache".to_string(), hex(Sha256::digest(tf)));
     if let Some(bytes) = supervisor {
         part("supervisor", bytes);
         parts.insert("supervisor".to_string(), hex(Sha256::digest(bytes)));
@@ -370,6 +375,12 @@ mod tests {
             h.update(bytes);
         }
         assert_ne!(i.stamp, hex(h.finalize()));
+    }
+
+    #[test]
+    fn the_install_stamp_covers_the_terraform_cache_script_so_older_sandboxes_are_stale() {
+        let i = install_of(b"relay", None, None, &[]);
+        assert_eq!(i.parts.get("terraform-cache"), Some(&hex(Sha256::digest(tod_sandbox::node::TERRAFORM_CACHE_SCRIPT.as_bytes()))));
     }
 
     #[test]

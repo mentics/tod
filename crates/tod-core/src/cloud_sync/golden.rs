@@ -23,7 +23,12 @@ pub fn my_stamp(files: &InstallFiles) -> Result<GoldenStamp> {
     let built: u64 = crate::GIT_COMMIT_TIME.parse().map_err(|_| {
         anyhow!("this tod was built without a commit time (not from a git checkout), so it cannot tell a newer golden sandbox from an older one")
     })?;
-    Ok(GoldenStamp { install: files.install().stamp, schema: contract.schema, wire: contract.wire, built })
+    let on_main = match crate::GIT_ON_MAIN {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    };
+    Ok(GoldenStamp { install: files.install().stamp, schema: contract.schema, wire: contract.wire, built, on_main })
 }
 
 /// The repository as owner/name, lower case, from a slug or a URL.
@@ -1306,9 +1311,9 @@ mod tests {
 
     #[test]
     fn a_golden_is_usable_in_blaxels_record_unless_gone_or_newer() {
-        let mine = GoldenStamp { install: "mine".into(), schema: 93, wire: 1, built: 100 };
-        let older = GoldenStamp { install: "old".into(), schema: 92, wire: 1, built: 50 };
-        let newer = GoldenStamp { install: "new".into(), schema: 94, wire: 1, built: 200 };
+        let mine = GoldenStamp { install: "mine".into(), schema: 93, wire: 1, built: 100, on_main: None };
+        let older = GoldenStamp { install: "old".into(), schema: 92, wire: 1, built: 50, on_main: None };
+        let newer = GoldenStamp { install: "new".into(), schema: 94, wire: 1, built: 200, on_main: None };
         assert!(!usable_in("g", None, &mine).unwrap());
         assert!(usable_in("g", Some(&info_with(Some(&older))), &mine).unwrap());
         assert!(usable_in("g", Some(&info_with(None)), &mine).unwrap());
@@ -1382,9 +1387,9 @@ mod tests {
     /// newer one (an older tod must not fork it) is not.
     #[test]
     fn an_existing_golden_is_usable_unless_a_newer_tod_made_it() {
-        let mine = GoldenStamp { install: "mine".into(), schema: 93, wire: 1, built: 100 };
-        let older = GoldenStamp { install: "old".into(), schema: 92, wire: 1, built: 50 };
-        let newer = GoldenStamp { install: "new".into(), schema: 94, wire: 1, built: 200 };
+        let mine = GoldenStamp { install: "mine".into(), schema: 93, wire: 1, built: 100, on_main: None };
+        let older = GoldenStamp { install: "old".into(), schema: 92, wire: 1, built: 50, on_main: None };
+        let newer = GoldenStamp { install: "new".into(), schema: 94, wire: 1, built: 200, on_main: None };
         assert!(usable_by_stamp(&mine, Some(&older)));
         assert!(usable_by_stamp(&mine, Some(&mine)));
         assert!(usable_by_stamp(&mine, None));
@@ -1419,8 +1424,8 @@ mod tests {
     /// called, so no sandbox is made and `sandboxes.toml` is not changed).
     #[test]
     fn an_older_tod_is_refused_a_newer_golden_naming_both_stamps_and_makes_nothing() {
-        let mine = GoldenStamp { install: "mine-files".into(), schema: 93, wire: 1, built: 100 };
-        let newer = GoldenStamp { install: "newer-files".into(), schema: 94, wire: 1, built: 200 };
+        let mine = GoldenStamp { install: "mine-files".into(), schema: 93, wire: 1, built: 100, on_main: None };
+        let newer = GoldenStamp { install: "newer-files".into(), schema: 94, wire: 1, built: 200, on_main: None };
         let info = info_with(Some(&newer));
         let mut said = Vec::new();
         let mut refreshed = false;
@@ -1448,7 +1453,7 @@ mod tests {
     /// new golden's name comes back.
     #[test]
     fn the_same_golden_is_used_and_an_older_or_unstamped_one_is_refreshed() {
-        let mine = GoldenStamp { install: "mine-files".into(), schema: 93, wire: 1, built: 100 };
+        let mine = GoldenStamp { install: "mine-files".into(), schema: 93, wire: 1, built: 100, on_main: None };
         let run = |stamp: Option<GoldenStamp>| {
             let mut refreshed = Vec::new();
             let mut said = Vec::new();
@@ -1466,7 +1471,7 @@ mod tests {
             (out.unwrap(), refreshed, said)
         };
         assert_eq!(run(Some(mine.clone())), ("old-name".to_string(), vec![], vec![]));
-        let older = GoldenStamp { install: "old-files".into(), schema: 92, wire: 1, built: 50 };
+        let older = GoldenStamp { install: "old-files".into(), schema: 92, wire: 1, built: 50, on_main: None };
         let (name, refreshed, said) = run(Some(older));
         assert_eq!((name.as_str(), refreshed), ("new-name", vec!["old-name".to_string()]));
         assert!(said[0].contains("being refreshed") && said[0].contains("older tod"), "{said:?}");
