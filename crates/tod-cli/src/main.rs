@@ -1171,6 +1171,53 @@ Second."), "{listed}");
 
         let _ = std::fs::remove_dir_all(root);
     }
+    /// Six drafts stopped on a "<bot> did not review" request the pull
+    /// request agent raised despite its prompt (2026-11): the refusal is the
+    /// command's.
+    #[test]
+    fn a_pull_request_agent_is_refused_a_request_about_a_review_bot_or_a_github_hiccup() {
+        let (root, node_id, _) = data_root();
+        let node = node_id.to_string();
+        let conversation = Uuid::new_v4();
+        {
+            let fleet = FleetStore::open(&root).unwrap();
+            fleet
+                .interview(
+                    tod_store::interview::ACTOR_AGENT,
+                    tod_store::interview::InterviewCommand::CreateConversation {
+                        id: conversation,
+                        focus: tod_store::conversation::Focus::Node(node_id),
+                        protocol: tod_store::conversation::ProtocolKind::Pr,
+                        platform: None,
+                        model: None,
+                        effort: None,
+                    },
+                )
+                .unwrap();
+        }
+        set_lifecycle(&root, node_id, "pr_draft");
+        // SAFETY: one process per test under nextest; nothing else reads it here.
+        unsafe { std::env::set_var(tod_core::conversation::implement::IMPLEMENT_CONVERSATION_ENV, conversation.to_string()) };
+        let bot = tod_core::pr_readiness::builtin_bots()[0].name;
+        let err = cli(&root, &["decisions", "ask", "--node", &node, &format!("Check why {bot} is not reviewing PR #7")]).unwrap_err();
+        assert!(err.to_string().contains("do not ask the user about the review bot"), "{err}");
+        let err = cli(
+            &root,
+            &["decisions", "ask", "--node", &node, "Fix GitHub: GraphQL: Something went wrong while executing your query"],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("transient GitHub failure"), "{err}");
+        assert_eq!(cli(&root, &["decisions", "list", "--node", &node]).unwrap(), "(no pending decisions)");
+        // A real question still goes through.
+        let asked = cli(&root, &["decisions", "ask", "--node", &node, "Should the migration land before the API change?"]).unwrap();
+        assert!(asked.starts_with("ok "), "{asked}");
+        // And so does the same question in another state.
+        set_lifecycle(&root, node_id, "active");
+        let asked = cli(&root, &["decisions", "ask", "--node", &node, &format!("{bot} is silent, why?")]).unwrap();
+        assert!(asked.starts_with("ok "), "{asked}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn phase_round_trip_status_ready_certify_and_reject() {
         let (root, node_id, _) = data_root();

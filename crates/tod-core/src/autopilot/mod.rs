@@ -790,8 +790,18 @@ impl Autopilot {
                     .lifecycle
                     .review_round_limit
                     .max(1);
-                if self.state.loops.review_rounds >= round_limit {
-                    let node = self.node;
+                let node = self.node;
+                let floor = self.state.loops.review_floor_ms;
+                let rounds_made = self.state.loops.review_rounds;
+                // At the limit a review stops only if its rounds repeat
+                // themselves (`review_progress`); the hard stop is twice it.
+                if rounds_made >= round_limit
+                    && crate::review_progress::limit_reached(
+                        rounds_made,
+                        round_limit,
+                        &fleet.read(|conn| crate::review_progress::finding_rounds(conn, node, floor, false))?,
+                    )
+                {
                     let standing = fleet.read(|conn| {
                         // What the latest review recorded and the fixer claims to have fixed.
                         let latest = tod_store::conversation::ConversationRepo::new(conn)
@@ -2211,7 +2221,14 @@ impl Autopilot {
                     let resuming = self.state.current.as_ref().is_some_and(|c| {
                         c.protocol == protocol_name(ProtocolKind::Review) && c.lifecycle == pr_draft_review::STATE
                     });
-                    if !resuming && rounds >= round_limit {
+                    if !resuming
+                        && rounds >= round_limit
+                        && crate::review_progress::limit_reached(
+                            rounds,
+                            round_limit,
+                            &fleet.read(|conn| crate::review_progress::finding_rounds(conn, node, made_at.max(floor), true))?,
+                        )
+                    {
                         let standing = fleet.read(|conn| pr_draft_review::change_standing(conn, node, made_at))?;
                         // Nothing standing is not non-convergence: review again.
                         if let Some(reason) = NeedsHuman::review_not_converging(rounds, standing) {
@@ -2295,7 +2312,18 @@ impl Autopilot {
                 let resuming = self.state.current.as_ref().is_some_and(|c| {
                     c.protocol == protocol_name(ProtocolKind::Review) && c.lifecycle == pr_draft_review::STATE
                 });
-                if !resuming && rounds >= REVIEW_ROUND_LIMIT {
+                let round_limit = tod_store::TodSettings::load(&tod_store::TodPaths::at(&self.config.data_root))?
+                    .lifecycle
+                    .review_round_limit
+                    .max(1);
+                if !resuming
+                    && rounds >= round_limit
+                    && crate::review_progress::limit_reached(
+                        rounds,
+                        round_limit,
+                        &fleet.read(|conn| crate::review_progress::finding_rounds(conn, node, floor, true))?,
+                    )
+                {
                     // Nothing standing is not a review that fails to converge:
                     // the head is simply reviewed.
                     let standing = fleet.read(|conn| pr_draft_review::stay_standing(conn, node))?;

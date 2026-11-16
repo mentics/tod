@@ -136,6 +136,26 @@ fn answer(inv: &Invocation, args: &Args, env: crate::operator::Env) -> anyhow::R
     Ok(format!("ok {} answered {}{moved}{changed}", short_id(done.decision), done.answered))
 }
 
+/// The error an agent is sent instead of a request it may not raise (about a
+/// review bot or a transient GitHub failure, from the pull request agent in
+/// `pr_draft`/`pr_review`: `tod_core::babysitter_request`). `ask` is the only
+/// way an agent files a request; `report_broken` is tod's own fault filing
+/// (a missing token, say), which the user must see, so it is not checked.
+fn refuse_babysitter_request(inv: &Invocation, node: Uuid, protocol: Option<&str>, question: &str) -> anyhow::Result<()> {
+    if protocol != Some("pr") {
+        return Ok(());
+    }
+    let lifecycle = inv
+        .client()
+        .read(|conn| Ok(tod_store::fleet::repos::task::TaskRepo::new(conn).get_node(&node.to_string())?))?
+        .ok_or_else(|| anyhow::anyhow!("node {node} not found"))?
+        .lifecycle;
+    match tod_core::babysitter_request::refusal(&inv.data_root, node, protocol, &lifecycle, question)? {
+        Some(why) => anyhow::bail!("{why}"),
+        None => Ok(()),
+    }
+}
+
 /// File a `broken` decision for the node this invocation runs for, so a
 /// fault the agent cannot fix reaches the user even if the agent does not
 /// report it. One question stays pending per distinct `what`: a retry loop
@@ -251,6 +271,9 @@ fn ask(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
     {
         protocol = Some(kind);
         guard_reask = false;
+    }
+    if guard_reask {
+        refuse_babysitter_request(inv, node, protocol.as_deref(), &question)?;
     }
     let result = inv.client().interview(InterviewCommand::AskDecision {
         node_id: node,

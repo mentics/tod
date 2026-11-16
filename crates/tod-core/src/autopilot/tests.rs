@@ -3581,6 +3581,12 @@ fn killed_reviews_in_pr_draft_are_not_rounds() {
 /// A finished review of `pr_draft` that recorded one finding the fixer
 /// then claimed fixed: a round that did not come back clean.
 fn seed_unclean_review(fx: &Fixture, n: usize) {
+    seed_unclean_review_saying(fx, &format!("Defect {n}."));
+}
+
+/// [`seed_unclean_review`] with the finding's words: the same words in two
+/// rounds are a finding that came back.
+fn seed_unclean_review_saying(fx: &Fixture, summary: &str) {
     let id = Uuid::new_v4();
     let conversation = |command| fx.fleet.interview(ACTOR_USER, command).unwrap();
     conversation(InterviewCommand::CreateConversation {
@@ -3603,7 +3609,7 @@ fn seed_unclean_review(fx: &Fixture, n: usize) {
             severity: "medium".into(),
             file: None,
             line: None,
-            summary: format!("Defect {n}."),
+            summary: summary.into(),
             detail: None,
         },
     });
@@ -3628,8 +3634,8 @@ fn reviews_that_each_leave_findings_standing_stop_at_the_round_limit_naming_them
     crate::pr_readiness::set_feed_override(Some(feed.clone()));
     with_pr_draft_review(&fx);
     linked_to_prs(&fx, "pr_draft", &["https://github.com/acme/app/pull/42"]);
-    for n in 0..REVIEW_ROUND_LIMIT as usize {
-        seed_unclean_review(&fx, n);
+    for _ in 0..REVIEW_ROUND_LIMIT as usize {
+        seed_unclean_review_saying(&fx, "Defect.");
     }
     assert_eq!(
         fx.fleet.read(|conn| crate::pr_draft_review::unconverged_rounds(conn, fx.node)).unwrap(),
@@ -3640,9 +3646,9 @@ fn reviews_that_each_leave_findings_standing_stop_at_the_round_limit_naming_them
     match &outcome {
         Outcome::NeedsHuman { reason: NeedsHuman::ReviewNotConverging { rounds, standing } } => {
             assert_eq!(*rounds, REVIEW_ROUND_LIMIT);
-            assert!(standing.iter().any(|s| s.contains("Defect 4.")), "{standing:?}");
+            assert!(standing.iter().any(|s| s.contains("Defect.")), "{standing:?}");
             let words = outcome_words(&outcome);
-            assert!(words.contains("Defect 4."), "{words}");
+            assert!(words.contains("Defect."), "{words}");
         }
         other => panic!("{other:?}"),
     }
@@ -3698,8 +3704,8 @@ fn a_user_go_on_after_the_pr_draft_review_limit_counts_the_rounds_from_then() {
     crate::pr_readiness::set_feed_override(Some(feed.clone()));
     with_pr_draft_review(&fx);
     linked_to_prs(&fx, "pr_draft", &["https://github.com/acme/app/pull/42"]);
-    for n in 0..REVIEW_ROUND_LIMIT as usize {
-        seed_unclean_review(&fx, n);
+    for _ in 0..REVIEW_ROUND_LIMIT as usize {
+        seed_unclean_review_saying(&fx, "Defect.");
     }
     let mut agent = FakeAgent::new(&fx.fleet);
     let mut pilot = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO);
@@ -4615,4 +4621,44 @@ fn a_question_for_an_earlier_head_is_withdrawn_by_a_new_commit() {
     let notes = fx.fleet.read(|conn| Ok(tod_store::node_timeline::TimelineRepo::new(conn).list(fx.node)?)).unwrap();
     assert!(notes.iter().any(|e| e.title.contains("has a new head")), "{notes:?}");
     assert!(agent.turns >= 2);
+}
+
+/// Seen live (ENG-2504, 2026-11): five rounds, each finding one or two new
+/// problems the fixer fixed, none repeating, stopped as "not converging".
+#[test]
+fn reviews_that_keep_finding_new_fixed_problems_go_past_the_round_limit_to_the_hard_stop() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    let feed = OwnReviewFeed::new(false);
+    crate::pr_readiness::set_feed_override(Some(feed.clone()));
+    with_pr_draft_review(&fx);
+    linked_to_prs(&fx, "pr_draft", &["https://github.com/acme/app/pull/42"]);
+    for n in 0..REVIEW_ROUND_LIMIT as usize {
+        seed_unclean_review(&fx, n);
+    }
+    let rounds = |fx: &Fixture| fx.fleet.read(|conn| crate::pr_draft_review::unconverged_rounds(conn, fx.node)).unwrap();
+    assert_eq!(rounds(&fx), REVIEW_ROUND_LIMIT);
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let _ = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO).run(&fx.fleet, &mut agent).unwrap();
+    assert!(
+        openings(&fx, ProtocolKind::Review).len() > REVIEW_ROUND_LIMIT as usize,
+        "all-new findings are not stopped at the limit"
+    );
+}
+
+#[test]
+fn the_hard_stop_holds_however_new_the_findings_are() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    let feed = OwnReviewFeed::new(false);
+    crate::pr_readiness::set_feed_override(Some(feed.clone()));
+    with_pr_draft_review(&fx);
+    linked_to_prs(&fx, "pr_draft", &["https://github.com/acme/app/pull/42"]);
+    for n in 0..2 * REVIEW_ROUND_LIMIT as usize {
+        seed_unclean_review(&fx, n);
+    }
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let outcome = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO).run(&fx.fleet, &mut agent).unwrap();
+    assert!(matches!(&outcome, Outcome::NeedsHuman { reason: NeedsHuman::ReviewNotConverging { .. } }), "{outcome:?}");
+    assert_eq!(openings(&fx, ProtocolKind::Review).len(), 2 * REVIEW_ROUND_LIMIT as usize, "no review past the hard stop");
 }

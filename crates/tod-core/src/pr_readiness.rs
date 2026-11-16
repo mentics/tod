@@ -89,7 +89,13 @@ fn is_ask(body: &str, markers: &[String]) -> bool {
 
 /// The built-in bot `name` selects.
 pub fn builtin_bot(name: &str) -> Option<&'static ReviewBot> {
-    [&GREPTILE].into_iter().find(|bot| bot.name.eq_ignore_ascii_case(name.trim()))
+    builtin_bots().into_iter().find(|bot| bot.name.eq_ignore_ascii_case(name.trim()))
+}
+
+/// Every built-in bot: the one list [`builtin_bot`] and the refusal of a
+/// request about a bot ([`crate::babysitter_request`]) read.
+pub fn builtin_bots() -> [&'static ReviewBot; 1] {
+    [&GREPTILE]
 }
 
 impl ReviewBot {
