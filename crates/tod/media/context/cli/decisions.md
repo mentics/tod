@@ -60,3 +60,32 @@ in full or as the 8-character prefix listings show.
 answered and withdrawn ones. `show` prints one decision and its full answer
 log — every answer the user has given it, oldest first, since a change of
 mind adds a new answer rather than replacing the old one.
+
+### A change the sandbox cannot make: hand it to the user to run
+
+In a cloud node's sandbox you have no write access to a production system
+(a web API such as Flagship's, a database, Redis); this is deliberate and
+there is no way around it. When the work needs such a write (a per-org
+resync, a retry, a deploy), file a request (`--reason access`) that asks the
+user to run it on their machine. Never ask for a token, never try another
+route.
+
+- **One call**: put the exact command in the request, ready to paste, with
+  every value filled in, and say what it changes and what you will check
+  afterwards. Options such as "Done, continue" and "Do not run it".
+- **More than one step**: write a script in the sandbox (a file under
+  `/tmp`, set to stop on the first error, printing what it does) and test
+  what you can without the write. The user copies it from the sandbox and
+  runs it, on their own machine from the root of their checkout of the
+  repository (`.local/` is not tracked; `mkdir -p` makes it):
+
+```
+mkdir -p .local && tod-sandbox cp "$TOD_SANDBOX":/tmp/<SCRIPT> .local/<SCRIPT> && bash .local/<SCRIPT>
+```
+
+  Write the request's command with `$TOD_SANDBOX` replaced by your sandbox's
+  name (read it from your own `TOD_SANDBOX` environment variable) and
+  `<SCRIPT>` by the file name, so the user pastes one line. `tod-sandbox cp
+  <name>:<absolute path> <local>` copies one file byte for byte. Tell the user
+  what the script does, in a few lines, before they run it: they are
+  trusting your code with production. Do not leave a secret in the script.

@@ -42,7 +42,8 @@ the service, the action and what went wrong (a refused or expired credential,
 a machine that cannot reach the server, an unknown argument): read it and fix
 the call. Triggering something (a resync, a retry, a deploy) is a change and is
 not available here; when the work needs one, record it as a request for the
-user, naming the exact call.
+user, naming the exact call (see "A change the sandbox cannot make" in
+`decisions`).
 
 It needs the user's machine to be on, with the app running. When it is not
 connected for a moment, `access` waits and asks again by itself, for a few

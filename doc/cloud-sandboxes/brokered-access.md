@@ -111,3 +111,15 @@ workflows`) and were not run against a real server: `service test` or
 `service add --check` shows within seconds whether the deployment's version
 matches. Redis is RESP over TCP or TLS and was tested against a fake server.
 The Flagship paths are whatever the user allows: tod does not know them.
+
+## Writes are never brokered (gap 31)
+
+A node's sandbox has no write access to the Flagship API or any other
+production system, directly or through the broker. A write the sandbox cannot
+make (for example the per-org resync) is a request to the user
+(`tod-cli decisions ask`, reason `access`): one call is given as the exact
+command to paste; anything longer is a script the agent writes in the
+sandbox, which the user copies to their checkout's untracked `.local/` and
+runs with one line: `tod-sandbox cp "$TOD_SANDBOX":/tmp/<script> .local/<script>`
+(`cp` copies one file from the sandbox byte for byte). The agent's side of
+this is the last section of `media/context/cli/decisions.md`.
