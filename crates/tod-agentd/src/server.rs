@@ -93,6 +93,7 @@ pub fn run(data_root: &Path) -> Result<bool> {
 
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let (stamp, built_at) = identity();
+    runners.set_build_time_ms(i64::try_from(built_at).unwrap_or(i64::MAX).saturating_mul(1000));
     let info = Info {
         pid: std::process::id(),
         port: listener.local_addr()?.port(),

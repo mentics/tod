@@ -90,6 +90,12 @@ struct Inner {
     /// When the stale waits were last swept (ms; 0 = never), so the
     /// reconciler writes at most once per [`WAIT_SWEEP_EVERY_MS`].
     last_wait_sweep: std::sync::atomic::AtomicI64,
+    /// When this build was made (ms; 0 = not known): requests filed before it
+    /// whose cause a deploy can remove are re-examined once
+    /// (`tod_core::decision_recheck`).
+    build_time_ms: std::sync::atomic::AtomicI64,
+    /// Whether that re-examination has been done by this process.
+    rechecked: std::sync::atomic::AtomicBool,
 }
 
 /// How often the reconciler sweeps waits nothing serves.
@@ -215,7 +221,36 @@ impl Runners {
                 subscribers: Mutex::new(Vec::new()),
                 actors: Mutex::new(ActorTracker::default()),
                 last_wait_sweep: std::sync::atomic::AtomicI64::new(0),
+                build_time_ms: std::sync::atomic::AtomicI64::new(0),
+                rechecked: std::sync::atomic::AtomicBool::new(false),
             }),
+        }
+    }
+
+    /// Say when this build was made, so the first tick re-examines the
+    /// requests filed before it (`tod_core::decision_recheck`).
+    pub fn set_build_time_ms(&self, ms: i64) {
+        self.inner.build_time_ms.store(ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Withdraw, once per process, the requests whose cause this build may
+    /// have fixed; the nodes' runs continue on the next tick, as for an
+    /// answered request. Not marked done on a failure, so the next tick tries
+    /// again.
+    fn recheck_requests(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let built_at = self.inner.build_time_ms.load(Relaxed);
+        if built_at <= 0 || self.inner.rechecked.load(Relaxed) {
+            return;
+        }
+        match tod_core::decision_recheck::sweep(&self.inner.store, built_at) {
+            Ok(withdrawn) => {
+                self.inner.rechecked.store(true, Relaxed);
+                for d in &withdrawn {
+                    tracing::info!(node = %d.node_id, request = %d.id, "withdrew a request filed before this build; its cause may be fixed");
+                }
+            }
+            Err(err) => tracing::error!("re-examining the requests filed before this build failed: {err:#}"),
         }
     }
 
@@ -307,6 +342,9 @@ impl Runners {
         if let Err(err) = self.reconcile() {
             tracing::error!("reconciling the runs failed: {err:#}");
         }
+        // After `start_due` has seen each node waiting, so the next tick sees
+        // its request gone and continues the run.
+        self.recheck_requests();
     }
 
     fn start_due(&self) {

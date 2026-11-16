@@ -532,6 +532,15 @@ impl<'a> DecisionRepo<'a> {
         Ok(rows)
     }
 
+    /// Every pending decision of every node, oldest first.
+    pub fn list_pending(&self) -> Result<Vec<Decision>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {DECISION_COLUMNS} FROM decisions WHERE status = 'pending' ORDER BY created_at"
+        ))?;
+        let rows = stmt.query_map([], map_decision)?.collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Pending decisions on one node, oldest first.
     pub fn list_pending_for_node(&self, node_id: Uuid) -> Result<Vec<Decision>> {
         let mut stmt = self.conn.prepare(&format!(

@@ -489,10 +489,14 @@ from Blaxel.
   that no longer applies; the options say "AWS CLI installed and SSO logged in".
 - **Cause**: pending decisions are never re-examined when a fix lands, and a node reaching
   `done` does not clear its run state's request.
-- **Fix**: open. Answered by hand ("Fixed, try again"); after the restart ENG-3358 went on
-  to query prod KB through the shim and asked a real product question.
-- **Measure**: pending decisions older than the deploy that fixed their cause; `done`
-  nodes with a pending decision.
+- **Fix**: the done-node half separately. The rest 2026-11-16 (shepherd gap 4):
+  `tod_core::decision_recheck` withdraws, once when `tod-agentd` starts on a build, every
+  pending `broken`/`access`/`capability` request (and the `supervisor:config` stop question)
+  filed before that build was made; the node's run continues as for an answered request and
+  asks again if the cause still holds. Judgment requests (intent, risk, ...), failure, budget,
+  watchdog, bot-silence and permission requests are left.
+- **Measure**: pending decisions older than the deploy that fixed their cause
+  (`decision_recheck::pending_older_than`); `done` nodes with a pending decision.
 
 ### Open minor gaps in the memory-freeing script (bc49872f)
 

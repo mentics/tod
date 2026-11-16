@@ -59,6 +59,7 @@ pub mod journey;
 pub mod lifecycle;
 pub mod lifecycle_next;
 pub mod lifecycle_validity;
+pub mod decision_recheck;
 pub mod lost_work;
 pub mod next_actor;
 pub mod node_problems;
