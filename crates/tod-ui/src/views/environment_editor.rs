@@ -16,6 +16,7 @@ use gpui::{
     Render, Styled, Subscription, Window, div, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::checkbox::Checkbox;
 use gpui_component::input::{Input, InputState, Textarea, TextareaState};
 use gpui_component::select::{Select, SelectEvent, SelectState};
 use gpui_component::{ActiveTheme, Disableable, Selectable, Sizable, StyledExt, h_flex, v_flex};
@@ -24,6 +25,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tod_store::environment::{self, Auth, Entry, EntryKind, Resolved};
 use tod_store::environment_presets::{self, Preset};
+use tod_store::environment_transfer::{self, Mode, OnConflict};
 use tod_store::fleet::FleetStore;
 use tod_store::outline::OutlineMutation;
 use tod_store::CredentialStore;
@@ -43,6 +45,7 @@ pub struct EnvironmentEditor {
     is_set: HashMap<String, bool>,
     presets: Vec<Preset>,
     form: Option<Form>,
+    transfer: Option<Transfer>,
     error: Option<String>,
     _subscriptions: Vec<Subscription>,
 }
@@ -71,6 +74,24 @@ struct Form {
     _subs: Vec<Subscription>,
 }
 
+/// The "Copy or move to another node" panel: which of this node's own
+/// entries go where, and what to do with a name the target already has.
+struct Transfer {
+    /// Every other node: its label and id.
+    targets: Vec<(String, Uuid)>,
+    select: Entity<SelectState<Vec<String>>>,
+    target: Option<Uuid>,
+    /// Each own entry: name, is a secret, picked.
+    names: Vec<(String, bool, bool)>,
+    /// Names the chosen target already defines.
+    conflicts: Vec<String>,
+    mode_move: bool,
+    overwrite: bool,
+    working: bool,
+    result: Option<(bool, String)>,
+    _sub: Subscription,
+}
+
 fn text(input: &Entity<InputState>, cx: &gpui::App) -> String {
     input.read(cx).text().to_string()
 }
@@ -87,6 +108,7 @@ impl EnvironmentEditor {
             is_set: HashMap::new(),
             presets: Vec::new(),
             form: None,
+            transfer: None,
             error: None,
             _subscriptions: Vec::new(),
         };
@@ -99,6 +121,7 @@ impl EnvironmentEditor {
         if self.node != node {
             self.node = node;
             self.form = None;
+            self.transfer = None;
             self.error = None;
             self.enabled = enabled;
             self.reload(cx);
@@ -354,6 +377,293 @@ impl EnvironmentEditor {
             });
         })
         .detach();
+    }
+
+    /// Open the transfer panel: list the other nodes off the UI thread.
+    fn open_transfer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let fleet = self.fleet.clone();
+        let node = self.node;
+        let names: Vec<(String, bool, bool)> =
+            self.own_entries().iter().map(|e| (e.name.clone(), e.kind == EntryKind::Secret, true)).collect();
+        cx.spawn_in(window, async move |this, cx| {
+            let nodes = cx
+                .background_executor()
+                .spawn(async move {
+                    fleet.read(|conn| tod_store::outline::repos::NodeRepo::new(conn).list_all())
+                })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| match nodes {
+                Ok(nodes) => {
+                    let targets: Vec<(String, Uuid)> = nodes
+                        .into_iter()
+                        .filter(|n| n.id != node)
+                        .map(|n| (format!("{} ({})", n.title, n.slug), n.id))
+                        .collect();
+                    let labels: Vec<String> = targets.iter().map(|(l, _)| l.clone()).collect();
+                    let select = cx.new(|cx| SelectState::new(labels, None, window, cx).searchable(true));
+                    let sub = cx.subscribe_in(&select, window, |this, _, ev: &SelectEvent<Vec<String>>, _, cx| {
+                        if let SelectEvent::Confirm(Some(label)) = ev {
+                            let id = this
+                                .transfer
+                                .as_ref()
+                                .and_then(|t| t.targets.iter().find(|(l, _)| l == label).map(|(_, id)| *id));
+                            if let Some(id) = id {
+                                this.choose_target(id, cx);
+                            }
+                        }
+                    });
+                    this.transfer = Some(Transfer {
+                        targets,
+                        select,
+                        target: None,
+                        names,
+                        conflicts: Vec::new(),
+                        mode_move: false,
+                        overwrite: false,
+                        working: false,
+                        result: None,
+                        _sub: sub,
+                    });
+                    cx.notify();
+                }
+                Err(e) => {
+                    this.error = Some(format!("{e:#}"));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// The target was picked: find which of its names would conflict.
+    fn choose_target(&mut self, target: Uuid, cx: &mut Context<Self>) {
+        let Some(t) = self.transfer.as_mut() else { return };
+        t.target = Some(target);
+        t.conflicts.clear();
+        t.result = None;
+        cx.notify();
+        let (fleet, root, node) = (self.fleet.clone(), self.data_root.clone(), self.node);
+        cx.spawn(async move |this, cx| {
+            let plan = cx
+                .background_executor()
+                .spawn(async move {
+                    environment_transfer::plan(&fleet, &CredentialStore::from_data_root(&root), node, target)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if let Some(t) = this.transfer.as_mut().filter(|t| t.target == Some(target)) {
+                    match plan {
+                        Ok(items) => t.conflicts = items.into_iter().filter(|i| i.conflict).map(|i| i.name).collect(),
+                        Err(e) => t.result = Some((false, format!("{e:#}"))),
+                    }
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn run_transfer(&mut self, cx: &mut Context<Self>) {
+        let Some(t) = self.transfer.as_mut() else { return };
+        let Some(target) = t.target else {
+            t.result = Some((false, "Choose the node to copy to first.".into()));
+            cx.notify();
+            return;
+        };
+        let picked: Vec<String> = t.names.iter().filter(|(_, _, p)| *p).map(|(n, _, _)| n.clone()).collect();
+        if picked.is_empty() {
+            t.result = Some((false, "Pick at least one entry.".into()));
+            cx.notify();
+            return;
+        }
+        let mode = if t.mode_move { Mode::Move } else { Mode::Copy };
+        let policy = if t.overwrite { OnConflict::Overwrite } else { OnConflict::Skip };
+        t.working = true;
+        t.result = None;
+        cx.notify();
+        let (fleet, root, node) = (self.fleet.clone(), self.data_root.clone(), self.node);
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    environment_transfer::transfer(
+                        &fleet,
+                        &CredentialStore::from_data_root(&root),
+                        node,
+                        target,
+                        Some(&picked),
+                        mode,
+                        policy,
+                    )
+                    .map(|o| (o.summary(mode), o.removed_from_source))
+                    .map_err(|e| format!("{e:#}"))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if let Some(t) = this.transfer.as_mut() {
+                    t.working = false;
+                    t.result = Some(match result {
+                        Ok((summary, removed)) => {
+                            // A move took them off this node: stop listing them.
+                            t.names.retain(|(n, _, _)| !removed.iter().any(|r| r.eq_ignore_ascii_case(n)));
+                            t.conflicts.clear();
+                            (true, summary)
+                        }
+                        Err(e) => (false, e),
+                    });
+                }
+                this.reload(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn render_transfer(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some(t) = &self.transfer else { return div().into_any_element() };
+        let muted = cx.theme().muted_foreground;
+        let warn = cx.theme().warning;
+        let mut col = v_flex()
+            .gap_2()
+            .w_full()
+            .p_2()
+            .rounded_md()
+            .border_1()
+            .border_color(cx.theme().list_active_border)
+            .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _, cx| {
+                if ev.keystroke.key == "escape" {
+                    this.transfer = None;
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+            }))
+            .child(div().text_sm().font_semibold().child("Copy or move to another node"))
+            .child(Self::field("To node", Select::new(&t.select).placeholder("Search for a node").small()))
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(
+                        Button::new("env-xfer-copy")
+                            .label("Copy")
+                            .compact()
+                            .selected(!t.mode_move)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(t) = this.transfer.as_mut() {
+                                    t.mode_move = false;
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("env-xfer-move")
+                            .label("Move (remove here)")
+                            .compact()
+                            .selected(t.mode_move)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(t) = this.transfer.as_mut() {
+                                    t.mode_move = true;
+                                }
+                                cx.notify();
+                            })),
+                    ),
+            );
+        let mut list = v_flex().gap_1();
+        for (i, (name, secret, picked)) in t.names.iter().enumerate() {
+            let conflict = t.conflicts.iter().any(|c| c.eq_ignore_ascii_case(name));
+            let label = format!(
+                "{name} · {}{}",
+                if *secret { "secret (value goes with it)" } else { "variable" },
+                if conflict { " · already on the target" } else { "" }
+            );
+            list = list.child(
+                Checkbox::new(("env-xfer-pick", i))
+                    .label(label)
+                    .checked(*picked)
+                    .on_click(cx.listener(move |this, checked: &bool, _, cx| {
+                        if let Some(t) = this.transfer.as_mut()
+                            && let Some(row) = t.names.get_mut(i)
+                        {
+                            row.2 = *checked;
+                        }
+                        cx.notify();
+                    })),
+            );
+        }
+        col = col.child(list);
+        if !t.conflicts.is_empty() {
+            col = col
+                .child(div().text_xs().text_color(warn).child(format!(
+                    "{} already on the target: choose what to do with them.",
+                    t.conflicts.len()
+                )))
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .child(
+                            Button::new("env-xfer-skip")
+                                .label("Skip those")
+                                .compact()
+                                .selected(!t.overwrite)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(t) = this.transfer.as_mut() {
+                                        t.overwrite = false;
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            Button::new("env-xfer-overwrite")
+                                .label("Overwrite them")
+                                .compact()
+                                .selected(t.overwrite)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(t) = this.transfer.as_mut() {
+                                        t.overwrite = true;
+                                    }
+                                    cx.notify();
+                                })),
+                        ),
+                );
+        }
+        col = col.child(
+            h_flex()
+                .gap_2()
+                .items_center()
+                .child(
+                    Button::new("env-xfer-go")
+                        .label(if t.working {
+                            "Working…"
+                        } else if t.mode_move {
+                            "Move"
+                        } else {
+                            "Copy"
+                        })
+                        .primary()
+                        .compact()
+                        .disabled(t.working || t.target.is_none())
+                        .on_click(cx.listener(|this, _, _, cx| this.run_transfer(cx))),
+                )
+                .child(
+                    Button::new("env-xfer-close")
+                        .label("Close")
+                        .ghost()
+                        .compact()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.transfer = None;
+                            cx.notify();
+                        })),
+                ),
+        );
+        if let Some((ok, message)) = &t.result {
+            col = col.child(
+                div()
+                    .text_xs()
+                    .text_color(if *ok { cx.theme().success } else { cx.theme().danger })
+                    .child(selectable_text("env-xfer-result", message.clone(), window, cx)),
+            );
+        }
+        let _ = muted;
+        col.into_any_element()
     }
 
     fn remove(&mut self, name: String, cx: &mut Context<Self>) {
@@ -668,14 +978,28 @@ impl Render for EnvironmentEditor {
             col = col.child(self.render_row(i, r, window, cx));
         }
         if self.enabled && self.form.is_none() {
+            let has_own = self.resolved.iter().any(|r| !r.inherited);
             col = col.child(
-                h_flex().child(
-                    Button::new("env-add")
-                        .label("Add variable or secret")
-                        .compact()
-                        .on_click(cx.listener(|this, _, window, cx| this.open_form(None, window, cx))),
-                ),
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("env-add")
+                            .label("Add variable or secret")
+                            .compact()
+                            .on_click(cx.listener(|this, _, window, cx| this.open_form(None, window, cx))),
+                    )
+                    .when(has_own && self.transfer.is_none(), |el| {
+                        el.child(
+                            Button::new("env-transfer")
+                                .label("Copy or move to another node…")
+                                .compact()
+                                .on_click(cx.listener(|this, _, window, cx| this.open_transfer(window, cx))),
+                        )
+                    }),
             );
+        }
+        if self.transfer.is_some() && self.form.is_none() {
+            col = col.child(self.render_transfer(window, cx));
         }
         if self.form.is_some() {
             col = col.child(self.render_form(window, cx));

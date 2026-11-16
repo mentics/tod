@@ -18,6 +18,7 @@ pub mod environment;
 pub mod groups;
 pub mod lifecycle_config;
 pub mod environment_presets;
+pub mod environment_transfer;
 pub mod fleet;
 pub mod incoming;
 pub mod install;

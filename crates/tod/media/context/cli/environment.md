@@ -15,6 +15,8 @@ tod-cli --data-root <DATA_ROOT> environment set-variable <NAME> <VALUE> [--env-v
 tod-cli --data-root <DATA_ROOT> environment set-secret <NAME> [VALUE] [--node <NODE>]
 tod-cli --data-root <DATA_ROOT> environment test <NAME> [--node <NODE>]
 tod-cli --data-root <DATA_ROOT> environment remove <NAME> [--node <NODE>]
+tod-cli --data-root <DATA_ROOT> environment copy --from <NODE> --to <NODE> [<NAME>...] [--on-conflict skip|overwrite]
+tod-cli --data-root <DATA_ROOT> environment move --from <NODE> --to <NODE> [<NAME>...] [--on-conflict skip|overwrite]
 ```
 
 Use a variable as it is (it is in your process environment). Use a credential
@@ -39,3 +41,9 @@ call the API directly.
 - `test` makes the service's harmless test request with the stored value and
   says whether it was accepted.
 - `remove` deletes an entry defined on this node.
+- `copy` and `move` take entries defined on the `--from` node itself (all of
+  them, or the names given) to the `--to` node, secret values included and
+  never shown. A name the target already defines is a conflict: without
+  `--on-conflict` nothing changes and the conflicts are listed; `skip` keeps
+  the target's own, `overwrite` replaces it. Like `set-secret`, they are for
+  when the user asks you to.

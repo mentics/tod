@@ -9,6 +9,7 @@
 use crate::Invocation;
 use crate::args::Args;
 use tod_store::environment::{self, Auth, Entry, EntryKind, Resolved};
+use tod_store::environment_transfer::{self, Mode, OnConflict};
 use tod_store::decisions::NewDecision;
 use tod_store::interview::InterviewCommand;
 use tod_store::outline::{Capability, OutlineMutation};
@@ -31,6 +32,8 @@ COMMANDS:
     set-secret  <NAME> [VALUE] [--node <NODE>]
     test        <NAME> [--node <NODE>]
     remove      <NAME> [--node <NODE>]
+    copy        --from <NODE> --to <NODE> [<NAME>...] [--on-conflict skip|overwrite]
+    move        --from <NODE> --to <NODE> [<NAME>...] [--on-conflict skip|overwrite]
 
 `list` shows each entry: its name, kind (variable or secret), the environment
 variable it becomes, its description, and for a secret whether it is set and
@@ -46,6 +49,13 @@ is omitted so it stays out of shell history; it is the user's to run, not
 yours. `test` makes the preset's harmless test request with the stored value
 and says whether the service accepted it. `remove` deletes an entry defined on
 this node, and a secret's stored value with it.
+`copy` and `move` take entries defined on the --from node itself (all of them,
+or the <NAME>s given) to the --to node, secret values included and never
+shown; the target's Environment is enabled if needed. A name the target already
+defines is a conflict: with no --on-conflict nothing is changed and the
+conflicts are listed; `skip` leaves the target's own, `overwrite` replaces it.
+`move` removes from the source only what reached the target. They are the
+user's to run, as `set-secret` is.
 ";
 
 pub fn run(inv: Invocation) -> anyhow::Result<String> {
@@ -64,6 +74,8 @@ pub fn run(inv: Invocation) -> anyhow::Result<String> {
         "set-secret" => set_secret(&inv, &args),
         "test" => test(&inv, &args),
         "remove" => remove(&inv, &args),
+        "copy" => transfer(&inv, &args, Mode::Copy),
+        "move" => transfer(&inv, &args, Mode::Move),
         other => anyhow::bail!("unknown command `{other}`\n\n{}", USAGE.trim_end()),
     }
 }
@@ -371,4 +383,57 @@ fn request(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
     })?;
     let _ = result;
     Ok(format!("ok asked the user for {name}; carry on with what does not need it"))
+}
+
+fn transfer(inv: &Invocation, args: &Args, mode: Mode) -> anyhow::Result<String> {
+    let from = crate::node::resolve(inv, args.require("--from")?)?;
+    let to = crate::node::resolve(inv, args.require("--to")?)?;
+    let names: Vec<String> = args.positional.clone();
+    let names = (!names.is_empty()).then_some(names);
+    let policy = match args.get("--on-conflict") {
+        None => None,
+        Some("skip") => Some(OnConflict::Skip),
+        Some("overwrite") => Some(OnConflict::Overwrite),
+        Some(other) => anyhow::bail!("--on-conflict is skip or overwrite (got `{other}`)"),
+    };
+    if from == to {
+        anyhow::bail!("--from and --to are the same node");
+    }
+    let store = CredentialStore::from_data_root(&inv.data_root);
+    let (source, target) = (own_entries(inv, from)?, own_entries(inv, to)?);
+    let conflicts: Vec<&str> = source
+        .iter()
+        .filter(|e| names.as_ref().is_none_or(|ns| ns.iter().any(|n| n.eq_ignore_ascii_case(&e.name))))
+        .filter(|e| target.iter().any(|t| t.name.eq_ignore_ascii_case(&e.name)))
+        .map(|e| e.name.as_str())
+        .collect();
+    if policy.is_none() && !conflicts.is_empty() {
+        anyhow::bail!(
+            "the target already defines {}; nothing changed. Run again with --on-conflict skip or overwrite",
+            conflicts.join(", ")
+        );
+    }
+    run_transfer(inv, &store, from, to, names.as_deref(), mode, policy.unwrap_or(OnConflict::Skip))
+}
+
+fn run_transfer(
+    inv: &Invocation,
+    store: &CredentialStore,
+    from: Uuid,
+    to: Uuid,
+    names: Option<&[String]>,
+    mode: Mode,
+    policy: OnConflict,
+) -> anyhow::Result<String> {
+    let out = environment_transfer::transfer_with(
+        store,
+        from,
+        to,
+        names,
+        mode,
+        policy,
+        || Ok((own_entries(inv, from)?, own_entries(inv, to)?, has_capability(inv, to)?)),
+        |mutation| write(inv, mutation),
+    )?;
+    Ok(format!("ok {}", out.summary(mode)))
 }
