@@ -313,8 +313,13 @@ node's own check (`tod_core::autopilot::check_github`) against the user's
 copy of the database. Still waiting, it has recorded the next look and the wake
 moves to it (under the new wait's id), with the sandbox left asleep, or gone.
 Clear, it pokes and the node goes on. If GitHub cannot be read from here (no
-access configured, a failed read) it says why on stderr and pokes, so the
-sandbox's own check, with the user's token, decides. Wakes from webhooks,
+access configured, a pull request the token cannot see, a failed read) it never
+pokes: a sandbox cannot read what the orchestrator could not, and each poke
+would reset the sandbox's idle clock, so the workspace's idle prune never takes
+it. The failure is recorded on the node (`look_failed_next_look`: its
+`github:pr:read` wait shows the error, and a failure retrying cannot help, such
+as a 404, puts the node on the user's list as failed) and the wake looks again
+in at most ten minutes, until a look reads GitHub and clears it. Wakes from webhooks,
 answers, and every other wait are not gated. The orchestrator reads GitHub
 through its own sandbox's proxy, so no token is on its disk or in its
 environment (see GitHub access, below). With `scheduler = "blaxel"` the node's own

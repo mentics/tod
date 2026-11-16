@@ -161,6 +161,28 @@ pub fn github_look_failed(
     }
 }
 
+/// A look at GitHub failed where no run is going to handle it (the
+/// orchestrator's wake gate, for a node whose sandbox is asleep). Records the
+/// failure exactly as [`github_look_failed`] does, so it counts, shows
+/// (`tod_core::next_actor`: waiting to retry, or failed on the user's list once
+/// retrying cannot help) and is cleared by the first look that reads GitHub,
+/// and returns when to look again (ms since the epoch): the retry the failure
+/// asks for, else [`retry_delay_ms`]'s longest. It never says to wake the
+/// sandbox: a sandbox cannot read what the orchestrator could not, and waking
+/// it only resets its idle clock.
+pub fn look_failed_next_look(
+    fleet: &FleetStore,
+    node: uuid::Uuid,
+    releasing: bool,
+    error: &str,
+    now_ms: i64,
+) -> Result<i64> {
+    Ok(match github_look_failed(fleet, node, releasing, error)? {
+        Outcome::Waiting { due_at_ms, .. } => due_at_ms,
+        _ => now_ms + retry_delay_ms(u32::MAX),
+    })
+}
+
 /// The node's `github:*:read` waits end: GitHub has been read since.
 pub(super) fn clear_read_failures(fleet: &FleetStore, node: uuid::Uuid) -> Result<()> {
     cancel_waits(fleet, node, |spec| spec.ends_with(":read") && spec.starts_with("github:"))

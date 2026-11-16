@@ -17,18 +17,19 @@
 //!   the working day, hours outside it), never a sandbox wake. A bot's
 //!   review, running checks, and work for the agent still poke.
 //! - Clear, or nothing to wait on: poke, the node goes on.
-//! - Not readable (no GitHub access here, a failed read): poke, as before,
-//!   and say why on stderr; the sandbox's own check then reads GitHub with
-//!   the user's token.
+//! - Not readable (no GitHub access here, a missing pull request, a failed
+//!   read): never a poke. The failure is recorded on the node
+//!   (`look_failed_next_look`: shown, counted, on the user's list when
+//!   retrying cannot help) and the wake looks again later.
 //!
 //! Only a wake whose id is a pending `github:` event wait is looked at;
 //! every other wake is poked as it always was.
 
 use crate::users::Users;
-use crate::wakes::{Verdict, Wake, WakeGate};
+use crate::wakes::{Verdict, Wake, WakeGate, now_ms};
 use anyhow::{Context, Result};
 use std::sync::Arc;
-use tod_core::autopilot::{GithubCheck, check_github};
+use tod_core::autopilot::{GithubCheck, check_github, look_failed_next_look};
 use tod_store::waits::WaitRepo;
 use uuid::Uuid;
 
@@ -97,9 +98,15 @@ impl GithubGate {
                 eprintln!("tod-orchestrator: {}'s node {node} has feedback to address ({what}); waking its sandbox", wake.user);
                 Ok(Verdict::Poke)
             }
+            // Not readable (no access, a failed read): the node's sandbox
+            // would read it no better, so it is not woken. The failure is
+            // recorded on the node (shown, counted, on the user's list once
+            // retrying cannot help) and the look is tried again later, under
+            // the same wake.
             GithubCheck::Unreadable(why) => {
-                eprintln!("tod-orchestrator: cannot look at GitHub for {}'s node {node}: {why}; waking its sandbox", wake.user);
-                Ok(Verdict::Poke)
+                eprintln!("tod-orchestrator: cannot look at GitHub for {}'s node {node}: {why}; recorded on the node, looking again later", wake.user);
+                let at = look_failed_next_look(&data.store, node, lifecycle == "merged", &why, now_ms())?;
+                Ok(Verdict::Later { id: wake.id.clone(), at })
             }
         }
     }

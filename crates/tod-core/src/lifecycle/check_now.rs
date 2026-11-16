@@ -254,6 +254,47 @@ mod tests {
         crate::pr_readiness::set_feed_override(None);
     }
 
+    /// A feed that cannot find the pull request (a token that cannot see its repository).
+    struct NotFound;
+    impl crate::pr_readiness::PrFeed for NotFound {
+        fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<PrSnapshot, String> {
+            Err("pull request not found (GitHub also answers 404 when tod's token cannot see the repository)".into())
+        }
+    }
+
+    /// The orchestrator's gate never wakes a sandbox for a pull request it cannot
+    /// read: the failure is recorded on the node (it stops, naming the error,
+    /// since asking again cannot help), and the next look is scheduled.
+    #[test]
+    fn an_unreadable_pull_request_is_recorded_not_poked() {
+        let fx = fixture();
+        fx.fleet
+            .enqueue_outline(OutlineMutation::EnableCapabilities { node_id: fx.node, capabilities: vec![Capability::Ticket] })
+            .unwrap();
+        fx.fleet.writer().flush().unwrap();
+        fx.fleet
+            .enqueue(FleetMutation::UpdateTaskLinkedPrs {
+                id: fx.node.to_string(),
+                linked_prs: vec!["https://github.com/acme/app/pull/42".into()],
+            })
+            .unwrap();
+        fx.fleet.writer().flush().unwrap();
+        fx.fleet.reload_if_stale().ok();
+        enable_lifecycle(&fx, "pr_draft");
+        crate::pr_readiness::set_feed_override(Some(Arc::new(NotFound)));
+
+        let found = crate::autopilot::check_github(&fx.fleet, fx.node, &fx.root, "pr_draft").unwrap();
+        let GithubCheck::Unreadable(why) = found else { panic!("{found:?}") };
+        let now = 1_000_000;
+        let at = crate::autopilot::look_failed_next_look(&fx.fleet, fx.node, false, &why, now).unwrap();
+        assert!(at > now, "the next look is later: {at}");
+        let waits = fx.fleet.read(|conn| tod_store::waits::WaitRepo::new(conn).list_pending_for_node(fx.node)).unwrap();
+        let read = waits.iter().find(|w| w.match_spec == "github:pr:read").expect("the failure is recorded");
+        assert!(read.last_error.as_deref().is_some_and(|e| e.contains("not found")), "{:?}", read.last_error);
+        assert!(read.exhausted(), "a missing pull request is not retried by the run: it is on the user's list");
+        crate::pr_readiness::set_feed_override(None);
+    }
+
     /// A pull request as the feed shows it: ready for review (not a draft),
     /// with the review threads given.
     struct Ready(Vec<tod_store::github::ReviewThread>);

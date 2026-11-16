@@ -25,7 +25,8 @@
 
 mod github_wait;
 pub use github_wait::{
-    GithubCheck, check_github, check_now, github_look_failed, read_wait_spec, retry_delay_ms,
+    GithubCheck, check_github, check_now, github_look_failed, look_failed_next_look, read_wait_spec,
+    retry_delay_ms,
 };
 pub mod local;
 mod state;
