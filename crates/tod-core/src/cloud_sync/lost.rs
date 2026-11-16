@@ -51,6 +51,70 @@ pub fn lost_rows(rows: &[CloudNodeRow], listing: Option<&[SandboxInfo]>) -> Vec<
         .collect()
 }
 
+/// How the control plane answers for one sandbox by name (`Blaxel::get`):
+/// `Ok(None)` only for a definite "no such sandbox"; every other failure
+/// (auth, rate limit, 5xx, a timeout, the not-ready 404) is an `Err`.
+pub trait SandboxLookup {
+    fn get(&self, name: &str) -> Result<Option<SandboxInfo>>;
+}
+
+impl SandboxLookup for tod_sandbox::blaxel::Blaxel {
+    fn get(&self, name: &str) -> Result<Option<SandboxInfo>> {
+        tod_sandbox::blaxel::Blaxel::get(self, name)
+    }
+}
+
+/// Tries per name, and the pause between them, when a name's own lookup fails.
+const LOOKUP_ATTEMPTS: u32 = 3;
+const LOOKUP_PAUSE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// `listing` made trustworthy for every name in `names`: Blaxel's listing has
+/// come back without sandboxes that exist (17 nodes' sandboxes at a daemon
+/// start, each then replaced under the same name), so absence from it proves
+/// nothing. Each name it lacks is asked for on its own, and is absent only
+/// when that answers a definite "no such sandbox"; a sandbox found there is
+/// added to the listing (so its status is judged as for any other). A failed
+/// lookup is retried, then is an error naming the sandbox and why, so nothing
+/// is replaced or forgotten on a guess.
+pub fn confirm_listing(
+    mut listing: Vec<SandboxInfo>,
+    names: &[String],
+    lookup: &dyn SandboxLookup,
+    attempts: u32,
+    pause: std::time::Duration,
+) -> Result<Vec<SandboxInfo>> {
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for name in names {
+        if !seen.insert(name.as_str()) || listing.iter().any(|s| &s.name == name) {
+            continue;
+        }
+        let mut tries = 0;
+        let found = loop {
+            tries += 1;
+            match lookup.get(name) {
+                Ok(found) => break found,
+                Err(err) if tries < attempts.max(1) => {
+                    tracing::warn!("cloud: asking Blaxel for sandbox {name} failed (try {tries}): {err:#}");
+                    std::thread::sleep(pause);
+                }
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!(
+                            "Blaxel's listing lacks sandbox {name} and asking for it by name failed \
+                             {tries} time(s); not treating it as gone"
+                        )
+                    });
+                }
+            }
+        };
+        if let Some(info) = found {
+            tracing::warn!("cloud: Blaxel's listing lacked sandbox {name} but it exists ({}); keeping it", info.status);
+            listing.push(info);
+        }
+    }
+    Ok(listing)
+}
+
 /// Drops the `sandboxes.toml` entry of every sandbox absent from Blaxel's
 /// `listing` (it expired or was deleted), saving only if one went. Returns
 /// the names forgotten.
@@ -297,7 +361,14 @@ pub fn check(fleet: &FleetStore, check: Check) -> Result<Repaired> {
     let listing = match check {
         Check::Full => {
             let mut sandboxes = tod_store::fleet::sandbox::Sandboxes::load(&root)?;
-            let listing = sandboxes.blaxel()?.list().context("list the workspace's sandboxes")?;
+            let bx = sandboxes.blaxel()?;
+            let listing = bx.list().context("list the workspace's sandboxes")?;
+            let names: Vec<String> = rows
+                .iter()
+                .map(|r| r.sandbox.clone())
+                .chain(sandboxes.config.sandboxes.iter().map(|s| s.name.clone()))
+                .collect();
+            let listing = confirm_listing(listing, &names, &bx, LOOKUP_ATTEMPTS, LOOKUP_PAUSE)?;
             let gone = forget_gone_sandboxes(&mut sandboxes, &listing).context("forget sandboxes Blaxel no longer has")?;
             if !gone.is_empty() {
                 tracing::info!("cloud: forgot {} sandbox(es) no longer in Blaxel: {}", gone.len(), gone.join(", "));
@@ -1133,6 +1204,75 @@ mod tests {
         let names: Vec<_> = saved.config.sandboxes.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, ["live", "failed"]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Answers each name from a table: a sandbox, a definite not-found, or an error.
+    struct FakeLookup {
+        answers: Vec<(&'static str, std::result::Result<Option<&'static str>, &'static str>)>,
+        calls: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl SandboxLookup for FakeLookup {
+        fn get(&self, name: &str) -> Result<Option<SandboxInfo>> {
+            self.calls.borrow_mut().push(name.to_string());
+            match self.answers.iter().find(|(n, _)| *n == name).map(|(_, a)| a) {
+                Some(Ok(Some(status))) => Ok(Some(sandbox(name, status))),
+                Some(Ok(None)) => Ok(None),
+                Some(Err(why)) => bail!("{why}"),
+                None => panic!("unexpected lookup of {name}"),
+            }
+        }
+    }
+
+    fn confirm(
+        listing: Vec<SandboxInfo>,
+        names: &[&str],
+        answers: Vec<(&'static str, std::result::Result<Option<&'static str>, &'static str>)>,
+    ) -> (Result<Vec<SandboxInfo>>, Vec<String>) {
+        let fake = FakeLookup { answers, calls: Default::default() };
+        let names: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+        let got = confirm_listing(listing, &names, &fake, 3, std::time::Duration::ZERO);
+        (got, fake.calls.into_inner())
+    }
+
+    #[test]
+    fn a_sandbox_the_listing_lacks_but_exists_is_not_lost_whatever_state_it_is_in() {
+        for status in ["RUNNING", "DEPLOYED", "STANDBY"] {
+            let (got, calls) = confirm(vec![sandbox("other", "DEPLOYED")], &["node-up"], vec![("node-up", Ok(Some(status)))]);
+            let listing = got.unwrap();
+            assert_eq!(calls, ["node-up"]);
+            assert!(lost_rows(&[row("node-up", None)], Some(&listing)).is_empty(), "{status}");
+        }
+        // One Blaxel says is dead is still judged dead.
+        let (got, _) = confirm(vec![], &["node-up"], vec![("node-up", Ok(Some("FAILED")))]);
+        assert_eq!(lost_rows(&[row("node-up", None)], Some(&got.unwrap())).len(), 1);
+    }
+
+    #[test]
+    fn only_a_definite_not_found_makes_a_missing_sandbox_lost() {
+        let (got, _) = confirm(vec![], &["node-gone"], vec![("node-gone", Ok(None))]);
+        assert_eq!(lost_rows(&[row("node-gone", None)], Some(&got.unwrap())).len(), 1);
+    }
+
+    #[test]
+    fn an_error_or_timeout_asking_for_the_sandbox_is_an_error_after_retries_never_a_replacement() {
+        for why in ["HTTP 401 unauthorized", "HTTP 429 rate limited", "timed out", "404 WORKLOAD_UNAVAILABLE"] {
+            let (got, calls) = confirm(vec![], &["node-x"], vec![("node-x", Err(why))]);
+            let err = format!("{:#}", got.unwrap_err());
+            assert!(err.contains("node-x") && err.contains(why) && err.contains("not treating it as gone"), "{err}");
+            assert_eq!(calls.len(), 3, "retried before giving up");
+        }
+    }
+
+    #[test]
+    fn a_listed_sandbox_is_not_asked_for_and_each_missing_name_once() {
+        let (got, calls) = confirm(
+            vec![sandbox("listed", "DEPLOYED")],
+            &["listed", "missing", "missing"],
+            vec![("missing", Ok(None))],
+        );
+        assert!(got.is_ok());
+        assert_eq!(calls, ["missing"]);
     }
 
     fn sandbox(name: &str, status: &str) -> SandboxInfo {
