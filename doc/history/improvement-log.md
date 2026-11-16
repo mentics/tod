@@ -10,8 +10,11 @@ ledger's `history.jsonl`; why a fix was made is in its commit message.
 
 ## Statistics worth collecting
 
-Ideas, not yet built. Each would come from data tod already has (conversations,
-turns, findings, run_state, node_timeline, journey records):
+Built as `tod-cli stats` (operator tier; `tod_core::shepherd_stats`), computed
+from data tod already has (conversations, turns, findings, decisions, run_state,
+node_events, the change journal). Each section prints what tod does not keep
+(tokens, bot findings, stop history, sandbox setup time) as `not available:`.
+The list below is what was asked for:
 
 - Per node and phase: agent sessions, turns, tool calls, tokens, wall time.
 - Review loop: rounds per stay, findings per round, how many rounds came back

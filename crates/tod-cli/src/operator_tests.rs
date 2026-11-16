@@ -300,3 +300,42 @@ fn a_runner_verb_goes_to_the_daemon_and_the_menu_follows_it() {
         .to_string();
     assert!(err.contains("alternatives"), "{err}");
 }
+
+#[test]
+fn stats_is_hidden_without_the_tier_refused_in_an_agent_session_and_reads_a_store() {
+    let off = env(&[]);
+    let (root, node, _) = data_root();
+    let err = cli_with(&root, &off, &["stats"]).unwrap_err().to_string();
+    assert!(err.contains("unknown noun `stats`"), "{err}");
+    assert!(!help_with(&off, &["--help"]).unwrap().contains("stats"));
+
+    let on = env(&[ON]);
+    assert!(help_with(&on, &["--help"]).unwrap().contains("stats "));
+    assert_eq!(help_with(&on, &["stats", "--help"]).unwrap(), crate::operator::STATS_USAGE.trim_end());
+
+    let agent = env(&[ON, ("TOD_INTERVIEW_ACTOR", "conversation:abc")]);
+    let err = cli_with(&root, &agent, &["stats"]).unwrap_err().to_string();
+    assert!(err.contains("agent session") || err.contains("refused"), "{err}");
+
+    let text = cli_with(&root, &on, &["stats"]).unwrap();
+    for head in ["COST", "REVIEW LOOP", "PR LOOP", "REQUESTS", "STOPS", "SANDBOX CHURN"] {
+        assert!(text.contains(head), "{head}: {text}");
+    }
+    let one = cli_with(&root, &on, &["stats", "--section", "requests"]).unwrap();
+    assert!(one.starts_with("REQUESTS") && !one.contains("COST"), "{one}");
+    let json = cli_with(&root, &on, &["--json", "stats", &node.to_string(), "--since", "7d", "--section", "stops"]).unwrap();
+    assert!(serde_json::from_str::<serde_json::Value>(&json).unwrap()["stops"].is_object(), "{json}");
+    let err = cli_with(&root, &on, &["stats", "--section", "nope"]).unwrap_err().to_string();
+    assert!(err.contains("unknown section `nope`"), "{err}");
+}
+
+#[test]
+fn the_skill_doc_shows_stats_and_every_section() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.claude/skills/shepherd-common/operator-cli.md");
+    let doc = std::fs::read_to_string(&path).unwrap();
+    assert!(doc.contains("tod-cli stats [<NODE>] [--section <NAME>] [--since <DURATION>]"));
+    for section in tod_core::shepherd_stats::Section::ALL {
+        assert!(doc.contains(section.name()), "operator-cli.md never names the `{}` section", section.name());
+        assert!(crate::operator::STATS_USAGE.contains(section.name()), "usage never names `{}`", section.name());
+    }
+}

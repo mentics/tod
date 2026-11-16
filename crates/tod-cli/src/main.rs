@@ -26,6 +26,7 @@ mod operator;
 #[cfg(test)]
 mod operator_tests;
 mod runner;
+mod stats;
 mod obligations;
 mod phase;
 mod plan;
@@ -352,6 +353,7 @@ fn run_with(args: &[String], env: operator::Env) -> anyhow::Result<String> {
         "environment" => environment::run(invocation),
         "decisions" => decisions::run_with(invocation, env),
         "runner" if operator => runner::run(invocation, env),
+        "stats" if operator => stats::run(invocation, env),
         "phase" => phase::run(invocation),
         "wait" => wait::run(invocation),
         "batch" => batch::run(invocation),

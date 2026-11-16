@@ -81,6 +81,30 @@ Refused in an agent session (TOD_INTERVIEW_ACTOR set). With TOD_ACTOR=shepherd:<
 the act is left on the node's activity as that shepherd's, else as the operator's.
 ";
 
+pub(crate) const STATS_SUMMARY: &str =
+    "stats                  How the lifecycle is going: cost, review, PR, requests, stops, sandbox churn (operator tier)";
+
+pub(crate) const STATS_USAGE: &str = "\
+tod-cli stats — how the lifecycle is going, from what tod already keeps (operator tier)
+
+COMMANDS:
+    stats [<NODE>] [--section <NAME>] [--since <DURATION>]
+
+Read-only. One report over the store with a section per question: `cost`
+(per node and phase: sessions, agent turns, tool calls, wall time), `review`
+(rounds, findings, clean rounds, reopened findings, rejected/declined ratio),
+`pr-draft` (PR agent sessions, draft review rounds, threads posted, pushes, CI
+failures), `requests` (how many, how long they waited, answered with an offered
+option or carry-on words, about tod's setup), `stops` (runs stopped now by
+reason, and who resumes them) and `sandbox` (locations made and removed,
+replacements, losses). <NODE> (a slug or UUID) narrows it to one node;
+--section to one section; --since (30m, 2h, 7d) to what happened in that
+window. Every section ends with `not available:` lines naming what tod does
+not keep (tokens, bot reviews, stop history, setup time), so a missing figure
+is never read as a zero. --json gives the same as JSON.
+Refused in an agent session (TOD_INTERVIEW_ACTOR set).
+";
+
 /// The command line `decisions answer` adds to `decisions`'s own.
 pub(crate) const DECISIONS_ANSWER_COMMAND: &str = "    answer <ID> (--option <N> | --text <TEXT>)\n";
 
@@ -105,7 +129,7 @@ pub(crate) fn top_usage(top: &str, on: bool) -> String {
     top.replace(
         anchor,
         &format!(
-            "    decisions              What the user answers: ask, list, show, answer (operator tier)\n    {RUNNER_SUMMARY}\n"
+            "    decisions              What the user answers: ask, list, show, answer (operator tier)\n    {RUNNER_SUMMARY}\n    {STATS_SUMMARY}\n"
         ),
     )
 }
@@ -129,6 +153,7 @@ pub(crate) fn nouns(on: bool) -> Vec<(&'static str, String)> {
         .collect();
     if on {
         out.push(("runner", RUNNER_USAGE.to_string()));
+        out.push(("stats", STATS_USAGE.to_string()));
     }
     out
 }
@@ -230,6 +255,9 @@ mod tests {
 
         let on = nouns(true);
         assert!(on.iter().any(|(n, _)| *n == "runner"));
+        assert!(on.iter().any(|(n, _)| *n == "stats"));
+        assert!(off.iter().all(|(n, _)| *n != "stats"));
+        assert!(!crate::USAGE.contains("stats"));
         let decisions_on = &on.iter().find(|(n, _)| *n == "decisions").unwrap().1;
         assert!(decisions_on.contains("    answer <ID> (--option <N> | --text <TEXT>)"), "{decisions_on}");
         assert!(top_usage(crate::USAGE, false) == crate::USAGE);
