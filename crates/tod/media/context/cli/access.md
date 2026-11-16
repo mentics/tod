@@ -45,6 +45,11 @@ not available here; when the work needs one, record it as a request for the
 user, naming the exact call (see "A change the sandbox cannot make" in
 `decisions`).
 
+A "TLS verification of service ... failed" error means the server's certificate
+is issued to a different name than the one checked. You cannot change that: the
+error names the exact `tod-sandbox service set ... --tls-name ...` command, so
+record a request to the user asking them to run it, then call again.
+
 It needs the user's machine to be on, with the app running. When it is not
 connected for a moment, `access` waits and asks again by itself, for a few
 minutes: do not retry it yourself. If it still fails with "has not been

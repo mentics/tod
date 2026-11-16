@@ -25,6 +25,8 @@ mod api;
 mod hatchet;
 mod redis;
 
+pub use redis::Probe;
+
 use anyhow::{Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -189,6 +191,19 @@ impl Service {
             Kind::Hatchet => hatchet::actions(),
             Kind::Redis => redis::actions(),
             Kind::Api => api::actions(self),
+        }
+    }
+
+    /// Checks, with no credential and no command, that a TLS service's
+    /// certificate verifies for the name it is checked against. A certificate
+    /// that does not is an error naming the cause and the fix; a server this
+    /// machine cannot reach is [`Probe::Unreachable`], and nothing else is
+    /// checked here. Only a `rediss://` Redis has such a name to set.
+    pub fn probe_tls(&self) -> Result<Probe> {
+        self.validate()?;
+        match self.kind {
+            Kind::Redis => redis::probe_tls(self),
+            Kind::Hatchet | Kind::Api => Ok(Probe::NotTls),
         }
     }
 

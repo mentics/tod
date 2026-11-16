@@ -7,9 +7,9 @@
 //! command, so a write is not refused, it is unrepresentable.
 
 use super::{Action, Args, Service, action, only, require};
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde_json::{Value, json};
-use std::io::{BufRead, BufReader, Read as _, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
@@ -157,21 +157,111 @@ pub(crate) fn server_name(host: &str, tls_name: Option<&str>) -> Result<rustls::
 trait Stream: std::io::Read + Write + Send {}
 impl<T: std::io::Read + Write + Send> Stream for T {}
 
+/// What [`probe_tls`] found.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Probe {
+    /// The TLS handshake completed and the certificate verified.
+    Verified,
+    /// The URL is `redis://`: there is no certificate to check.
+    NotTls,
+    /// The server could not be reached from this machine, so nothing was
+    /// checked (no VPN, not allowed). Says why.
+    Unreachable(String),
+}
+
+/// Connects to the service's host and completes the TLS handshake (no
+/// credential sent, no command). A certificate that does not verify is an
+/// `Err` naming the cause and the fix ([`tls_failure`]); only a server that
+/// cannot be reached is [`Probe::Unreachable`].
+pub fn probe_tls(svc: &Service) -> Result<Probe> {
+    let (tls, _, _) = parse_url(&svc.url)?;
+    if !tls {
+        return Ok(Probe::NotTls);
+    }
+    match Conn::connect(svc) {
+        Ok(_) => Ok(Probe::Verified),
+        Err(e) if e.downcast_ref::<Unreachable>().is_some() => Ok(Probe::Unreachable(format!("{e:#}"))),
+        Err(e) => Err(e),
+    }
+}
+
+/// Marks a connection failure that is about reaching the server, not about it.
+#[derive(Debug)]
+struct Unreachable(String);
+
+impl std::fmt::Display for Unreachable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Unreachable {}
+
+/// The error for a TLS handshake that failed, naming the cause and, for a
+/// certificate that is not for the name checked, the exact command that fixes
+/// it. This is the one place a failed handshake becomes a message: the only
+/// code that opens a TLS connection to a service ([`Conn::connect`], used by
+/// every call, `service test`, `--check` and [`probe_tls`]) goes through it.
+pub(crate) fn tls_failure(svc: &Service, host: &str, port: u16, err: &std::io::Error) -> anyhow::Error {
+    use rustls::{CertificateError, Error};
+    let checked = svc.tls_name.as_deref().unwrap_or(host);
+    let rustls_err = err.get_ref().and_then(|i| i.downcast_ref::<Error>());
+    let name = &svc.name;
+    match rustls_err {
+        Some(Error::InvalidCertificate(CertificateError::NotValidForNameContext { expected, presented })) => {
+            let expected = expected.to_str();
+            let shown = if presented.is_empty() { "no names".to_string() } else { presented.join(", ") };
+            let fix = match presented.iter().find(|p| !p.starts_with("*.")) {
+                Some(real) => format!("tod-sandbox service set {name} --tls-name {real}"),
+                None => match presented.iter().find_map(|p| p.strip_prefix("*.")) {
+                    Some(rest) => format!("tod-sandbox service set {name} --tls-name <the cache's own endpoint host, which ends in .{rest}>"),
+                    None => format!("tod-sandbox service set {name} --tls-name <a name the certificate is issued to>"),
+                },
+            };
+            anyhow!(
+                "TLS verification of service {name} failed: the certificate {host}:{port} presented is issued to {shown}, not to {expected} ({}). \
+                 The connection is not made, and verification is never relaxed. The user fixes it once, on their machine, by saying which name the certificate is issued to: `{fix}`. \
+                 An agent cannot change this: record a request to the user that asks them to run that command (then call again).",
+                if svc.tls_name.is_some() { "the service's tls_name" } else { "the URL's host" },
+            )
+        }
+        Some(Error::InvalidCertificate(CertificateError::NotValidForName)) => anyhow!(
+            "TLS verification of service {name} failed: the certificate {host}:{port} presented is not issued to {checked}. \
+             The user fixes it once, on their machine, with `tod-sandbox service set {name} --tls-name <a name the certificate is issued to>` \
+             (an agent cannot: record a request to the user asking for that)"
+        ),
+        Some(Error::InvalidCertificate(other)) => anyhow!(
+            "TLS verification of service {name} failed: the certificate {host}:{port} presented was refused ({other:?}); it is checked against this machine's system roots, and verification is never relaxed. \
+             A certificate from a private authority needs that authority in this machine's trust store: record a request to the user saying so"
+        ),
+        Some(other) => anyhow!("TLS handshake with {host}:{port} for service {name} failed: {other}"),
+        None => anyhow!("TLS handshake with {host}:{port} for service {name} failed: {err}"),
+    }
+}
+
 struct Conn {
     reader: BufReader<Box<dyn Stream>>,
 }
 
 impl Conn {
     fn open(svc: &Service) -> Result<Conn> {
+        Conn::connect(svc)
+    }
+
+    /// The one place that connects; for TLS it finishes the handshake here
+    /// (not lazily at the first read), so a certificate that does not verify
+    /// is reported as that ([`tls_failure`]) and never as a bare read error.
+    fn connect(svc: &Service) -> Result<Conn> {
         let (tls, host, port) = parse_url(&svc.url)?;
         let target = format!("{host}:{port}");
         let addr = target
             .to_socket_addrs()
-            .with_context(|| format!("look up {target}"))?
+            .map_err(|e| anyhow::Error::new(Unreachable(format!("look up {target}: {e}"))))?
             .next()
             .with_context(|| format!("{target} has no address"))?;
-        let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(8))
-            .with_context(|| format!("connect to {target} from this machine: is the VPN up, and is this machine allowed?"))?;
+        let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(8)).map_err(|e| {
+            anyhow::Error::new(Unreachable(format!("connect to {target} from this machine: is the VPN up, and is this machine allowed? ({e})")))
+        })?;
         tcp.set_read_timeout(Some(Duration::from_secs(20)))?;
         tcp.set_write_timeout(Some(Duration::from_secs(20)))?;
         let stream: Box<dyn Stream> = if tls {
@@ -180,7 +270,11 @@ impl Conn {
             let config = Arc::new(rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth());
             let name = server_name(&host, svc.tls_name.as_deref())?;
             let conn = rustls::ClientConnection::new(config, name).context("start TLS")?;
-            Box::new(rustls::StreamOwned::new(conn, tcp))
+            let mut tls = rustls::StreamOwned::new(conn, tcp);
+            while tls.conn.is_handshaking() {
+                tls.conn.complete_io(&mut tls.sock).map_err(|e| tls_failure(svc, &host, port, &e))?;
+            }
+            Box::new(tls)
         } else {
             Box::new(tcp)
         };
@@ -520,6 +614,69 @@ mod tests {
         let mut b = svc(Kind::Redis, "rediss://r.example");
         b.tls_name = Some("bad name".into());
         assert!(b.validate().is_err());
+    }
+
+    fn io_err(e: rustls::Error) -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+    }
+
+    #[test]
+    fn a_certificate_for_another_name_says_so_and_gives_the_command() {
+        use rustls::{CertificateError, Error, pki_types::ServerName};
+        let mut s = svc(Kind::Redis, "rediss://prod-monolith-redis.cofactr.com:6379");
+        s.name = "redis-prod".into();
+        let presented = vec!["*.prod-monolith-redis-2025-12-04.abc.cache.amazonaws.com".to_string()];
+        let expected = ServerName::try_from("prod-monolith-redis.cofactr.com".to_string()).unwrap();
+        let e = io_err(Error::InvalidCertificate(CertificateError::NotValidForNameContext { expected, presented }));
+        let msg = tls_failure(&s, "prod-monolith-redis.cofactr.com", 6379, &e).to_string();
+        assert!(msg.contains("*.prod-monolith-redis-2025-12-04.abc.cache.amazonaws.com"), "{msg}");
+        assert!(msg.contains("not to prod-monolith-redis.cofactr.com"), "{msg}");
+        assert!(msg.contains("tod-sandbox service set redis-prod --tls-name"), "{msg}");
+        assert!(msg.contains("record a request to the user"), "{msg}");
+        assert!(msg.contains("never relaxed"), "{msg}");
+        // A concrete name is the exact command.
+        let expected = ServerName::try_from("a.example".to_string()).unwrap();
+        let e = io_err(Error::InvalidCertificate(CertificateError::NotValidForNameContext { expected, presented: vec!["real.example".into()] }));
+        let msg = tls_failure(&s, "a.example", 6379, &e).to_string();
+        assert!(msg.contains("`tod-sandbox service set redis-prod --tls-name real.example`"), "{msg}");
+    }
+
+    #[test]
+    fn other_handshake_failures_name_the_cause() {
+        let s = svc(Kind::Redis, "rediss://r.example");
+        let e = io_err(rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer));
+        let msg = tls_failure(&s, "r.example", 6379, &e).to_string();
+        assert!(msg.contains("UnknownIssuer") && msg.contains("system roots"), "{msg}");
+        let plain = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "eof");
+        assert!(tls_failure(&s, "r.example", 6379, &plain).to_string().contains("TLS handshake with r.example:6379"));
+    }
+
+    /// A server that is not TLS: the handshake fails at connect (not at the
+    /// first command) and says it was the handshake.
+    #[test]
+    fn a_handshake_failure_is_reported_at_connect_not_as_a_bare_read_error() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let t = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut c, _) = listener.accept().unwrap();
+                let _ = c.write_all(b"-ERR this is not tls\r\n");
+            }
+        });
+        let s = svc(Kind::Redis, &format!("rediss://127.0.0.1:{port}"));
+        let err = probe_tls(&s).unwrap_err().to_string();
+        assert!(err.contains("TLS handshake with 127.0.0.1"), "{err}");
+        assert!(s.call(None, "get", &args(&[("key", "k")])).unwrap_err().to_string().contains("TLS handshake"));
+        t.join().unwrap();
+    }
+
+    #[test]
+    fn probe_tls_is_quiet_about_plain_redis_and_names_an_unreachable_server() {
+        let s = svc(Kind::Redis, "redis://127.0.0.1:1");
+        assert_eq!(probe_tls(&s).unwrap(), Probe::NotTls);
+        let s = svc(Kind::Redis, "rediss://127.0.0.1:1");
+        assert!(matches!(probe_tls(&s).unwrap(), Probe::Unreachable(m) if m.contains("127.0.0.1:1")));
     }
 
     #[test]

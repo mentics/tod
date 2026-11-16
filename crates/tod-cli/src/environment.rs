@@ -160,12 +160,38 @@ fn require_enabled(inv: &Invocation, node: Uuid) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn describe(store: &CredentialStore, r: &Resolved) -> String {
+/// What a secret's state is called. A process that cannot see the user's
+/// credential store (a cloud node's `tod-cli`, answered by the orchestrator)
+/// cannot know a value is set, so it never says "NOT SET" for one the user
+/// answered as provided: the value is on the user's machine and the sandbox's
+/// proxy adds it to requests to the secret's hosts.
+fn secret_state(store: &CredentialStore, r: &Resolved, provided: &std::collections::HashSet<String>, absent: bool) -> &'static str {
+    if r.is_set(store) {
+        "set"
+    } else if absent {
+        if provided.contains(&r.entry.name.to_ascii_lowercase()) {
+            "provided by the user, held by the sandbox's proxy and not visible here: call the API it is for"
+        } else {
+            "NOT PROVIDED YET"
+        }
+    } else {
+        "NOT SET"
+    }
+}
+
+fn provided(inv: &Invocation, node: Uuid) -> anyhow::Result<std::collections::HashSet<String>> {
+    if !tod_core::environment_request::store_absent() {
+        return Ok(Default::default());
+    }
+    inv.client().read(|conn| tod_core::environment_request::provided_names(conn, node))
+}
+
+fn describe(store: &CredentialStore, provided: &std::collections::HashSet<String>, r: &Resolved) -> String {
     let e = &r.entry;
     let mut line = match e.kind {
         EntryKind::Variable => format!("{} (variable) ${} = {}", e.name, e.env_name(), e.value.as_deref().unwrap_or("")),
         EntryKind::Secret => {
-            let state = if r.is_set(store) { "set" } else { "NOT SET" };
+            let state = secret_state(store, r, provided, tod_core::environment_request::store_absent());
             let hosts = if e.hosts.is_empty() { String::new() } else { format!(", for {}", e.hosts.join(", ")) };
             format!("{} (secret, {state}) ${}{hosts}", e.name, e.env_name())
         }
@@ -183,6 +209,7 @@ fn list(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
     let node = current_node(inv, Some(args))?;
     let store = CredentialStore::from_data_root(&inv.data_root);
     let all = resolved(inv, node)?;
+    let provided = provided(inv, node)?;
     if inv.json {
         let rows: Vec<serde_json::Value> = all
             .iter()
@@ -191,7 +218,8 @@ fn list(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
                     "name": r.entry.name, "kind": r.entry.kind, "env_var": r.entry.env_name(),
                     "description": r.entry.description(), "hosts": r.entry.hosts,
                     "value": if r.entry.kind == EntryKind::Variable { r.entry.value.clone() } else { None },
-                    "set": r.is_set(&store), "inherited": r.inherited,
+                    "set": r.is_set(&store), "provided": provided.contains(&r.entry.name.to_ascii_lowercase()),
+                    "state": secret_state(&store, r, &provided, tod_core::environment_request::store_absent()), "inherited": r.inherited,
                 })
             })
             .collect();
@@ -200,7 +228,7 @@ fn list(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
     if all.is_empty() {
         return Ok("(nothing defined; `environment request` asks the user for a credential)".into());
     }
-    Ok(all.iter().map(|r| describe(&store, r)).collect::<Vec<_>>().join("\n"))
+    Ok(all.iter().map(|r| describe(&store, &provided, r)).collect::<Vec<_>>().join("\n"))
 }
 
 fn presets(inv: &Invocation) -> anyhow::Result<String> {
@@ -342,6 +370,13 @@ fn request(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
     if resolved(inv, node)?.iter().any(|r| r.entry.name.eq_ignore_ascii_case(name) && r.is_set(&CredentialStore::from_data_root(&inv.data_root))) {
         return Ok(format!("{name} is already set; use it with `secrets run`"));
     }
+    // From a cloud node the store cannot be seen: the user's answer is the record.
+    if provided(inv, node)?.contains(&name.to_ascii_lowercase()) {
+        return Ok(format!(
+            "{name} was already provided by the user: it is held by the sandbox's proxy (not visible here), which adds it to requests to its hosts. \
+             Call the API it is for; do not ask again. If the API refuses it (401/403), say so in a request that names the call and the status"
+        ));
+    }
     if !has_capability(inv, node)? {
         write(inv, OutlineMutation::EnableCapabilities {
             node_id: node,
@@ -436,4 +471,26 @@ fn run_transfer(
         |mutation| write(inv, mutation),
     )?;
     Ok(format!("ok {}", out.summary(mode)))
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn resolved() -> Resolved {
+        Resolved { entry: Entry::secret("datadog_api_key"), source_node: Uuid::new_v4(), inherited: false }
+    }
+
+    /// A cloud node's list is answered where the user's credential store is
+    /// not: it must not call a credential the user provided "NOT SET".
+    #[test]
+    fn without_the_users_store_a_provided_credential_is_not_called_unset() {
+        let store = CredentialStore::from_data_root(&tod_test_util::scratch_dir(format!("tod-env-state-{}", Uuid::new_v4())));
+        let r = resolved();
+        let provided: HashSet<String> = ["datadog_api_key".to_string()].into();
+        assert_eq!(secret_state(&store, &r, &HashSet::new(), false), "NOT SET");
+        assert!(secret_state(&store, &r, &provided, true).starts_with("provided by the user"));
+        assert_eq!(secret_state(&store, &r, &HashSet::new(), true), "NOT PROVIDED YET");
+    }
 }

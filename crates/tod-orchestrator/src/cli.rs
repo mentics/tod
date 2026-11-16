@@ -57,6 +57,9 @@ pub fn run(cli: &Path, prefix: &[String], data_root: &Path, request: RelayReques
         .args(with_data_root(request.args, data_root))
         .envs(request.env)
         .env("TOD_DATA_ROOT", data_root)
+        // The user's credentials are on the user's machine, not here: tell
+        // `tod-cli environment` not to call a secret "NOT SET" for that.
+        .env("TOD_CREDENTIAL_STORE_ABSENT", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

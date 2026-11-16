@@ -125,6 +125,38 @@ pub fn answer_message(name: &str, provided: bool) -> String {
     }
 }
 
+/// The set environment variable of a process that runs where the user's
+/// credential store is not (the orchestrator answering a cloud node's
+/// `tod-cli`): a secret is then never "set" *here*, whatever the user did,
+/// so what is shown must come from the user's answers instead
+/// ([`provided_names`]). Set by the orchestrator when it runs `tod-cli`.
+pub const STORE_ABSENT_ENV: &str = "TOD_CREDENTIAL_STORE_ABSENT";
+
+/// Whether this process cannot see the user's credential store.
+pub fn store_absent() -> bool {
+    std::env::var_os(STORE_ABSENT_ENV).is_some()
+}
+
+/// The lowercased names of the credentials the user answered *provided* on
+/// `node`: the one record of a value stored on the user's machine that a
+/// process without the store (a cloud node's `tod-cli`) can read.
+pub fn provided_names(conn: &Connection, node: Uuid) -> Result<std::collections::HashSet<String>> {
+    let repo = tod_store::decisions::DecisionRepo::new(conn);
+    let mut names = std::collections::HashSet::new();
+    for decision in repo.list_for_node(node)? {
+        if !is_request(&decision) {
+            continue;
+        }
+        let Some(full) = repo.get_with_answers(decision.id)? else { continue };
+        if full.answers.last().is_some_and(|a| was_provided(&full.decision, a.option)) {
+            if let Some((name, _)) = parse_question(&full.decision.question) {
+                names.insert(name.to_ascii_lowercase());
+            }
+        }
+    }
+    Ok(names)
+}
+
 /// What Retry says when the credential is still not stored.
 pub fn still_unset_message(name: &str) -> String {
     format!("`{name}` is still not set. Enter its value (Save), or set it in the Environment editor, then Retry.")
@@ -153,6 +185,36 @@ mod tests {
     fn an_old_style_question_still_parses() {
         let q = "Provide the credential `gb`: to read flags. Store its value in this node's Environment section (or `tod-cli environment set-secret gb`), then answer here.";
         assert_eq!(parse_question(q), Some(("gb".into(), "to read flags".into())));
+    }
+
+    /// A cloud node's `tod-cli` runs where the user's credential store is not:
+    /// the only record that a credential was given is the answer.
+    #[test]
+    fn provided_names_are_the_credentials_the_user_answered_provided() {
+        use tod_store::decisions::{DecisionRepo, NewDecision};
+        use tod_store::fleet::schema;
+        use tod_store::outline::repos::NodeRepo;
+        let dir = tod_test_util::scratch_dir(format!("tod-env-request-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = schema::open_writer_connection(&dir.join("tod.db")).unwrap();
+        let node = Uuid::new_v4();
+        NodeRepo::new(&conn).create_with_id(node, "n", "N").unwrap();
+        let repo = DecisionRepo::new(&conn);
+        let ask = |name: &str| {
+            repo.create(
+                node,
+                None,
+                Some(PROTOCOL),
+                &NewDecision { question: question(name, "to read"), options: options(), reason: "access".into(), ..Default::default() },
+            )
+            .unwrap()
+        };
+        let (given, declined, waiting) = (ask("Given_Key"), ask("declined_key"), ask("waiting_key"));
+        repo.answer(given.id, Some(1), None, "user").unwrap();
+        repo.answer(declined.id, Some(2), None, "user").unwrap();
+        let _ = waiting;
+        let names = provided_names(&conn, node).unwrap();
+        assert_eq!(names.into_iter().collect::<Vec<_>>(), vec!["given_key".to_string()]);
     }
 
     #[test]

@@ -669,6 +669,7 @@ fn service(ctx: &mut Ctx, mut args: Args) -> Result<i32> {
             args.done()?;
             let svc = Service { name: name.clone(), kind, url, tenant, username, tls_name, db, allow, auth_header, token_command };
             svc.validate()?;
+            verify_certificate(&svc)?;
             if check_now {
                 println!("{}", check(ctx, &svc)?);
             }
@@ -687,6 +688,7 @@ fn service(ctx: &mut Ctx, mut args: Args) -> Result<i32> {
             let mut svc = find(ctx, &name)?;
             svc.tls_name = tls_name;
             svc.validate()?;
+            verify_certificate(&svc)?;
             ctx.set_service(svc)?;
             println!("{name}: saved");
             Ok(0)
@@ -722,6 +724,21 @@ fn service(ctx: &mut Ctx, mut args: Args) -> Result<i32> {
         }
         other => bail!("unknown service command {other:?}: add, list, remove, test or token"),
     }
+}
+
+/// Before a service is saved: a `rediss://` certificate that does not verify
+/// for the name it will be checked against refuses the save, naming the fix
+/// (a service every call would fail on is not worth saving). A server this
+/// machine cannot reach right now is said so on stderr and the save goes on,
+/// since nothing was shown wrong.
+fn verify_certificate(svc: &tod_sandbox::service::Service) -> Result<()> {
+    match svc.probe_tls().with_context(|| format!("{}: not saved", svc.name))? {
+        tod_sandbox::service::Probe::Unreachable(why) => {
+            eprintln!("warning: {}: the certificate was not checked, the server could not be reached ({why}); run `tod-sandbox service test {}` once it can be", svc.name, svc.name)
+        }
+        tod_sandbox::service::Probe::Verified | tod_sandbox::service::Probe::NotTls => {}
+    }
+    Ok(())
 }
 
 fn read_stdin_line() -> Result<String> {

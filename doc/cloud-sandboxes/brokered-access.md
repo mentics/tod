@@ -105,6 +105,14 @@ certificate is issued to. The connection still goes to the URL's host and the
 certificate is still fully verified against the system roots, only against that
 name. It needs a `rediss://` URL, and `service list` shows it.
 
+The handshake is finished when the connection is opened, so a certificate that
+does not verify is reported as that, naming the names the server presented and
+the exact `service set` command, never as a bare read error (`redis::tls_failure`,
+the one place that opens a TLS connection to a service). `service add` and
+`service set` also open one (no credential, no command) before saving and refuse
+to save on a certificate that does not verify; a server this machine cannot
+reach only warns on stderr.
+
 The credential is the one saved with `service token` (OS keyring, else the
 encrypted file, as other tod secrets), else what `token_command` prints. A
 credential that is missing for a Hatchet service is an error telling the agent
