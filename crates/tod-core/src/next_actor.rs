@@ -747,7 +747,19 @@ fn actor_for(facts: &Facts<'_>) -> (NextActor, i64) {
         .collect();
     // A look at the outside that failed as often as it may (or in a way
     // asking again cannot fix) is the user's, with the error.
-    if let Some(wait) = waits.iter().copied().find(|w| w.exhausted()) {
+    //
+    // Not when the failure is one asking again fixes (GitHub down, a timeout)
+    // and the runner's last word is that the node waits: the wake that owns
+    // the wait (the orchestrator's gate, for a sandbox asleep) keeps looking,
+    // so the node is waiting, with the error and attempts shown by `Others`
+    // below. Were nothing looking any more, the wait would go past due and the
+    // overdue check after this one would put it on the user's list.
+    let wake_keeps_looking = |w: &Wait| {
+        w.last_error.as_deref().is_some_and(tod_store::github::is_transient_message)
+            && run_state.is_some_and(|r| r.phase == Phase::Waiting)
+            && w.expired_by(facts.now_ms, facts.cloud.is_some()).is_none()
+    };
+    if let Some(wait) = waits.iter().copied().find(|w| w.exhausted() && !wake_keeps_looking(w)) {
         return (
             NextActor::You {
                 why: YouReason::Failed {
@@ -1191,6 +1203,40 @@ mod tests {
             wait.retry,
             Some(Retry { attempt: 2, max: 5, error: "GitHub is unavailable (HTTP 503)".into() })
         );
+    }
+
+    fn waiting_row() -> RunState {
+        RunState {
+            node_id: Uuid::nil(),
+            phase: Phase::Waiting,
+            reason_kind: crate::run_state::kind::WAITING_OUTSIDE.into(),
+            reason_text: "a review".into(),
+            since: NOW - 2_000,
+            resumable_by: "runner".into(),
+            updated_at: NOW - 1_000,
+            writer: "supervisor".into(),
+        }
+    }
+
+    #[test]
+    fn spent_transient_github_reads_do_not_fail_a_node_the_runner_says_waits() {
+        let mut c = case("pr_draft");
+        let mut read = wait("github:pr:read", NOW + 30_000, NOW - 5);
+        read.attempt = 5;
+        read.max_attempts = Some(5);
+        read.last_error = Some("https://github.com/o/r/pull/1: HTTP request failed: io: Interrupted system call (os error 4)".into());
+        let hook = wait("github:pr:1:ready_for_review", NOW + 600_000, NOW - 1_000);
+        c.waits = vec![read, hook];
+        c.run_state = Some(waiting_row());
+        let NextActor::Others { wait } = standing(&c).actor else { panic!("{:?}", standing(&c).actor) };
+        assert!(wait.retry.is_some(), "the error is still shown");
+        // The same failure with no word that the node waits is the user's, and
+        // so is one asking again cannot fix, and one nothing is looking at.
+        c.run_state = None;
+        assert!(matches!(standing(&c).actor, NextActor::You { why: YouReason::Failed { .. }, .. }));
+        c.run_state = Some(waiting_row());
+        c.waits[0].last_error = Some("https://github.com/o/r/pull/1: pull request not found".into());
+        assert!(matches!(standing(&c).actor, NextActor::You { why: YouReason::Failed { .. }, .. }));
     }
 
     #[test]
