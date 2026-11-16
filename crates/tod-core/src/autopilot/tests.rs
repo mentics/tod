@@ -4004,8 +4004,10 @@ fn the_same_bot_is_still_asked_on_a_draft_with_no_evidence_it_skips_them() {
 fn answering_the_silence_question_wakes_the_parked_run_and_keep_waiting_parks_it_again() {
     let feed = BotFeed::new("2020-01-01T00:00:00Z", None);
     let (fx, mut agent) = bot_node(feed.clone(), SILENT_BOT);
+    // The run ends by parking (`Waiting`), never by its budget; the budget is
+    // only a backstop, generous so a loaded machine cannot spend it first.
     let run = |agent: &mut FakeAgent| {
-        autopilot(&fx, Budget { max_duration: Duration::from_millis(300), ..Budget::default() })
+        autopilot(&fx, Budget { max_duration: Duration::from_secs(120), ..Budget::default() })
             .with_pr_poll_interval(Duration::ZERO)
             .run(&fx.fleet, agent)
             .unwrap()

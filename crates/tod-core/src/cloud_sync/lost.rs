@@ -869,6 +869,10 @@ trait RunnerStopper {
         place: crate::runner_place::RunnerPlace,
         poll: std::time::Duration,
     ) -> Result<()>;
+    /// The clock the deadline is measured on; a test drives its own.
+    fn now(&mut self) -> std::time::Instant {
+        std::time::Instant::now()
+    }
 }
 
 struct RealStopper;
@@ -956,9 +960,9 @@ fn stop_and_delete_with(
             RunnerPlace::Local => bounds.local_within,
             RunnerPlace::Supervisor => bounds.supervised_within,
         };
-        let deadline = std::time::Instant::now() + within;
+        let deadline = stopper.now() + within;
         while let Some(why) = runner_blocker(fleet, node_id)? {
-            if std::time::Instant::now() >= deadline {
+            if stopper.now() >= deadline {
                 match place {
                     RunnerPlace::Local => anyhow::bail!(
                         "the sandbox was not deleted: {why} still, {} seconds after it was told to stop",
@@ -1727,6 +1731,9 @@ mod tests {
         ends_the_run: bool,
         stops: Vec<crate::runner_place::RunnerPlace>,
         looks: usize,
+        /// A virtual clock: it moves only when a look waits, by the poll, so
+        /// how many looks fit in a deadline never depends on machine load.
+        clock: std::time::Instant,
     }
 
     impl RunnerStopper for FakeStopper {
@@ -1741,8 +1748,11 @@ mod tests {
         }
         fn wait_step(&mut self, _: &FleetStore, _: crate::runner_place::RunnerPlace, poll: std::time::Duration) -> Result<()> {
             self.looks += 1;
-            std::thread::sleep(poll);
+            self.clock += poll;
             Ok(())
+        }
+        fn now(&mut self) -> std::time::Instant {
+            self.clock
         }
     }
 
@@ -1767,7 +1777,7 @@ mod tests {
     }
 
     fn stopper(fx: &Fx, ends_the_run: bool) -> FakeStopper {
-        FakeStopper { db: fx.fleet.paths().db().to_path_buf(), ends_the_run, stops: Vec::new(), looks: 0 }
+        FakeStopper { db: fx.fleet.paths().db().to_path_buf(), ends_the_run, stops: Vec::new(), looks: 0, clock: std::time::Instant::now() }
     }
 
     #[test]
