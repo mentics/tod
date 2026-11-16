@@ -89,6 +89,11 @@ pub fn resolve_launch_cwd_with(
                     .or_else(|| worktree::current_branch(&dir));
                 match branch {
                     Some(branch) => {
+                        // The checkout itself first: a made location can sit
+                        // on the default branch (only its submodules were
+                        // ever put back), and the supervisor refuses to push
+                        // that. Never a warning: nothing runs on it.
+                        worktree::ensure_on_branch(&dir, &branch)?;
                         progress("Checking the submodules…");
                         match worktree::branch_submodules(&dir, &branch) {
                             Ok(warnings) => warnings,

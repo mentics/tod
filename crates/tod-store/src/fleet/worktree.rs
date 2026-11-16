@@ -690,6 +690,35 @@ pub fn branch_submodules(worktree: &Workdir, branch: &str) -> Result<Vec<String>
     Ok(warnings)
 }
 
+/// Puts the repository `worktree` itself (not its submodules) on the node's
+/// `branch`, as every launch and every environment setup or reset must: the
+/// supervisor pushes only the node's own branch, and refuses a checkout that
+/// sits on a default branch. A checkout already on `branch` is untouched. Any
+/// other (a default branch, another branch, a detached HEAD) is switched: to
+/// the branch when it exists here or on `origin`, else a new one from
+/// `origin`'s default branch, so `origin` is fetched first when the branch has
+/// to be made. Uncommitted work that the switch would overwrite is git's
+/// refusal, returned as the error naming the branch and where it was.
+/// Network (only when the branch is new): never on the UI thread.
+pub fn ensure_on_branch(worktree: &Workdir, branch: &str) -> Result<()> {
+    if branch.is_empty() {
+        return Ok(());
+    }
+    let was = current_branch(worktree);
+    if was.as_deref() == Some(branch) {
+        return Ok(());
+    }
+    if !branch_exists(worktree, branch) {
+        fetch_origin(worktree)?;
+    }
+    checkout_branch(worktree, branch).with_context(|| {
+        format!(
+            "put {worktree} on the node's branch {branch} (it is on {})",
+            was.as_deref().unwrap_or("a detached HEAD")
+        )
+    })
+}
+
 /// Undo [`branch_submodules`] where it was not needed: a submodule still on
 /// the `branch` this app created, at the commit it started from, with nothing
 /// uncommitted, goes back to a detached HEAD and the branch is deleted.
@@ -2203,5 +2232,47 @@ git -c user.name=t -c user.email=t@t commit -q -m 'add sub'"#;
         let out = run("task/new");
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Seen live (ENG-2506): a made location whose superproject sat on `main`
+    /// while its submodules were on the node's branch; every launch only
+    /// branched the submodules, so the supervisor's push refused `main`.
+    #[test]
+    fn a_checkout_on_the_default_branch_is_put_on_a_new_node_branch_from_origin() {
+        let (clone, _) = clone_with_remote_feature();
+        assert_eq!(current_branch(&clone).as_deref(), Some("main"));
+        let main_tip = run_git(&clone, &["rev-parse", "origin/main"]).unwrap();
+        ensure_on_branch(&clone, "task/node").unwrap();
+        assert_eq!(current_branch(&clone).as_deref(), Some("task/node"));
+        assert_eq!(run_git(&clone, &["rev-parse", "HEAD"]).unwrap(), main_tip);
+        // Idempotent, and `main` is left where it was.
+        ensure_on_branch(&clone, "task/node").unwrap();
+        assert_eq!(current_branch(&clone).as_deref(), Some("task/node"));
+        assert_eq!(run_git(&clone, &["rev-parse", "main"]).unwrap(), main_tip);
+    }
+
+    #[test]
+    fn a_detached_checkout_returns_to_the_nodes_existing_branch() {
+        let (clone, _) = clone_with_remote_feature();
+        git_in(&clone, &["branch", "--no-track", "task/node", "main"]);
+        git_in(&clone, &["switch", "--detach", "main"]);
+        ensure_on_branch(&clone, "task/node").unwrap();
+        assert_eq!(current_branch(&clone).as_deref(), Some("task/node"));
+    }
+
+    #[test]
+    fn a_switch_git_refuses_is_an_error_naming_the_branch_and_where_it_was() {
+        let (clone, _) = clone_with_remote_feature();
+        let path = clone.host_path().unwrap().to_path_buf();
+        git_in(&clone, &["switch", "-q", "-c", "task/node"]);
+        fs::write(path.join("work.txt"), "committed\n").unwrap();
+        git_in(&clone, &["add", "work.txt"]);
+        git_in(&clone, &["commit", "-q", "-m", "work"]);
+        git_in(&clone, &["switch", "-q", "main"]);
+        // An untracked file the switch would overwrite: git refuses.
+        fs::write(path.join("work.txt"), "local\n").unwrap();
+        let err = format!("{:#}", ensure_on_branch(&clone, "task/node").unwrap_err());
+        assert!(err.contains("task/node") && err.contains("it is on main"), "{err}");
+        assert_eq!(current_branch(&clone).as_deref(), Some("main"));
     }
 }
