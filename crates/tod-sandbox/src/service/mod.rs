@@ -238,11 +238,26 @@ pub(crate) fn enc(value: &str) -> String {
     out
 }
 
+/// The host a `Location` points at, for an error message: never the path,
+/// query or any userinfo, which may carry a secret.
+fn redirect_host(location: &str) -> String {
+    match location.split_once("://") {
+        Some((_, rest)) => {
+            let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+            authority.rsplit('@').next().unwrap_or("").to_string()
+        }
+        None => "the same host (a relative Location)".to_string(),
+    }
+}
+
 /// A GET as JSON, with the credential in `header` if given. A status other
 /// than 2xx is an error carrying the status and the start of the body.
 pub(crate) fn get_json(url: &str, header: Option<(&str, String)>) -> Result<Value> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .http_status_as_error(false)
+        // A redirect would leave the allowed path (or host) and re-send the
+        // credential header there: never followed, always an error below.
+        .max_redirects(0)
         .timeout_global(Some(std::time::Duration::from_secs(30)))
         .build()
         .into();
@@ -253,6 +268,15 @@ pub(crate) fn get_json(url: &str, header: Option<(&str, String)>) -> Result<Valu
     let shown = url.split('?').next().unwrap_or(url);
     let mut resp = req.call().map_err(|e| anyhow::anyhow!("GET {shown}: {e}"))?;
     let status = resp.status().as_u16();
+    if (300..400).contains(&status) {
+        let host = resp
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .map(redirect_host)
+            .unwrap_or_else(|| "(no Location header)".to_string());
+        anyhow::bail!("GET {shown} answered {status}, a redirect to {host}; redirects are never followed (the service's url or allow list must name the final path)");
+    }
     let body = resp.body_mut().read_to_string().map_err(|e| anyhow::anyhow!("GET {shown}: reading the reply: {e}"))?;
     ensure!(
         (200..300).contains(&status),
@@ -324,5 +348,57 @@ pub(crate) mod tests {
         assert_eq!(cut["truncated"], true);
         assert!(cut["note"].as_str().unwrap().contains("ask for less"));
         assert_eq!(cap(serde_json::json!({"a": 1})), serde_json::json!({"a": 1}));
+    }
+
+    /// Answers the first request with a 302 to `to`.
+    fn redirector(to: String) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).unwrap();
+            let reply = format!("HTTP/1.1 302 Found\r\nLocation: {to}/secret/path?token=zzz\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            sock.write_all(reply.as_bytes()).unwrap();
+        });
+        (url, handle)
+    }
+
+    #[test]
+    fn a_redirect_is_an_error_and_is_never_followed() {
+        for kind in [Kind::Api, Kind::Hatchet] {
+            let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            target.set_nonblocking(true).unwrap();
+            let target_url = format!("http://{}", target.local_addr().unwrap());
+            let (url, handle) = redirector(target_url.clone());
+            let mut s = svc(kind, &url);
+            s.auth_header = (kind == Kind::Api).then(|| "x-api-key".into());
+            let mut args = Args::new();
+            let (action, token) = match kind {
+                Kind::Api => {
+                    args.insert("path".into(), "/api/v1/orgs/acme".into());
+                    ("get", Some("k1"))
+                }
+                _ => ("workflows-list", Some("secret")),
+            };
+            let err = s.call(token, action, &args).unwrap_err().to_string();
+            handle.join().unwrap();
+            let host = target_url.trim_start_matches("http://");
+            assert!(err.contains("302") && err.contains("redirect") && err.contains(host), "{err}");
+            assert!(err.contains(&format!("{action} on s")), "{err}");
+            assert!(!err.contains("secret/path") && !err.contains("zzz") && !err.contains("k1"), "{err}");
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            match target.accept() {
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                other => panic!("{kind:?}: the redirect target was contacted: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_redirect_host_drops_path_query_and_userinfo() {
+        assert_eq!(redirect_host("https://u:p@evil.example:8443/a?b=c"), "evil.example:8443");
+        assert!(redirect_host("/relative").contains("same host"));
     }
 }
