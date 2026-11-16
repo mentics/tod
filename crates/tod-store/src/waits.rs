@@ -613,6 +613,24 @@ pub fn expire_overdue(conn: &Connection, now: i64, grace: i64) -> Result<Vec<Swe
     Ok(ended)
 }
 
+/// How long a wait that is no longer pending is kept as history before
+/// [`prune_finished`] deletes it.
+pub const FINISHED_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+
+/// Deletes the waits that stopped being pending (satisfied, cancelled,
+/// expired) more than `retention_ms` ago, by their `updated_at` (the time they
+/// ended). Pending waits are never touched, and neither is a finished one
+/// inside the window, so `tod-cli wait list --all` still shows recent history.
+/// Run with every [`sweep`] (`InterviewCommand::SweepWaits`), the one place
+/// every runner (the daemon, the app, the orchestrator's gate) passes through.
+/// Returns how many were deleted.
+pub fn prune_finished(conn: &Connection, now: i64, retention_ms: i64) -> Result<usize> {
+    if !has_waits_table(conn)? {
+        return Ok(0);
+    }
+    Ok(conn.execute("DELETE FROM waits WHERE state != 'pending' AND updated_at < ?1", [now - retention_ms])?)
+}
+
 /// `30s`, `5m`, `2h`, `1d`, or a bare number of seconds.
 pub fn parse_duration(raw: &str) -> Result<i64> {
     let raw = raw.trim();
@@ -766,6 +784,30 @@ mod tests {
     }
     fn pending(r: &Real, node: Uuid) -> Vec<String> {
         WaitRepo::new(&r.conn).list_pending_for_node(node).unwrap().into_iter().map(|w| w.match_spec).collect()
+    }
+
+    #[test]
+    fn prune_finished_deletes_only_old_waits_that_are_not_pending() {
+        let (conn, node) = conn();
+        let repo = WaitRepo::new(&conn);
+        let now = 100 * 24 * 60 * 60 * 1000;
+        let mut ids = Vec::new();
+        for state in [WAIT_SATISFIED, WAIT_CANCELLED, WAIT_EXPIRED, WAIT_PENDING] {
+            let w = repo.create(node, &NewWait::until(1)).unwrap();
+            if state != WAIT_PENDING {
+                repo.set_state(w.id, state).unwrap();
+            }
+            conn.execute("UPDATE waits SET updated_at = ?2 WHERE id = ?1", params![uuid_to_blob(w.id), now - FINISHED_RETENTION_MS - 1]).unwrap();
+            ids.push(w.id);
+        }
+        let recent = repo.create(node, &NewWait::until(1)).unwrap();
+        repo.set_state(recent.id, WAIT_SATISFIED).unwrap();
+        conn.execute("UPDATE waits SET updated_at = ?2 WHERE id = ?1", params![uuid_to_blob(recent.id), now - FINISHED_RETENTION_MS + 1000]).unwrap();
+        assert_eq!(prune_finished(&conn, now, FINISHED_RETENTION_MS).unwrap(), 3);
+        assert!(repo.get(ids[3]).unwrap().is_some(), "an old pending wait is live, not history");
+        assert!(repo.get(recent.id).unwrap().is_some(), "a recent finished wait stays");
+        assert!(repo.get(ids[0]).unwrap().is_none());
+        assert_eq!(prune_finished(&conn, now, FINISHED_RETENTION_MS).unwrap(), 0);
     }
 
     #[test]

@@ -1333,7 +1333,11 @@ pub fn execute(
                 Some(grace) => crate::waits::expire_overdue(conn, now, *grace)?,
                 None => Vec::new(),
             };
+            // Waits that ended long ago are history nobody reads; every
+            // runner sweeps, so this is where they leave.
+            let pruned = crate::waits::prune_finished(conn, now, crate::waits::FINISHED_RETENTION_MS)?;
             Ok(json!({
+                "pruned": pruned,
                 "cancelled": swept.iter().map(|s| format!("{} ({})", s.spec, s.reason)).collect::<Vec<_>>(),
                 "expired": expired.iter().map(|s| format!("{} ({})", s.spec, s.reason)).collect::<Vec<_>>(),
             }))
@@ -1662,6 +1666,27 @@ mod tests {
             .unwrap();
         tx.commit().unwrap();
         out
+    }
+
+    /// Every runner's sweep prunes the waits that ended more than a week ago
+    /// and keeps the recent ones and the pending ones.
+    #[test]
+    fn sweeping_waits_prunes_the_ones_that_ended_long_ago() {
+        use crate::waits::{FINISHED_RETENTION_MS, NewWait, WAIT_SATISFIED, WaitRepo};
+        let (_dir, conn, node, _session) = setup();
+        let repo = WaitRepo::new(&conn);
+        let now = crate::outline::uuid_blob::now_ms();
+        let old = repo.create(node, &NewWait::until(1)).unwrap();
+        let recent = repo.create(node, &NewWait::until(1)).unwrap();
+        let pending = repo.create(node, &NewWait::until(i64::MAX / 2)).unwrap();
+        repo.set_state(old.id, WAIT_SATISFIED).unwrap();
+        repo.set_state(recent.id, WAIT_SATISFIED).unwrap();
+        conn.execute("UPDATE waits SET updated_at = ?1 WHERE id = ?2", params![now - FINISHED_RETENTION_MS - 1000, uuid_to_blob(old.id)]).unwrap();
+        let out = run(&conn, "user", InterviewCommand::SweepWaits { expire_grace_ms: None }).unwrap();
+        assert_eq!(out["pruned"], 1);
+        assert!(repo.get(old.id).unwrap().is_none());
+        assert!(repo.get(recent.id).unwrap().is_some());
+        assert!(repo.get(pending.id).unwrap().is_some());
     }
 
     fn draft(question: &str, proposal: Option<Proposal>) -> QuestionDraft {

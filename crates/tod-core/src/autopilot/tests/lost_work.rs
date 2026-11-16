@@ -510,3 +510,33 @@ fn steps_reset_to_pending_on_a_proposed_node_are_remembered_by_the_sticky_mark_a
     assert!(matches!(finding, crate::lost_work::Finding::Unproven(_)), "{finding:?}");
     assert_eq!(lifecycle::current_state(&fx.fleet, fx.node).unwrap(), "review");
 }
+
+/// A replaced sandbox leaves a note per repository on the node, so lost
+/// submodule work is counted and not found only when an agent notices.
+#[test]
+fn a_replaced_sandbox_records_what_its_checkout_holds_of_the_nodes_work() {
+    let fx = setup();
+    workspace_is_a_clone(&fx);
+    in_review_with_done_steps(&fx);
+    let lost = crate::lost_work::record_replacement(&fx.fleet, fx.node, "old-box", "new-box").unwrap();
+    assert!(lost.is_empty(), "no submodules here: {lost:?}");
+    let timeline = fx.fleet.read(|c| tod_store::node_timeline::TimelineRepo::new(c).list(fx.node)).unwrap();
+    let note = timeline.iter().find(|e| e.title == crate::lost_work::REPLACED_TITLE).expect("a note");
+    assert!(note.detail.contains("old-box") && note.detail.contains("new-box") && note.detail.contains(".: Untouched"), "{}", note.detail);
+    assert!(!note.failed);
+}
+
+#[test]
+fn a_submodule_with_no_commit_of_the_nodes_own_is_lost_work_only_when_steps_were_done() {
+    use crate::lost_work::{RepoState, lost_submodules};
+    let repos = vec![
+        (".".to_string(), RepoState::OwnCommits),
+        ("kb".to_string(), RepoState::Untouched),
+        ("ui".to_string(), RepoState::OwnCommits),
+        ("infra".to_string(), RepoState::Unknown("no origin".into())),
+    ];
+    assert_eq!(lost_submodules(&repos, 2), vec!["kb".to_string()]);
+    assert!(lost_submodules(&repos, 0).is_empty(), "nothing was done, nothing was lost");
+    let only_root = vec![(".".to_string(), RepoState::Untouched)];
+    assert!(lost_submodules(&only_root, 2).is_empty(), "the checkout itself is not a submodule");
+}

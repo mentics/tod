@@ -520,18 +520,75 @@ pub fn check(fleet: &FleetStore, node: Uuid, state: &str) -> Result<Finding> {
     if done == 0 {
         return Ok(Finding::NotLooked);
     }
-    // Not made yet: nothing to look at. Any error (a stale location, Files
-    // missing) is the caller's to see.
+    match inspect_node(fleet, node)? {
+        Some(repos) => Ok(conclude(&repos, done)),
+        None => Ok(Finding::NotLooked),
+    }
+}
+
+/// What each repository of the node's checkout (the checkout itself and every
+/// submodule) holds of its work; `None` when the checkout is not made yet. Any
+/// error (a stale location, Files missing, a git failure) is the caller's.
+fn inspect_node(fleet: &FleetStore, node: Uuid) -> Result<Option<Vec<(String, RepoState)>>> {
     let Some(cwd) = tod_store::fleet::provision::launch_cwd_if_made(fleet, &node.to_string())? else {
-        return Ok(Finding::NotLooked);
+        return Ok(None);
     };
     let branch = fleet.resolve_files_for_node(&node.to_string())?.and_then(|files| files.branch().map(str::to_string));
     let starts = match &branch {
         Some(branch) => fleet.read(|conn| tod_store::branch_starts::get(conn, &node.to_string(), branch))?,
         None => BranchStarts::default(),
     };
-    let repos = inspect(&cwd, branch.as_deref(), &starts)?;
-    Ok(conclude(&repos, done))
+    Ok(Some(inspect(&cwd, branch.as_deref(), &starts)?))
+}
+
+/// The title of the note [`record_replacement`] leaves on the node's activity:
+/// one per replaced sandbox, so counting them (and the failed ones) is the
+/// measure of lost submodule work.
+pub const REPLACED_TITLE: &str = "Sandbox replaced: work check";
+
+/// The submodules of `repos` that hold no commit of the node's own, which with
+/// `done_steps` above 0 means the commits made there were on no remote branch
+/// (never pushed, so gone with the sandbox). Empty when nothing was done.
+pub fn lost_submodules(repos: &[(String, RepoState)], done_steps: usize) -> Vec<String> {
+    if done_steps == 0 {
+        return Vec::new();
+    }
+    repos.iter().filter(|(name, s)| name != "." && *s == RepoState::Untouched).map(|(name, _)| name.clone()).collect()
+}
+
+/// Records, on the node's activity, what a freshly made replacement for the
+/// lost sandbox `old` holds of the node's work, per repository: the commits
+/// the old sandbox had that no remote branch had are not in the new checkout,
+/// so a submodule with no commit of the node's own, for a node with done
+/// steps, is lost work. The note is `failed` when any is. A checkout that
+/// cannot be read is an error (the caller shows it); one not made yet is
+/// recorded as such. Returns the submodules found lost.
+pub fn record_replacement(fleet: &FleetStore, node: Uuid, old: &str, new: &str) -> Result<Vec<String>> {
+    let done = done_steps(fleet, node)?;
+    // Nothing was implemented, so nothing was at stake and nothing to record.
+    if done == 0 {
+        return Ok(Vec::new());
+    }
+    let state = lifecycle::current_state(fleet, node)?;
+    let repos = inspect_node(fleet, node)?;
+    let (failed, detail, lost) = match &repos {
+        None => (false, format!("Sandbox {old} was replaced by {new}; the new checkout is not made yet, so nothing could be compared. {done} implementation step(s) were done."), Vec::new()),
+        Some(repos) => {
+            let lost = lost_submodules(repos, done);
+            let per_repo = repos.iter().map(|(name, s)| format!("{name}: {s:?}")).collect::<Vec<_>>().join("; ");
+            let verdict = if lost.is_empty() {
+                "No submodule commits of the node's were lost.".to_string()
+            } else {
+                format!("Submodule commits were on no remote branch when the sandbox was lost: {}.", lost.join(", "))
+            };
+            (!lost.is_empty(), format!("Sandbox {old} was replaced by {new}. {done} implementation step(s) were done. In the new checkout: {per_repo}. {verdict}"), lost)
+        }
+    };
+    tracing::info!("cloud: node {node}: {detail}");
+    let entry = TimelineEntry::new(node, KIND_NOTE, &state, REPLACED_TITLE, failed, detail);
+    fleet.enqueue(FleetMutation::RecordTimeline(Box::new(entry)))?;
+    fleet.writer().flush()?;
+    Ok(lost)
 }
 
 /// Reopen the implementation of a node [`check`] found lost: back to `active`

@@ -546,6 +546,14 @@ fn replace_with(
                 &id,
                 Some(format!("Its sandbox {} was pruned or deleted outside the app; made a new one, {name}, at {when}. Whatever its agent had not pushed to the remote (or kept as a checkpoint) is gone with it: check that the node's branch, in the repository and in each submodule, still holds the work before relying on a later step.", row.sandbox)),
             );
+            // What the new checkout holds of the node's work, per repository,
+            // is recorded on the node (the measure of submodule commits that
+            // were on no remote branch when the sandbox was lost). A failed
+            // look is shown, not dropped.
+            if let Err(err) = crate::lost_work::record_replacement(fleet, row.node_id, &row.sandbox, &name) {
+                tracing::error!("cloud: recording what node {id}'s new sandbox {name} holds of its work: {err:#}");
+                set_note(&id, Some(format!("Its sandbox {} was replaced by {name}, but what it holds of the node's work could not be recorded: {err:#}", row.sandbox)));
+            }
             // A new sandbox holds only what the remote had: a node past
             // implementation whose branch has none of its done work is sent
             // back now, not when someone finds it (`crate::lost_work`). A

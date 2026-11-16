@@ -144,12 +144,43 @@ pub fn forget_lost_sandbox(fleet: &FleetStore, node_id: &str, sandbox: &str, err
     if files.location.as_ref().and_then(|l| l.sandbox.as_deref()) != Some(sandbox) {
         return Ok(false);
     }
+    // Recorded first, and a failure to record stops the forgetting: the
+    // measure of lost work must not depend on the launch that finds the loss.
+    record_sandbox_lost(fleet, node_id, sandbox, error)?;
     fleet.enqueue(FleetMutation::DeleteFilesLocation { node_id: node_id.to_string() })?;
     fleet.writer().flush()?;
     fleet.reload_if_stale()?;
     // A sandbox that is gone cannot hold sessions the next one should resume.
     sandbox::forget_cached(sandbox);
     Ok(true)
+}
+
+/// The title of the note [`forget_lost_sandbox`] leaves on the node's activity.
+pub const SANDBOX_LOST_TITLE: &str = "Sandbox lost";
+
+/// Leaves a note on the node's activity that its sandbox was found gone by a
+/// launch, with how many implementation steps were done there. What the old
+/// sandbox held cannot be read any more, so this counts the loss (and what
+/// was at stake); `tod_core::lost_work::record_replacement` records what the
+/// replacement holds when the background repair makes it.
+fn record_sandbox_lost(fleet: &FleetStore, node_id: &str, sandbox: &str, error: &str) -> Result<()> {
+    use crate::outline::repos::PlanStepRepo;
+    use crate::outline::repos::plan_steps::{PHASE_ACTIVE, PHASE_VERIFYING, STATUS_IMPLEMENTED, STATUS_VERIFIED};
+    let id: uuid::Uuid = node_id.parse().with_context(|| format!("node id {node_id}"))?;
+    let done = fleet.read(|conn| {
+        Ok(PlanStepRepo::new(conn)
+            .list_for_node(id)?
+            .iter()
+            .filter(|s| matches!(s.phase.as_str(), PHASE_ACTIVE | PHASE_VERIFYING) && matches!(s.status.as_str(), STATUS_IMPLEMENTED | STATUS_VERIFIED))
+            .count())
+    })?;
+    let lifecycle = fleet.get_node(node_id)?.map(|n| n.lifecycle).unwrap_or_default();
+    let detail = format!(
+        "Sandbox {sandbox} was found gone ({error}). {done} implementation step(s) were done in it; commits it held that no remote branch had are gone with it, in the repository and in each submodule."
+    );
+    let entry = crate::node_timeline::TimelineEntry::new(id, crate::node_timeline::KIND_NOTE, &lifecycle, SANDBOX_LOST_TITLE, done > 0, detail);
+    fleet.enqueue(FleetMutation::RecordTimeline(Box::new(entry)))?;
+    Ok(())
 }
 
 /// Runs `op` (which resolves the node's launch directory and uses it); when
@@ -166,7 +197,8 @@ pub fn retry_if_sandbox_lost<T>(
         Err(err) => {
             let sandbox = node_location(fleet, node_id).ok().flatten().and_then(|l| l.sandbox);
             let lost = match sandbox {
-                Some(name) => forget_lost_sandbox(fleet, node_id, &name, &format!("{err:#}")).unwrap_or(false),
+                Some(name) => forget_lost_sandbox(fleet, node_id, &name, &format!("{err:#}"))
+                    .with_context(|| format!("the sandbox {name} is gone ({err:#}) but could not be forgotten"))?,
                 None => false,
             };
             if lost {
