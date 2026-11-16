@@ -96,6 +96,15 @@ tod-sandbox service add flagship-prod --kind api --url https://<flagship host> \
     --allow '/api/v1/orgs/*' --token-command 'op read op://…' --check
 ```
 
+A Redis URL often names a DNS alias of a managed cache (ElastiCache) whose
+certificate is issued to the cache's own endpoint, so verifying against the URL's
+host fails ("certificate not valid for name ..."). Set `tls_name` (`--tls-name`
+on `service add`, or `tod-sandbox service set <name> --tls-name <name>` to change
+only that on a saved service; `--clear-tls-name` removes it) to the name the
+certificate is issued to. The connection still goes to the URL's host and the
+certificate is still fully verified against the system roots, only against that
+name. It needs a `rediss://` URL, and `service list` shows it.
+
 The credential is the one saved with `service token` (OS keyring, else the
 encrypted file, as other tod secrets), else what `token_command` prints. A
 credential that is missing for a Hatchet service is an error telling the agent

@@ -70,6 +70,12 @@ pub struct Service {
     /// Redis: the ACL user to `AUTH` as, when not the default user.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
+    /// Redis over TLS: the name the server's certificate is verified against,
+    /// when it is not the host in `url` (a friendly DNS alias of a managed
+    /// cache whose certificate names the cache's own endpoint). The
+    /// certificate is still fully verified against the system roots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_name: Option<String>,
     /// Redis: the logical database to `SELECT`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub db: Option<u32>,
@@ -152,7 +158,12 @@ impl Service {
             ensure!(self.tenant.is_none(), "service {name}: `tenant` is for hatchet services");
         }
         if self.kind != Kind::Redis {
-            ensure!(self.username.is_none() && self.db.is_none(), "service {name}: `username` and `db` are for redis services");
+            ensure!(self.username.is_none() && self.db.is_none() && self.tls_name.is_none(), "service {name}: `username`, `db` and `tls_name` are for redis services");
+        }
+        if let Some(t) = &self.tls_name {
+            let (tls, _, _) = redis::parse_url(&self.url).map_err(|e| anyhow::anyhow!("service {name}: {e}"))?;
+            ensure!(tls, "service {name}: `tls_name` needs a rediss:// url (there is no certificate over redis://)");
+            redis::server_name(&self.url_host()?, Some(t)).map_err(|e| anyhow::anyhow!("service {name}: tls_name: {e}"))?;
         }
         if self.kind != Kind::Api {
             ensure!(self.allow.is_empty() && self.auth_header.is_none(), "service {name}: `allow` and `auth_header` are for api services");
@@ -161,6 +172,10 @@ impl Service {
             ensure!(!c.trim().is_empty(), "service {name}: token_command is empty");
         }
         Ok(())
+    }
+
+    fn url_host(&self) -> Result<String> {
+        Ok(redis::parse_url(&self.url)?.1)
     }
 
     /// Whether a call needs a credential (the others work without one).
@@ -303,6 +318,7 @@ pub(crate) mod tests {
             url: url.into(),
             tenant: (kind == Kind::Hatchet).then(|| "707d0855-80ab-4e1f-a156-f1c4546cbf57".into()),
             username: None,
+            tls_name: None,
             db: None,
             allow: if kind == Kind::Api { vec!["/api/v1/orgs/*".into()] } else { vec![] },
             auth_header: None,

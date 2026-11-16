@@ -844,6 +844,7 @@ claude_token_via = \"env\"
             url: "https://f.example".into(),
             tenant: None,
             username: None,
+            tls_name: None,
             db: None,
             allow: vec!["/api/v1/orgs/*".into()],
             auth_header: None,

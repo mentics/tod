@@ -6,7 +6,7 @@
 //! ever read from `--data-root`, `TOD_DATA_ROOT`, or install.toml; this tool
 //! never writes install.toml.
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -93,7 +93,8 @@ database list | remove <name> | test <name>
                          tests it first; `test` signs a login and connects to the
                          host from here, and sends nothing to it.
 service add <name> --kind hatchet|redis|api --url U [--tenant T] [--username U]
-      [--db N] [--allow PATH]... [--auth-header H] [--token-command C] [--check]
+      [--tls-name N] [--db N] [--allow PATH]... [--auth-header H] [--token-command C] [--check]
+service set <name> --tls-name N | --clear-tls-name
 service list | remove <name> | test <name> | token <name>
                          The read-only services a node running in the cloud may use
                          through this machine with `tod-cli access` (Hatchet runs,
@@ -590,12 +591,12 @@ fn database(ctx: &mut Ctx, mut args: Args) -> Result<i32> {
     }
 }
 
-/// `service add|list|remove|test|token`: the read-only services a cloud node may
+/// `service add|list|set|remove|test|token`: the read-only services a cloud node may
 /// use through this machine (`doc/cloud-sandboxes/brokered-access.md`).
 fn service(ctx: &mut Ctx, mut args: Args) -> Result<i32> {
     use tod_sandbox::service::{Args as CallArgs, Kind, Service};
     if args.0.is_empty() {
-        bail!("usage: tod-sandbox service add|list|remove|test|token (see `tod-sandbox help`)");
+        bail!("usage: tod-sandbox service add|list|set|remove|test|token (see `tod-sandbox help`)");
     }
     let verb = args.0.remove(0);
     let find = |ctx: &Ctx, name: &str| -> Result<Service> {
@@ -634,8 +635,9 @@ fn service(ctx: &mut Ctx, mut args: Args) -> Result<i32> {
                 } else {
                     "no credential"
                 };
+                let tls = s.tls_name.as_deref().map(|t| format!(" [certificate checked for {t}]")).unwrap_or_default();
                 println!(
-                    "{}: {} at {} ({source}); actions: {}",
+                    "{}: {} at {}{tls} ({source}); actions: {}",
                     s.name,
                     s.kind.name(),
                     s.url,
@@ -655,6 +657,7 @@ fn service(ctx: &mut Ctx, mut args: Args) -> Result<i32> {
             let url = args.opt("--url").ok_or_else(|| anyhow!("--url is required"))?;
             let tenant = args.opt("--tenant");
             let username = args.opt("--username");
+            let tls_name = args.opt("--tls-name");
             let db = args.opt("--db").map(|d| d.parse()).transpose().context("--db is a number")?;
             let mut allow = Vec::new();
             while let Some(a) = args.opt("--allow") {
@@ -664,13 +667,28 @@ fn service(ctx: &mut Ctx, mut args: Args) -> Result<i32> {
             let token_command = args.opt("--token-command");
             let check_now = args.flag("--check");
             args.done()?;
-            let svc = Service { name: name.clone(), kind, url, tenant, username, db, allow, auth_header, token_command };
+            let svc = Service { name: name.clone(), kind, url, tenant, username, tls_name, db, allow, auth_header, token_command };
             svc.validate()?;
             if check_now {
                 println!("{}", check(ctx, &svc)?);
             }
             ctx.set_service(svc)?;
             println!("{name}: saved. Nodes running in the cloud can now use it with `tod-cli access`.");
+            Ok(0)
+        }
+        "set" => {
+            // Changes only the named settings of a saved service, so the rest
+            // (a token_command, say) stays as it is.
+            let name = args.positional("service name")?;
+            let tls_name = args.opt("--tls-name");
+            let clear = args.flag("--clear-tls-name");
+            args.done()?;
+            ensure!(tls_name.is_some() != clear, "service set: give --tls-name NAME or --clear-tls-name");
+            let mut svc = find(ctx, &name)?;
+            svc.tls_name = tls_name;
+            svc.validate()?;
+            ctx.set_service(svc)?;
+            println!("{name}: saved");
             Ok(0)
         }
         "remove" => {

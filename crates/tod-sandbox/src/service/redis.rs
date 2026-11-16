@@ -144,6 +144,16 @@ pub(crate) fn parse_url(url: &str) -> Result<(bool, String, u16)> {
     Ok((tls, host.to_string(), port))
 }
 
+/// The name the certificate is verified against: `tls_name` when the service
+/// sets one, else the URL's host. Verification is never relaxed.
+pub(crate) fn server_name(host: &str, tls_name: Option<&str>) -> Result<rustls::pki_types::ServerName<'static>> {
+    let (name, what) = match tls_name {
+        Some(t) => (t, "tls_name"),
+        None => (host, "host"),
+    };
+    rustls::pki_types::ServerName::try_from(name.to_string()).with_context(|| format!("{what} {name:?} is not a valid TLS name"))
+}
+
 trait Stream: std::io::Read + Write + Send {}
 impl<T: std::io::Read + Write + Send> Stream for T {}
 
@@ -168,7 +178,7 @@ impl Conn {
             let mut roots = rustls::RootCertStore::empty();
             roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
             let config = Arc::new(rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth());
-            let name = rustls::pki_types::ServerName::try_from(host.clone()).with_context(|| format!("{host:?} is not a valid TLS name"))?;
+            let name = server_name(&host, svc.tls_name.as_deref())?;
             let conn = rustls::ClientConnection::new(config, name).context("start TLS")?;
             Box::new(rustls::StreamOwned::new(conn, tcp))
         } else {
@@ -488,6 +498,37 @@ mod tests {
         assert_eq!(parse_url("redis://r.example").unwrap(), (false, "r.example".into(), 6379));
         assert!(parse_url("redis://user:pw@r.example").is_err());
         assert!(parse_url("http://r.example").is_err());
+    }
+
+    #[test]
+    fn tls_name_overrides_the_certificate_name_only() {
+        use rustls::pki_types::ServerName;
+        let alias = "prod-redis.example.com";
+        let real = "cache.abc.use1.cache.amazonaws.com";
+        assert_eq!(server_name(alias, None).unwrap(), ServerName::try_from(alias.to_string()).unwrap());
+        assert_eq!(server_name(alias, Some(real)).unwrap(), ServerName::try_from(real.to_string()).unwrap());
+        assert!(server_name(alias, Some("not a name")).unwrap_err().to_string().contains("tls_name"));
+        // Declarations: only for TLS redis, and a bad name is refused.
+        let mut s = svc(Kind::Redis, "rediss://prod-redis.example.com:6379");
+        s.tls_name = Some(real.into());
+        assert!(s.validate().is_ok());
+        s.url = "redis://prod-redis.example.com".into();
+        assert!(s.validate().unwrap_err().to_string().contains("rediss://"));
+        let mut a = svc(Kind::Api, "https://f.example");
+        a.tls_name = Some(real.into());
+        assert!(a.validate().is_err());
+        let mut b = svc(Kind::Redis, "rediss://r.example");
+        b.tls_name = Some("bad name".into());
+        assert!(b.validate().is_err());
+    }
+
+    #[test]
+    fn tls_name_round_trips_through_toml() {
+        let s: Service = toml::from_str("name = \"r\"\nkind = \"redis\"\nurl = \"rediss://a.example\"\ntls_name = \"b.example\"\n").unwrap();
+        assert_eq!(s.tls_name.as_deref(), Some("b.example"));
+        assert!(toml::to_string(&s).unwrap().contains("tls_name = \"b.example\""));
+        let none: Service = toml::from_str("name = \"r\"\nkind = \"redis\"\nurl = \"rediss://a.example\"\n").unwrap();
+        assert_eq!(none.tls_name, None);
     }
 
     #[test]
