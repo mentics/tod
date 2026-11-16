@@ -30,6 +30,30 @@ pub enum GithubError {
          repository, even if `gh` can: check the token's access to it)"
     )]
     NotFound,
+    /// A 404 on a pull request, told apart: the pull request's repository
+    /// has no token routed to it, so the call went out with no credentials
+    /// and GitHub answers 404 for any private repository.
+    #[error(
+        "pull request not found: no GitHub token is routed to {0}, so it was read with no \
+         credentials and GitHub answers 404 for a private repository (add a token for it in \
+         Settings → Orchestrator GitHub access)"
+    )]
+    NoTokenRouted(String),
+    /// A 404 on a pull request, told apart: the repository itself is not
+    /// visible either, so the token used cannot see it.
+    #[error(
+        "pull request not found: the repository {0} is not visible to the GitHub token used \
+         (GitHub answers 404 for a repository a token cannot see, even if `gh` can): check that \
+         token's access to it"
+    )]
+    RepoNotVisible(String),
+    /// A 404 on a pull request, told apart: the repository is visible, so
+    /// the pull request really is not there.
+    #[error(
+        "pull request not found: {0} is visible to the GitHub token used but has no such pull \
+         request (it was deleted, or the number or repository recorded on the node is wrong)"
+    )]
+    PullRequestGone(String),
     #[error("GitHub API error: {0}")]
     Api(String),
     /// HTTP 429 or 5xx: GitHub is rate limiting or down. Asking again later is
@@ -288,7 +312,34 @@ impl Github {
             return Err(GithubError::ProxyMissing);
         }
         let response = self.authorize(self.agent.get(&format!("{}{path}", self.api)), path, None).call();
-        read_json(response)
+        match read_json(response) {
+            Err(GithubError::NotFound) => Err(self.explain_pull_not_found(path)),
+            other => other,
+        }
+    }
+
+    /// A 404 on `/repos/<o>/<r>/pulls/<n>...`, told apart by asking GitHub
+    /// what it can see: no route (read with no token), a repository the token
+    /// cannot see, or a repository that has no such pull request. Any other
+    /// path, or a probe that itself failed, keeps the plain `NotFound`.
+    fn explain_pull_not_found(&self, path: &str) -> GithubError {
+        let Some((owner, repo)) = crate::github_routes::repo_of_path(path) else { return GithubError::NotFound };
+        if !path.contains("/pulls/") {
+            return GithubError::NotFound;
+        }
+        let name = format!("{owner}/{repo}");
+        if let GithubAuth::Routed(routes) = &self.auth {
+            if routes.secret_for(owner, repo).is_none() {
+                return GithubError::NoTokenRouted(name);
+            }
+        }
+        let probe = format!("/repos/{owner}/{repo}");
+        let response = self.authorize(self.agent.get(&format!("{}{probe}", self.api)), &probe, None).call();
+        match read_json::<serde_json::Value>(response) {
+            Ok(_) => GithubError::PullRequestGone(name),
+            Err(GithubError::NotFound) => GithubError::RepoNotVisible(name),
+            Err(_) => GithubError::NotFound,
+        }
     }
 
     /// `POST <api><path>` with a JSON body, the reply as JSON.
@@ -2182,6 +2233,33 @@ mod tests {
     fn client(url: &str, delays: &[u64]) -> Github {
         let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
         Github::with_agent(GithubAuth::Token("t".into()), agent, url).with_retry_delays(delays)
+    }
+
+    #[test]
+    fn a_404_on_a_pull_request_says_which_of_three_causes_it_is() {
+        // The repository is visible: the pull request really is not there.
+        let (url, handle) = serve_canned(vec![("404 Not Found", "{}"), ("200 OK", r#"{"id":1}"#)]);
+        let err = client(&url, &[]).get_pr_merge("o", "r", 7).unwrap_err();
+        assert!(matches!(err, GithubError::PullRequestGone(ref r) if r == "o/r"), "{err}");
+        assert!(err.to_string().contains("pull request not found") && !err.is_transient());
+        handle.join().unwrap();
+        // The repository is not visible either: the token cannot see it.
+        let (url, handle) = serve_canned(vec![("404 Not Found", "{}"), ("404 Not Found", "{}")]);
+        let err = client(&url, &[]).get_pr_merge("o", "r", 7).unwrap_err();
+        assert!(matches!(err, GithubError::RepoNotVisible(ref r) if r == "o/r"), "{err}");
+        handle.join().unwrap();
+        // No token is routed to the repository: named without a second call.
+        let (url, handle) = serve_canned(vec![("404 Not Found", "{}")]);
+        let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+        let routed = Github::with_agent(GithubAuth::Routed(GithubRoutes::default()), agent, &url).with_retry_delays(&[]);
+        let err = routed.get_pr_merge("o", "r", 7).unwrap_err();
+        assert!(matches!(err, GithubError::NoTokenRouted(ref r) if r == "o/r"), "{err}");
+        assert_eq!(handle.join().unwrap(), 1);
+        // A 404 on something that is not a pull request stays plain.
+        let (url, handle) = serve_canned(vec![("404 Not Found", "{}")]);
+        let err = client(&url, &[]).list_releases("o", "r").unwrap_err();
+        assert!(matches!(err, GithubError::NotFound), "{err}");
+        handle.join().unwrap();
     }
 
     fn recent_reply(timeline: &str, review: &str) -> String {
