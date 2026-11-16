@@ -14,7 +14,7 @@
 
 use crate::blaxel::Blaxel;
 use crate::relay;
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use std::time::{Duration, Instant};
 
@@ -258,9 +258,60 @@ pub fn is_node_kind(kind_label: Option<&str>) -> bool {
 /// own provisioning may install into it, with the supervisor's environment.
 pub fn node_sandbox_refusal(name: &str) -> String {
     format!(
-        "{name} is a node's sandbox and is being set up by that node (or its files are missing); tod will not \
-         provision it as a plain sandbox. Run the node in the cloud again to set it up"
+        "{name} is a node's sandbox, its relay is down, and tod's node files are not in it, so it cannot be used \
+         as it is; tod will not provision it as a plain sandbox. Start or Reset environment on the node sets it up \
+         again (they are the node's own provisioning); Delete sandbox anyway discards its uncommitted work"
     )
+}
+
+/// What to do about a node's sandbox whose relay does not answer, given what
+/// its manifest file says (read without the relay, through Blaxel's process
+/// API).
+#[derive(Debug, PartialEq, Eq)]
+pub enum RelayRevival {
+    /// tod's node files are installed: starting the relay with the
+    /// supervisor's environment is all it needs.
+    Start,
+    /// The files are not there (a redeploy from the image wiped `/opt/tod`):
+    /// only the node's own provisioning can put them back.
+    FilesMissing,
+}
+
+/// [`RelayRevival`] for a sandbox whose manifest file reads `manifest`.
+pub fn relay_revival(manifest: &str) -> RelayRevival {
+    if is_node_manifest(manifest) { RelayRevival::Start } else { RelayRevival::FilesMissing }
+}
+
+/// A node's sandbox whose relay does not answer but whose node files are
+/// installed gets its relay started again, with `supervisor_env` (the one
+/// thing a plain provisioning lacks, which is why it refuses a node's
+/// sandbox). Returns whether it did; `false` when the relay already answers
+/// or the files are missing ([`RelayRevival::FilesMissing`]).
+pub fn revive_node_relay(
+    bx: &Blaxel,
+    url: &str,
+    supervisor_env: &[(String, String)],
+    progress: &mut dyn FnMut(&str),
+) -> Result<bool> {
+    if relay_manifest(bx, url).is_some() {
+        return Ok(false);
+    }
+    let found = bx.run(url, &format!("cat {MANIFEST_PATH} 2>/dev/null"), 30)?;
+    if relay_revival(found.output()) == RelayRevival::FilesMissing {
+        return Ok(false);
+    }
+    progress("the node's relay does not answer; starting it again…");
+    crate::node::start_relay(bx, url, supervisor_env).context("start the node's relay again")?;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if relay_manifest(bx, url).is_some_and(|m| is_node_manifest(&m)) {
+            return Ok(true);
+        }
+        if Instant::now() > deadline {
+            bail!("the node's relay was started again but did not answer within 60s (see {TOD_DIR}/logs in the sandbox)");
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
 }
 
 /// Whether a fork whose golden carried tod's files needs them installed
@@ -663,6 +714,10 @@ mod tests {
         assert!(is_node_kind(Some("node")) && is_node_kind(Some("node-base")));
         assert!(!is_node_kind(Some("golden")) && !is_node_kind(None));
         assert!(node_sandbox_refusal("tod-x-1").contains("tod-x-1"));
+        assert!(node_sandbox_refusal("tod-x-1").contains("Reset environment"));
+        assert_eq!(relay_revival("node relay=0123456789abcdef"), RelayRevival::Start);
+        assert_eq!(relay_revival(""), RelayRevival::FilesMissing);
+        assert_eq!(relay_revival("fork relay=1"), RelayRevival::FilesMissing);
     }
 
     #[test]

@@ -49,9 +49,10 @@ fn lock_with(root: &Path, node_id: &str, wait: Duration, poll: Duration, progres
     let dir = locks_dir(root);
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     let path = dir.join(format!("node-{node_id}.lock"));
-    let file = std::fs::OpenOptions::new()
+    let mut file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
+        .read(true)
         .write(true)
         .open(&path)
         .with_context(|| format!("open {}", path.display()))?;
@@ -59,15 +60,20 @@ fn lock_with(root: &Path, node_id: &str, wait: Duration, poll: Duration, progres
     let mut said = false;
     loop {
         match fs2::FileExt::try_lock_exclusive(&file) {
-            Ok(()) => return Ok(NodeProvisionGuard { _file: file }),
+            Ok(()) => {
+                record_holder(&mut file).with_context(|| format!("record the holder in {}", path.display()))?;
+                return Ok(NodeProvisionGuard { _file: file });
+            }
             Err(err) if err.kind() == fs2::lock_contended_error().kind() => {
+                let holder = read_holder(&path);
                 if !said {
-                    progress("another provisioning of this node is running; waiting for it…");
+                    progress(&format!("another provisioning of this node is running ({holder}); waiting for it…"));
                     said = true;
                 }
                 if std::time::Instant::now() >= deadline {
                     return Err(anyhow!(
-                        "another provisioning of node {node_id} has held {} for {}s; if it is stuck, stop the app or daemon that runs it",
+                        "another provisioning of node {node_id} has held {} for {}s ({holder}); the lock dies with its process, \
+                         so that provisioning is alive and stuck: restart the app or daemon with that pid",
                         path.display(),
                         wait.as_secs()
                     ));
@@ -77,6 +83,81 @@ fn lock_with(root: &Path, node_id: &str, wait: Duration, poll: Duration, progres
             Err(err) => return Err(err).with_context(|| format!("lock {}", path.display())),
         }
     }
+}
+
+/// Writes who holds the lock (`pid <n> since <ms>`) into the lock file, which
+/// the holder owns while it holds the `flock`; a waiter reads it to say whom
+/// it waits for. The lock itself never depends on this text.
+fn record_holder(file: &mut std::fs::File) -> std::io::Result<()> {
+    use std::io::{Seek, Write};
+    file.set_len(0)?;
+    file.seek(std::io::SeekFrom::Start(0))?;
+    write!(file, "pid {} since {}", std::process::id(), now_ms())?;
+    file.flush()
+}
+
+/// Who the lock file at `path` says holds it, in words for a waiting message.
+fn read_holder(path: &Path) -> String {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let mut words = text.split_whitespace();
+    match (words.next(), words.next(), words.next(), words.next().and_then(|t| t.parse::<i64>().ok())) {
+        (Some("pid"), Some(pid), Some("since"), Some(since)) => {
+            let age = (now_ms() - since).max(0) / 1000;
+            let own = if pid == std::process::id().to_string() { ", this process" } else { "" };
+            format!("pid {pid}{own}, for {age}s")
+        }
+        _ => "holder unknown".to_string(),
+    }
+}
+
+/// How long a `starting` row written by the app may stand with no
+/// provisioning running before [`expire_orphaned_starts`] calls it failed:
+/// the time the view already gives a supervisor to report in
+/// ([`super::SUPERVISOR_REPORTS_WITHIN`]).
+const ORPHANED_START_AFTER_MS: i64 = super::SUPERVISOR_REPORTS_WITHIN.as_millis() as i64;
+
+/// Whether anything holds the provisioning lock of `node_id` right now.
+fn provisioning_running(root: &Path, node_id: &str) -> Result<bool> {
+    let dir = locks_dir(root);
+    let path = dir.join(format!("node-{node_id}.lock"));
+    let file = match std::fs::OpenOptions::new().read(true).write(true).open(&path) {
+        Ok(f) => f,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err).with_context(|| format!("open {}", path.display())),
+    };
+    match fs2::FileExt::try_lock_exclusive(&file) {
+        Ok(()) => Ok(false),
+        Err(err) if err.kind() == fs2::lock_contended_error().kind() => Ok(true),
+        Err(err) => Err(err).with_context(|| format!("lock {}", path.display())),
+    }
+}
+
+/// A node whose `starting` row (written by the app when it sent the node) was
+/// left by a process that died mid-start (the app restarted) stays "starting"
+/// for good: nothing is provisioning it, and nothing will write the next word.
+/// Marks each such row failed, saying so, so every verb (Start included) sees
+/// a stopped node, not one that is starting forever. Returns the nodes marked.
+/// A row is left alone while a provisioning holds the node's lock, or while it
+/// is younger than [`ORPHANED_START_AFTER_MS`], or if not the app's.
+pub fn expire_orphaned_starts(fleet: &FleetStore, root: &Path, now_ms: i64) -> Result<Vec<String>> {
+    let starting = fleet.read(tod_store::run_state::list_starting)?;
+    let mut marked = Vec::new();
+    for row in starting {
+        if row.writer != "app" || now_ms - row.updated_at < ORPHANED_START_AFTER_MS {
+            continue;
+        }
+        let node_id = row.node_id.to_string();
+        if provisioning_running(root, &node_id)? {
+            continue;
+        }
+        let text = format!(
+            "starting in the cloud was interrupted (the app stopped before it finished: {}); Start sends the node again",
+            row.reason_text
+        );
+        crate::run_state::record(fleet, row.node_id, crate::run_state::runner_failed(&text), "app")?;
+        marked.push(node_id);
+    }
+    Ok(marked)
 }
 
 /// The sandbox a provisioning of a node is about to use.
@@ -429,8 +510,74 @@ mod tests {
             .expect("the lock is held");
         assert!(format!("{err:#}").contains("another provisioning of node n1"), "{err:#}");
         assert_eq!(said.len(), 1, "{said:?}");
+        let me = format!("pid {}, this process", std::process::id());
+        assert!(said[0].contains(&me), "the wait names who holds the lock: {said:?}");
+        assert!(format!("{err:#}").contains(&me), "{err:#}");
         drop(held);
         drop(lock_node_provisioning(&root, "n1", &mut |_| {}).unwrap());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn node_with_start(root: &Path, writer: &str) -> (FleetStore, uuid::Uuid) {
+        use tod_store::outline::{CreatePosition, OutlineMutation};
+        let fleet = FleetStore::open(root).unwrap();
+        fleet.enqueue_outline(OutlineMutation::CreateList { slug: "t".into(), title: "T".into() }).unwrap();
+        fleet.writer().flush().unwrap();
+        let list_id = fleet.list_outline_lists().unwrap()[0].id;
+        let node = uuid::Uuid::new_v4();
+        fleet
+            .enqueue_outline(OutlineMutation::CreateNode {
+                node_id: Some(node),
+                list_id,
+                parent_id: None,
+                anchor_id: None,
+                position: CreatePosition::Below,
+                title: "N".into(),
+            })
+            .unwrap();
+        fleet.writer().flush().unwrap();
+        fleet.reload_if_stale().unwrap();
+        crate::run_state::record(&fleet, node, crate::run_state::sending(), writer).unwrap();
+        (fleet, node)
+    }
+
+    fn phase(fleet: &FleetStore, node: uuid::Uuid) -> tod_store::run_state::Phase {
+        fleet.read(|c| tod_store::run_state::get(c, node)).unwrap().unwrap().phase
+    }
+
+    #[test]
+    fn a_start_left_by_a_dead_process_expires_but_a_running_or_recent_one_does_not() {
+        use tod_store::run_state::Phase;
+        let root = temp_root("orphan");
+        let (fleet, node) = node_with_start(&root, "app");
+        let id = node.to_string();
+        // Judged against the row's own clock, so the test does not depend on the machine's.
+        let wrote = fleet.read(|c| tod_store::run_state::get(c, node)).unwrap().unwrap().updated_at;
+        let later = wrote + ORPHANED_START_AFTER_MS + 1_000;
+        // Too recent: the supervisor may still report in.
+        assert!(expire_orphaned_starts(&fleet, &root, wrote + 1_000).unwrap().is_empty());
+        assert_eq!(phase(&fleet, node), Phase::Starting);
+        // A provisioning is running: left alone.
+        let held = lock_node_provisioning(&root, &id, &mut |_| {}).unwrap();
+        assert!(expire_orphaned_starts(&fleet, &root, later).unwrap().is_empty());
+        assert_eq!(phase(&fleet, node), Phase::Starting);
+        // Its process is gone (the lock is free): the row is failed, saying why.
+        drop(held);
+        assert_eq!(expire_orphaned_starts(&fleet, &root, later).unwrap(), vec![id]);
+        let row = fleet.read(|c| tod_store::run_state::get(c, node)).unwrap().unwrap();
+        assert_eq!(row.phase, Phase::Stopped);
+        assert!(row.reason_text.contains("interrupted"), "{}", row.reason_text);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_supervisors_starting_row_is_never_expired_by_the_app() {
+        use tod_store::run_state::Phase;
+        let root = temp_root("orphan-sup");
+        let (fleet, node) = node_with_start(&root, "supervisor:sb");
+        let wrote = fleet.read(|c| tod_store::run_state::get(c, node)).unwrap().unwrap().updated_at;
+        assert!(expire_orphaned_starts(&fleet, &root, wrote + ORPHANED_START_AFTER_MS * 10).unwrap().is_empty());
+        assert_eq!(phase(&fleet, node), Phase::Starting);
         let _ = std::fs::remove_dir_all(root);
     }
 

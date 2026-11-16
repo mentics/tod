@@ -296,7 +296,19 @@ impl Sandboxes {
             bx.wait_deployed(name, Duration::from_secs(180))?
         };
         let url = info.url.clone().unwrap_or_default();
-        let refuse = !by_node && mode != provision::Mode::ForceInstall && provision::is_node_kind(info.label("tod-kind"));
+        let node_kind = provision::is_node_kind(info.label("tod-kind"));
+        let refuse = !by_node && mode != provision::Mode::ForceInstall && node_kind;
+        if node_kind && mode != provision::Mode::ForceInstall {
+            // A node's sandbox whose relay is down but whose node files are
+            // there needs only its relay started with the supervisor's
+            // environment. Done here, the one place every git, Files,
+            // checkpoint and delete call makes a sandbox ready through, so
+            // none of them is a dead end while the relay is down.
+            let creds = self.node_credentials(Vec::new());
+            let env = tod_sandbox::node::supervisor_env(&creds, self.claude_token_via());
+            provision::revive_node_relay(bx, &url, &env, progress)
+                .with_context(|| format!("start {name}'s relay again"))?;
+        }
         let agents = self.config.sandbox(name).is_some_and(|s| s.agents);
         let relay_bin = relay_binary()?;
         let payload = payload(&relay_bin, agents);
@@ -1120,6 +1132,36 @@ fn ready_gate(name: &str) -> std::sync::Arc<Mutex<()>> {
         .clone()
 }
 
+thread_local! {
+    static NODE_PROVISIONING: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Marks the current thread as a node's own provisioning (`ensure_supervisor`,
+/// which Start and Reset environment run) while alive: [`connect`] then makes
+/// the node's sandbox ready the way that provisioning may (installing into
+/// it), instead of refusing it as a plain provisioning would. Without this the
+/// provisioning's own first git call on a node's sandbox whose relay is down
+/// was refused, so nothing could ever set it up again.
+pub struct NodeProvisioningScope(());
+
+impl NodeProvisioningScope {
+    pub fn enter() -> Self {
+        NODE_PROVISIONING.with(|c| c.set(c.get() + 1));
+        Self(())
+    }
+}
+
+impl Drop for NodeProvisioningScope {
+    fn drop(&mut self) {
+        NODE_PROVISIONING.with(|c| c.set(c.get().saturating_sub(1)));
+    }
+}
+
+/// Whether this thread is inside a [`NodeProvisioningScope`].
+pub fn node_provisioning_active() -> bool {
+    NODE_PROVISIONING.with(|c| c.get() > 0)
+}
+
 /// How long a check that a sandbox is ready stands (its relay could restart
 /// after that, and a token expires).
 const READY_TTL: Duration = Duration::from_secs(600);
@@ -1144,7 +1186,14 @@ pub fn connect(name: &str) -> Result<Connection> {
     }
     let mut sandboxes = Sandboxes::load(&data_root()?)?;
     let bx = sandboxes.blaxel()?;
-    let url = sandboxes.ensure(&bx, name, &mut |m| tracing::info!(sandbox = name, "{m}"))?;
+    let mut say = |m: &str| tracing::info!(sandbox = name, "{m}");
+    // A node's own provisioning may install into its node's sandbox; any
+    // other caller only revives its relay or is refused with the way out.
+    let url = if node_provisioning_active() {
+        sandboxes.ensure_node_as(&bx, name, provision::Mode::Install, &mut say)?
+    } else {
+        sandboxes.ensure(&bx, name, &mut say)?
+    };
     let conn = Connection { url, token: bx.token().to_string() };
     ready()
         .lock()
@@ -1295,6 +1344,20 @@ pub fn validate_name(name: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_node_provisioning_scope_is_per_thread_and_nests() {
+        use super::{NodeProvisioningScope, node_provisioning_active};
+        assert!(!node_provisioning_active());
+        let outer = NodeProvisioningScope::enter();
+        let inner = NodeProvisioningScope::enter();
+        assert!(node_provisioning_active());
+        assert!(!std::thread::spawn(node_provisioning_active).join().unwrap(), "another thread is not in it");
+        drop(inner);
+        assert!(node_provisioning_active(), "the outer scope still holds");
+        drop(outer);
+        assert!(!node_provisioning_active());
+    }
+
     #[test]
     fn saves_at_once_each_write_a_whole_file_and_leave_no_temp_files() {
         let dir = tempfile::tempdir().unwrap();

@@ -186,6 +186,16 @@ pub fn get(conn: &Connection, node: Uuid) -> Result<Option<RunState>> {
         .transpose()
 }
 
+/// Every row whose phase is `starting`.
+pub fn list_starting(conn: &Connection) -> Result<Vec<RunState>> {
+    if !has_table(conn)? {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(&format!("SELECT {COLUMNS} FROM run_state WHERE phase = 'starting'"))?;
+    let rows = stmt.query_map([], read)?.collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter().map(finish).collect()
+}
+
 /// The rows of any of `node_ids`.
 pub fn list_for_nodes(conn: &Connection, node_ids: &[Uuid]) -> Result<Vec<RunState>> {
     if node_ids.is_empty() || !has_table(conn)? {

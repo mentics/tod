@@ -1229,6 +1229,12 @@ pub fn sync_now(fleet: &FleetStore, root: &Path) -> Result<SyncReport> {
 pub fn sync_on_start(fleet: std::sync::Arc<FleetStore>) {
     spawn_outbox_pusher(fleet.clone());
     let root = fleet.paths().root().to_path_buf();
+    // A start the previous process died in is not "starting" any more.
+    match provisioning::expire_orphaned_starts(&fleet, &root, tod_store::outline::uuid_blob::now_ms()) {
+        Ok(nodes) if !nodes.is_empty() => tracing::warn!("marked interrupted cloud starts failed: {nodes:?}"),
+        Ok(_) => {}
+        Err(err) => tracing::error!("could not expire interrupted cloud starts: {err:#}"),
+    }
     // Whether or not anything is seeded: a workspace with no orchestrator
     // gets one, in the background.
     deploy::spawn_ensure(root.clone());
@@ -1606,6 +1612,10 @@ pub fn ensure_supervisor(
     // One provisioning of a node at a time, across the app and the daemon:
     // two would fork the same name or start two relays.
     let _provisioning = provisioning::lock_node_provisioning(root, node_id, progress)?;
+    // This is the node's own provisioning: its git calls on the node's
+    // sandbox may install into it (see `NodeProvisioningScope`), so Start and
+    // Reset environment can set one up again whatever state its relay is in.
+    let _own = tod_store::fleet::sandbox::NodeProvisioningScope::enter();
     let (task, repo_url, branch) = node_source(fleet, node_id)?;
     // Before any network call: without it the sandbox could not run Claude.
     let claude_oauth_token = claude_token_for_node(root)?;
