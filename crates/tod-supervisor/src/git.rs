@@ -121,7 +121,10 @@ fn push_repo(repo: &Path, expected: Expected) -> Result<bool> {
         return Ok(false);
     }
     if is_protected(&branch, default_branch(repo).as_deref()) {
-        bail!("refusing to push {branch}: it is a default branch, not the node's own");
+        bail!(
+            "refusing to push {branch}: it is a default branch, not the node's own. The node's checkout was never put on its \
+             branch (use Reset environment, which does); nothing was pushed"
+        );
     }
     match expected {
         Expected::Any => {}

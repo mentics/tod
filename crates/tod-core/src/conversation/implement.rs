@@ -699,6 +699,7 @@ pub(super) fn prepare_submodules(env: &ProtocolEnv<'_>, cwd: &Workdir) -> Result
     let Some(branch) = recorded.or_else(|| current_branch(cwd)) else {
         return Ok(());
     };
+    worktree::ensure_on_branch(cwd, &branch)?;
     for warning in worktree::branch_submodules(cwd, &branch)? {
         tracing::warn!("{warning}");
     }
