@@ -378,6 +378,7 @@ mod tests {
             allow: vec![],
             auth_header: None,
             token_command: None,
+            tls_name: None,
         }
     }
 
