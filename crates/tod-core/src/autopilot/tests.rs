@@ -455,11 +455,39 @@ impl crate::pr_readiness::PrFeed for FailingGithub {
 }
 
 /// A node with a workspace and nothing else: no requirements, no plan.
+/// The workspace is a real repository with one commit: every launch puts the
+/// node's checkout on its branch (`worktree::ensure_on_branch`), which a plain
+/// directory cannot be (git: "not a git repository"). `origin` is a bare
+/// repository beside it, because a branch that does not exist yet is made from
+/// `origin`'s default branch. Hermetic: no network, no user git config needed.
+fn init_workspace_repo(workspace: &std::path::Path) {
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.email=t@t", "-c", "user.name=t", "-c", "init.defaultBranch=main"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    let origin = workspace.with_file_name("origin.git");
+    std::fs::create_dir_all(&origin).unwrap();
+    git(&origin, &["init", "-q", "--bare"]);
+    git(workspace, &["init", "-q"]);
+    git(workspace, &["commit", "-q", "--allow-empty", "-m", "first"]);
+    git(workspace, &["remote", "add", "origin", &origin.display().to_string()]);
+    git(workspace, &["push", "-q", "origin", "HEAD:refs/heads/main"]);
+    git(workspace, &["fetch", "-q", "origin"]);
+    git(workspace, &["remote", "set-head", "origin", "main"]);
+}
+
 fn bare() -> Fixture {
     crate::pr_readiness::set_feed_override(Some(Arc::new(FinishedGithub)));
     let fx = fixture();
     let workspace = fx.root.join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
+    init_workspace_repo(&workspace);
     fx.fleet
         .enqueue_outline(OutlineMutation::EnableCapabilities {
             node_id: fx.node,
@@ -2969,12 +2997,6 @@ fn a_finding_left_open_by_an_earlier_stay_is_still_owed_after_the_phase_is_rerun
 /// with `command` configured as a check for `phase`.
 fn with_check(fx: &Fixture, phase: &str, label: &str, command: &str) -> PathBuf {
     let workspace = fx.root.join("workspace");
-    let git = |args: &[&str]| {
-        let out = std::process::Command::new("git").arg("-C").arg(&workspace).args(args).output().unwrap();
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
-    };
-    git(&["init", "-q"]);
-    git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "first"]);
     fx.fleet
         .enqueue_outline(OutlineMutation::EnableCapabilities {
             node_id: fx.node,
