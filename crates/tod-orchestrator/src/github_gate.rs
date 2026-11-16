@@ -15,7 +15,9 @@
 //!   `pr_review` node whose pull request waits only for a person's review:
 //!   the look is at the review cadence (`tod_core::wait_cadence`: minutes in
 //!   the working day, hours outside it), never a sandbox wake. A bot's
-//!   review, running checks, and work for the agent still poke.
+//!   review, running checks, and work for the agent still poke. Being behind
+//!   the base alone is not work for this: it waits like the rest, so a busy base
+//!   does not wake the sandbox all day (it is merged in when anything else wakes it).
 //! - Clear, or nothing to wait on: poke, the node goes on.
 //! - Not readable (no GitHub access here, a missing pull request, a failed
 //!   read): never a poke. The failure is recorded on the node

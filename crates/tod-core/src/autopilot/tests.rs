@@ -1529,6 +1529,40 @@ fn pr_review_with_skills_runs_every_group_on_entry_then_waits_for_the_person() {
     assert_eq!(agent.turns, 2, "a restart is not a new phase");
 }
 
+/// A pull request waiting on a person's review that falls behind its base is
+/// still just waiting: no sandbox is woken to merge the base in (a busy base
+/// moves all day, and each wake resets the idle clock the workspace's prune
+/// reads). A conflict is work, so it still wakes it.
+#[test]
+fn pr_review_behind_its_base_alone_keeps_waiting_for_the_person() {
+    struct Moving(std::sync::Mutex<(u32, bool)>);
+    impl crate::pr_readiness::PrFeed for Moving {
+        fn snapshot(&self, pr: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
+            let mut snap = AwaitingReview.snapshot(pr)?;
+            let (behind, conflict) = *self.0.lock().unwrap();
+            snap.status.behind_by = Some(behind);
+            if conflict {
+                snap.status.mergeable = Some(false);
+                snap.status.mergeable_state = Some("dirty".into());
+            }
+            Ok(snap)
+        }
+    }
+    let fx = bare();
+    retire_outside_criteria(&fx);
+    let feed = Arc::new(Moving(std::sync::Mutex::new((4, false))));
+    crate::pr_readiness::set_feed_override(Some(feed.clone()));
+    linked_to_prs(&fx, "pr_review", &["https://github.com/acme/app/pull/42"]);
+
+    let found = super::check_now(&fx.fleet, fx.node, &fx.root).unwrap();
+    assert!(matches!(found, super::GithubCheck::Waiting { .. }), "behind alone must wait: {found:?}");
+
+    *feed.0.lock().unwrap() = (4, true);
+    let found = super::check_now(&fx.fleet, fx.node, &fx.root).unwrap();
+    let super::GithubCheck::Feedback { what } = found else { panic!("expected Feedback, got {found:?}") };
+    assert!(what.contains("conflicts with its base"), "{what}");
+}
+
 #[test]
 fn pr_review_without_skills_takes_no_entry_turn() {
     let fx = setup();
@@ -2445,9 +2479,9 @@ fn check_now_in_pr_draft_waits_for_the_draft_to_be_ready_and_reviewed() {
     assert!(pending_specs(&fx).is_empty());
 }
 
-/// A draft waiting for a person to mark it ready, then main moves: the next
-/// scheduled look finds work for the agent (behind, or conflicting) and
-/// cancels the wait, instead of waiting on. GitHub reports a draft's
+/// A draft waiting for a person to mark it ready, then main moves: being
+/// behind alone changes nothing (no sandbox is woken for it); a conflict is
+/// work for the agent and cancels the wait, instead of waiting on. GitHub reports a draft's
 /// `mergeable_state` as `draft`, so a conflict shows only in `mergeable`.
 #[test]
 fn a_draft_waiting_to_be_marked_ready_gets_work_when_it_falls_behind_or_conflicts() {
@@ -2481,12 +2515,13 @@ fn a_draft_waiting_to_be_marked_ready_gets_work_when_it_falls_behind_or_conflict
     assert!(matches!(found, super::GithubCheck::Waiting { .. }), "{found:?}");
     assert_eq!(pending_specs(&fx), ["github:pr:42:ready_for_review"]);
 
-    // Main moved: behind.
+    // Main moved: behind. Only housekeeping: the wait stands and no sandbox
+    // is woken for it (the base is merged in when something else wakes it).
     feed.0.lock().unwrap().status.behind_by = Some(4);
     let found = super::check_now(&fx.fleet, fx.node, &fx.root).unwrap();
-    let super::GithubCheck::Feedback { what } = found else { panic!("expected Feedback, got {found:?}") };
-    assert!(what.contains("behind its base"), "{what}");
-    assert!(pending_specs(&fx).is_empty());
+    assert!(matches!(found, super::GithubCheck::Waiting { .. }), "{found:?}");
+    assert_eq!(pending_specs(&fx), ["github:pr:42:ready_for_review"]);
+    feed.0.lock().unwrap().status.behind_by = Some(0);
 
     // Conflicting on a draft: `mergeable` is false, the state still `draft`.
     {

@@ -312,7 +312,10 @@ wait passes a gate before its sandbox is poked: the orchestrator runs the
 node's own check (`tod_core::autopilot::check_github`) against the user's
 copy of the database. Still waiting, it has recorded the next look and the wake
 moves to it (under the new wait's id), with the sandbox left asleep, or gone.
-Clear, it pokes and the node goes on. If GitHub cannot be read from here (no
+Clear, it pokes and the node goes on. A pull request that is only behind its base
+(nothing else for the agent) still counts as waiting, so a busy base branch does not
+wake the sandbox each time it moves; real feedback (threads, comments, failing checks,
+a conflict) does. If GitHub cannot be read from here (no
 access configured, a pull request the token cannot see, a failed read) it never
 pokes: a sandbox cannot read what the orchestrator could not, and each poke
 would reset the sandbox's idle clock, so the workspace's idle prune never takes

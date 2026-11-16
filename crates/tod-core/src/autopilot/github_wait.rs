@@ -342,7 +342,7 @@ fn check_ready_for_review(fleet: &FleetStore, node: uuid::Uuid, data_root: &std:
         }
         .answered_through(answered_at)
             .work();
-        if !work.is_empty() {
+        if !work.is_empty() && !only_behind(&work) {
             feedback.push(format!("{label}: {}", work_description(&work)));
         }
         if crate::gate::derived::ready_for_review(&pr.url, status).is_err() {
@@ -431,6 +431,13 @@ fn check_in_review(fleet: &FleetStore, node: uuid::Uuid, data_root: &std::path::
             cancel_github_waits(fleet, node)?;
             Ok(GithubCheck::Clear)
         }
+        // Only behind its base, and a person's review is the one thing waited
+        // for: that is the review wait, not work to wake the sandbox for.
+        Next::Work(work) if only_behind(&work) && waits_only_on_a_person(&live) => {
+            let (spec, what) = review_wait_of(&live);
+            let due_at_ms = record_github_wait(fleet, node, spec, "github:pr:", &settings, &what)?;
+            Ok(GithubCheck::Waiting { what, due_at_ms })
+        }
         Next::Work(work) => {
             cancel_github_waits(fleet, node)?;
             Ok(GithubCheck::Feedback { what: work_description(&work) })
@@ -442,6 +449,23 @@ fn check_in_review(fleet: &FleetStore, node: uuid::Uuid, data_root: &std::path::
         }
         Next::Wait(_) => Ok(GithubCheck::NothingToWaitOn),
     }
+}
+
+/// Whether `work` is only "merge the base in". That is housekeeping, not
+/// feedback: a pull request that is merely behind and waits on a person must not
+/// wake its sandbox each time the base moves (a busy base moves all day, and each
+/// wake resets the sandbox's idle clock, so the workspace's idle prune never takes
+/// it). The base is merged in when something else wakes the node: the person's
+/// review, a comment, a failing check.
+fn only_behind(work: &[crate::pr_readiness::Work]) -> bool {
+    !work.is_empty() && work.iter().all(|w| matches!(w, crate::pr_readiness::Work::Behind))
+}
+
+/// Whether the only thing `live`'s pull requests wait for is a person's review.
+fn waits_only_on_a_person(live: &[crate::pr_readiness::LivePr]) -> bool {
+    use crate::pr_readiness::Wait;
+    let waits: Vec<Wait> = live.iter().flat_map(|p| p.assessment.waits()).collect();
+    !waits.is_empty() && waits.iter().all(|w| matches!(w, Wait::HumanReview))
 }
 
 /// What `work` asks of the agent, in words.
