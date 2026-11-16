@@ -140,7 +140,8 @@ pub fn record_decision_answer_as(
 /// in the message sent to the old conversation, and a run that started a new
 /// session handed the same step back again. Blocks on the store: run it off
 /// the UI thread, before the message is sent (a message sent first would be
-/// older than the answer and the answer would be told twice).
+/// older than the answer). The turn that delivers `message` does not repeat
+/// the answer as "already answered" (`node_context::message_carries`).
 pub fn record_plan_step_handoff_answer(
     fleet: &FleetStore,
     step: &tod_store::outline::PlanStep,

@@ -513,7 +513,7 @@ impl ConversationDriver {
         // What the user answered since the last turn went out, for a session
         // that goes on (a rotation's snapshot carries it already). Read before
         // this turn is appended, which is what marks it as sent.
-        let answers = self.unsent_answers(fleet, id)?;
+        let answers = self.unsent_answers(fleet, id, text)?;
         let sent_context = Some(join_sections(&changes, &answers)).filter(|c| !c.is_empty());
         let user_seq = self.append_with_parts_and_context(
             fleet,
@@ -579,6 +579,7 @@ impl ConversationDriver {
                 let context = self.with_recent_answers(
                     fleet,
                     self.protocol.opening(&self.env(fleet, id))?,
+                    text,
                 )?;
                 // Kept so the user can read what the agent was given.
                 fleet.interview(
@@ -960,7 +961,7 @@ impl ConversationDriver {
                 self.continuations += 1;
                 // An answer given while the run was going reaches it here,
                 // once, whatever the protocol.
-                let answers = self.unsent_answers(fleet, id)?;
+                let answers = self.unsent_answers(fleet, id, &message)?;
                 let message = join_sections(&message, &answers);
                 let message = if quiet_turn {
                     format!("{}{message}", super::protocol::QUIET_TURN_NOTE)
@@ -1093,12 +1094,12 @@ impl ConversationDriver {
     /// so without this it never learns the answer and hands the step back
     /// again (ENG-2072 was answered three times). Nothing is added for a
     /// conversation without a node.
-    fn with_recent_answers(&self, fleet: &FleetStore, mut context: String) -> Result<String> {
+    fn with_recent_answers(&self, fleet: &FleetStore, mut context: String, sending: &str) -> Result<String> {
         let Some(node) = self.focus.node_id() else {
             return Ok(context);
         };
         let answered = fleet
-            .read(|conn| Ok(crate::node_context::render_recent_answers(conn, node)?))
+            .read(|conn| Ok(crate::node_context::render_recent_answers(conn, node, sending)?))
             .context("could not read the user's recent answers")?;
         if !answered.is_empty() {
             context.push_str("\n\n");
@@ -1112,12 +1113,12 @@ impl ConversationDriver {
     /// session that is being resumed or continued has not been told. A fresh
     /// session gets them through [`Self::with_recent_answers`] instead, so a
     /// turn never carries both. Empty for a conversation without a node.
-    fn unsent_answers(&self, fleet: &FleetStore, id: Uuid) -> Result<String> {
+    fn unsent_answers(&self, fleet: &FleetStore, id: Uuid, sending: &str) -> Result<String> {
         let Some(node) = self.focus.node_id() else {
             return Ok(String::new());
         };
         fleet
-            .read(|conn| Ok(crate::node_context::render_unsent_answers(conn, node, id)?))
+            .read(|conn| Ok(crate::node_context::render_unsent_answers(conn, node, id, sending)?))
             .context("could not read the user's recent answers")
     }
 
@@ -1163,6 +1164,7 @@ impl ConversationDriver {
             fleet,
             self.protocol
                 .resume_snapshot(&self.env(fleet, id), budget, Some(user_seq))?,
+            text,
         )?;
         self.session_tokens = Some(0);
         self.start(

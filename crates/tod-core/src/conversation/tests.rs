@@ -662,6 +662,82 @@ fn an_answer_to_a_handed_back_plan_step_reaches_the_next_session() {
     assert!(sent.contains("Apply the terraform plan"), "{sent}");
 }
 
+/// The answer is recorded before its message goes out, and the turn that
+/// delivers it must not tell it a second time as "already answered": in a
+/// session that goes on, and in one resumed by id.
+#[test]
+fn an_answer_is_in_the_turn_that_delivers_it_exactly_once() {
+    let fx = fixture();
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut driver = ConversationDriver::new(config(&fx, 100_000), Focus::Node(fx.node), ProtocolKind::Outline);
+    say(&mut driver, &fx, &mut agent, "ask Hello?");
+    let id = driver.conversation_id().unwrap();
+    answer_on_node(&fx, ANSWER_QUESTION, ANSWER_TEXT);
+    // The app's own delivery message for a decision.
+    let message = format!("Decision answered: {ANSWER_QUESTION}\n\nThe user answered \"{ANSWER_TEXT}\".");
+    say(&mut driver, &fx, &mut agent, &message);
+    let sent = everything_sent(agent.last());
+    assert_eq!(sent.matches(ANSWER_TEXT).count(), 1, "{sent}");
+    assert!(!sent.contains("already answered"), "{sent}");
+
+    // A session resumed by id.
+    answer_on_node(&fx, "Is it ready?", "ready since noon");
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut driver = ConversationDriver::open(config(&fx, 100_000), &fx.fleet, id).unwrap();
+    let message = "Decision answered: Is it ready?\n\nThe user answered \"ready since noon\".";
+    say(&mut driver, &fx, &mut agent, message);
+    let sent = everything_sent(agent.last());
+    assert_eq!(sent.matches("ready since noon").count(), 1, "{sent}");
+}
+
+/// A plan step's handoff answer is recorded with its own message as the
+/// answer text; the message that delivers it carries it once, to a session
+/// that goes on and to one that starts fresh.
+#[test]
+fn a_handoff_answer_is_in_the_message_that_delivers_it_exactly_once() {
+    use super::implement::HandoffAnswer;
+    use tod_store::outline::repos::PlanStepRepo;
+    use tod_store::outline::repos::plan_steps::HandoffReason;
+    let fx = fixture();
+    let step_id = Uuid::new_v4();
+    fx.fleet
+        .enqueue_outline(OutlineMutation::CreatePlanStep {
+            step_id: Some(step_id),
+            node_id: fx.node,
+            after_id: None,
+            before: false,
+            body: "Apply the terraform plan".into(),
+        })
+        .unwrap();
+    fx.fleet
+        .enqueue_outline(OutlineMutation::UpdatePlanStepStatus {
+            step_id,
+            status: "blocked".into(),
+            note: Some("Needs the AWS key".into()),
+            reason: Some(HandoffReason::Access { needs: "the AWS key".into(), tried: "plan, got 403".into() }),
+        })
+        .unwrap();
+    fx.fleet.writer().flush().unwrap();
+    let step = fx.fleet.read(|conn| PlanStepRepo::new(conn).get(step_id)).unwrap().unwrap();
+
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut driver = ConversationDriver::new(config(&fx, 100_000), Focus::Node(fx.node), ProtocolKind::Outline);
+    say(&mut driver, &fx, &mut agent, "ask Hello?");
+    let message =
+        crate::lifecycle::answer::record_plan_step_handoff_answer(&fx.fleet, &step, &HandoffAnswer::Retry).unwrap();
+    say(&mut driver, &fx, &mut agent, &message);
+    let sent = everything_sent(agent.last());
+    assert_eq!(sent.matches("the access it needed is in place now").count(), 1, "{sent}");
+    assert!(!sent.contains("already answered"), "{sent}");
+
+    // A fresh session whose first message is the delivery.
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut driver = ConversationDriver::new(config(&fx, 100_000), Focus::Node(fx.node), ProtocolKind::Outline);
+    say(&mut driver, &fx, &mut agent, &message);
+    let sent = everything_sent(agent.last());
+    assert_eq!(sent.matches("the access it needed is in place now").count(), 1, "{sent}");
+}
+
 #[test]
 fn after_a_reversal_the_next_send_carries_a_delta_and_resumes_the_session() {
     let fx = fixture();

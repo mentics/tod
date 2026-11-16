@@ -457,9 +457,30 @@ fn lowercase_first(s: &str) -> String {
 /// (`decisions ask` refuses the repeat, too). Empty when there are none. A
 /// permission (a standing grant) and a credential request (never to echo)
 /// are left out.
-pub fn render_recent_answers(conn: &Connection, node_id: Uuid) -> Result<String> {
+///
+/// `sending` is the message this goes out with: an answer that message already
+/// carries ([`message_carries`]) is left out, so the agent is not told it twice.
+pub fn render_recent_answers(conn: &Connection, node_id: Uuid, sending: &str) -> Result<String> {
     let since = tod_store::outline::uuid_blob::now_ms() - tod_store::decisions::REASK_WINDOW_MS;
-    render_answers_since(conn, node_id, since)
+    render_answers_since(conn, node_id, since, sending)
+}
+
+/// Whether `message` already tells the agent this answer: it is the message
+/// [`crate::lifecycle::answer::record_decision_answer`] worked out ("Decision
+/// answered: <question>"), or the text recorded for a plan step handed back
+/// ([`crate::lifecycle::answer::record_plan_step_handoff_answer`] records the
+/// message itself as the answer). Both are recorded before they are sent, so
+/// this is the one place that stops the answer from going out twice (in the
+/// message and again as "already answered").
+fn message_carries(message: &str, question: &str, answer_text: Option<&str>) -> bool {
+    let message = message.trim();
+    if message.is_empty() {
+        return false;
+    }
+    if answer_text.is_some_and(|t| !t.trim().is_empty() && t.trim() == message) {
+        return true;
+    }
+    message.contains(&format!("Decision answered: {question}"))
 }
 
 /// The answers [`render_recent_answers`] would show that were given after
@@ -468,7 +489,7 @@ pub fn render_recent_answers(conn: &Connection, node_id: Uuid) -> Result<String>
 /// been told. A session that was told (the answer delivered as a user turn,
 /// or carried by an earlier turn) has a later turn than the answer, so an
 /// answer reaches it once.
-pub fn render_unsent_answers(conn: &Connection, node_id: Uuid, conversation_id: Uuid) -> Result<String> {
+pub fn render_unsent_answers(conn: &Connection, node_id: Uuid, conversation_id: Uuid, sending: &str) -> Result<String> {
     use tod_store::conversation::{ConversationRepo, TurnRole};
     let window = tod_store::outline::uuid_blob::now_ms() - tod_store::decisions::REASK_WINDOW_MS;
     let last_sent = ConversationRepo::new(conn)
@@ -477,11 +498,11 @@ pub fn render_unsent_answers(conn: &Connection, node_id: Uuid, conversation_id: 
         .rev()
         .find(|t| matches!(t.role, TurnRole::User | TurnRole::Continuation))
         .map_or(0, |t| t.created_at);
-    render_answers_since(conn, node_id, window.max(last_sent))
+    render_answers_since(conn, node_id, window.max(last_sent), sending)
 }
 
 /// The user's answers on the node given strictly after `since` (ms).
-fn render_answers_since(conn: &Connection, node_id: Uuid, since: i64) -> Result<String> {
+fn render_answers_since(conn: &Connection, node_id: Uuid, since: i64, sending: &str) -> Result<String> {
     use tod_store::decisions::{DECISION_ANSWERED, DecisionRepo};
     let repo = DecisionRepo::new(conn);
     let mut out = String::new();
@@ -501,6 +522,9 @@ fn render_answers_since(conn: &Connection, node_id: Uuid, since: i64) -> Result<
         else {
             continue;
         };
+        if message_carries(sending, &decision.question, answer.text.as_deref()) {
+            continue;
+        }
         let picked = answer
             .option
             .and_then(|o| decision.options.get(usize::try_from(o).ok()?.checked_sub(1)?))
@@ -556,7 +580,7 @@ mod tests {
             .read(|conn| Ok(DecisionRepo::new(conn).list_pending_for_node(fx.node)?))
             .unwrap()
             .remove(0);
-        let render = || fx.fleet.read(|conn| render_recent_answers(conn, fx.node)).unwrap();
+        let render = || fx.fleet.read(|conn| render_recent_answers(conn, fx.node, "")).unwrap();
         assert_eq!(render(), "");
         fx.fleet
             .interview(
@@ -602,7 +626,7 @@ mod tests {
                 InterviewCommand::WithdrawDecision { decision_id: pending.id },
             )
             .unwrap();
-        let text = fx.fleet.read(|conn| render_recent_answers(conn, fx.node)).unwrap();
+        let text = fx.fleet.read(|conn| render_recent_answers(conn, fx.node, "")).unwrap();
         assert_eq!(text, "");
     }
 

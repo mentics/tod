@@ -131,6 +131,21 @@ fn git_ref(repo: &Workdir, args: &[&str]) -> Result<Option<String>> {
     anyhow::bail!("git {} in {repo} failed: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim())
 }
 
+/// Refreshes `repo`'s remote-tracking refs from `origin` before anything is
+/// compared with them: a stale `origin/main` makes an upstream commit (a
+/// submodule left at what the base pinned) look like the node's own work. Does
+/// not recurse into submodules ([`inspect`] refreshes each itself). A failed
+/// fetch is an error naming the repository, never an answer from stale refs;
+/// with no `origin` URL there is nothing to refresh.
+fn refresh_origin(repo: &Workdir) -> Result<()> {
+    if git_ref(repo, &["config", "--get", "remote.origin.url"])?.is_none_or(|u| u.is_empty()) {
+        return Ok(());
+    }
+    repo.git(&["fetch", "--quiet", "--no-recurse-submodules", "origin"])
+        .map(|_| ())
+        .with_context(|| format!("refresh the remote refs of {repo} (git fetch origin) before telling whether its work is lost; without a fresh fetch an upstream commit can look like the node's own work"))
+}
+
 /// The repository's default branch as a ref, from `origin`. `None` only when
 /// it has no `origin` at all; an `origin` with no default branch ref is an
 /// error (the checkout never fetched it).
@@ -373,6 +388,7 @@ pub fn inspect(cwd: &Workdir, branch: Option<&str>, starts: &BranchStarts) -> Re
     if !is_checkout(cwd)? {
         return Ok(Vec::new());
     }
+    refresh_origin(cwd)?;
     // Only the node's own branch, as Files records it; with none known, HEAD
     // alone is compared (never a guess from the branch checked out).
     let mut out = vec![(".".to_string(), state_of(cwd, &default_ref(cwd)?.into_iter().collect::<Vec<_>>(), "the checkout", branch, starts.born.get(".").map(String::as_str), starts.replaced.get(".").map(String::as_str))?)];
@@ -397,6 +413,7 @@ pub fn inspect(cwd: &Workdir, branch: Option<&str>, starts: &BranchStarts) -> Re
         // submodule's own default branch has: a golden's submodules sit on
         // their default branch, ahead of what the checkout records.
         let sub = cwd.join(rel);
+        refresh_origin(&sub)?;
         let bases: Vec<String> = pinned(&parent, &in_parent)?.into_iter().chain(default_ref_opt(&sub)?).collect();
         out.push((rel.clone(), state_of(&sub, &bases, &format!("submodule {rel}"), branch, starts.born.get(rel).map(String::as_str), starts.replaced.get(rel).map(String::as_str))?));
     }
@@ -726,8 +743,41 @@ mod tests {
         let (_dir, work) = fixture();
         run(&work, &["update-ref", "-d", "refs/remotes/origin/main"]);
         run(&work, &["update-ref", "-d", "refs/remotes/origin/HEAD"]);
+        // A fetch that finds nothing (origin has no branches at all) restores no ref.
+        let empty = work.parent().unwrap().join("empty.git");
+        run(work.parent().unwrap(), &["init", "-q", "--bare", empty.to_str().unwrap()]);
+        run(&work, &["remote", "set-url", "origin", empty.to_str().unwrap()]);
         let err = format!("{:#}", inspect(&Workdir::host(&work), None, &no_starts()).unwrap_err());
         assert!(err.contains("fetch origin"), "{err}");
+    }
+
+    #[test]
+    fn an_upstream_commit_the_remote_refs_do_not_show_yet_is_not_the_nodes_work() {
+        let (dir, work) = fixture();
+        // Upstream moves on after the clone: the submodule's origin/main in the
+        // checkout is stale, and the submodule sits on the new commit (as a
+        // golden's does).
+        let root = dir.path();
+        let upstream = root.join("subup");
+        run(root, &["clone", "-q", root.join("kb.git").to_str().unwrap(), upstream.to_str().unwrap()]);
+        commit_in(&upstream, "up");
+        run(&upstream, &["push", "-q", "origin", "HEAD:main"]);
+        let kb = work.join("kb");
+        run(&kb, &["fetch", "-q", "origin"]);
+        run(&kb, &["checkout", "-q", "--detach", "FETCH_HEAD"]);
+        let old = run(&kb, &["rev-parse", "HEAD~1"]);
+        run(&kb, &["update-ref", "refs/remotes/origin/main", &old]);
+        let repos = states(&work);
+        let kb_state = &repos.iter().find(|(p, _)| p == "kb").unwrap().1;
+        assert_ne!(*kb_state, RepoState::OwnCommits, "{repos:?}");
+    }
+
+    #[test]
+    fn a_failed_refresh_of_origin_is_an_error_naming_the_repository() {
+        let (_dir, work) = fixture();
+        run(&work, &["remote", "set-url", "origin", "/nonexistent/nowhere.git"]);
+        let err = format!("{:#}", inspect(&Workdir::host(&work), Some("task/x"), &no_starts()).unwrap_err());
+        assert!(err.contains("refresh the remote refs"), "{err}");
     }
 
     #[test]
