@@ -58,7 +58,7 @@ for n, a in sorted(nodes, key=lambda x: -x[1]):
 if len(other) > max_other:
     problems.append(f"{len(other)} sandboxes unrelated to tod: " + ", ".join(sorted(other)))
 
-stamp = now.strftime("%Y-%m-%d %H:%M:%S UTC")
+stamp = now.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
 if problems:
     print(f"[{stamp}] PROBLEMS")
     for p in problems:
