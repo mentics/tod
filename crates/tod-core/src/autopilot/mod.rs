@@ -1343,6 +1343,18 @@ impl Autopilot {
                 && overall != PrNext::Merged;
             if change_owed {
                 overall = PrNext::Work(Vec::new());
+            } else if let PrNext::Work(works) = &overall
+                && works.iter().all(|w| matches!(w, pr_readiness::Work::Behind))
+            {
+                // A base that moved is not work: nothing is started for it, no
+                // sandbox is kept busy, and no review is owed. The base is
+                // merged in when the agent runs for real work (its message
+                // lists it). Read the pull request as if it were up to date.
+                let mut current = live.clone();
+                for p in &mut current {
+                    p.assessment.behind_by = None;
+                }
+                overall = pr_readiness::overall(&current);
             }
             match overall {
                 PrNext::Merged => {
@@ -2148,7 +2160,12 @@ impl Autopilot {
         } else {
             fleet.read(|conn| pr_draft_review::cleared(conn, node, &pr_draft_review::current_heads(live)))?
         };
-        if let Some(review) = cleared {
+        // Only a review of a change the agent made names the local head it
+        // clears. A merge of the base alone leaves the heads the review
+        // recorded as they are: the checkout's head may not be on GitHub at
+        // all (a replaced sandbox's), and recording it made the next look
+        // read the pull request's head as unreviewed, every time.
+        if changed && let Some(review) = cleared {
             let head = pr_draft_review::local_head(&cwd).with_context(|| format!("reading the head commit in {cwd}"))?;
             fleet.interview(
                 "autopilot",
@@ -2283,7 +2300,7 @@ impl Autopilot {
             return Ok(OwnReview::Clear);
         }
         pr_draft_review::sync_resolved(fleet, node, live)?;
-        match fleet.read(|conn| pr_draft_review::owed(conn, node, live))? {
+        match fleet.read(|conn| pr_draft_review::owed(conn, node, live, feed))? {
             Owed::Clear => Ok(OwnReview::Clear),
             Owed::Post(findings) => {
                 hook.working_on("posting tod's code review on the pull request");

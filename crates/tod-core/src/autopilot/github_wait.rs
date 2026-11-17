@@ -318,7 +318,7 @@ fn check_ready_for_review(fleet: &FleetStore, node: uuid::Uuid, data_root: &std:
         return Ok(GithubCheck::NothingToWaitOn);
     }
     if !matches!(
-        fleet.read(|conn| crate::pr_draft_review::owed(conn, node, &live))?,
+        fleet.read(|conn| crate::pr_draft_review::owed(conn, node, &live, feed.as_ref()))?,
         crate::pr_draft_review::Owed::Clear
     ) {
         return Ok(GithubCheck::NothingToWaitOn);

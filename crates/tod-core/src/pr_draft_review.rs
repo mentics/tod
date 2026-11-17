@@ -217,7 +217,7 @@ pub enum Owed {
 }
 
 /// [`Owed`] for `node`, whose linked pull requests stand at `live`.
-pub fn owed(conn: &Connection, node: Uuid, live: &[LivePr]) -> Result<Owed> {
+pub fn owed(conn: &Connection, node: Uuid, live: &[LivePr], feed: &dyn PrFeed) -> Result<Owed> {
     if !enabled(conn, node)? {
         return Ok(Owed::Clear);
     }
@@ -242,8 +242,36 @@ pub fn owed(conn: &Connection, node: Uuid, live: &[LivePr]) -> Result<Owed> {
     let Some(latest) = latest_review(conn, node)? else {
         return Ok(Owed::Review);
     };
-    if reviewed_heads(conn, latest.id)?.is_none_or(|heads| heads != current_heads(live)) {
-        return Ok(Owed::Review);
+    let current = current_heads(live);
+    match reviewed_heads(conn, latest.id)? {
+        None => return Ok(Owed::Review),
+        Some(reviewed) if reviewed != current => {
+            // A head that only merges the base in is the change already
+            // reviewed: base moves every few minutes on a busy repository, and
+            // a full review per merge never ends. Any other difference (a
+            // commit of the branch's own, a reviewed head GitHub no longer
+            // has) is a review owed. Not telling is an error, never a guess.
+            if reviewed.keys().ne(current.keys()) {
+                return Ok(Owed::Review);
+            }
+            for p in live {
+                let label = pr_label(&p.pr);
+                let (Some(was), Some(now)) = (reviewed.get(&label), current.get(&label)) else { continue };
+                if was == now {
+                    continue;
+                }
+                let base = p.base_ref.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("GitHub did not say which branch {} merges into, so a review of {was} cannot be compared with head {now}", p.pr.url)
+                })?;
+                let same = feed
+                    .same_change(&p.pr, base, was, now)
+                    .map_err(|err| anyhow::anyhow!("{}: comparing tod's review of {was} with head {now}: {err}", p.pr.url))?;
+                if !same {
+                    return Ok(Owed::Review);
+                }
+            }
+        }
+        Some(_) => {}
     }
     Ok(if round_clean(&findings, &latest) { Owed::Clear } else { Owed::Review })
 }

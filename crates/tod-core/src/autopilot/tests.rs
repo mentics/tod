@@ -1915,19 +1915,6 @@ fn scripted_pr(script: Vec<Look>) -> (Fixture, Arc<Scripted>, FakeAgent) {
     (fx, feed, agent)
 }
 
-/// Seen live: merges of main and asks for a bot's review used up the rounds
-/// of pull requests that were converging, and three nodes stopped.
-#[test]
-fn rounds_of_housekeeping_do_not_stop_the_babysitter() {
-    use Look::*;
-    let (fx, _, mut agent) = scripted_pr(vec![Behind, Behind, Behind, Behind, Behind, Behind]);
-    let mut pilot = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO);
-    let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
-    assert!(matches!(outcome, Outcome::Waiting { .. }), "{outcome:?}");
-    assert_eq!(agent.turns, 6);
-    assert_eq!(pilot.state().loops.pr_rounds, 0);
-}
-
 /// Stops the run after `n` looks at the pull request.
 struct StopAfter(u32);
 
@@ -1936,47 +1923,6 @@ impl StepHook for StopAfter {
         self.0 = self.0.saturating_sub(1);
         Ok((self.0 == 0).then(|| "test over".to_string()))
     }
-}
-
-/// Seen live (ENG-3095): on a busy base branch the pull request was behind
-/// again minutes after every merge, and each merge cost two or three agent
-/// sessions, all night, until the session budget was gone. A round that only
-/// merges the base in is started at most once per gap; in between the run waits.
-#[test]
-fn a_base_that_keeps_moving_is_waited_on_not_merged_in_every_poll() {
-    use Look::*;
-    let (fx, _, mut agent) = scripted_pr(vec![Behind; 20]);
-    let mut pilot = autopilot(&fx, Budget::default())
-        .with_pr_poll_interval(Duration::ZERO)
-        .with_housekeeping_gap(Duration::from_secs(3600));
-    let outcome = pilot.run_with(&fx.fleet, &mut agent, &mut StopAfter(40)).unwrap();
-    assert!(matches!(outcome, Outcome::Stopped { .. }), "{outcome:?}");
-    // One round (a turn) at the start; every other look waited.
-    assert_eq!(agent.turns, 1);
-    assert_eq!(pilot.state().loops.pr_housekeeping_rounds, 1);
-}
-
-/// The gap runs from the last merge of the base whatever happened in
-/// between: a clear read (or a hand-off to a person) does not buy another
-/// immediate merge.
-#[test]
-fn the_gap_between_base_merges_survives_a_clear_read() {
-    use Look::*;
-    let (fx, feed, mut agent) = scripted_pr(vec![Behind, HumanReview]);
-    let gap = Duration::from_secs(3600);
-    let mut pilot = autopilot(&fx, Budget::default())
-        .with_pr_poll_interval(Duration::ZERO)
-        .with_housekeeping_gap(gap);
-    let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
-    assert!(matches!(outcome, Outcome::Waiting { .. }), "{outcome:?}");
-    assert_eq!(agent.turns, 1);
-    feed.restart(vec![Behind; 10]);
-    let mut again = autopilot(&fx, Budget::default())
-        .with_pr_poll_interval(Duration::ZERO)
-        .with_housekeeping_gap(gap);
-    let outcome = again.run_with(&fx.fleet, &mut agent, &mut StopAfter(20)).unwrap();
-    assert!(matches!(outcome, Outcome::Stopped { .. }), "{outcome:?}");
-    assert_eq!(agent.turns, 1, "the base moved again within the gap: waited, not merged");
 }
 
 #[test]
@@ -2024,52 +1970,17 @@ fn a_failed_read_after_a_turn_keeps_the_unchanged_count() {
     assert_eq!(pilot.state().loops.pr_unchanged, 1);
 }
 
-/// A base that moves once a day is not "in a row": after a long quiet
-/// stretch the count starts again, so eight such days never stop the run.
-#[test]
-fn base_merges_far_apart_never_reach_the_limit() {
-    use Look::*;
-    let (fx, _, mut agent) = scripted_pr(vec![Behind; 5]);
-    let gap = Duration::from_secs(60);
-    let mut pilot = autopilot(&fx, Budget::default())
-        .with_pr_poll_interval(Duration::ZERO)
-        .with_housekeeping_gap(gap);
-    // Seven rounds so far, the last one a day ago.
-    pilot.state.loops.pr_housekeeping_rounds = 7;
-    pilot.state.loops.pr_housekeeping_at_ms = chrono::Utc::now().timestamp_millis() - 24 * 3600 * 1000;
-    let outcome = pilot.run_with(&fx.fleet, &mut agent, &mut StopAfter(6)).unwrap();
-    assert!(matches!(outcome, Outcome::Stopped { .. }), "{outcome:?}");
-    assert_eq!(agent.turns, 1, "merged in, not stopped");
-    assert_eq!(pilot.state().loops.pr_housekeeping_rounds, 1);
-}
-
-#[test]
-fn a_base_that_never_stops_moving_ends_in_a_precise_stop() {
-    use Look::*;
-    let (fx, _, mut agent) = scripted_pr(vec![Behind; 20]);
-    let mut pilot = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO);
-    let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
-    match &outcome {
-        Outcome::NeedsHuman { reason: NeedsHuman::PrStuck { why } } => {
-            assert!(why.contains("base branch moved"), "{why}")
-        }
-        other => panic!("{other:?}"),
-    }
-    assert_eq!(agent.turns, 8);
-}
-
 #[test]
 fn consecutive_rounds_of_feedback_still_stop_the_babysitter() {
     use Look::*;
-    let (fx, _, mut agent) = scripted_pr(vec![Thread, Behind, Thread, Thread]);
+    let (fx, _, mut agent) = scripted_pr(vec![Thread, Thread, Thread]);
     let mut pilot = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO);
     let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
     assert!(
         matches!(&outcome, Outcome::NeedsHuman { reason: NeedsHuman::PrStuck { .. } }),
         "{outcome:?}"
     );
-    // Two rounds of feedback, with a merge between them that is not one.
-    assert_eq!(agent.turns, 3);
+    assert_eq!(agent.turns, 2);
     assert_eq!(pilot.state().loops.pr_rounds, 2);
 }
 
@@ -3024,7 +2935,7 @@ fn a_finding_left_open_by_an_earlier_stay_is_still_owed_after_the_phase_is_rerun
     let links = fx.fleet.read(|conn| tod_store::github::NodePrRepo::new(conn).read(fx.node)).unwrap();
     let settings = crate::pr_readiness::settings_for_node(&fx.fleet, fx.node, &fx.root).unwrap();
     let live = crate::pr_readiness::live_answered(feed.as_ref(), &links.prs, &settings, None).unwrap();
-    let owed = fx.fleet.read(|conn| owed(conn, fx.node, &live)).unwrap();
+    let owed = fx.fleet.read(|conn| owed(conn, fx.node, &live, feed.as_ref())).unwrap();
     assert!(!matches!(owed, Owed::Clear), "the open finding is owed, not a clear review: {owed:?}");
 }
 
@@ -3369,7 +3280,7 @@ fn pr_draft_feedback_is_reviewed_and_fixed_before_it_is_pushed() {
         None,
     )
     .unwrap();
-    let owed = fx.fleet.read(|conn| crate::pr_draft_review::owed(conn, fx.node, &live)).unwrap();
+    let owed = fx.fleet.read(|conn| crate::pr_draft_review::owed(conn, fx.node, &live, feed.as_ref())).unwrap();
     assert_eq!(owed, crate::pr_draft_review::Owed::Clear);
     assert!(fx.fleet.read(|conn| Ok(tod_store::review::ReviewRepo::new(conn).list_for_node(fx.node)?)).unwrap().iter().all(|f| !f.is_open()));
     assert!(Autopilot::new(config(&fx), fx.node, Budget::default()).unwrap().state().pr_change.is_none());
@@ -3486,9 +3397,15 @@ struct MovingHeadFeed {
     inner: Arc<OwnReviewFeed>,
     reads: std::sync::atomic::AtomicUsize,
     moves: usize,
+    /// Every move only merges the base in: the change is the same.
+    merge_only: bool,
 }
 
 impl crate::pr_readiness::PrFeed for MovingHeadFeed {
+    fn same_change(&self, _: &tod_store::github::NodePr, _: &str, _: &str, _: &str) -> Result<bool, String> {
+        Ok(self.merge_only)
+    }
+
     fn snapshot(&self, pr: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
         let n = self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst).min(self.moves);
         let mut snapshot = self.inner.snapshot(pr)?;
@@ -3534,6 +3451,7 @@ fn clean_reviews_of_new_heads_never_count_toward_the_round_limit() {
         inner: OwnReviewFeed::new(false),
         reads: Default::default(),
         moves: 8 * REVIEW_ROUND_LIMIT as usize,
+        merge_only: false,
     });
     crate::pr_readiness::set_feed_override(Some(feed.clone()));
     with_pr_draft_review(&fx);
@@ -4742,4 +4660,37 @@ fn the_hard_stop_holds_however_new_the_findings_are() {
     let outcome = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO).run(&fx.fleet, &mut agent).unwrap();
     assert!(matches!(&outcome, Outcome::NeedsHuman { reason: NeedsHuman::ReviewNotConverging { .. } }), "{outcome:?}");
     assert_eq!(openings(&fx, ProtocolKind::Review).len(), 2 * REVIEW_ROUND_LIMIT as usize, "no review past the hard stop");
+}
+
+/// Seen live: a draft pull request on a busy repository got a full review of
+/// every merge of the base into it (72 of them over a week), because any new
+/// head, not a new change, made a review owed.
+#[test]
+fn a_head_that_only_merges_the_base_in_is_not_reviewed_again() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    let feed = Arc::new(MovingHeadFeed {
+        inner: OwnReviewFeed::new(false),
+        reads: Default::default(),
+        moves: 8 * REVIEW_ROUND_LIMIT as usize,
+        merge_only: true,
+    });
+    crate::pr_readiness::set_feed_override(Some(feed.clone()));
+    with_pr_draft_review(&fx);
+    a_finding_before_the_pull_request(&fx);
+    linked_to_prs(&fx, "pr_draft", &["https://github.com/acme/app/pull/42"]);
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let outcome = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO).run(&fx.fleet, &mut agent).unwrap();
+    let reviews = openings(&fx, ProtocolKind::Review).len();
+    assert_eq!(reviews, 1, "one review covers every merge of the base: {outcome:?}");
+}
+
+/// A base that moved is not work: no agent turn, no review, nothing woken.
+#[test]
+fn a_pull_request_only_behind_its_base_is_not_worked_on() {
+    use Look::*;
+    let (fx, _, mut agent) = scripted_pr(vec![Behind; 20]);
+    let mut pilot = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO);
+    let outcome = pilot.run_with(&fx.fleet, &mut agent, &mut StopAfter(40)).unwrap();
+    assert_eq!(agent.turns, 0, "{outcome:?}");
 }
