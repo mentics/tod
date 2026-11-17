@@ -161,6 +161,14 @@ impl Sandboxes {
         self.forget(cleared.name())
     }
 
+    /// Deletes a node sandbox the caller found asleep (`STANDBY`), with no
+    /// guard: a sleeping sandbox holds nothing that was not already pushed or
+    /// checkpointed before it slept, and the guard would wake it.
+    pub fn delete_asleep(&mut self, bx: &Blaxel, name: &str) -> Result<()> {
+        bx.delete_waiting_not_ready(name, tod_sandbox::blaxel::NOT_READY_WAIT)?;
+        self.forget(name)
+    }
+
     /// The one unguarded delete of a node sandbox: one this very call just
     /// made (forked or created seconds ago) that failed its own setup. Nothing
     /// has run a node's work in it, so no commit of the node's can be in it,

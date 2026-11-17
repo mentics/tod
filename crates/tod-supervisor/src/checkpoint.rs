@@ -66,7 +66,7 @@ impl Checkpointer {
         if let Some(handle) = self.running.take()
             && handle.join().is_err()
         {
-            tracing::warn!("checkpointing the node's uncommitted work: the checkpoint thread panicked");
+            tracing::error!("checkpointing the node's uncommitted work: the checkpoint thread panicked");
         }
     }
 }
@@ -81,7 +81,7 @@ fn save(workspace: &Path, node: &str) {
                 }
             }
         }
-        Err(err) => tracing::warn!("checkpointing the node's uncommitted work: {err:#}"),
+        Err(err) => tracing::error!("checkpointing the node's uncommitted work failed: {err:#}"),
     }
 }
 

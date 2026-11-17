@@ -265,6 +265,10 @@ pub fn retire_due_with(
             continue;
         }
         match delete(&item.node_id) {
+            // Awake: not touched, no problem recorded; the next pass looks again.
+            Err(err) if err.downcast_ref::<lost::NotAsleep>().is_some() => {
+                tracing::debug!("sandbox retire: {} is awake; later", item.title);
+            }
             Ok(message) => {
                 stopped().get_or_insert_with(Default::default).remove(&item.node_id);
                 tracing::info!("sandbox retire: {} reached {FINAL_PHASE}: {message}", item.title);
@@ -485,6 +489,53 @@ mod tests {
         retire_due_with(&fx.fleet, 1, &mut |n| fx.fake_delete(&calls, n)).unwrap();
         assert!(calls.borrow().is_empty());
         assert!(fx.has_location());
+    }
+
+    fn enable_lifecycle(fx: &Fx) {
+        fx.fleet
+            .enqueue_outline(OutlineMutation::EnableCapabilities {
+                node_id: fx.node,
+                capabilities: vec![tod_store::outline::Capability::Lifecycle],
+            })
+            .unwrap();
+        fx.fleet.writer().flush().unwrap();
+        fx.fleet.reload_if_stale().unwrap();
+    }
+
+    #[test]
+    fn a_node_waiting_on_something_outside_is_retired_before_done_and_one_with_nothing_to_wait_on_is_not() {
+        let fx = fx();
+        fx.locate("sb-wait");
+        fx.set_lifecycle("pr_draft");
+        enable_lifecycle(&fx);
+        assert!(due(&fx.fleet).unwrap().is_empty(), "nothing waits and nothing runs: not started, left alone");
+        let conn = rusqlite::Connection::open(fx.fleet.paths().db()).unwrap();
+        tod_store::waits::WaitRepo::new(&conn)
+            .create(
+                fx.node,
+                &tod_store::waits::NewWait {
+                    kind: "check".into(),
+                    match_spec: "github:pr:7:checks".into(),
+                    every_secs: Some(300),
+                    due_at: tod_store::outline::uuid_blob::now_ms() + 600_000,
+                    detail: None,
+                },
+            )
+            .unwrap();
+        fx.fleet.reload_if_stale().unwrap();
+        let found = due(&fx.fleet).unwrap();
+        assert_eq!(found.len(), 1, "waiting on CI is an indeterminate wait: its sandbox goes");
+        assert_eq!(found[0].sandbox, "sb-wait");
+    }
+
+    #[test]
+    fn a_sandbox_that_is_not_asleep_is_left_without_a_problem() {
+        let fx = fx();
+        fx.locate("sb-awake");
+        fx.set_lifecycle("done");
+        let r = retire_due_with(&fx.fleet, 1, &mut |_| Err(anyhow::Error::new(lost::NotAsleep("sb-awake".into())))).unwrap();
+        assert!(r.deleted.is_empty() && r.failed == 0);
+        assert!(fx.problem().is_none() && fx.has_location(), "awake: untouched, tried again next pass");
     }
 
     #[test]

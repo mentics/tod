@@ -112,6 +112,36 @@ pub fn run_in_cloud(fleet: &FleetStore, root: &std::path::Path, node_id: &str, p
     }
 }
 
+/// **The one place that gives a cloud node's agent work**: "this node has
+/// work now" (a Start, a Resume, an answer, a wake). The principle
+/// (`doc/architecture.md`, "Sandboxes exist only for work"): a node's sandbox
+/// is made when there is work for it and not before, so this decides, every
+/// time, whether it has one:
+///
+/// - the node has run in the cloud before (it has a `cloud_nodes` row) and
+///   `kind` is a request: [`request`] hands the work to its supervisor; the
+///   wake behind it makes a new sandbox first when the node has none or its
+///   sandbox is gone;
+/// - otherwise (a first Start, or a Start with no request): [`run_in_cloud`]
+///   makes the sandbox when there is none and starts the supervisor.
+///
+/// Only the app makes sandboxes (the user's Blaxel token is only here), so the
+/// orchestrator, which finds work for a node with no sandbox (a webhook, a
+/// timed wake), marks the node and the app comes back through here
+/// (`cloud_sync::lost`).
+pub fn submit_work(
+    fleet: &FleetStore,
+    root: &std::path::Path,
+    node_id: &str,
+    kind: Option<&'static str>,
+    progress: &mut dyn FnMut(&str),
+) -> JobResult {
+    match kind {
+        Some(kind) if cloud_sync::cloud_node(fleet, node_id).is_some() => request(fleet, root, node_id, kind, progress),
+        _ => run_in_cloud(fleet, root, node_id, progress).result,
+    }
+}
+
 /// What the user asked of a supervisor, in words, for the line: what was
 /// asked for, and the menu entry's name for a failure's title.
 pub fn request_words(kind: &str) -> (&'static str, &'static str) {

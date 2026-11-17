@@ -173,6 +173,8 @@ pub fn run(data_root: &Path) -> Result<bool> {
 /// and how often a pass runs after that.
 const RETIRE_FIRST_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
 const RETIRE_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+/// The quick looks after a poke, while the sandbox falls asleep.
+const RETIRE_FOLLOW_UP: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Deletes the sandbox of every node that is in its final phase and whose
 /// "Delete sandbox" setting is on ([`tod_core::sandbox_retire`]): once shortly
@@ -184,11 +186,18 @@ const RETIRE_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
 fn watch_done_sandboxes(shared: Arc<Shared>) {
     let spawned = std::thread::Builder::new().name("tod-agentd-retire".into()).spawn(move || {
         std::thread::sleep(RETIRE_FIRST_AFTER);
+        let mut follow_ups = 0u8;
         while !shared.quit.load(Ordering::SeqCst) {
             retire_pass(&shared.store);
             // Every minute, and at once (after a short settle) when a run
             // ends or a sync brings news: an idle node's sandbox goes then.
-            tod_core::sandbox_retire::wait_for_poke(RETIRE_EVERY, std::time::Duration::from_secs(3));
+            // A sandbox only goes once it is asleep (about 15 s after its
+            // last activity), so a poke is followed by two quick looks.
+            let wait = if follow_ups > 0 { RETIRE_FOLLOW_UP } else { RETIRE_EVERY };
+            follow_ups = follow_ups.saturating_sub(1);
+            if tod_core::sandbox_retire::wait_for_poke(wait, std::time::Duration::from_secs(3)) {
+                follow_ups = 2;
+            }
         }
     });
     if let Err(err) = spawned {

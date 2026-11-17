@@ -989,7 +989,7 @@ fn stop_and_delete_with(
         }
     }
     let plan = delete_plan_with(fleet, node_id, !runner_ignored)?;
-    delete_with(fleet, node_id, &plan, force, true, backend)
+    delete_with(fleet, node_id, &plan, force, true, false, backend)
 }
 
 /// Why the node's runner is active, when it is: a live `run` activity lease
@@ -1053,6 +1053,14 @@ trait SandboxBackend {
     /// an error means nothing may be deleted.
     fn checkpoint(&mut self, fleet: &FleetStore, node_id: &str, name: &str) -> Result<()>;
     fn delete(&mut self, name: &str) -> Result<()>;
+    /// Whether Blaxel reports the sandbox asleep (`STANDBY`). Asks the control
+    /// plane only: it never wakes the sandbox.
+    fn is_asleep(&mut self, name: &str) -> Result<bool>;
+    /// Deletes a sandbox known to be asleep, with no guard and no checkpoint:
+    /// a sleeping sandbox holds nothing that was not already kept (the
+    /// supervisor pushes and checkpoints before it sleeps), and looking
+    /// would wake it.
+    fn delete_asleep(&mut self, name: &str) -> Result<()>;
     /// Drops the record of a sandbox that is already gone.
     fn forget(&mut self, name: &str) -> Result<()>;
 }
@@ -1097,6 +1105,15 @@ impl SandboxBackend for BlaxelBackend {
         self.sandboxes.delete(&self.bx, &cleared).with_context(|| format!("delete sandbox {name}"))
     }
 
+    fn is_asleep(&mut self, name: &str) -> Result<bool> {
+        let info = self.bx.get(name).with_context(|| format!("look up sandbox {name}"))?;
+        Ok(info.is_some_and(|i| i.state.as_deref() == Some("STANDBY")))
+    }
+
+    fn delete_asleep(&mut self, name: &str) -> Result<()> {
+        self.sandboxes.delete_asleep(&self.bx, name).with_context(|| format!("delete sandbox {name}"))
+    }
+
     fn forget(&mut self, name: &str) -> Result<()> {
         self.sandboxes.forget(name)
     }
@@ -1105,8 +1122,20 @@ impl SandboxBackend for BlaxelBackend {
 fn delete_node_sandbox_with(fleet: &FleetStore, node_id: &str, force: bool) -> Result<String> {
     let plan = delete_plan(fleet, node_id)?;
     let mut backend = BlaxelBackend::load(fleet.paths().root())?;
-    delete_with(fleet, node_id, &plan, force, true, &mut backend)
+    delete_with(fleet, node_id, &plan, force, true, false, &mut backend)
 }
+
+/// An idle retirement found the sandbox awake: left alone, tried again later.
+#[derive(Debug)]
+pub struct NotAsleep(pub String);
+
+impl std::fmt::Display for NotAsleep {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "sandbox {} is not asleep yet", self.0)
+    }
+}
+
+impl std::error::Error for NotAsleep {}
 
 /// The retirement of a done node's sandbox (`sandbox_retire`): the delete
 /// [`delete_node_sandbox`] does, but not the user's choice to have no
@@ -1115,7 +1144,7 @@ fn delete_node_sandbox_with(fleet: &FleetStore, node_id: &str, force: bool) -> R
 pub fn retire_node_sandbox(fleet: &FleetStore, node_id: &str) -> Result<String> {
     let plan = delete_plan(fleet, node_id)?;
     let mut backend = BlaxelBackend::load(fleet.paths().root())?;
-    delete_with(fleet, node_id, &plan, false, false, &mut backend)
+    delete_with(fleet, node_id, &plan, false, false, true, &mut backend)
 }
 
 fn delete_with(
@@ -1124,6 +1153,7 @@ fn delete_with(
     plan: &DeletePlan,
     force: bool,
     by_user: bool,
+    asleep_only: bool,
     backend: &mut dyn SandboxBackend,
 ) -> Result<String> {
     let root = fleet.paths().root().to_path_buf();
@@ -1132,7 +1162,14 @@ fn delete_with(
     // leaves the sandbox as it was.
     let name = plan.sandbox.as_str();
     let present = backend.exists(name)?;
-    if present {
+    if present && asleep_only {
+        // An idle retirement: delete only a sandbox that is asleep, and never
+        // wake it to look. Awake means it may still be working: not touched.
+        if !backend.is_asleep(name)? {
+            return Err(anyhow::Error::new(NotAsleep(name.to_string())));
+        }
+        backend.delete_asleep(name)?;
+    } else if present {
         // Commits no remote has are never lost by a delete, not even the one
         // that skips the checkpoint (that one gives up *uncommitted* work).
         backend.secure_commits(fleet, node_id, name)?;
@@ -1432,7 +1469,7 @@ mod tests {
 
         fn run(&self, force: bool, backend: &mut Fake) -> Result<String> {
             let plan = delete_plan(&self.fleet, &self.id())?;
-            delete_with(&self.fleet, &self.id(), &plan, force, true, backend)
+            delete_with(&self.fleet, &self.id(), &plan, force, true, false, backend)
         }
     }
 
@@ -1446,6 +1483,7 @@ mod tests {
         checkpointed: Vec<String>,
         deleted: Vec<String>,
         forgotten: Vec<String>,
+        asleep: bool,
     }
 
     impl SandboxBackend for Fake {
@@ -1466,6 +1504,13 @@ mod tests {
             Ok(())
         }
         fn delete(&mut self, name: &str) -> Result<()> {
+            self.deleted.push(name.into());
+            Ok(())
+        }
+        fn is_asleep(&mut self, _: &str) -> Result<bool> {
+            Ok(self.asleep)
+        }
+        fn delete_asleep(&mut self, name: &str) -> Result<()> {
             self.deleted.push(name.into());
             Ok(())
         }
@@ -1956,7 +2001,7 @@ mod tests {
         fx.cloud_row();
         let plan = delete_plan(&fx.fleet, &fx.id()).unwrap();
         // A retirement (not the user's choice) leaves no flag.
-        delete_with(&fx.fleet, &fx.id(), &plan, false, false, &mut has(&["node-old"])).unwrap();
+        delete_with(&fx.fleet, &fx.id(), &plan, false, false, false, &mut has(&["node-old"])).unwrap();
         assert!(!crate::cloud_sync::sandbox_deleted_by_user(&fx.root, &fx.id()));
         // The user's own delete flags it, with the sandbox's name.
         fx.locate("node-old");

@@ -27,7 +27,7 @@ use crate::cloud_jobs;
 use crate::cloud_sync;
 use crate::next_actor::{NextActor, NodeStanding};
 use crate::runner_menu::{
-    self, EndedHow, Place, RunFacts, RunState, RunnerAction, RunnerActions, RunnerFacts, RunnerInputs,
+    self, EndedHow, RunFacts, RunState, RunnerAction, RunnerActions, RunnerFacts, RunnerInputs,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use std::path::{Path, PathBuf};
@@ -509,28 +509,17 @@ pub fn record_note(fleet: &FleetStore, node: Uuid, phase: &str, title: String, f
     Ok(())
 }
 
-fn has_sandbox(g: &Gathered) -> bool {
-    matches!(g.inputs.place, Place::Sandbox { exists: true }) && g.facts.cloud.as_ref().is_some_and(|c| c.lost_at.is_none())
-}
-
-/// Start, or go on with, a supervised node (`TaskPanel::supervised_go`): a
-/// request goes to its supervisor when it has a sandbox now; otherwise it is
-/// started, which makes its sandbox.
+/// Start, or go on with, a supervised node (`TaskPanel::supervised_go`): the
+/// one place that gives a cloud node's agent work ([`cloud_jobs::submit_work`]),
+/// which makes the sandbox when the node has none.
 fn supervised_go(
     ctx: &Ctx,
     node: Uuid,
-    g: &Gathered,
+    _g: &Gathered,
     kind: Option<&'static str>,
     progress: &mut dyn FnMut(&str),
 ) -> Result<Done> {
-    let id = node.to_string();
-    match kind {
-        Some(kind) if has_sandbox(g) => job(cloud_jobs::request(ctx.fleet, ctx.root, &id, kind, progress)),
-        _ => {
-            let started = cloud_jobs::run_in_cloud(ctx.fleet, ctx.root, &id, progress);
-            job(started.result)
-        }
-    }
+    job(cloud_jobs::submit_work(ctx.fleet, ctx.root, &node.to_string(), kind, progress))
 }
 
 fn start_local(ctx: &Ctx, node: Uuid, renew_budget: bool) -> Result<Done> {
