@@ -254,6 +254,39 @@ pub fn render(blocks: &[DynamicBlock], ctx: &DynamicContext<'_>) -> String {
     out
 }
 
+/// The paragraph naming the app's own `tod-cli` by full path, for an agent on
+/// this machine. `None` when there is no such binary (tests, a broken install).
+fn host_cli_note() -> Option<String> {
+    let cli = crate::interview::tod_cli_path();
+    cli.is_file().then(|| {
+        format!(
+            "**`tod-cli`:** `{}` — call it by this full path if plain \
+             `tod-cli` is not found. Never build or `cargo run` your own \
+             copy against this data root.\n\n",
+            cli.display().to_string().replace('\\', "/")
+        )
+    })
+}
+
+/// What an agent in a cloud sandbox or dev container is told instead of
+/// [`host_cli_note`]: this machine's paths do not exist there.
+const REMOTE_CLI_NOTE: &str = "**`tod-cli`:** run plain `tod-cli` (on your `PATH`). \
+    It relays to the app, which uses its own data root, so the `--data-root` \
+    path above is on the app's machine and does not exist on this filesystem: \
+    never look for it or for a `tod-cli` binary here. If `tod-cli` is not \
+    found, report that; do not build your own copy.\n\n";
+
+/// `context` (an opening or snapshot built on this machine) adjusted for an
+/// agent that runs in a sandbox or dev container: the host `tod-cli` path is
+/// replaced by [`REMOTE_CLI_NOTE`], since the agent would otherwise call a
+/// binary that is not there.
+pub fn for_remote_agent(context: String) -> String {
+    match host_cli_note() {
+        Some(note) if context.contains(&note) => context.replacen(&note, REMOTE_CLI_NOTE, 1),
+        _ => context,
+    }
+}
+
 fn render_block(block: DynamicBlock, ctx: &DynamicContext<'_>, out: &mut String) {
     match block {
         DynamicBlock::DataRoot => {
@@ -266,14 +299,8 @@ fn render_block(block: DynamicBlock, ctx: &DynamicContext<'_>, out: &mut String)
             // The app puts tod-cli on the agent's PATH, but an agent's own
             // shell setup can lose it; the full path always works. Forward
             // slashes, so it runs unchanged from bash or PowerShell.
-            let cli = crate::interview::tod_cli_path();
-            if cli.is_file() {
-                out.push_str(&format!(
-                    "**`tod-cli`:** `{}` — call it by this full path if plain \
-                     `tod-cli` is not found. Never build or `cargo run` your own \
-                     copy against this data root.\n\n",
-                    cli.display().to_string().replace('\\', "/")
-                ));
+            if let Some(note) = host_cli_note() {
+                out.push_str(&note);
             }
         }
 

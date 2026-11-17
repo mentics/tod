@@ -1266,6 +1266,14 @@ impl ConversationDriver {
         // Whatever the protocol, an agent running in a codebase gets its rules.
         let context =
             context.map(|context| crate::codebase_rules::with_codebase_rules_in(context, &cwd));
+        // The opening names this machine's `tod-cli` path; an agent in a
+        // sandbox or container has the relay shim on its PATH instead.
+        let context = match &cwd {
+            Workdir::Host(_) => context,
+            Workdir::Container { .. } | Workdir::Sandbox { .. } => {
+                context.map(crate::dynamic::for_remote_agent)
+            }
+        };
         // An agent inside a dev container or sandbox is started from the
         // data root here.
         let workdir = cwd.clone();
