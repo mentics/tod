@@ -36,7 +36,7 @@ impl PrFeed for Github {
     fn merge(&self, _: &NodePr) -> Result<PrMerge, String> {
         Ok(PrMerge { title: "Add ingest".into(), merged: true, merged_at: Some("2026-03-01T00:00:00Z".into()) })
     }
-    fn releases(&self, _: &NodePr) -> Result<Vec<Release>, String> {
+    fn releases(&self, _: &NodePr, _merge: &PrMerge) -> Result<Vec<Release>, String> {
         Ok(self
             .0
             .lock()
@@ -186,7 +186,7 @@ impl PrFeed for Review {
     fn merge(&self, _: &NodePr) -> Result<PrMerge, String> {
         Err("not read here".into())
     }
-    fn releases(&self, _: &NodePr) -> Result<Vec<Release>, String> {
+    fn releases(&self, _: &NodePr, _merge: &PrMerge) -> Result<Vec<Release>, String> {
         Ok(Vec::new())
     }
 }

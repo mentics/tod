@@ -1250,21 +1250,41 @@ impl Github {
         })
     }
 
-    /// The repository's latest published releases (the first 30, newest
-    /// first). Drafts and pre-releases are left out: neither is released.
-    pub fn list_releases(&self, owner: &str, repo: &str) -> Result<Vec<Release>, GithubError> {
-        let raw: Vec<ReleaseRaw> = self.get_json(&format!("/repos/{owner}/{repo}/releases?per_page=30"))?;
-        Ok(raw
-            .into_iter()
-            .filter(|r| !r.draft && !r.prerelease)
-            .map(|r| Release {
+    /// The repository's published releases, newest first. Drafts and
+    /// pre-releases are left out: neither is released. Pages are read until
+    /// one reaches a release published before `since` (a merge time), so a
+    /// pull request merged weeks ago still finds the release that carries it
+    /// however many releases came after; with no `since`, only the first page.
+    pub fn list_releases(&self, owner: &str, repo: &str, since: Option<&str>) -> Result<Vec<Release>, GithubError> {
+        const PER_PAGE: usize = 100;
+        const MAX_PAGES: usize = 30;
+        let since = since.and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok());
+        let mut out = Vec::new();
+        for page in 1..=MAX_PAGES {
+            let raw: Vec<ReleaseRaw> =
+                self.get_json(&format!("/repos/{owner}/{repo}/releases?per_page={PER_PAGE}&page={page}"))?;
+            let full = raw.len() == PER_PAGE;
+            let reached = since.is_some_and(|since| {
+                raw.last()
+                    .and_then(|r| r.published_at.as_deref())
+                    .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                    .is_some_and(|published| published < since)
+            });
+            out.extend(raw.into_iter().filter(|r| !r.draft && !r.prerelease).map(|r| Release {
                 tag: r.tag_name,
                 name: r.name.filter(|n| !n.trim().is_empty()),
                 body: r.body.unwrap_or_default(),
                 url: r.html_url,
                 published_at: r.published_at,
-            })
-            .collect())
+            }));
+            if since.is_none() || !full || reached {
+                return Ok(out);
+            }
+        }
+        Err(GithubError::Http(format!(
+            "{owner}/{repo} has more than {} releases newer than the merge",
+            MAX_PAGES * PER_PAGE
+        )))
     }
 
     pub fn get_pr_snapshot(&self, owner: &str, repo: &str, number: i64) -> Result<PrSnapshot, GithubError> {
@@ -2553,9 +2573,27 @@ mod tests {
         assert_eq!(handle.join().unwrap(), 1);
         // A 404 on something that is not a pull request stays plain.
         let (url, handle) = serve_canned(vec![("404 Not Found", "{}")]);
-        let err = client(&url, &[]).list_releases("o", "r").unwrap_err();
+        let err = client(&url, &[]).list_releases("o", "r", None).unwrap_err();
         assert!(matches!(err, GithubError::NotFound), "{err}");
         handle.join().unwrap();
+    }
+
+    /// A pull request merged long ago finds its release past the first
+    /// page: pages are read until one reaches a release older than the merge.
+    #[test]
+    fn releases_are_paged_back_to_the_merge() {
+        let release = |tag: &str, at: &str| format!(r#"{{"tag_name":"{tag}","html_url":"u","published_at":"{at}"}}"#);
+        let page1: Vec<String> = (0..100).map(|i| release(&format!("n{i}"), "2026-11-01T00:00:00Z")).collect();
+        let page1: &'static str = Box::leak(format!("[{}]", page1.join(",")).into_boxed_str());
+        let page2: &'static str = Box::leak(
+            format!("[{},{}]", release("hit", "2026-10-23T18:32:46Z"), release("old", "2026-10-01T00:00:00Z"))
+                .into_boxed_str(),
+        );
+        let (url, handle) = serve_canned(vec![("200 OK", page1), ("200 OK", page2)]);
+        let got = client(&url, &[]).list_releases("o", "r", Some("2026-10-23T00:00:00Z")).unwrap();
+        assert_eq!(got.len(), 102);
+        assert!(got.iter().any(|r| r.tag == "hit"));
+        assert_eq!(handle.join().unwrap(), 2);
     }
 
     fn recent_reply(timeline: &str, review: &str) -> String {
