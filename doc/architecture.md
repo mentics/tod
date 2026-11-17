@@ -263,9 +263,39 @@ the daemon deletes the node's sandbox (with a checkpoint) unless the lifecycle
 config's **Delete sandbox** is off, and the runner menu's Delete sandbox does
 it on demand. `doc/runner-menu/design.md`.
 
-A sandbox is awake only while it has work, and every hold on it expires or is
-cleared by the hourly watchdog, so a crash never leaves one awake.
-`doc/files-locations.md`, `doc/cloud-sandboxes/`.
+**Two principles govern a node's sandbox** (a sandbox is billed for the time it
+is awake, and Blaxel's bill is the thing this protects):
+
+1. **No imminent work, no sandbox.** The moment a node has nothing an
+   automated action is about to do, its sandbox is stopped and deleted: it
+   waits on the user (a request, a failure, a stop, a pause), on CI, a review,
+   a merge, or a timer. It stays only while an automated action is in flight
+   and its agent is active. The daemon retires on the transition
+   (`tod_core::sandbox_retire`, poked by every run end and sync, with a
+   one-minute pass as the net). Only a sandbox that is **asleep** is deleted,
+   with no wake and no checkpoint: its work was pushed or checkpointed before
+   it slept (`doc/cloud-sandboxes/checkpoints.md`); one that is awake is left
+   to sleep first. A crash or kill may lose unsaved work, and that is accepted.
+2. **A sandbox is made only for work that exists now.** Never ahead of need,
+   never to replace a lost one speculatively. The orchestrator cannot create
+   sandboxes (only the app holds the user's Blaxel tokens): a wake or webhook
+   that finds the node's sandbox gone marks it for the app, which makes one
+   when the work is real.
+
+**One place gives a cloud node's agent work**: `cloud_jobs::submit_work`.
+If the node's sandbox exists it delivers the work; if not, it makes the
+sandbox (`provision::make_sandbox` through `ensure_supervisor`) and then
+delivers. Callers never ask "is there a sandbox?" themselves.
+
+A **billing watch** in the daemon (`tod_core::billing_watch`, every 5 minutes)
+reads Blaxel's cost through the Billing API with the credentials the app
+already holds, and notifies on this machine when the 5-minute rate passes
+$30/month or its smoothed rate (the last 6 samples) passes $20/month, in
+dollars-per-month equivalent. A read that fails is reported, not skipped.
+
+Every hold on an awake sandbox expires or is cleared by the hourly watchdog,
+so a crash never leaves one awake. `doc/files-locations.md`,
+`doc/cloud-sandboxes/`.
 
 ## The user interface
 

@@ -129,6 +129,9 @@ pub fn run(data_root: &Path) -> Result<bool> {
     tod_core::cloud_sync::sync_on_start(shared.store.clone());
     tod_core::cloud_notify::start(shared.store.clone());
     watch_done_sandboxes(shared.clone());
+    if !mock {
+        watch_billing(shared.clone(), data_root.to_path_buf());
+    }
     tod_core::db_broker::start(shared.store.clone());
     // Old build copies go (this one is running from `daemon/`, not removed).
     let running = std::env::current_exe().ok();
@@ -202,6 +205,54 @@ fn watch_done_sandboxes(shared: Arc<Shared>) {
     });
     if let Err(err) = spawned {
         tracing::warn!("tod-agentd: the done-sandbox check did not start: {err}");
+    }
+}
+
+/// Samples Blaxel's month-to-date cost every five minutes and alerts when its
+/// rate passes a threshold ([`tod_core::billing_watch`]). A failure to read
+/// it is an error in the log too (once an hour while it repeats), never
+/// silence: a watch that cannot see is not a watch.
+fn watch_billing(shared: Arc<Shared>, root: std::path::PathBuf) {
+    use tod_core::billing_watch as bw;
+    let spawned = std::thread::Builder::new().name("tod-agentd-billing".into()).spawn(move || {
+        let mut last_alert: Option<std::time::Instant> = None;
+        let mut last_failure: Option<std::time::Instant> = None;
+        while !shared.quit.load(Ordering::SeqCst) {
+            let result = bw::Thresholds::from_env().and_then(|t| bw::sample(&root, t));
+            match result {
+                Ok(reading) => {
+                    last_failure = None;
+                    if let Some(r) = reading.rates {
+                        tracing::info!(
+                            "billing watch: ${:.2} this month; ${:.0}/month over five minutes, ${:.0}/month smoothed",
+                            reading.total, r.immediate, r.smoothed
+                        );
+                    }
+                    if !reading.over.is_empty() && last_alert.is_none_or(|t| t.elapsed() >= bw::REALERT_AFTER) {
+                        last_alert = Some(std::time::Instant::now());
+                        bw::notify(&reading.over.join("; "));
+                    } else if reading.over.is_empty() {
+                        last_alert = None;
+                    }
+                }
+                Err(err) => {
+                    if last_failure.is_none_or(|t| t.elapsed() >= bw::REALERT_AFTER) {
+                        last_failure = Some(std::time::Instant::now());
+                        let message = format!("The Blaxel spend watch could not read the billing: {err:#}");
+                        tracing::error!("tod-agentd: {message}");
+                        tod_core::logging::buffer::record(
+                            tod_core::logging::buffer::Level3::Error,
+                            tod_core::logging::buffer::LogSource::App,
+                            message,
+                        );
+                    }
+                }
+            }
+            std::thread::sleep(bw::SAMPLE_EVERY);
+        }
+    });
+    if let Err(err) = spawned {
+        tracing::warn!("tod-agentd: the billing watch did not start: {err}");
     }
 }
 

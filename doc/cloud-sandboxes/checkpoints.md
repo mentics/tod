@@ -45,8 +45,11 @@ this machine. While the autopilot runs there:
 - once more before the run exits, after the final branch push, so a node
   that stops for the user or for a wait is saved before its sandbox sleeps.
 
-A failure is a warning in the node's problem log, forwarded to the user; it
-never stops the run.
+A failure is an **error** (logged as one, recorded in the node's problem log
+and forwarded to the user); it does not stop the run, but it is never
+downgraded to a warning. A sandbox is deleted only while asleep, and never
+woken to be checkpointed (see `doc/architecture.md`), so these saves are what
+make that safe.
 
 **In the app too**, `tod_core::checkpoint::Tracker`, fed by the unified
 view's standings pass (this also covers work done in a terminal handoff,

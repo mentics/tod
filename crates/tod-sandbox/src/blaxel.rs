@@ -665,6 +665,40 @@ impl Blaxel {
         Ok(Some(resp.body_mut().read_json()?))
     }
 
+    /// The accounts this token can read: `(id, name)`. The Billing API is
+    /// account-scoped (`GET /accounts/{id}/metrics`).
+    pub fn accounts(&self) -> Result<Vec<(String, String)>> {
+        let mut resp = self.cp(true, || self.auth(self.agent.get(&format!("{API}/accounts"))).call()).context("Blaxel API")?;
+        check(&mut resp, "list accounts")?;
+        let v: Value = resp.body_mut().read_json()?;
+        Ok(v.as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| {
+                        let id = x["metadata"]["id"].as_str().or_else(|| x["id"].as_str())?;
+                        let name = x["metadata"]["name"].as_str().unwrap_or(id);
+                        Some((id.to_string(), name.to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// What `account` has been charged, in USD, from `start` to `end`
+    /// (RFC 3339 UTC), across all its workspaces (`summary.totalCost` of the
+    /// Billing API; filtering to one workspace is account-admin only).
+    /// Metering runs a few minutes behind, so the total only ever
+    /// catches up.
+    pub fn cost_between(&self, account: &str, start: &str, end: &str) -> Result<f64> {
+        let url = format!("{API}/accounts/{account}/metrics?startTime={start}&endTime={end}");
+        let mut resp = self.cp(true, || self.auth(self.agent.get(&url)).call()).context("Blaxel API")?;
+        check(&mut resp, "read billing")?;
+        let v: Value = resp.body_mut().read_json()?;
+        v["summary"]["totalCost"]
+            .as_f64()
+            .with_context(|| format!("Blaxel's billing reply has no summary.totalCost: {}", v.to_string().chars().take(300).collect::<String>()))
+    }
+
     pub fn list(&self) -> Result<Vec<SandboxInfo>> {
         let mut resp = self.cp(true, || self.auth(self.agent.get(&format!("{API}/sandboxes"))).call()).context("Blaxel API")?;
         check(&mut resp, "list sandboxes")?;
