@@ -246,6 +246,7 @@ impl ChatDrawer {
         self.error = None;
         self.sessions = Vec::new();
         self.transcript.update(cx, |panel, cx| panel.reset(cx));
+        self.refresh_status(cx);
         self.reload(cx);
         self.load_sessions(cx);
     }
@@ -259,6 +260,7 @@ impl ChatDrawer {
         self.conversation_id = Some(id);
         self.error = None;
         self.transcript.update(cx, |panel, cx| panel.reset(cx));
+        self.refresh_status(cx);
         self.reload(cx);
         cx.notify();
     }
@@ -355,6 +357,7 @@ impl ChatDrawer {
         self.error = None;
         self.expanded = true;
         self.transcript.update(cx, |panel, cx| panel.reset(cx));
+        self.refresh_status(cx);
         self.reload(cx);
         self.transcript.update(cx, |panel, cx| panel.start_editing(window, cx));
         cx.notify();
