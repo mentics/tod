@@ -385,7 +385,6 @@ mod tests {
         use gpui::AppContext as _;
         use std::cell::RefCell;
         use std::rc::Rc;
-        use tod_store::fleet::FleetMutation;
         use tod_store::outline::OutlineMutation;
         use tod_store::outline::types::Capability;
 

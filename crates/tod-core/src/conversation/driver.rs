@@ -890,8 +890,8 @@ impl ConversationDriver {
             events.push(ConversationEvent::Notice(notice));
         }
         let report = fleet.read(|conn| ConversationRepo::new(conn).report_since(id, turn_seq))?;
-        let mut new_streak = self.quiet_streak;
-        let mut quiet_turn = false;
+        let new_streak: u32;
+        let quiet_turn: bool;
         let next = {
             let env = self.env(fleet, id);
             let after = match self.protocol.progress(&env) {

@@ -16,7 +16,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use gpui::prelude::FluentBuilder as _;
 use gpui::InteractiveElement as _;
 use gpui::{
     AnyElement, AppContext as _, Context, Entity, IntoElement, ParentElement as _, Render,

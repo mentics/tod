@@ -419,14 +419,6 @@ impl AgentRuns {
         }
     }
 
-    /// Work in flight, for the close-window warning.
-    #[cfg(test)]
-    pub fn running_work(&self) -> Vec<String> {
-        let (mut affected, continuing) = self.running_work_split();
-        affected.extend(continuing);
-        affected
-    }
-
     /// Work in flight, split for the close-window warning: what closing the
     /// app would cut off, and what the resident daemon keeps running (a
     /// conversation a node's runner drives there).

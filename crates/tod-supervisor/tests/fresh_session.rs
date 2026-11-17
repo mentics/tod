@@ -107,12 +107,6 @@ fn config(orchestrator: &Orchestrator, node: Uuid, base: &Path) -> Config {
     }
 }
 
-fn remote(base: &Path) -> rusqlite::Connection {
-    let conn = rusqlite::Connection::open(base.join("orchestrator").join("users").join("alice").join("tod.db")).unwrap();
-    conn.busy_timeout(Duration::from_secs(10)).unwrap();
-    conn
-}
-
 #[test]
 fn a_requested_new_session_is_taken_when_the_supervisor_wakes() {
     let tmp = Temp(std::env::temp_dir().join(format!("tod-supervisor-fresh-{}", Uuid::new_v4())));

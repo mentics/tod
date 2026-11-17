@@ -43,10 +43,6 @@ impl Node {
         self.bounds
             .map(|[x, y, w, h]| (x + w / 2.0, y + h / 2.0))
     }
-
-    pub fn supports(&self, action: &str) -> bool {
-        self.actions.iter().any(|a| a.eq_ignore_ascii_case(action))
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

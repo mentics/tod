@@ -324,9 +324,9 @@ pub fn half_made_action(new: &str, old: &str, found: Option<&SandboxInfo>) -> Ha
     if new == old {
         return HalfMade::Keep(format!("{new} is the golden the refresh started from"));
     }
-    let Some(info) = found else {
+    if found.is_none() {
         return HalfMade::Keep(format!("{new} does not exist"));
-    };
+    }
     if !new.starts_with("tod-golden-") {
         return HalfMade::Keep(format!("{new} was not named by tod's refresh"));
     }
