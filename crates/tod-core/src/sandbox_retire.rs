@@ -47,6 +47,10 @@ pub struct Facts {
     pub sandbox: Option<String>,
     /// Why its runner is active, when it is.
     pub runner_blocker: Option<String>,
+    /// The node waits on the user for a request, a failure, a stop, or a
+    /// pause (`next_actor` `You`, not `NotStarted`): nothing will use its
+    /// sandbox until the user acts, and a Start or Resume makes a new one.
+    pub waiting_on_user: bool,
 }
 
 /// What to do with a node now.
@@ -61,7 +65,7 @@ pub enum Decision {
 /// Why a node is left alone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Keep {
-    /// Not yet in the final phase.
+    /// Not yet in the final phase, and not waiting on the user.
     NotDone,
     /// The user turned "Delete sandbox" off for it.
     SettingOff,
@@ -74,7 +78,7 @@ pub enum Keep {
 /// The pure decision.
 pub fn decide(facts: &Facts) -> Decision {
     let final_rank = crate::task::model::lifecycle_rank(FINAL_PHASE);
-    if crate::task::model::lifecycle_rank(&facts.lifecycle) < final_rank {
+    if crate::task::model::lifecycle_rank(&facts.lifecycle) < final_rank && !facts.waiting_on_user {
         return Decision::Keep(Keep::NotDone);
     }
     if !facts.delete_enabled {
@@ -98,7 +102,9 @@ pub struct Due {
 }
 
 /// The nodes whose sandbox should be deleted now: every Files location that
-/// names a sandbox is read, and [`decide`] says [`Decision::Retire`].
+/// names a sandbox is read, and [`decide`] says [`Decision::Retire`]: the node
+/// is `done`, or it waits on the user (nothing runs until they act, and the
+/// next Start makes a sandbox, so keeping one only costs usage).
 pub fn due(fleet: &FleetStore) -> Result<Vec<Due>> {
     let located: Vec<tod_store::fleet::FilesLocation> = fleet
         .read(|c| tod_store::fleet::repos::files_location::FilesLocationRepo::new(c).list_all())?
@@ -106,6 +112,8 @@ pub fn due(fleet: &FleetStore) -> Result<Vec<Due>> {
         .filter(|l| l.sandbox().is_some())
         .collect();
     let mut out = Vec::new();
+    let final_rank = crate::task::model::lifecycle_rank(FINAL_PHASE);
+    let mut standings: Option<std::collections::HashMap<uuid::Uuid, crate::next_actor::NodeStanding>> = None;
     for location in located {
         let node = location.node_id.clone();
         let Some(task) = fleet.get_node(&node)? else { continue };
@@ -114,7 +122,21 @@ pub fn due(fleet: &FleetStore) -> Result<Vec<Due>> {
             delete_enabled: true,
             sandbox: location.sandbox().map(str::to_string),
             runner_blocker: None,
+            waiting_on_user: false,
         };
+        if crate::task::model::lifecycle_rank(&facts.lifecycle) < final_rank {
+            // Read once, and only when a node before `done` has a sandbox.
+            if standings.is_none() {
+                standings = Some(crate::next_actor::compute(fleet, fleet.paths().root())?);
+            }
+            facts.waiting_on_user = uuid::Uuid::parse_str(&node)
+                .ok()
+                .and_then(|id| standings.as_ref().and_then(|s| s.get(&id)))
+                .is_some_and(|s| {
+                    matches!(&s.actor, crate::next_actor::NextActor::You { why, .. }
+                        if !matches!(why, crate::next_actor::YouReason::NotStarted))
+                });
+        }
         // The cheap checks first: the setting and the runner are only read
         // for a node that is otherwise due.
         if decide(&facts) != Decision::Retire {
@@ -155,7 +177,7 @@ pub struct Retired {
 /// The problem's text for a failed delete.
 fn failure_message(item: &Due, err: &anyhow::Error, transient: bool) -> String {
     let what = format!(
-        "Deleting the sandbox {} of {} (it reached {FINAL_PHASE}) failed: {err:#}.",
+        "Deleting the idle sandbox {} of {} (it is done or waiting on you) failed: {err:#}.",
         item.sandbox, item.title
     );
     if transient {
@@ -270,7 +292,13 @@ mod tests {
     use uuid::Uuid;
 
     fn facts() -> Facts {
-        Facts { lifecycle: "done".into(), delete_enabled: true, sandbox: Some("s".into()), runner_blocker: None }
+        Facts {
+            lifecycle: "done".into(),
+            delete_enabled: true,
+            sandbox: Some("s".into()),
+            runner_blocker: None,
+            waiting_on_user: false,
+        }
     }
 
     #[test]
@@ -287,6 +315,11 @@ mod tests {
         // The setting off wins over a running node: it never runs.
         let both = Facts { delete_enabled: false, ..busy };
         assert_eq!(decide(&both), Decision::Keep(Keep::SettingOff));
+        // Waiting on the user retires it before `done`; a running one still waits.
+        let waiting = Facts { lifecycle: "review".into(), waiting_on_user: true, ..facts() };
+        assert_eq!(decide(&waiting), Decision::Retire);
+        let running = Facts { runner_blocker: Some("active".into()), ..waiting };
+        assert!(matches!(decide(&running), Decision::Keep(Keep::Running(_))));
     }
 
     struct Fx {

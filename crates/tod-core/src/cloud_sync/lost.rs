@@ -527,25 +527,24 @@ pub fn heal_deleted_flags(fleet: &FleetStore) -> Result<Vec<String>> {
     Ok(cleared)
 }
 
-/// Keeps the lost rows whose node is still meant to run. A node the user
-/// paused or stopped, one that failed or needs someone, and one that is done
-/// has a run row saying so (`Phase::Stopped` / `Done`): its sandbox is left
-/// gone until the user starts it (Start makes a new one), so a prune never
-/// restarts work the user stopped. A node waiting (`Waiting`), working, or
-/// with no row yet is meant to run.
+/// Keeps the lost rows whose node has work to do **right now**: its run is
+/// `Working` or `Starting`. A sandbox is never made ahead of need. A node
+/// that is stopped, paused, failed, done, or waiting (on the user, or on
+/// something outside that wakes it: the wake finds the sandbox gone and
+/// makes one then, `wake_node_requesting`) is left without one until it
+/// runs again; so is a node with no run row at all.
 fn wanted_to_run(fleet: &FleetStore, rows: Vec<CloudNodeRow>) -> Result<Vec<CloudNodeRow>> {
     use tod_store::run_state::Phase;
     let mut kept = Vec::new();
     for row in rows {
         let state = fleet.read(|conn| tod_store::run_state::get(conn, row.node_id))?;
-        // A done node whose sandbox was retired is not given another.
         if fleet.get_node(&row.node_id.to_string())?.is_some_and(|n| {
             crate::task::model::lifecycle_rank(&n.lifecycle) >= crate::task::model::lifecycle_rank(tod_store::lifecycle_config::FINAL_PHASE)
         }) {
             continue;
         }
-        if state.is_some_and(|s| matches!(s.phase, Phase::Stopped | Phase::Done)) {
-            tracing::info!("cloud: node {}'s sandbox is gone; not replacing it for a node that is stopped", row.node_id);
+        if !state.is_some_and(|s| matches!(s.phase, Phase::Working | Phase::Starting)) {
+            tracing::info!("cloud: node {}'s sandbox is gone; not making another until the node has work to do", row.node_id);
             continue;
         }
         kept.push(row);
@@ -1871,8 +1870,14 @@ mod tests {
         let fx = fx();
         let row = lost_node(&fx);
         run_row(&fx, crate::run_state::waiting_outside("CI"));
+        assert!(
+            wanted_to_run(&fx.fleet, vec![row.clone()]).unwrap().is_empty(),
+            "a node waiting on GitHub has no work now: no sandbox ahead of need"
+        );
+        let working = tod_store::run_state::Draft { phase: tod_store::run_state::Phase::Working, ..crate::run_state::waiting_outside("CI") };
+        run_row(&fx, working);
         let wanted = wanted_to_run(&fx.fleet, vec![row.clone()]).unwrap();
-        assert_eq!(wanted.len(), 1, "a node waiting on GitHub is meant to run");
+        assert_eq!(wanted.len(), 1, "a working node needs its sandbox");
         let mut made = 0;
         let ok = replace_with(&fx.fleet, &row, "t", &mut || {
             made += 1;
