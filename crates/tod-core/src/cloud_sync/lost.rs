@@ -385,17 +385,9 @@ pub fn check(fleet: &FleetStore, check: Check) -> Result<Repaired> {
         lost.retain(|row| !backed_off(&row.node_id.to_string()));
     }
     // A node being replaced gets this build anyway: not reinstalled too.
-    let (stale, current) = match check {
-        Check::Full => {
-            let fine: Vec<CloudNodeRow> = rows
-                .iter()
-                .filter(|row| !lost.iter().any(|l| l.node_id == row.node_id))
-                .cloned()
-                .collect();
-            super::refresh::stale(fleet, &fine)?
-        }
-        Check::Marked => (Vec::new(), String::new()),
-    };
+    // Never at the app's start either: reinstalling wakes an idle sandbox, and
+    // an old-build sandbox gets this build when it is next made or replaced.
+    let (stale, current): (Vec<CloudNodeRow>, String) = (Vec::new(), String::new());
     let owner = crate::next_actor::this_process();
     let repaired = std::thread::scope(|scope| {
         let replacing: Vec<_> = lost
@@ -549,10 +541,15 @@ fn wanted_to_run(fleet: &FleetStore, rows: Vec<CloudNodeRow>, check: Check) -> R
         // stimulus: only a node actually at work gets one then.
         let needs = |p: Phase| match check {
             Check::Marked => matches!(p, Phase::Working | Phase::Starting | Phase::Waiting),
-            Check::Full => matches!(p, Phase::Working | Phase::Starting),
+            // The app's start makes nothing: it cannot tell a node that is
+            // still at work from one whose agent finished while it was
+            // closed, and a missing sandbox most likely means it finished.
+            // It syncs, and a real stimulus (a wake or webhook, an answer,
+            // a start) makes the sandbox then.
+            Check::Full => false,
         };
         if !state.is_some_and(|s| needs(s.phase)) {
-            tracing::info!("cloud: node {}'s sandbox is gone; not making another until the node has work to do", row.node_id);
+            tracing::debug!("cloud: node {}'s sandbox is gone; not making another until the node has work to do", row.node_id);
             continue;
         }
         kept.push(row);
@@ -1944,8 +1941,12 @@ mod tests {
         );
         let working = tod_store::run_state::Draft { phase: tod_store::run_state::Phase::Working, ..crate::run_state::waiting_outside("CI") };
         run_row(&fx, working);
-        let wanted = wanted_to_run(&fx.fleet, vec![row.clone()], Check::Full).unwrap();
-        assert_eq!(wanted.len(), 1, "a working node needs its sandbox");
+        assert!(
+            wanted_to_run(&fx.fleet, vec![row.clone()], Check::Full).unwrap().is_empty(),
+            "the app's start makes no sandbox, even for a node that was working"
+        );
+        let wanted = wanted_to_run(&fx.fleet, vec![row.clone()], Check::Marked).unwrap();
+        assert_eq!(wanted.len(), 1, "a working node that a stimulus found sandbox-less gets one");
         let mut made = 0;
         let ok = replace_with(&fx.fleet, &row, "t", &mut || {
             made += 1;

@@ -277,7 +277,9 @@ is awake, and Blaxel's bill is the thing this protects):
    it slept (`doc/cloud-sandboxes/checkpoints.md`); one that is awake is left
    to sleep first. A crash or kill may lose unsaved work, and that is accepted.
 2. **A sandbox is made only for work that exists now.** Never ahead of need,
-   never to replace a lost one speculatively. The orchestrator cannot create
+   never to replace a lost one speculatively, and never by the app's start:
+   it syncs and forgets sandboxes Blaxel no longer has, but makes none and
+   reinstalls none (a missing sandbox most likely means its agent finished). The orchestrator cannot create
    sandboxes (only the app holds the user's Blaxel tokens): a wake or webhook
    that finds the node's sandbox gone marks it for the app, which makes one
    when the work is real.
