@@ -177,9 +177,14 @@ pub fn sample(root: &Path, thresholds: Thresholds) -> Result<Reading> {
     Ok(Reading { total, rates, over })
 }
 
-/// A desktop notification (macOS), and an error in the app's log, which
-/// raises a toast wherever the app runs. A notification that cannot be shown
-/// is itself logged.
+/// The alert that is on screen now, if the user has not dismissed it yet.
+#[cfg(target_os = "macos")]
+static OPEN_ALERT: std::sync::Mutex<Option<std::process::Child>> = std::sync::Mutex::new(None);
+
+/// An error in the app's log, which raises a toast wherever the app runs, and
+/// on macOS a dialog that **stays until the user dismisses it** (a banner
+/// notification goes away on its own). While one is still open, a repeat adds
+/// no second dialog. A dialog that cannot be shown is itself logged.
 pub fn notify(message: &str) {
     crate::logging::buffer::record(
         crate::logging::buffer::Level3::Error,
@@ -188,13 +193,20 @@ pub fn notify(message: &str) {
     );
     #[cfg(target_os = "macos")]
     {
+        let mut open = OPEN_ALERT.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(child) = open.as_mut() {
+            match child.try_wait() {
+                Ok(None) => return,
+                Ok(Some(_)) => {}
+                Err(err) => tracing::error!("billing watch: could not check the open alert: {err}"),
+            }
+        }
+        let text = serde_json::to_string(message).unwrap_or_else(|_| "\"see the tod log\"".into());
         let script = format!(
-            "display notification {} with title \"Blaxel spend is high\"",
-            serde_json::to_string(message).unwrap_or_else(|_| "\"see the tod log\"".into())
+            "display alert \"Blaxel spend is high\" message {text} as critical buttons {{\"Dismiss\"}} default button \"Dismiss\""
         );
-        match std::process::Command::new("osascript").arg("-e").arg(script).output() {
-            Ok(out) if out.status.success() => {}
-            Ok(out) => tracing::error!("billing watch: the notification failed: {}", String::from_utf8_lossy(&out.stderr)),
+        match std::process::Command::new("osascript").arg("-e").arg(script).spawn() {
+            Ok(child) => *open = Some(child),
             Err(err) => tracing::error!("billing watch: could not run osascript: {err}"),
         }
     }
