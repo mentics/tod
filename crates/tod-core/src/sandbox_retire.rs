@@ -133,8 +133,12 @@ pub fn due(fleet: &FleetStore) -> Result<Vec<Due>> {
                 .ok()
                 .and_then(|id| standings.as_ref().and_then(|s| s.get(&id)))
                 .is_some_and(|s| {
+                    // An indeterminate wait: on the user, or on something
+                    // outside (CI, a review, a timer). A wake or webhook for
+                    // the node makes its sandbox again.
                     matches!(&s.actor, crate::next_actor::NextActor::You { why, .. }
                         if !matches!(why, crate::next_actor::YouReason::NotStarted))
+                        || matches!(&s.actor, crate::next_actor::NextActor::Others { .. })
                 });
         }
         // The cheap checks first: the setting and the runner are only read
@@ -163,6 +167,33 @@ static STOPPED: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
 
 fn stopped() -> std::sync::MutexGuard<'static, Option<HashMap<String, String>>> {
     STOPPED.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+static POKE: (Mutex<bool>, std::sync::Condvar) = (Mutex::new(false), std::sync::Condvar::new());
+
+/// Something may have ended a node's work (a run finished, a sync brought
+/// the supervisor's idle report): the daemon's pass runs soon, not at its
+/// next minute. Cheap; a no-op in a process with no pass.
+pub fn poke() {
+    *POKE.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    POKE.1.notify_all();
+}
+
+/// Waits up to `timeout` for a [`poke`]; after one, waits `settle` more so
+/// the state the ending wrote (outcome, lease, heartbeat) is there to read.
+/// Returns whether it was poked.
+pub fn wait_for_poke(timeout: std::time::Duration, settle: std::time::Duration) -> bool {
+    let mut poked = POKE.0.lock().unwrap_or_else(|e| e.into_inner());
+    if !*poked {
+        poked = POKE.1.wait_timeout(poked, timeout).unwrap_or_else(|e| e.into_inner()).0;
+    }
+    let was = *poked;
+    drop(poked);
+    if was {
+        std::thread::sleep(settle);
+        *POKE.0.lock().unwrap_or_else(|e| e.into_inner()) = false;
+    }
+    was
 }
 
 /// What one pass did.

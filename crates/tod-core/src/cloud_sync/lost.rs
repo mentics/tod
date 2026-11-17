@@ -380,7 +380,7 @@ pub fn check(fleet: &FleetStore, check: Check) -> Result<Repaired> {
     let deleted = CloudSyncState::load(&root)?.deleted_by_user;
     let mut lost = lost_rows(&rows, listing.as_deref());
     lost.retain(|row| !deleted.contains(&row.node_id.to_string()));
-    lost = wanted_to_run(fleet, lost)?;
+    lost = wanted_to_run(fleet, lost, check)?;
     if check == Check::Marked {
         lost.retain(|row| !backed_off(&row.node_id.to_string()));
     }
@@ -528,12 +528,12 @@ pub fn heal_deleted_flags(fleet: &FleetStore) -> Result<Vec<String>> {
 }
 
 /// Keeps the lost rows whose node has work to do **right now**: its run is
-/// `Working` or `Starting`. A sandbox is never made ahead of need. A node
+/// `Working` or `Starting` (or, for a mark the orchestrator brought, `Waiting`). A sandbox is never made ahead of need. A node
 /// that is stopped, paused, failed, done, or waiting (on the user, or on
 /// something outside that wakes it: the wake finds the sandbox gone and
 /// makes one then, `wake_node_requesting`) is left without one until it
 /// runs again; so is a node with no run row at all.
-fn wanted_to_run(fleet: &FleetStore, rows: Vec<CloudNodeRow>) -> Result<Vec<CloudNodeRow>> {
+fn wanted_to_run(fleet: &FleetStore, rows: Vec<CloudNodeRow>, check: Check) -> Result<Vec<CloudNodeRow>> {
     use tod_store::run_state::Phase;
     let mut kept = Vec::new();
     for row in rows {
@@ -543,7 +543,15 @@ fn wanted_to_run(fleet: &FleetStore, rows: Vec<CloudNodeRow>) -> Result<Vec<Clou
         }) {
             continue;
         }
-        if !state.is_some_and(|s| matches!(s.phase, Phase::Working | Phase::Starting)) {
+        // A mark the orchestrator brought (`Check::Marked`) means a wake or a
+        // webhook found the sandbox gone: something needs the node, so a
+        // waiting node gets one. A look at the listing (`Check::Full`) is no
+        // stimulus: only a node actually at work gets one then.
+        let needs = |p: Phase| match check {
+            Check::Marked => matches!(p, Phase::Working | Phase::Starting | Phase::Waiting),
+            Check::Full => matches!(p, Phase::Working | Phase::Starting),
+        };
+        if !state.is_some_and(|s| needs(s.phase)) {
             tracing::info!("cloud: node {}'s sandbox is gone; not making another until the node has work to do", row.node_id);
             continue;
         }
@@ -1139,7 +1147,17 @@ fn delete_with(
     // The location goes; the row's copy of its sandbox stays, marked lost
     // below, until a Start records a new location.
     fleet.enqueue(FleetMutation::DeleteFilesLocation { node_id: plan.location.node_id.clone() })?;
-    if plan.row.is_some() {
+    // An idle node's sandbox retired by the app (not done, not the user's
+    // choice) is deliberately not marked lost: the orchestrator's next wake
+    // or webhook for the node pokes it, finds it gone and marks it then, and
+    // that mark (kept once set, `mark_lost`) is the stimulus that has the app
+    // make a new one. Marking it here would hide that stimulus.
+    let idle_retirement = !by_user
+        && !fleet.get_node(node_id)?.is_some_and(|n| {
+            crate::task::model::lifecycle_rank(&n.lifecycle)
+                >= crate::task::model::lifecycle_rank(tod_store::lifecycle_config::FINAL_PHASE)
+        });
+    if plan.row.is_some() && !idle_retirement {
         // The sandbox is gone either way: record it so the panel offers to start the node again.
         if by_user {
             super::record_sandbox_deleted_by_user(&root, node_id, name)?;
@@ -1871,12 +1889,17 @@ mod tests {
         let row = lost_node(&fx);
         run_row(&fx, crate::run_state::waiting_outside("CI"));
         assert!(
-            wanted_to_run(&fx.fleet, vec![row.clone()]).unwrap().is_empty(),
+            wanted_to_run(&fx.fleet, vec![row.clone()], Check::Full).unwrap().is_empty(),
             "a node waiting on GitHub has no work now: no sandbox ahead of need"
+        );
+        assert_eq!(
+            wanted_to_run(&fx.fleet, vec![row.clone()], Check::Marked).unwrap().len(),
+            1,
+            "a wake or webhook that found the sandbox gone is a stimulus"
         );
         let working = tod_store::run_state::Draft { phase: tod_store::run_state::Phase::Working, ..crate::run_state::waiting_outside("CI") };
         run_row(&fx, working);
-        let wanted = wanted_to_run(&fx.fleet, vec![row.clone()]).unwrap();
+        let wanted = wanted_to_run(&fx.fleet, vec![row.clone()], Check::Full).unwrap();
         assert_eq!(wanted.len(), 1, "a working node needs its sandbox");
         let mut made = 0;
         let ok = replace_with(&fx.fleet, &row, "t", &mut || {
@@ -1901,7 +1924,7 @@ mod tests {
             crate::run_state::runner_failed("boom"),
         ] {
             run_row(&fx, draft);
-            assert!(wanted_to_run(&fx.fleet, vec![row.clone()]).unwrap().is_empty());
+            assert!(wanted_to_run(&fx.fleet, vec![row.clone()], Check::Full).unwrap().is_empty());
         }
     }
 
@@ -1923,7 +1946,7 @@ mod tests {
         assert_eq!(state.phase, tod_store::run_state::Phase::Stopped);
         assert!(state.reason_text.contains("blaxel refused: quota"), "{}", state.reason_text);
         // Failed: no further automatic tries.
-        assert!(wanted_to_run(&fx.fleet, vec![row]).unwrap().is_empty());
+        assert!(wanted_to_run(&fx.fleet, vec![row], Check::Full).unwrap().is_empty());
     }
 
     #[test]

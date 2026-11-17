@@ -854,6 +854,8 @@ impl Inner {
             match event {
                 LocalEvent::Live(live) => slot.live = live,
                 LocalEvent::Finished(result) => {
+                    // The node's work ended: its idle sandbox is retired now.
+                    tod_core::sandbox_retire::poke();
                     slot.run = None;
                     slot.live = Live::default();
                     slot.outcome = Some(match result {

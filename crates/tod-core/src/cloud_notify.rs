@@ -454,6 +454,8 @@ pub fn runner(fleet: &Arc<FleetStore>) -> Arc<Coalesced> {
                         tracing::info!("{note}");
                     }
                     tracing::info!("cloud sync: {}", report.summary());
+                    // A supervisor's idle report may have arrived.
+                    crate::sandbox_retire::poke();
                     note_degraded(&root, report.notices_degraded_secs);
                     refresh_topics(&root);
                     // The orchestrator found a node's sandbox gone: replace it.

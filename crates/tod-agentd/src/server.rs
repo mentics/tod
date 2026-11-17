@@ -186,7 +186,9 @@ fn watch_done_sandboxes(shared: Arc<Shared>) {
         std::thread::sleep(RETIRE_FIRST_AFTER);
         while !shared.quit.load(Ordering::SeqCst) {
             retire_pass(&shared.store);
-            std::thread::sleep(RETIRE_EVERY);
+            // Every minute, and at once (after a short settle) when a run
+            // ends or a sync brings news: an idle node's sandbox goes then.
+            tod_core::sandbox_retire::wait_for_poke(RETIRE_EVERY, std::time::Duration::from_secs(3));
         }
     });
     if let Err(err) = spawned {
