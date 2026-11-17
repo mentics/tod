@@ -414,7 +414,18 @@ pub fn inspect(cwd: &Workdir, branch: Option<&str>, starts: &BranchStarts) -> Re
         // their default branch, ahead of what the checkout records.
         let sub = cwd.join(rel);
         refresh_origin(&sub)?;
-        let bases: Vec<String> = pinned(&parent, &in_parent)?.into_iter().chain(default_ref_opt(&sub)?).collect();
+        let pin = pinned(&parent, &in_parent)?;
+        // A pinned commit this submodule does not hold (a fresh checkout
+        // fetched only its branches) cannot be compared with: say so, never
+        // run git against an object that is not there.
+        if let Some(pin) = &pin {
+            let present = sub.git_output(&["cat-file", "-e", &format!("{pin}^{{commit}}")]).with_context(|| format!("run git cat-file -e in {sub}"))?;
+            if !present.status.success() {
+                out.push((rel.clone(), RepoState::Unknown(format!("submodule {rel} does not hold the commit {pin} the checkout pins it to, so its work cannot be compared with it"))));
+                continue;
+            }
+        }
+        let bases: Vec<String> = pin.into_iter().chain(default_ref_opt(&sub)?).collect();
         out.push((rel.clone(), state_of(&sub, &bases, &format!("submodule {rel}"), branch, starts.born.get(rel).map(String::as_str), starts.replaced.get(rel).map(String::as_str))?));
     }
     Ok(out)

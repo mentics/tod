@@ -452,6 +452,9 @@ pub enum QuickBranch {
     /// ([`init_submodules`] then [`branch_submodules`], idempotent, so they
     /// finish what this began) must run, and the reason is to be reported.
     Declined(String),
+    /// A submodule already has the branch (here or on `origin`): the designed
+    /// case for the step-by-step way, which then runs. Not a problem.
+    Careful(String),
 }
 
 /// [`branch_submodules`] for the common case in a cloud sandbox, in one call
@@ -481,12 +484,18 @@ pub fn branch_submodules_quickly(worktree: &Workdir, branch: &str) -> Result<Qui
         return Ok(QuickBranch::Done);
     }
     let said = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    if out.status.code() == Some(CAREFUL_EXIT) {
+        return Ok(QuickBranch::Careful(said.trim().to_string()));
+    }
     Ok(QuickBranch::Declined(format!("exit {:?}: {}", out.status.code(), said.trim())))
 }
 
 /// Exit status of [`quick_branch_script`] when a submodule's fetch of the
 /// branch failed (not "origin has no such branch").
 const FETCH_FAILED_EXIT: i32 = 9;
+
+/// Exit status of [`quick_branch_script`] when the careful path must run.
+const CAREFUL_EXIT: i32 = 7;
 
 /// The shell script behind [`branch_submodules_quickly`]: `$1` the branch,
 /// `$2` the key that records where it started. Each submodule, side by side,
