@@ -1,9 +1,11 @@
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     App, InteractiveElement, IntoElement, ParentElement, SharedString, Styled, Window, div, px,
+    relative,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::notification::Notification;
+use gpui_component::scroll::ScrollableElement;
 use gpui_component::spinner::Spinner;
 use gpui_component::{IconName, Root, Sizable, StyledExt, WindowExt, h_flex};
 use std::cell::RefCell;
@@ -350,10 +352,15 @@ pub fn close_guard_toast(
             .p_0()
             .content(move |_note, window, cx| {
                 let on_force_exit = on_force_exit.clone();
+                // The item lists scroll once they would take more than
+                // most of the window, so the buttons below always stay on
+                // screen however much is running.
+                let list_max_h = window.viewport_size().height * 0.6;
                 gpui::div()
                     .id("close-guard-toast")
-                    .max_w(px(360.))
-                    .min_w(px(280.))
+                    .w(px(560.))
+                    .max_w(relative(0.95))
+                    .max_h(relative(0.9))
                     .px_4()
                     .py_3()
                     .gap_1()
@@ -395,6 +402,16 @@ pub fn close_guard_toast(
                                 .text_color(gpui::white()),
                             ),
                     )
+                    // The lists go in a scroll area of their own, so a long
+                    // list never pushes the buttons off the bottom of the window.
+                    .child(
+                        gpui::div()
+                            .id("close-guard-list")
+                            .max_h(list_max_h)
+                            .overflow_y_scrollbar()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
                     // What closing the app would cancel or affect, first and
                     // highlighted: these are the ones that may be a problem.
                     .when(!running.affected.is_empty(), |this| this.child(
@@ -454,7 +471,8 @@ pub fn close_guard_toast(
                                     },
                                 )),
                         )
-                    })
+                    }),
+                    )
                     .child(
                         h_flex()
                             .gap_2()
