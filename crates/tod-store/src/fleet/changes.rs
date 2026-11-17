@@ -149,7 +149,6 @@ mod tests {
     #[test]
     fn trigger_changes_when_files_settings_change() {
         use crate::fleet::test_util::{cleanup_fleet_root, temp_fleet_root};
-        use crate::fleet::writer::FleetMutation;
         use crate::outline::types::Capability;
         use crate::outline::{CreatePosition, OutlineMutation};
 

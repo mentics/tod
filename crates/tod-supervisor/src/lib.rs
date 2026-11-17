@@ -453,7 +453,7 @@ fn hours(d: Duration) -> String {
 }
 
 /// What the node spent of `budget` when `limit` stopped it.
-fn budget_spent(limit: &BudgetLimit, budget: &Budget) -> (u32, f64) {
+fn budget_spent(limit: &BudgetLimit) -> (u32, f64) {
     match limit {
         BudgetLimit::Sessions { used, elapsed_secs } => (*used, *elapsed_secs as f64 / 3600.0),
         BudgetLimit::Time { elapsed_secs, used } => (*used, *elapsed_secs as f64 / 3600.0),
@@ -461,7 +461,7 @@ fn budget_spent(limit: &BudgetLimit, budget: &Budget) -> (u32, f64) {
 }
 
 fn budget_question(limit: &BudgetLimit, budget: &Budget) -> String {
-    let (sessions, spent_hours) = budget_spent(limit, budget);
+    let (sessions, spent_hours) = budget_spent(limit);
     let spent_hours = fmt_hours(spent_hours);
     format!(
         "Used {sessions} of {} sessions ({spent_hours} of {} hours). Keep going gives it {} more sessions \
@@ -475,7 +475,7 @@ fn budget_question(limit: &BudgetLimit, budget: &Budget) -> String {
 
 /// A spent budget in plain words, with what was used and what answers it.
 fn budget_reason(limit: &BudgetLimit, budget: &Budget) -> String {
-    let (sessions, spent_hours) = budget_spent(limit, budget);
+    let (sessions, spent_hours) = budget_spent(limit);
     format!(
         "its budget is spent ({sessions} of {} sessions, {} of {} hours). \
          Answer the budget question \"{}\" to give it more.",

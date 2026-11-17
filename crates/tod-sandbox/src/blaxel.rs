@@ -997,7 +997,7 @@ impl Blaxel {
 
     pub fn wait_deployed(&self, name: &str, timeout: Duration) -> Result<SandboxInfo> {
         let start = Instant::now();
-        let mut not_ready: Option<String> = None;
+        let mut not_ready: Option<String>;
         loop {
             // A 404 saying the workload is not ready is part of the wait.
             let found = match self.get(name) {

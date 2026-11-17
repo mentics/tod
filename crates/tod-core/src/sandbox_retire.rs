@@ -47,10 +47,12 @@ pub struct Facts {
     pub sandbox: Option<String>,
     /// Why its runner is active, when it is.
     pub runner_blocker: Option<String>,
-    /// The node waits on the user for a request, a failure, a stop, or a
-    /// pause (`next_actor` `You`, not `NotStarted`): nothing will use its
-    /// sandbox until the user acts, and a Start or Resume makes a new one.
-    pub waiting_on_user: bool,
+    /// Nothing automated is in flight for the node: its next actor is `You`
+    /// (a request, a failure, a stop, a pause, or nothing started) or
+    /// `Others` (CI, a review, a timer). Nothing will use its sandbox until
+    /// the user acts or the wait ends, and a Start, Resume, or wake makes a
+    /// new one when needed.
+    pub nothing_in_flight: bool,
 }
 
 /// What to do with a node now.
@@ -65,7 +67,7 @@ pub enum Decision {
 /// Why a node is left alone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Keep {
-    /// Not yet in the final phase, and not waiting on the user.
+    /// Not yet in the final phase, and something automated is in flight.
     NotDone,
     /// The user turned "Delete sandbox" off for it.
     SettingOff,
@@ -78,7 +80,7 @@ pub enum Keep {
 /// The pure decision.
 pub fn decide(facts: &Facts) -> Decision {
     let final_rank = crate::task::model::lifecycle_rank(FINAL_PHASE);
-    if crate::task::model::lifecycle_rank(&facts.lifecycle) < final_rank && !facts.waiting_on_user {
+    if crate::task::model::lifecycle_rank(&facts.lifecycle) < final_rank && !facts.nothing_in_flight {
         return Decision::Keep(Keep::NotDone);
     }
     if !facts.delete_enabled {
@@ -103,8 +105,10 @@ pub struct Due {
 
 /// The nodes whose sandbox should be deleted now: every Files location that
 /// names a sandbox is read, and [`decide`] says [`Decision::Retire`]: the node
-/// is `done`, or it waits on the user (nothing runs until they act, and the
-/// next Start makes a sandbox, so keeping one only costs usage).
+/// is `done`, or nothing automated is in flight for it (it waits on the user,
+/// on something outside, or has nothing pending). The next wake, webhook, or
+/// Start makes a sandbox when there is work, so keeping an idle one only costs
+/// usage.
 pub fn due(fleet: &FleetStore) -> Result<Vec<Due>> {
     let located: Vec<tod_store::fleet::FilesLocation> = fleet
         .read(|c| tod_store::fleet::repos::files_location::FilesLocationRepo::new(c).list_all())?
@@ -122,23 +126,25 @@ pub fn due(fleet: &FleetStore) -> Result<Vec<Due>> {
             delete_enabled: true,
             sandbox: location.sandbox().map(str::to_string),
             runner_blocker: None,
-            waiting_on_user: false,
+            nothing_in_flight: false,
         };
         if crate::task::model::lifecycle_rank(&facts.lifecycle) < final_rank {
             // Read once, and only when a node before `done` has a sandbox.
             if standings.is_none() {
                 standings = Some(crate::next_actor::compute(fleet, fleet.paths().root())?);
             }
-            facts.waiting_on_user = uuid::Uuid::parse_str(&node)
+            facts.nothing_in_flight = uuid::Uuid::parse_str(&node)
                 .ok()
                 .and_then(|id| standings.as_ref().and_then(|s| s.get(&id)))
                 .is_some_and(|s| {
-                    // An indeterminate wait: on the user, or on something
-                    // outside (CI, a review, a timer). A wake or webhook for
-                    // the node makes its sandbox again.
-                    matches!(&s.actor, crate::next_actor::NextActor::You { why, .. }
-                        if !matches!(why, crate::next_actor::YouReason::NotStarted))
-                        || matches!(&s.actor, crate::next_actor::NextActor::Others { .. })
+                    // Nothing automated is running. `You` covers a request,
+                    // a failure, a stop, a pause, and a node that has nothing
+                    // pending (`NotStarted`, which the derivation falls back
+                    // to, so a node with no wait is not an exception). `Others`
+                    // is an indeterminate wait (CI, a review, a timer). A wake
+                    // or webhook for the node makes its sandbox again.
+                    matches!(&s.actor, crate::next_actor::NextActor::You { .. }
+                        | crate::next_actor::NextActor::Others { .. })
                 });
         }
         // The cheap checks first: the setting and the runner are only read
@@ -332,7 +338,7 @@ mod tests {
             delete_enabled: true,
             sandbox: Some("s".into()),
             runner_blocker: None,
-            waiting_on_user: false,
+            nothing_in_flight: false,
         }
     }
 
@@ -350,8 +356,8 @@ mod tests {
         // The setting off wins over a running node: it never runs.
         let both = Facts { delete_enabled: false, ..busy };
         assert_eq!(decide(&both), Decision::Keep(Keep::SettingOff));
-        // Waiting on the user retires it before `done`; a running one still waits.
-        let waiting = Facts { lifecycle: "review".into(), waiting_on_user: true, ..facts() };
+        // Nothing in flight retires it before `done`; a running one still waits.
+        let waiting = Facts { lifecycle: "review".into(), nothing_in_flight: true, ..facts() };
         assert_eq!(decide(&waiting), Decision::Retire);
         let running = Facts { runner_blocker: Some("active".into()), ..waiting };
         assert!(matches!(decide(&running), Decision::Keep(Keep::Running(_))));
@@ -481,13 +487,19 @@ mod tests {
     }
 
     #[test]
-    fn a_node_before_done_is_left() {
+    fn a_node_before_done_with_a_run_in_flight_is_left() {
         let fx = fx();
         fx.locate("sb-2");
         fx.set_lifecycle("review");
+        let now = tod_store::outline::uuid_blob::now_ms();
+        let lease = Uuid::new_v4();
+        let conn = rusqlite::Connection::open(fx.fleet.paths().db()).unwrap();
+        tod_store::activity::ActivityRepo::new(&conn)
+            .start(lease, fx.node, tod_store::activity::KIND_RUN, "t", now)
+            .unwrap();
         let calls = std::cell::RefCell::new(Vec::new());
         retire_due_with(&fx.fleet, 1, &mut |n| fx.fake_delete(&calls, n)).unwrap();
-        assert!(calls.borrow().is_empty());
+        assert!(calls.borrow().is_empty(), "a run in flight keeps its sandbox");
         assert!(fx.has_location());
     }
 
@@ -503,12 +515,15 @@ mod tests {
     }
 
     #[test]
-    fn a_node_waiting_on_something_outside_is_retired_before_done_and_one_with_nothing_to_wait_on_is_not() {
+    fn a_node_before_done_is_retired_with_nothing_in_flight_or_waiting_on_something_outside() {
         let fx = fx();
         fx.locate("sb-wait");
         fx.set_lifecycle("pr_draft");
         enable_lifecycle(&fx);
-        assert!(due(&fx.fleet).unwrap().is_empty(), "nothing waits and nothing runs: not started, left alone");
+        // Nothing waits and nothing runs: the sandbox it has is idle, so it goes.
+        let idle = due(&fx.fleet).unwrap();
+        assert_eq!(idle.len(), 1, "nothing in flight: an idle sandbox is retired");
+        assert_eq!(idle[0].sandbox, "sb-wait");
         let conn = rusqlite::Connection::open(fx.fleet.paths().db()).unwrap();
         tod_store::waits::WaitRepo::new(&conn)
             .create(

@@ -1345,9 +1345,16 @@ fn make_sandbox_once(
         // Anything the one-call way did not complete is said, not hidden: the
         // step-by-step way then does the work, and it fails loudly if the
         // sandbox is really wrong.
-        if let Some(worktree::QuickBranch::Declined(why)) = &quick {
-            tracing::warn!(sandbox = %name, "the one-call submodule branching did not complete: {why}");
-            progress(&format!("warning: the one-call submodule branching did not complete ({why}); doing it step by step"));
+        match &quick {
+            Some(worktree::QuickBranch::Declined(why)) => {
+                tracing::warn!(sandbox = %name, "the one-call submodule branching did not complete: {why}");
+                progress(&format!("warning: the one-call submodule branching did not complete ({why}); doing it step by step"));
+            }
+            Some(worktree::QuickBranch::Careful(why)) => {
+                tracing::info!(sandbox = %name, "submodules already have the branch ({why}); branching step by step");
+                progress(&format!("submodules already have the branch ({why}); doing it step by step"));
+            }
+            _ => {}
         }
         if !matches!(quick, Some(worktree::QuickBranch::Done)) {
             if let Err(err) = worktree::init_submodules(&dir) {
