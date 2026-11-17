@@ -2176,8 +2176,12 @@ fn wake_node_requesting_inner(fleet: &FleetStore, root: &Path, node_id: &str, ki
     let fresh_session = kind == REQUEST_FRESH_SESSION;
     let stops = matches!(kind, REQUEST_PAUSE | REQUEST_STOP_NOW);
     let row = cloud_node(fleet, node_id).ok_or_else(|| anyhow!("this node does not run in the cloud"))?;
-    // The node's sandbox is its Files location's, not the row's copy.
-    let sandbox = cloud_sandbox(fleet, node_id)?;
+    // The node's sandbox is its Files location's, not the row's copy. None
+    // when the sandbox was retired while the node waited on the user (idle
+    // sandboxes are deleted, never kept): the same as a gone one below, so
+    // the one place that wakes a node's agent also makes its sandbox.
+    let recorded = cloud_sandbox_if_any(fleet, node_id)?;
+    let sandbox = recorded.clone().unwrap_or_else(|| "(none: retired while idle)".to_string());
     let (orch, user) = resolve(root)?;
     // Before the sync, so the answer and the row travel with it: a supervisor
     // that reads "left stopped" would ignore the request.
@@ -2198,8 +2202,12 @@ fn wake_node_requesting_inner(fleet: &FleetStore, root: &Path, node_id: &str, ki
     let bx = sandboxes.blaxel()?;
     // A sandbox that is gone (deleted or reclaimed since the last look) is
     // replaced the way the lost-sandbox check does, then woken.
-    let found = bx.get_waiting_not_ready(&sandbox, tod_sandbox::blaxel::NOT_READY_WAIT)
-        .with_context(|| format!("wake {sandbox}"))?;
+    let found = match &recorded {
+        Some(_) => bx
+            .get_waiting_not_ready(&sandbox, tod_sandbox::blaxel::NOT_READY_WAIT)
+            .with_context(|| format!("wake {sandbox}"))?,
+        None => None,
+    };
     // A sandbox in standby answers 502/503/504 and Blaxel's own 404 "workload
     // is not ready" for up to ~30s after waking, and WORKLOAD_UNAVAILABLE for
     // longer in an outage. That is waited out above
