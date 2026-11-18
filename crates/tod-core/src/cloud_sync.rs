@@ -1114,21 +1114,61 @@ fn warn_problem_log_unreadable(err: &anyhow::Error) {
 /// How long the store must be quiet before the outbox goes out.
 pub const PUSH_DEBOUNCE: Duration = Duration::from_secs(2);
 
+/// Whether the outbox must go out now: a cloud node is working (the
+/// orchestrator is awake anyway), or a pending change touches a node that is in
+/// the cloud (an answer or a wait that must wake it, an edit it must take), or
+/// belongs to no node. What only a node run on this machine changed (its
+/// transcript, its run state, its waits) waits for the batch
+/// ([`crate::cloud_notify::IDLE_POLL`]): it wakes no one, and sending it at
+/// once would keep the orchestrator's sandbox, which bills while awake, from
+/// ever sleeping while a local run works.
+pub fn push_is_urgent(
+    pending: &[Change],
+    cloud: &[uuid::Uuid],
+    outline: &dyn crate::impact::OutlineView,
+    cloud_working: bool,
+) -> bool {
+    if cloud_working {
+        return true;
+    }
+    if pending.iter().any(|c| c.node_id.is_none_or(|n| cloud.contains(&n))) {
+        return true;
+    }
+    !crate::impact::affected(pending, None, cloud, outline).is_empty()
+}
+
 /// On a thread of its own: a sync through the shared runner
 /// ([`crate::cloud_notify::runner`]) [`PUSH_DEBOUNCE`] after the last store
-/// change, for as long as the store lives, so the user's edits reach running
-/// nodes. A data root that was never seeded makes no network call. The sync
-/// the push starts reloads the store only when it received something, and
-/// an empty outbox sends nothing.
+/// change when [`push_is_urgent`], for as long as the store lives, so the
+/// user's edits reach running nodes. Changes that are not urgent go out with
+/// the next sync, or [`crate::cloud_notify::IDLE_POLL`] after the first one
+/// waited, whichever comes first. A data root that was never seeded makes no
+/// network call. The sync the push starts reloads the store only when it
+/// received something, and an empty outbox sends nothing.
 pub fn spawn_outbox_pusher(fleet: std::sync::Arc<FleetStore>) {
     let mut rx = fleet.subscribe_changes();
     let root = fleet.paths().root().to_path_buf();
     let spawned = std::thread::Builder::new().name("tod-cloud-outbox".into()).spawn(move || {
         use tokio::sync::broadcast::error::{RecvError, TryRecvError};
+        // When the oldest change held back for the batch began to wait.
+        let mut held_since: Option<std::time::Instant> = None;
         loop {
-            match rx.blocking_recv() {
-                Ok(()) | Err(RecvError::Lagged(_)) => {}
-                Err(RecvError::Closed) => return,
+            match held_since {
+                None => match rx.blocking_recv() {
+                    Ok(()) | Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Closed) => return,
+                },
+                Some(since) => loop {
+                    match rx.try_recv() {
+                        Ok(()) | Err(TryRecvError::Lagged(_)) => break,
+                        Err(TryRecvError::Closed) => return,
+                        Err(TryRecvError::Empty) => {}
+                    }
+                    if since.elapsed() >= crate::cloud_notify::IDLE_POLL {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_secs(1));
+                },
             }
             // Wait until a whole debounce passes with no change.
             loop {
@@ -1146,16 +1186,34 @@ pub fn spawn_outbox_pusher(fleet: std::sync::Arc<FleetStore>) {
                 }
             }
             if !CloudSyncState::load(&root).is_ok_and(|s| s.seeded) {
+                held_since = None;
                 continue;
             }
             // Nothing new of ours to send: no call (the store also changes
             // when a sync applies what it received).
-            let pending = CloudSyncState::load(&root).ok().and_then(|state| {
-                let conn = connect(fleet.paths().db()).ok()?;
-                Some(sync::last_seq(&conn).ok()? > state.sent_after)
-            });
-            if pending == Some(true) {
+            let Some(state) = CloudSyncState::load(&root).ok() else { continue };
+            let Some(conn) = connect(fleet.paths().db()).ok() else { continue };
+            if !sync::last_seq(&conn).is_ok_and(|seq| seq > state.sent_after) {
+                held_since = None;
+                continue;
+            }
+            let pending = sync::export_changes(&conn, state.sent_after).unwrap_or_default();
+            let cloud: Vec<uuid::Uuid> = tod_store::cloud_nodes::list(&conn)
+                .map(|rows| rows.into_iter().map(|r| r.node_id).collect())
+                .unwrap_or_default();
+            let urgent = push_is_urgent(
+                &pending,
+                &cloud,
+                &crate::impact::SqlOutline(&conn),
+                crate::cloud_notify::any_working_in_cloud(&fleet),
+            );
+            drop(conn);
+            let batch_due = held_since.is_some_and(|s| s.elapsed() >= crate::cloud_notify::IDLE_POLL);
+            if urgent || batch_due {
+                held_since = None;
                 crate::cloud_notify::runner(&fleet).request();
+            } else if held_since.is_none() {
+                held_since = Some(std::time::Instant::now());
             }
         }
     });
