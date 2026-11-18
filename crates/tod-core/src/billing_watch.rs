@@ -186,6 +186,7 @@ static OPEN_ALERT: std::sync::Mutex<Option<std::process::Child>> = std::sync::Mu
 /// notification goes away on its own). While one is still open, a repeat adds
 /// no second dialog. A dialog that cannot be shown is itself logged.
 pub fn notify(message: &str) {
+    let message = &format!("{message} ({})", chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z"));
     crate::logging::buffer::record(
         crate::logging::buffer::Level3::Error,
         crate::logging::buffer::LogSource::App,
