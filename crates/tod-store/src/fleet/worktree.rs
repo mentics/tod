@@ -1026,7 +1026,7 @@ fn treehouse_get_lease(
             tracing::warn!(
                 "stale worktree registration reported by treehouse in {repo}; pruning and retrying: {stderr}"
             );
-            prune_worktrees_recursive(repo);
+            prune_worktrees_recursive(repo, stale_worktree_path(&stderr).as_deref());
             output = run()?;
         }
         if !output.status.success() {
@@ -1205,8 +1205,89 @@ pub fn remove_git_worktree(repo: &Workdir, worktree: &Workdir) -> Result<()> {
 }
 
 /// Forget worktrees of `repo` whose folders no longer exist.
+///
+/// In a container or sandbox this is git's own `git worktree prune`. On this
+/// machine it is not: a repository bind-mounted into a dev container also
+/// holds the registrations of worktrees made in the container (Treehouse's
+/// slots under the container user's home), which this machine cannot see,
+/// and a plain prune here would delete them while they are in use. So only
+/// a registration whose folder's parent exists here and whose folder does
+/// not is forgotten ([`prune_host_registrations`]).
 pub fn prune_git_worktrees(repo: &Workdir) -> Result<()> {
-    run_git(repo, &["worktree", "prune"]).map(|_| ())
+    match repo {
+        Workdir::Host(dir) => prune_host_registrations(dir, None),
+        Workdir::Container { .. } | Workdir::Sandbox { .. } => {
+            run_git(repo, &["worktree", "prune"]).map(|_| ())
+        }
+    }
+}
+
+/// Forget the worktree registrations of the repository at `repo` (on this
+/// machine) whose worktree folder's parent exists here while the folder
+/// itself does not: a parent that is missing too may be a directory of
+/// another machine sharing the repository (a dev container), whose
+/// worktrees only that side can judge. `also` is a worktree folder known to
+/// be on this side (the one git just refused to add at), forgotten when
+/// missing whatever its parent. Locked registrations are kept, as git keeps
+/// them; a relative `gitdir` is relative to the registration's own folder.
+/// The workspace's `prune-worktrees` script applies the same rule.
+fn prune_host_registrations(repo: &Path, also: Option<&Path>) -> Result<()> {
+    let common = run_git(
+        &Workdir::Host(repo.to_path_buf()),
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    let admin_root = PathBuf::from(common).join("worktrees");
+    let entries = match std::fs::read_dir(&admin_root) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(anyhow!(err).context(format!("read {}", admin_root.display()))),
+    };
+    for entry in entries {
+        let admin = entry
+            .with_context(|| format!("read {}", admin_root.display()))?
+            .path();
+        if !admin.is_dir() || admin.join("locked").exists() {
+            continue;
+        }
+        let Ok(gitdir) = std::fs::read_to_string(admin.join("gitdir")) else {
+            continue;
+        };
+        let gitdir = gitdir.trim();
+        if gitdir.is_empty() {
+            continue;
+        }
+        let mut target = admin.join(gitdir);
+        if target.file_name().is_some_and(|name| name == ".git") {
+            target.pop();
+        }
+        if target.symlink_metadata().is_ok() {
+            continue;
+        }
+        let on_this_side = target.parent().is_some_and(Path::is_dir)
+            || also.is_some_and(|also| comparable_host_path(also) == comparable_host_path(&target));
+        if on_this_side {
+            std::fs::remove_dir_all(&admin).with_context(|| {
+                format!("forget missing worktree {} ({})", target.display(), admin.display())
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// `path` with `.` and `..` resolved lexically, for comparing a registered
+/// worktree folder with the one git named.
+fn comparable_host_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Whether `err` is git refusing to add a worktree because its registry
@@ -1218,6 +1299,14 @@ fn is_stale_worktree_registration(message: &str) -> bool {
     message.contains("is a missing but already registered worktree")
 }
 
+/// The worktree folder git named in a stale-registration refusal
+/// (`fatal: '<path>' is a missing but already registered worktree`).
+fn stale_worktree_path(message: &str) -> Option<PathBuf> {
+    let end = message.find("' is a missing but already registered worktree")?;
+    let start = message[..end].rfind('\'')? + 1;
+    Some(PathBuf::from(&message[start..end]))
+}
+
 /// [`prune_git_worktrees`] for `repo`, and, best-effort, for each of its
 /// already-checked-out submodules too. Treehouse pools a submodule's
 /// checkout the same way it pools the superproject's, so a submodule pool
@@ -1225,16 +1314,35 @@ fn is_stale_worktree_registration(message: &str) -> bool {
 /// submodule's own worktree list stale — pruning only the superproject
 /// would miss it, and the retry would fail again with the same error, just
 /// deeper in the setup (submodule init instead of the top-level checkout).
-fn prune_worktrees_recursive(repo: &Workdir) {
-    if let Err(err) = prune_git_worktrees(repo) {
+///
+/// On this machine every repository is pruned by [`prune_host_registrations`],
+/// with `named` (the folder git refused to add at) forgotten whatever its
+/// parent, so a dev container's worktrees in the same repositories survive.
+fn prune_worktrees_recursive(repo: &Workdir, named: Option<&Path>) {
+    let Workdir::Host(dir) = repo else {
+        if let Err(err) = prune_git_worktrees(repo) {
+            tracing::warn!("prune worktrees in {repo}: {err:#}");
+        }
+        // A submodule not checked out here has nothing of its own to prune yet,
+        // and `git submodule foreach` merely skips it — nothing to report.
+        let _ = run_git(
+            repo,
+            &["submodule", "foreach", "--recursive", "git worktree prune"],
+        );
+        return;
+    };
+    if let Err(err) = prune_host_registrations(dir, named) {
         tracing::warn!("prune worktrees in {repo}: {err:#}");
     }
-    // A submodule not checked out here has nothing of its own to prune yet,
-    // and `git submodule foreach` merely skips it — nothing to report.
-    let _ = run_git(
-        repo,
-        &["submodule", "foreach", "--recursive", "git worktree prune"],
-    );
+    // As above: a submodule not checked out is skipped, with nothing to report.
+    let Ok(listing) = run_git(repo, &["submodule", "foreach", "--quiet", "--recursive", "pwd"]) else {
+        return;
+    };
+    for submodule in listing.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        if let Err(err) = prune_host_registrations(Path::new(submodule), named) {
+            tracing::warn!("prune worktrees in {submodule}: {err:#}");
+        }
+    }
 }
 
 /// Run `f` (a worktree-add attempt); if it fails only because of a stale
@@ -1246,10 +1354,11 @@ fn retry_after_pruning_stale_worktree<T>(
 ) -> Result<T> {
     match f() {
         Err(err) if is_stale_worktree_registration(&format!("{err:#}")) => {
+            let message = format!("{err:#}");
             tracing::warn!(
-                "stale worktree registration in {repo}; pruning and retrying: {err:#}"
+                "stale worktree registration in {repo}; pruning and retrying: {message}"
             );
-            prune_worktrees_recursive(repo);
+            prune_worktrees_recursive(repo, stale_worktree_path(&message).as_deref());
             f()
         }
         other => other,
@@ -2080,6 +2189,86 @@ git -c user.name=t -c user.email=t@t commit -q -m 'add sub'"#;
         assert_eq!(branch, "feature");
         let _ = fs::remove_dir_all(repo.host_path().unwrap());
         let _ = fs::remove_dir_all(&data_root);
+    }
+
+    /// The registrations folder of the worktree at `path` in `repo`.
+    fn registration_of(repo: &Path, path: &Path) -> PathBuf {
+        let name = path.file_name().unwrap();
+        let admin = repo.join(".git/worktrees").join(name);
+        assert!(admin.join("gitdir").is_file(), "no registration at {}", admin.display());
+        admin
+    }
+
+    fn add_host_worktree(repo: &Path, path: &Path, branch: &str) {
+        let out = StdCommand::new("git")
+            .args(["worktree", "add", "-b", branch])
+            .arg(path)
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    #[test]
+    fn host_prune_keeps_registrations_this_machine_cannot_see() {
+        let repo = init_temp_repo();
+        let parent = crate::fleet::test_util::scratch_dir("tod-wt-side-");
+        // Made in a dev container: its path is under a directory this machine
+        // does not have (stood in for by rewriting `gitdir`).
+        let container = parent.join("container");
+        add_host_worktree(&repo, &container, "c");
+        let container_admin = registration_of(&repo, &container);
+        fs::write(
+            container_admin.join("gitdir"),
+            "/nonexistent-tod-test/home/vscode/worktrees/pool/1/container/.git\n",
+        )
+        .unwrap();
+        // Genuinely stale on this machine: its folder was deleted.
+        let stale = parent.join("stale");
+        add_host_worktree(&repo, &stale, "s");
+        let stale_admin = registration_of(&repo, &stale);
+        fs::remove_dir_all(&stale).unwrap();
+        // Stale too, but recorded relative to its registration folder.
+        let relative = parent.join("relative");
+        add_host_worktree(&repo, &relative, "r");
+        let relative_admin = registration_of(&repo, &relative);
+        fs::remove_dir_all(&relative).unwrap();
+        let depth = relative_admin.components().count() - 1;
+        let rel = "../".repeat(depth) + parent.strip_prefix("/").unwrap().to_str().unwrap() + "/relative/.git";
+        fs::write(relative_admin.join("gitdir"), rel).unwrap();
+        // Stale but locked: git keeps it, and so does tod.
+        let locked = parent.join("locked");
+        add_host_worktree(&repo, &locked, "l");
+        let locked_admin = registration_of(&repo, &locked);
+        fs::write(locked_admin.join("locked"), "on a removable drive").unwrap();
+        fs::remove_dir_all(&locked).unwrap();
+        // Alive here.
+        let alive = parent.join("alive");
+        add_host_worktree(&repo, &alive, "a");
+        let alive_admin = registration_of(&repo, &alive);
+
+        prune_git_worktrees(&Workdir::host(repo.clone())).unwrap();
+
+        assert!(container_admin.is_dir(), "a container's worktree was deregistered");
+        assert!(!stale_admin.exists(), "a missing host worktree stayed registered");
+        assert!(!relative_admin.exists(), "a relative gitdir was not followed");
+        assert!(locked_admin.is_dir(), "a locked worktree was deregistered");
+        assert!(alive_admin.is_dir(), "a live worktree was deregistered");
+    }
+
+    #[test]
+    fn a_stale_host_registration_is_cleared_for_the_add_that_hit_it() {
+        let repo = Workdir::host(init_temp_repo());
+        let parent = crate::fleet::test_util::scratch_dir("tod-wt-side-");
+        // The whole folder holding it is gone, so the parent rule alone would
+        // keep it: git naming it in its refusal is what marks it as ours.
+        let gone = parent.join("pool").join("feature");
+        add_host_worktree(repo.host_path().unwrap(), &gone, "first");
+        fs::remove_dir_all(parent.join("pool")).unwrap();
+        let dest = Workdir::host(gone.clone());
+        let made = git_worktree_add(&repo, &dest, "feature").unwrap();
+        assert!(made.is_dir());
+        assert!(is_registered_worktree(&repo, &made).unwrap());
     }
 
     #[test]
