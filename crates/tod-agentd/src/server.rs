@@ -215,7 +215,6 @@ fn watch_done_sandboxes(shared: Arc<Shared>) {
 fn watch_billing(shared: Arc<Shared>, root: std::path::PathBuf) {
     use tod_core::billing_watch as bw;
     let spawned = std::thread::Builder::new().name("tod-agentd-billing".into()).spawn(move || {
-        let mut last_alert: Option<std::time::Instant> = None;
         let mut last_failure: Option<std::time::Instant> = None;
         while !shared.quit.load(Ordering::SeqCst) {
             let result = bw::Thresholds::from_env().and_then(|t| bw::sample(&root, t));
@@ -228,11 +227,13 @@ fn watch_billing(shared: Arc<Shared>, root: std::path::PathBuf) {
                             reading.total, r.immediate, r.smoothed
                         );
                     }
-                    if !reading.over.is_empty() && last_alert.is_none_or(|t| t.elapsed() >= bw::REALERT_AFTER) {
-                        last_alert = Some(std::time::Instant::now());
+                    // The time of the last alert is on disk, so a restart does
+                    // not alert again at once for a rate that stays over.
+                    if !reading.over.is_empty() && bw::alert_due(&root) {
+                        if let Err(err) = bw::record_alert(&root) {
+                            tracing::error!("billing watch: could not record the alert: {err:#}");
+                        }
                         bw::notify(&reading.over.join("; "));
-                    } else if reading.over.is_empty() {
-                        last_alert = None;
                     }
                 }
                 Err(err) => {

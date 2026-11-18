@@ -136,6 +136,27 @@ fn save(root: &Path, samples: &[Sample]) -> Result<()> {
     std::fs::rename(&tmp, path(root)).with_context(|| format!("replace {}", path(root).display()))
 }
 
+fn alert_path(root: &Path) -> PathBuf {
+    root.join("billing-last-alert.txt")
+}
+
+/// When (ms since the epoch) the last alert was raised, kept on disk so a
+/// restart of the daemon does not raise it again at once.
+pub fn last_alert_ms(root: &Path) -> Option<i64> {
+    std::fs::read_to_string(alert_path(root)).ok()?.trim().parse().ok()
+}
+
+/// Records that an alert was raised now.
+pub fn record_alert(root: &Path) -> Result<()> {
+    let p = alert_path(root);
+    std::fs::write(&p, tod_store::outline::uuid_blob::now_ms().to_string()).with_context(|| format!("write {}", p.display()))
+}
+
+/// Whether an alert is due: none yet, or the last one was [`REALERT_AFTER`] ago.
+pub fn alert_due(root: &Path) -> bool {
+    last_alert_ms(root).is_none_or(|at| tod_store::outline::uuid_blob::now_ms() - at >= REALERT_AFTER.as_millis() as i64)
+}
+
 /// Reads the month's cost from Blaxel now.
 fn read_total(root: &Path) -> Result<f64> {
     use chrono::{Datelike, TimeZone, Utc};
