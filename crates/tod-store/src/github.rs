@@ -925,6 +925,16 @@ impl Github {
         Ok(out)
     }
 
+    /// Merge the base branch into the pull request's branch, as GitHub's
+    /// "Update branch" button does. Refused (an error) when the merge conflicts.
+    pub fn update_pr_branch(&self, owner: &str, repo: &str, number: i64) -> Result<(), GithubError> {
+        self.put_json::<serde_json::Value>(
+            &format!("/repos/{owner}/{repo}/pulls/{number}/update-branch"),
+            serde_json::json!({}),
+        )?;
+        Ok(())
+    }
+
     /// Ask `reviewers` (logins) to review the pull request.
     pub fn request_reviewers(&self, owner: &str, repo: &str, number: i64, reviewers: &[String]) -> Result<(), GithubError> {
         self.post_json::<serde_json::Value>(

@@ -23,6 +23,9 @@ pub struct PrFacts {
     /// The same in a few words, for the indicator beside the buttons.
     pub waiting_on: String,
     pub labels: Vec<String>,
+    /// The only thing wrong with it is that it is behind its base (so
+    /// [`update`] merges the base in itself).
+    pub only_behind: bool,
     /// Logins GitHub still waits on for a review.
     pub requested_reviewers: Vec<String>,
 }
@@ -130,6 +133,9 @@ fn facts_from(
         not_clean_because,
         waiting_on,
         labels: Vec::new(),
+        only_behind: !assessment.merged
+            && assessment.work() == [crate::pr_readiness::Work::Behind]
+            && assessment.waits().iter().all(|w| matches!(w, crate::pr_readiness::Wait::HumanReview)),
         requested_reviewers: assessment.requested_reviewers.clone(),
     })
 }
@@ -160,12 +166,20 @@ pub fn update(
     pr: &NodePr,
     choice: &crate::pr_choices::Choice,
 ) -> Result<(), String> {
-    let facts = load(data_root, fleet, node, pr)?;
+    let mut facts = load(data_root, fleet, node, pr)?;
     if facts.merged {
         return Err("this pull request is merged".to_string());
     }
-    let not_clean = || format!("the code review has not passed yet: {}", facts.not_clean_because);
     let gh = github(data_root)?;
+    // Behind its base and nothing else: bring the base in here rather than
+    // refuse and make the user do it.
+    if facts.only_behind {
+        gh.update_pr_branch(&pr.owner, &pr.repo, pr.pr_number)
+            .map_err(|e| format!("could not update the branch from its base: {}", say(e)))?;
+        crate::pr_readiness::forget_snapshot(pr);
+        facts = load(data_root, fleet, node, pr)?;
+    }
+    let not_clean = || format!("the code review has not passed yet: {}", facts.not_clean_because);
     let mut draft = facts.draft;
     if let Some(labels) = &choice.labels {
         let mut want = labels.clone();

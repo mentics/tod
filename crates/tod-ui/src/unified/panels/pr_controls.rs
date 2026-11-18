@@ -670,6 +670,7 @@ mod tests {
             not_clean_because: String::new(),
             waiting_on: String::new(),
             labels: labels.iter().map(|s| s.to_string()).collect(),
+            only_behind: false,
             requested_reviewers: requested.iter().map(|s| s.to_string()).collect(),
         }
     }
