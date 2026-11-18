@@ -146,7 +146,8 @@ impl Server {
     /// Starts the wake timer, then accepts connections until the listener
     /// fails; one thread each.
     pub fn serve(self: &Arc<Self>, listener: TcpListener) -> Result<()> {
-        self.wakes.spawn_timer(Box::new(wakes::LocalRelayAwake::default()))?;
+        let port = listener.local_addr().context("the listener's port")?.port();
+        self.wakes.spawn_timer(Box::new(wakes::SleepingAwake::from_env(&self.config.base, port)))?;
         for stream in listener.incoming() {
             let stream = match stream {
                 Ok(s) => s,
@@ -224,7 +225,27 @@ impl Server {
         tod_store::sync::contract::Contract::current(tod_core::CLI_BUILD_STAMP)
     }
 
+    /// `POST /tick`: the orchestrator's own wake schedule firing
+    /// ([`wakes::SelfWake`]). It carries a secret the schedule was made with.
+    fn tick(&self, request: &Request) -> Response {
+        if request.method != "POST" {
+            return Response::text(405, "POST /tick");
+        }
+        let token = match wakes::tick_token(&self.config.base) {
+            Ok(t) => t,
+            Err(err) => return Response::text(500, format!("{err:#}")),
+        };
+        if !wakes::tick_allowed(&token, request.header(wakes::TICK_HEADER)) {
+            return Response::text(401, "a tick needs the orchestrator's tick secret");
+        }
+        self.wakes.tick();
+        Response::text(200, "ok")
+    }
+
     fn route(&self, request: &Request) -> Response {
+        if request.path.trim_matches('/') == "tick" {
+            return self.tick(request);
+        }
         if request.path.trim_matches('/') != "health"
             && let Err(why) = tod_store::sync::contract::check_client(
                 &self.contract(),

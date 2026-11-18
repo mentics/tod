@@ -42,6 +42,7 @@ fn main() -> Result<()> {
         service_token: Box::new(move |svc| tod_core::db_broker::service_token(&token_root, svc)),
         service_call: Box::new(|svc, token, action, args| svc.call(token, action, args)),
         sandbox_of: Box::new(move |_| Some(sandbox.clone())),
+        working: Box::new(|| true),
         orchestrator: Box::new(move || Ok((HttpOrchestrator::new(url.clone(), Some(token.clone())), user.clone()))),
     });
     eprintln!("answering; Ctrl-C to stop");

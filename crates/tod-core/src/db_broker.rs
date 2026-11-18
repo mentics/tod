@@ -22,6 +22,16 @@
 //!
 //! A failure is the reply: the agent sees why (the profile has expired, the
 //! machine cannot reach the database, the node is unknown), never a hang.
+//!
+//! **The poll is held only while it can be used.** The orchestrator is billed
+//! while awake, and a long poll re-issued back to back keeps it so forever.
+//! Only a sandbox whose supervisor is at work asks (`Service::working`: a
+//! fresh `cloud_activity` beat, which reaches this machine through the
+//! synced feed), so nothing is polled while every node is asleep, a minute's
+//! linger ([`LINGER`]) follows the last work, and forwards still open count
+//! as work. A request that comes with no machine polling is held by the
+//! orchestrator for its grace period, which covers the time the beat takes
+//! to arrive; past it the caller gets the orchestrator's retryable error.
 
 use crate::cloud_sync::{self, HttpOrchestrator};
 use anyhow::{Context, Result, anyhow};
@@ -39,6 +49,11 @@ use tod_store::fleet::FleetStore;
 /// How long a sandbox's forwards stay open after the node last asked.
 pub const IDLE: Duration = Duration::from_secs(10 * 60);
 const POLL_SECS: u64 = tod_store::sync::BROKER_POLL_SECS;
+/// How often to look again for work while not polling (a local read).
+const IDLE_CHECK: Duration = Duration::from_secs(10);
+/// How long polling goes on after the last sign of work, so a node that
+/// pauses between requests keeps its machine connected.
+const LINGER: Duration = Duration::from_secs(60);
 
 /// What the broker needs from its surroundings; tests and the live check
 /// replace the parts that would otherwise need a running app.
@@ -55,6 +70,9 @@ pub struct Service {
     pub service_call: Box<dyn Fn(&Declared, Option<&str>, &str, &Args) -> Result<Value> + Send + Sync>,
     /// The sandbox a node runs in, if it is a cloud node this machine knows.
     pub sandbox_of: Box<dyn Fn(&str) -> Option<String> + Send + Sync>,
+    /// Whether a cloud node's supervisor is at work right now: the only time
+    /// a sandbox asks, so the only time the orchestrator is polled.
+    pub working: Box<dyn Fn() -> bool + Send + Sync>,
     /// The orchestrator to answer for, and the user's name there.
     pub orchestrator: Box<dyn Fn() -> Result<(HttpOrchestrator, String)> + Send + Sync>,
 }
@@ -66,6 +84,7 @@ impl Service {
         let root = fleet.paths().root().to_path_buf();
         let (databases_root, orchestrator_root) = (root.clone(), root.clone());
         let (services_root, token_root) = (root.clone(), root.clone());
+        let working_fleet = fleet.clone();
         Self {
             root,
             databases: Box::new(move || databases(&databases_root)),
@@ -87,6 +106,10 @@ impl Service {
                     }
                 }
             }),
+            working: {
+                let fleet = working_fleet;
+                Box::new(move || crate::cloud_notify::any_working_in_cloud(&fleet))
+            },
             orchestrator: Box::new(move || cloud_sync::resolve(&orchestrator_root)),
         }
     }
@@ -175,6 +198,7 @@ fn run(service: Arc<Service>) {
     tunnels.clone().spawn_reaper();
     let mut quiet = Quiet::default();
     let mut orchestrator: Option<(Arc<HttpOrchestrator>, String)> = None;
+    let mut last_work: Option<Instant> = None;
     loop {
         match (service.databases)().and_then(|dbs| Ok((dbs, (service.services)()?))) {
             Ok((dbs, svcs)) if dbs.is_empty() && svcs.is_empty() => {
@@ -187,6 +211,15 @@ fn run(service: Arc<Service>) {
                 std::thread::sleep(Duration::from_secs(60));
                 continue;
             }
+        }
+        if (service.working)() || tunnels.any_open() {
+            last_work = Some(Instant::now());
+        }
+        if !last_work.is_some_and(|at| at.elapsed() < LINGER) {
+            // Nothing runs that could ask: no connection to the orchestrator,
+            // so it can sleep.
+            std::thread::sleep(IDLE_CHECK);
+            continue;
         }
         let (orch, user) = match &orchestrator {
             Some((o, u)) => (o.clone(), u.clone()),
@@ -344,6 +377,12 @@ impl Tunnels {
         Ok(())
     }
 
+    /// Whether any forward is open (one that is is still in use, or would
+    /// have been reaped).
+    fn any_open(&self) -> bool {
+        !self.map.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+    }
+
     fn spawn_reaper(self: Arc<Self>) {
         let spawned = std::thread::Builder::new().name("db-broker-reaper".into()).spawn(move || loop {
             std::thread::sleep(Duration::from_secs(30));
@@ -402,6 +441,7 @@ mod tests {
                 Ok(json!({"service": svc.name, "token_seen": token, "action": action, "args": args}))
             }),
             sandbox_of: Box::new(move |node| nodes.iter().find(|(n, _)| *n == node).map(|(_, s)| s.to_string())),
+            working: Box::new(|| true),
             orchestrator: Box::new(|| Err(anyhow!("not used"))),
         }
     }

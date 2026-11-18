@@ -24,6 +24,17 @@
 //! `cloud_nodes.lost_at`) is told, so the app replaces the sandbox on its
 //! next sync. Only the app can: the user's tokens are only on their machine.
 //!
+//! **The orchestrator sleeps between wakes.** It is billed while awake, so
+//! with a wake pending it does not hold itself up until the wake is due. Past
+//! [`HOLD_WITHIN`] it makes a one-shot Blaxel schedule on its own sandbox
+//! ([`SelfWake`], `orchestrator-wake`) that calls `POST /tick` at the earliest
+//! due time, releases its hold, and goes to sleep; the schedule wakes the
+//! sandbox (standby included), the tick takes a hold and the timer fires what
+//! is due. A new earliest wake replaces the schedule; no wake left removes it.
+//! When it cannot arm one (no Blaxel account or sandbox name in its
+//! environment, or Blaxel refusing) it says so and stays awake as before,
+//! rather than sleep through a wake.
+//!
 //! Poking needs Blaxel credentials to reach other sandboxes: [`RelayPoker`]
 //! reads `TOD_ORCHESTRATOR_BLAXEL_WORKSPACE` and `TOD_ORCHESTRATOR_BLAXEL_TOKEN`.
 //! Without them a poke fails (and is retried) with a message saying so.
@@ -97,16 +108,37 @@ pub trait Poker: Send + Sync {
     fn poke(&self, wake: &Wake) -> Result<()>;
 }
 
-/// Keeps the orchestrator's own sandbox up while wakes are pending.
+/// A wake due within this long (or overdue) keeps the orchestrator awake for
+/// it; a later one lets it sleep, woken by a schedule. A Blaxel schedule fires
+/// 10 to 50 seconds after its time, so for a nearer wake sleeping would only
+/// make it late.
+pub const HOLD_WITHIN: Duration = Duration::from_secs(90);
+
+/// Keeps the orchestrator's own sandbox up for the wakes that are due soon,
+/// and lets it sleep for the rest.
 pub trait KeepAwake: Send + Sync {
-    /// Called by the timer on every pass: `pending` is whether any wake is
-    /// still waiting. Implementations renew their hold, or let it lapse.
-    fn tick(&self, pending: bool);
+    /// Called by the timer on every pass: `next_due` is the earliest pending
+    /// wake (ms), `None` when there is none, and `now` the time (ms).
+    /// Implementations renew their hold, or let it lapse.
+    fn tick(&self, next_due: Option<i64>, now: i64);
+
+    /// Holds the sandbox awake for a lease from now: a wake's tick has come
+    /// in and the timer is about to do its work.
+    fn hold(&self) {}
 }
 
 pub struct NoKeepAwake;
 impl KeepAwake for NoKeepAwake {
-    fn tick(&self, _pending: bool) {}
+    fn tick(&self, _next_due: Option<i64>, _now: i64) {}
+}
+
+/// Wakes the orchestrator's own sandbox at a time (a Blaxel schedule), so it
+/// can sleep until then.
+pub trait SelfWake: Send + Sync {
+    /// Wake the sandbox at `at_ms`, replacing any earlier time.
+    fn arm(&self, at_ms: i64) -> Result<()>;
+    /// Drop the wake.
+    fn disarm(&self) -> Result<()>;
 }
 
 pub fn now_ms() -> i64 {
@@ -123,6 +155,8 @@ pub struct Wakes {
     poker: Box<dyn Poker>,
     lost: std::sync::OnceLock<LostHandler>,
     gate: std::sync::OnceLock<Box<dyn WakeGate>>,
+    /// What keeps the sandbox up, once the timer runs (for [`Self::tick`]).
+    awake: std::sync::OnceLock<Arc<dyn KeepAwake>>,
 }
 
 impl Wakes {
@@ -134,7 +168,7 @@ impl Wakes {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
         };
-        Ok(Arc::new(Self { path, rows: Mutex::new(rows), changed: Condvar::new(), poker, lost: std::sync::OnceLock::new(), gate: std::sync::OnceLock::new() }))
+        Ok(Arc::new(Self { path, rows: Mutex::new(rows), changed: Condvar::new(), poker, lost: std::sync::OnceLock::new(), gate: std::sync::OnceLock::new(), awake: std::sync::OnceLock::new() }))
     }
 
     /// Who hears of a sandbox found gone (set once; later calls are ignored).
@@ -278,9 +312,14 @@ impl Wakes {
     pub fn run_timer(self: &Arc<Self>, clock: &dyn Fn() -> i64, awake: &dyn KeepAwake) {
         loop {
             self.fire_due(clock());
+            let next = self.earliest();
+            // Without the lock: arming a schedule is a call to Blaxel.
+            awake.tick(next, clock());
             let rows = self.rows.lock().unwrap();
-            awake.tick(!rows.is_empty());
-            let next = rows.iter().map(|w| w.at).min();
+            // A wake put or dropped meanwhile is looked at now, not a minute on.
+            if rows.iter().map(|w| w.at).min() != next {
+                continue;
+            }
             let sleep = match next {
                 Some(at) => Duration::from_millis((at - clock()).max(0) as u64).min(MAX_SLEEP),
                 None => MAX_SLEEP,
@@ -291,14 +330,31 @@ impl Wakes {
         }
     }
 
+    fn earliest(&self) -> Option<i64> {
+        self.rows.lock().unwrap().iter().map(|w| w.at).min()
+    }
+
     /// Starts [`Wakes::run_timer`] on its own thread with the real clock.
     pub fn spawn_timer(self: &Arc<Self>, awake: Box<dyn KeepAwake>) -> Result<()> {
+        let awake: Arc<dyn KeepAwake> = Arc::from(awake);
+        let _ = self.awake.set(awake.clone());
         let wakes = self.clone();
         std::thread::Builder::new()
             .name("tod-orchestrator-wakes".into())
             .spawn(move || wakes.run_timer(&now_ms, awake.as_ref()))
             .context("spawn the wake timer")?;
         Ok(())
+    }
+
+    /// `POST /tick`, from the schedule [`SelfWake`] made: the sandbox has
+    /// just been woken for a wake that is due. Holds it awake before the
+    /// request returns (it would otherwise be free to sleep again before the
+    /// timer's pokes are done) and has the timer look now.
+    pub fn tick(&self) {
+        if let Some(awake) = self.awake.get() {
+            awake.hold();
+        }
+        self.changed.notify_all();
     }
 
     /// `POST /wakes` and `DELETE /wakes/<id>`, for `user` (already checked).
@@ -420,20 +476,209 @@ impl Default for LocalRelayAwake {
     }
 }
 
-impl KeepAwake for LocalRelayAwake {
-    fn tick(&self, pending: bool) {
-        // A lease on the relay's hold, renewed every tick and released as
-        // soon as nothing is pending (it would lapse on its own anyway).
-        let path = if pending { "/hold?reason=wakes&secs=120" } else { "/release?reason=wakes" };
-        let result = std::net::TcpStream::connect(&self.addr).and_then(|mut s| {
-            s.set_write_timeout(Some(Duration::from_secs(5)))?;
-            write!(s, "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-        });
-        if let Err(err) = result
-            && pending
-        {
-            eprintln!("tod-orchestrator: cannot hold awake through {}: {err}", self.addr);
+impl LocalRelayAwake {
+    fn post(&self, path: &str) -> std::io::Result<()> {
+        let mut s = std::net::TcpStream::connect(&self.addr)?;
+        s.set_write_timeout(Some(Duration::from_secs(5)))?;
+        write!(s, "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+    }
+
+    /// A lease on the relay's hold, for two minutes (it lapses on its own).
+    fn hold(&self) -> std::io::Result<()> {
+        self.post("/hold?reason=wakes&secs=120")
+    }
+
+    fn release(&self) -> std::io::Result<()> {
+        self.post("/release?reason=wakes")
+    }
+}
+
+/// What [`SleepingAwake`] has done, so it talks to the relay and Blaxel only
+/// when something changes.
+#[derive(Default)]
+struct Standing {
+    held: bool,
+    /// The time the schedule is set for (ms), if one is.
+    armed: Option<i64>,
+    /// Whether the reason it cannot sleep has been said already.
+    told: bool,
+}
+
+/// The real [`KeepAwake`]: holds the relay for a wake due soon and, for a
+/// later one, arms a schedule on its own sandbox and lets go, so the
+/// sandbox sleeps (module docs).
+pub struct SleepingAwake {
+    relay: LocalRelayAwake,
+    waker: Result<Box<dyn SelfWake>, String>,
+    standing: Mutex<Standing>,
+}
+
+impl SleepingAwake {
+    pub fn new(relay: LocalRelayAwake, waker: Result<Box<dyn SelfWake>, String>) -> Self {
+        Self { relay, waker, standing: Mutex::new(Standing::default()) }
+    }
+
+    /// With the schedule from the environment ([`BlaxelSelfWake::from_env`]).
+    pub fn from_env(base: &std::path::Path, port: u16) -> Self {
+        let waker = BlaxelSelfWake::from_env(base, port).map(|w| Box::new(w) as Box<dyn SelfWake>).map_err(|e| format!("{e:#}"));
+        Self::new(LocalRelayAwake::default(), waker)
+    }
+
+    fn take_hold(&self, standing: &mut Standing) {
+        match self.relay.hold() {
+            Ok(()) => standing.held = true,
+            Err(err) => eprintln!("tod-orchestrator: cannot hold awake through {}: {err}", self.relay.addr),
         }
+    }
+}
+
+impl KeepAwake for SleepingAwake {
+    fn hold(&self) {
+        let mut standing = self.standing.lock().unwrap_or_else(|e| e.into_inner());
+        self.take_hold(&mut standing);
+    }
+
+    fn tick(&self, next_due: Option<i64>, now: i64) {
+        let mut standing = self.standing.lock().unwrap_or_else(|e| e.into_inner());
+        match next_due {
+            None => {
+                if standing.held {
+                    match self.relay.release() {
+                        Ok(()) => standing.held = false,
+                        Err(err) => eprintln!("tod-orchestrator: cannot release the hold through {}: {err}", self.relay.addr),
+                    }
+                }
+                if standing.armed.is_some() {
+                    match self.waker.as_ref().map(|w| w.disarm()) {
+                        Ok(Ok(())) | Err(_) => standing.armed = None,
+                        Ok(Err(err)) => eprintln!("tod-orchestrator: cannot remove its wake schedule: {err:#}"),
+                    }
+                }
+            }
+            Some(at) if at - now <= HOLD_WITHIN.as_millis() as i64 => self.take_hold(&mut standing),
+            Some(at) => {
+                let armed = match &self.waker {
+                    Ok(_) if standing.armed == Some(at) => true,
+                    Ok(waker) => match waker.arm(at) {
+                        Ok(()) => {
+                            standing.armed = Some(at);
+                            standing.told = false;
+                            true
+                        }
+                        Err(err) => {
+                            eprintln!("tod-orchestrator: cannot arm its wake schedule ({err:#}); staying awake for the wake due in {}s", (at - now) / 1000);
+                            false
+                        }
+                    },
+                    Err(why) => {
+                        if !standing.told {
+                            eprintln!("tod-orchestrator: cannot sleep between wakes ({why}); staying awake while one is pending");
+                            standing.told = true;
+                        }
+                        false
+                    }
+                };
+                if armed {
+                    if standing.held {
+                        match self.relay.release() {
+                            Ok(()) => standing.held = false,
+                            Err(err) => eprintln!("tod-orchestrator: cannot release the hold through {}: {err}", self.relay.addr),
+                        }
+                    }
+                } else {
+                    // Never sleep through a wake that cannot be woken for.
+                    self.take_hold(&mut standing);
+                }
+            }
+        }
+    }
+}
+
+/// The name of the orchestrator's own wake schedule.
+pub const SELF_WAKE_NAME: &str = "orchestrator-wake";
+/// The environment variable naming the orchestrator's own sandbox.
+pub const SANDBOX_ENV: &str = "TOD_ORCHESTRATOR_SANDBOX";
+/// The header a tick carries its secret in.
+pub const TICK_HEADER: &str = "X-Tod-Tick";
+const TICK_FILE: &str = "tick-token";
+
+/// The secret a `POST /tick` must carry, kept in `<base>/tick-token` (made
+/// on first use, so a schedule made before a restart still works after it).
+/// The route is on a public port, and a tick holds the sandbox awake.
+pub fn tick_token(base: &std::path::Path) -> Result<String> {
+    let path = base.join(TICK_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(t) if !t.trim().is_empty() => Ok(t.trim().to_string()),
+        Ok(_) => bail!("{} is empty", path.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let token = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
+            std::fs::create_dir_all(base).with_context(|| format!("create {}", base.display()))?;
+            std::fs::write(&path, &token).with_context(|| format!("write {}", path.display()))?;
+            Ok(token)
+        }
+        Err(e) => Err(e).with_context(|| format!("read {}", path.display())),
+    }
+}
+
+/// Whether `given` is the tick secret (compared without stopping at the
+/// first difference).
+pub fn tick_allowed(token: &str, given: Option<&str>) -> bool {
+    let Some(given) = given else { return false };
+    given.len() == token.len() && given.bytes().zip(token.bytes()).fold(0u8, |d, (a, b)| d | (a ^ b)) == 0
+}
+
+/// What the schedule runs in the orchestrator's sandbox: a tick on loopback.
+pub fn tick_command(port: u16, token: &str) -> String {
+    format!("curl -fsS -m 20 -X POST -H '{TICK_HEADER}: {token}' http://127.0.0.1:{port}/tick")
+}
+
+/// The body of the schedule that wakes the orchestrator at `at_ms` (never
+/// sooner than five seconds after `now_ms`). `keepAlive` holds the sandbox
+/// only while the tick runs; the tick then takes the orchestrator's own hold.
+pub fn self_wake_body(port: u16, token: &str, at_ms: i64, now_ms: i64) -> serde_json::Value {
+    tod_sandbox::blaxel::schedule_body(SELF_WAKE_NAME, &tick_command(port, token), at_ms.max(now_ms + 5_000), true, 120)
+}
+
+/// [`SelfWake`] through Blaxel's schedules on the orchestrator's own sandbox.
+pub struct BlaxelSelfWake {
+    blaxel: tod_sandbox::blaxel::Blaxel,
+    sandbox: String,
+    port: u16,
+    token: String,
+}
+
+impl BlaxelSelfWake {
+    pub fn new(blaxel: tod_sandbox::blaxel::Blaxel, sandbox: String, port: u16, token: String) -> Self {
+        Self { blaxel, sandbox, port, token }
+    }
+
+    /// From the environment the orchestrator is deployed with: the Blaxel
+    /// account (`TOD_ORCHESTRATOR_BLAXEL_*`) and its own sandbox's name
+    /// ([`SANDBOX_ENV`]).
+    pub fn from_env(base: &std::path::Path, port: u16) -> Result<Self> {
+        let var = |name: &str| {
+            std::env::var(name).ok().filter(|v| !v.trim().is_empty()).with_context(|| format!("{name} is not set"))
+        };
+        let blaxel = tod_sandbox::blaxel::Blaxel::with_agent(
+            var("TOD_ORCHESTRATOR_BLAXEL_WORKSPACE")?,
+            var("TOD_ORCHESTRATOR_BLAXEL_TOKEN")?,
+            RelayPoker::agent()?,
+        );
+        Ok(Self::new(blaxel, var(SANDBOX_ENV)?, port, tick_token(base)?))
+    }
+}
+
+impl SelfWake for BlaxelSelfWake {
+    fn arm(&self, at_ms: i64) -> Result<()> {
+        // Replace any earlier time: drop the old one by name, then create.
+        self.blaxel.delete_schedules_named(&self.sandbox, SELF_WAKE_NAME)?;
+        self.blaxel.create_schedule(&self.sandbox, &self_wake_body(self.port, &self.token, at_ms, now_ms()))?;
+        Ok(())
+    }
+
+    fn disarm(&self) -> Result<()> {
+        self.blaxel.delete_schedules_named(&self.sandbox, SELF_WAKE_NAME)?;
+        Ok(())
     }
 }
 
@@ -531,8 +776,8 @@ mod tests {
     fn the_timer_thread_fires_a_due_wake_and_holds_awake_meanwhile() {
         struct Awake(Mutex<Vec<bool>>);
         impl KeepAwake for Arc<Awake> {
-            fn tick(&self, pending: bool) {
-                self.0.lock().unwrap().push(pending);
+            fn tick(&self, next_due: Option<i64>, _now: i64) {
+                self.0.lock().unwrap().push(next_due.is_some());
             }
         }
         let dir = base();
@@ -551,6 +796,166 @@ mod tests {
         let ticks = awake.0.lock().unwrap().clone();
         assert_eq!(ticks.first(), Some(&true), "held while the wake was pending");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A relay on loopback that records the path of each request it gets.
+    fn fake_relay() -> (LocalRelayAwake, Arc<Mutex<Vec<String>>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader};
+            for stream in listener.incoming().flatten() {
+                let mut line = String::new();
+                let _ = BufReader::new(stream).read_line(&mut line);
+                log.lock().unwrap().push(line.split_whitespace().nth(1).unwrap_or_default().to_string());
+            }
+        });
+        (LocalRelayAwake { addr }, seen)
+    }
+
+    fn seen_eventually(seen: &Arc<Mutex<Vec<String>>>, n: usize) -> Vec<String> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while seen.lock().unwrap().len() < n && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        seen.lock().unwrap().clone()
+    }
+
+    #[derive(Default)]
+    struct FakeWaker {
+        armed: Mutex<Vec<i64>>,
+        disarmed: Mutex<u32>,
+        fail: AtomicBool,
+    }
+    impl SelfWake for Arc<FakeWaker> {
+        fn arm(&self, at_ms: i64) -> Result<()> {
+            if self.fail.load(Ordering::SeqCst) {
+                bail!("blaxel is down");
+            }
+            self.armed.lock().unwrap().push(at_ms);
+            Ok(())
+        }
+        fn disarm(&self) -> Result<()> {
+            *self.disarmed.lock().unwrap() += 1;
+            Ok(())
+        }
+    }
+
+    const NOW: i64 = 1_000_000;
+    const FAR: i64 = NOW + 10 * 60_000;
+
+    #[test]
+    fn a_far_wake_arms_a_schedule_and_lets_the_sandbox_sleep() {
+        let (relay, seen) = fake_relay();
+        let waker = Arc::new(FakeWaker::default());
+        let awake = SleepingAwake::new(relay, Ok(Box::new(waker.clone())));
+        // Awake for something else first: the hold is let go once armed.
+        awake.hold();
+        awake.tick(Some(FAR), NOW);
+        awake.tick(Some(FAR), NOW + 45_000);
+        awake.tick(Some(FAR), NOW + 90_000);
+        assert_eq!(*waker.armed.lock().unwrap(), [FAR], "armed once, not on every pass");
+        assert_eq!(seen_eventually(&seen, 2), ["/hold?reason=wakes&secs=120", "/release?reason=wakes"], "released once, then silent");
+        // An earlier wake replaces the schedule.
+        awake.tick(Some(FAR - 60_000), NOW + 100_000);
+        assert_eq!(*waker.armed.lock().unwrap(), [FAR, FAR - 60_000]);
+    }
+
+    #[test]
+    fn a_wake_due_soon_holds_the_sandbox_and_makes_no_schedule() {
+        let (relay, seen) = fake_relay();
+        let waker = Arc::new(FakeWaker::default());
+        let awake = SleepingAwake::new(relay, Ok(Box::new(waker.clone())));
+        awake.tick(Some(NOW + 60_000), NOW);
+        awake.tick(Some(NOW - 5_000), NOW);
+        assert!(waker.armed.lock().unwrap().is_empty());
+        assert_eq!(seen_eventually(&seen, 2), ["/hold?reason=wakes&secs=120"; 2], "renewed on each pass");
+    }
+
+    #[test]
+    fn a_schedule_that_cannot_be_made_keeps_the_sandbox_awake() {
+        let (relay, seen) = fake_relay();
+        let waker = Arc::new(FakeWaker::default());
+        waker.fail.store(true, Ordering::SeqCst);
+        let awake = SleepingAwake::new(relay, Ok(Box::new(waker.clone())));
+        awake.tick(Some(FAR), NOW);
+        assert_eq!(seen_eventually(&seen, 1), ["/hold?reason=wakes&secs=120"], "never sleep through a wake");
+
+        let (relay, seen) = fake_relay();
+        let awake = SleepingAwake::new(relay, Err("TOD_ORCHESTRATOR_SANDBOX is not set".into()));
+        awake.tick(Some(FAR), NOW);
+        assert_eq!(seen_eventually(&seen, 1), ["/hold?reason=wakes&secs=120"]);
+    }
+
+    #[test]
+    fn no_wake_left_removes_the_schedule_and_the_hold() {
+        let (relay, seen) = fake_relay();
+        let waker = Arc::new(FakeWaker::default());
+        let awake = SleepingAwake::new(relay, Ok(Box::new(waker.clone())));
+        awake.tick(Some(FAR), NOW);
+        awake.tick(None, NOW + 1);
+        awake.tick(None, NOW + 2);
+        assert_eq!(*waker.disarmed.lock().unwrap(), 1, "removed once");
+        assert!(seen_eventually(&seen, 1).is_empty(), "nothing was held, so nothing to release");
+    }
+
+    #[test]
+    fn the_timer_notices_a_wake_put_while_it_was_ticking_and_the_tick_route_holds() {
+        #[derive(Default)]
+        struct Awake {
+            ticks: Mutex<Vec<Option<i64>>>,
+            holds: Mutex<u32>,
+        }
+        impl KeepAwake for Arc<Awake> {
+            fn tick(&self, next_due: Option<i64>, _now: i64) {
+                self.ticks.lock().unwrap().push(next_due);
+            }
+            fn hold(&self) {
+                *self.holds.lock().unwrap() += 1;
+            }
+        }
+        let dir = base();
+        let wakes = Wakes::load(&dir, Box::new(Arc::new(FakePoker::default()))).unwrap();
+        let awake = Arc::new(Awake::default());
+        wakes.spawn_timer(Box::new(awake.clone())).unwrap();
+        wakes.tick();
+        assert_eq!(*awake.holds.lock().unwrap(), 1, "held before the tick returns");
+        wakes.put(wake("later", now_ms() + 3_600_000)).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !awake.ticks.lock().unwrap().iter().any(|t| t.is_some()) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(awake.ticks.lock().unwrap().iter().any(|t| t.is_some()), "a new wake is looked at at once");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_tick_secret_is_kept_across_restarts_and_checked() {
+        let dir = base();
+        let token = tick_token(&dir).unwrap();
+        assert!(token.len() >= 32);
+        assert_eq!(tick_token(&dir).unwrap(), token, "a schedule made before a restart still works");
+        assert!(tick_allowed(&token, Some(&token)));
+        assert!(!tick_allowed(&token, Some("nope")));
+        assert!(!tick_allowed(&token, Some(&format!("{token}x"))));
+        assert!(!tick_allowed(&token, None));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_schedule_runs_a_tick_with_the_secret_at_the_wake_time() {
+        let body = self_wake_body(8090, "sekrit", FAR, NOW);
+        assert_eq!(body["input"]["name"], SELF_WAKE_NAME);
+        assert_eq!(body["input"]["keepAlive"], true);
+        let command = body["input"]["command"].as_str().unwrap();
+        assert!(command.contains("http://127.0.0.1:8090/tick") && command.contains("X-Tod-Tick: sekrit"), "{command}");
+        assert_eq!(body["value"], tod_sandbox::blaxel::rfc3339_utc(FAR / 1000 + i64::from(FAR % 1000 != 0)));
+        // A time already past is not made sooner than five seconds from now.
+        let late = self_wake_body(8090, "t", NOW - 1_000, NOW);
+        assert_eq!(late["value"], tod_sandbox::blaxel::rfc3339_utc((NOW + 5_000) / 1000));
     }
 
     #[test]

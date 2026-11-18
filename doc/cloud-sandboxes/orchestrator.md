@@ -148,10 +148,28 @@ the server in `TOD_NTFY_URL`; `off` turns it off). Messages carry no data.
   (then empty); the answer carries `"waited": true`. An orchestrator that
   predates it ignores `wait` and answers at once without `waited`; an old
   client sends no `wait` and is unchanged. The app holds one such request
-  (25 s) while a node runs in the cloud, so the orchestrator is awake only
-  while a request is in flight, and once an orchestrator has answered one the
-  app stops subscribing to ntfy and stops its timers (ntfy stays for the
-  phone's alerts). Deploy the orchestrator before the app.
+  (25 s) only while a node's supervisor is at work in the cloud
+  (`cloud_notify::any_working_in_cloud`: a fresh `cloud_activity` beat), when
+  the orchestrator is awake anyway. While every node is asleep the app holds
+  nothing open on it: the ntfy subscription (a third party) says when
+  something changed, and a safety pull runs at most every 5 minutes
+  (`cloud_notify::IDLE_POLL`). Back-to-back long-polls kept the orchestrator
+  awake, and billed, for ever. Deploy the orchestrator before the app.
+
+**Sleeping between wakes (`wakes.rs`).** A wake due within 90 s keeps the
+orchestrator up (a lease on its relay's hold, renewed by the timer). A later
+one does not: the orchestrator makes a one-shot Blaxel schedule on its own
+sandbox (`orchestrator-wake`, sandbox name from `TOD_ORCHESTRATOR_SANDBOX`,
+set when it is deployed; the Blaxel account is `TOD_ORCHESTRATOR_BLAXEL_*`)
+that runs `curl -X POST http://127.0.0.1:8090/tick` at the earliest due time,
+releases its hold, and sleeps. The schedule wakes the sandbox (standby
+included), the tick, which carries the secret in `<base>/tick-token` since the
+route is on a public port, takes a hold and has the timer fire what is due.
+A new earliest wake replaces the schedule; none left removes it. When it
+cannot make one (an orchestrator deployed before `TOD_ORCHESTRATOR_SANDBOX`, no
+Blaxel account, Blaxel refusing) it says so in its log and stays awake as
+before, rather than sleep through a wake. Redeploy the orchestrator
+(`tod-sandbox orchestrator`) for it to take effect.
 
 ## The watchdog (`tod_sandbox::watchdog`, `tod-watchdog`)
 

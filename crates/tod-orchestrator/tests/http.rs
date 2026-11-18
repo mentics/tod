@@ -221,6 +221,17 @@ fn a_snapshot_is_the_users_database() {
 }
 
 #[test]
+fn a_tick_needs_the_secret_the_schedule_was_made_with() {
+    let h = start("tick");
+    assert_eq!(send(h.port, "GET", "/tick", &[], b"").0, 405);
+    assert_eq!(send(h.port, "POST", "/tick", &[], b"").0, 401, "no secret");
+    assert_eq!(send(h.port, "POST", "/tick", &[("X-Tod-Tick", "guess")], b"").0, 401, "wrong secret");
+    let token = tod_orchestrator::wakes::tick_token(&h.base).unwrap();
+    // The way the schedule's curl sends it: no wire-contract headers.
+    assert_eq!(send(h.port, "POST", "/tick", &[("X-Tod-Tick", &token)], b"").0, 200);
+}
+
+#[test]
 fn wakes_are_recorded_listed_on_disk_and_deleted() {
     let h = start("wakes");
     let body = br#"{"id":"w1","user":"alice","node":"n1","sandbox":"sb","at":4102444800000}"#;

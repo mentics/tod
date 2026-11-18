@@ -10,28 +10,36 @@
 //! the store, whose change events update the views.
 //!
 //! A notice is only a hint, and ntfy may drop, delay, or refuse (a rate
-//! limit, a 502) with nothing on this side to show it, so while any node runs
-//! in the cloud [`start`] also pulls on a timer ([`FALLBACK_POLL`]). A sync
-//! reads the orchestrator only, so polling wakes no node's sandbox.
+//! limit, a 502) with nothing on this side to show it, so while any node is
+//! in the cloud [`start`] also pulls on a timer: every [`IDLE_POLL`] (five
+//! minutes) while nothing runs there, every [`FALLBACK_POLL`] while a node's
+//! supervisor is at work ([`any_working_in_cloud`]). A sync reads the
+//! orchestrator only, so polling wakes no node's sandbox.
+//!
+//! **The orchestrator sleeps when nothing is running.** It is billed while
+//! awake, and a request in flight (or a timer that keeps asking) keeps it
+//! so. So nothing here talks to it on a short cycle while every node is
+//! asleep: the ntfy subscription (a third party, not the orchestrator) says
+//! when something changed, and the safety pull above runs at most once every
+//! five minutes. While a node works the orchestrator is awake anyway (its
+//! supervisor syncs and beats), so the faster paths below apply only then.
 //!
 //! When the orchestrator's publishes are refused (ntfy answers 429) it stops
 //! publishing for a minute and says so in the feed
-//! (`notices_degraded_secs`); until then the app pulls every
-//! [`DEGRADED_POLL`], node in the cloud or not, and goes back to the
-//! subscription alone after.
+//! (`notices_degraded_secs`); until then, while a node works, the app pulls
+//! every [`DEGRADED_POLL`], and goes back to the subscription alone after.
 //!
 //! **Long-poll** ([`spawn_longpoll`]). An orchestrator that knows it
 //! (`?wait=`; see `tod_orchestrator::sync_backend::export_changes_waiting`)
 //! is pulled from with one request in flight, held until another client's
 //! change is committed: no third party in the path, and the orchestrator is
-//! awake only while the request is. It is held only while a node runs in the
-//! cloud ([`any_running_in_cloud`]); with none there is nothing to wait for,
-//! and the app's own syncs (start, each local change) still pull. Once an
-//! orchestrator has answered one ([`longpoll_supported`]) the ntfy
-//! subscription and the timers stand down: ntfy remains for the phone's
-//! alerts, which the orchestrator publishes whatever the app does. An older
-//! orchestrator answers a `wait` at once without saying it waited, and the
-//! subscription and timers above apply as before.
+//! awake only while the request is. It is held only while a node's
+//! supervisor is at work ([`any_working_in_cloud`]), when the orchestrator is
+//! awake regardless; with none working there is nothing to wait for, and the
+//! subscription and the five-minute pull above carry the app (so the
+//! orchestrator is free to sleep). While one is held ([`longpoll_supported`])
+//! the faster timer stands down. An older orchestrator answers a `wait` at
+//! once without saying it waited, and the timers above apply as before.
 //!
 //! The server and topic come from `GET /users/<u>/notify` on the
 //! orchestrator, kept in `cloud-sync.json` (`notify`) and fetched again on
@@ -65,12 +73,20 @@ const RENEW_AFTER: Duration = Duration::from_secs(10 * 60);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// How often a data root that is not seeded yet is looked at again.
 const SEEDED_CHECK: Duration = Duration::from_secs(30);
-/// How often the orchestrator is pulled from while a node runs in the
-/// cloud, whether or not a notice arrived.
+/// How often the orchestrator is pulled from while a node's supervisor is at
+/// work in the cloud, whether or not a notice arrived.
 pub const FALLBACK_POLL: Duration = Duration::from_secs(20);
-/// How often it is pulled from while the orchestrator says its notices are
-/// refused ([`note_degraded`]).
+/// How often it is pulled from while a node works and the orchestrator says
+/// its notices are refused ([`note_degraded`]).
 pub const DEGRADED_POLL: Duration = Duration::from_secs(5);
+/// How often it is pulled from while nodes are in the cloud but none is at
+/// work: the safety net for a notice that never came, and the most often
+/// anything here wakes a sleeping orchestrator.
+pub const IDLE_POLL: Duration = Duration::from_secs(5 * 60);
+/// The longest the notice subscription waits to retry after a failure while
+/// nothing runs in the cloud (each retry asks the orchestrator for the
+/// topic, which wakes it).
+const MAX_NOTICE_BACKOFF: Duration = Duration::from_secs(5 * 60);
 
 /// Per data root, until when the orchestrator said its notices are refused.
 static DEGRADED_UNTIL: Mutex<Option<std::collections::HashMap<std::path::PathBuf, Instant>>> = Mutex::new(None);
@@ -169,7 +185,7 @@ fn spawn_longpoll(fleet: Arc<FleetStore>) {
         loop {
             let state = CloudSyncState::load(&root);
             let seeded = state.as_ref().is_ok_and(|s| s.seeded);
-            if !seeded || !longpoll_due(longpoll_state(&root), Instant::now()) || !any_running_in_cloud(&fleet) {
+            if !seeded || !longpoll_due(longpoll_state(&root), Instant::now()) || !any_working_in_cloud(&fleet) {
                 std::thread::sleep(if seeded { LONGPOLL_IDLE_CHECK } else { SEEDED_CHECK });
                 continue;
             }
@@ -231,19 +247,20 @@ fn degraded(root: &Path) -> bool {
     map.as_ref().and_then(|m| m.get(root)).is_some_and(|until| *until > Instant::now())
 }
 
-/// Whether the timer pulls now: every [`DEGRADED_POLL`] while notices are
-/// refused, else every [`FALLBACK_POLL`] while a node runs in the cloud.
-fn poll_due(since_last: Duration, degraded: bool, in_cloud: impl FnOnce() -> bool) -> bool {
-    if degraded {
-        since_last >= DEGRADED_POLL
+/// Whether the timer pulls now. While a node works: every [`DEGRADED_POLL`]
+/// if notices are refused, else every [`FALLBACK_POLL`]. While none does:
+/// every [`IDLE_POLL`], and only if a node is in the cloud at all.
+fn poll_due(since_last: Duration, degraded: bool, working: bool, in_cloud: impl FnOnce() -> bool) -> bool {
+    if working {
+        since_last >= if degraded { DEGRADED_POLL } else { FALLBACK_POLL }
     } else {
-        since_last >= FALLBACK_POLL && in_cloud()
+        since_last >= IDLE_POLL && in_cloud()
     }
 }
 
 /// Whether any node is assigned to the cloud and not lost: its supervisor may
-/// be changing it there, so the feed is worth pulling without a notice.
-fn any_running_in_cloud(fleet: &FleetStore) -> bool {
+/// change it there, so the feed is worth pulling now and then without a notice.
+fn any_in_cloud(fleet: &FleetStore) -> bool {
     fleet
         .read(|conn| Ok(tod_store::cloud_nodes::list(conn)?.iter().any(|row| row.lost_at.is_none())))
         .unwrap_or_else(|err| {
@@ -252,21 +269,37 @@ fn any_running_in_cloud(fleet: &FleetStore) -> bool {
         })
 }
 
-/// Pulls on a timer for as long as the app runs: while a node runs in the
-/// cloud ([`any_running_in_cloud`]), in case no notice comes, and faster
-/// while the orchestrator says its notices are refused.
+/// Whether a node's supervisor is at work in the cloud right now (a fresh
+/// `cloud_activity` beat, `tod_store::cloud_activity::any_live`). Only then
+/// is the orchestrator awake anyway, so only then is it worth holding a
+/// request open on it.
+pub fn any_working_in_cloud(fleet: &FleetStore) -> bool {
+    let now = tod_store::outline::now_ms();
+    fleet.read(|conn| tod_store::cloud_activity::any_live(conn, now)).unwrap_or_else(|err| {
+        tracing::warn!("cloud poll: reading the cloud activity: {err:#}");
+        false
+    })
+}
+
+/// Pulls on a timer for as long as the app runs, in case no notice comes:
+/// every [`IDLE_POLL`] while a node is in the cloud, faster while one works
+/// ([`any_working_in_cloud`]), and faster still while the orchestrator says
+/// its notices are refused.
 fn spawn_fallback_poll(fleet: Arc<FleetStore>) {
     let root = fleet.paths().root().to_path_buf();
     let spawned = std::thread::Builder::new().name("tod-cloud-poll".into()).spawn(move || {
         let mut last = Instant::now();
         loop {
             std::thread::sleep(DEGRADED_POLL);
-            // The feed long-poll replaces the timers once the orchestrator holds one.
-            if longpoll_supported(&root) {
+            // While a node works, the feed long-poll replaces the fast timers
+            // once the orchestrator holds one; the slow safety pull is never
+            // replaced (nothing is held open when no node works).
+            let working = any_working_in_cloud(&fleet);
+            if working && longpoll_supported(&root) {
                 last = Instant::now();
                 continue;
             }
-            let due = poll_due(last.elapsed(), degraded(&root), || any_running_in_cloud(&fleet));
+            let due = poll_due(last.elapsed(), degraded(&root), working, || any_in_cloud(&fleet));
             if due && CloudSyncState::load(&root).is_ok_and(|s| s.seeded) {
                 last = Instant::now();
                 runner(&fleet).request();
@@ -522,7 +555,7 @@ fn save_topics(root: &Path, fresh: &NotifyTopics) -> Result<()> {
 /// (so one that subscribes, or did, notices a changed topic at its next
 /// renewal). A failure is logged, not dropped.
 fn refresh_topics(root: &Path) {
-    if longpoll_supported(root) || !CloudSyncState::load(root).is_ok_and(|s| s.notify.is_some()) {
+    if !CloudSyncState::load(root).is_ok_and(|s| s.notify.is_some()) {
         return;
     }
     if let Err(err) = topics(root) {
@@ -544,12 +577,9 @@ pub fn start(fleet: Arc<FleetStore>) {
         let mut backoff = Duration::from_secs(1);
         let mut since: Option<String> = None;
         loop {
-            // The orchestrator holds a feed long-poll: the app needs no
-            // subscription (ntfy is for the phone's alerts).
-            if longpoll_supported(&root) {
-                std::thread::sleep(LONGPOLL_IDLE_CHECK);
-                continue;
-            }
+            // Always subscribed (to ntfy, not the orchestrator): it is what
+            // tells the app of a change while no long-poll is held, so the
+            // orchestrator can sleep between changes.
             let result = topics(&root).and_then(|t| {
                 // A (re)connect may have missed messages; pull once to be sure.
                 sync.request();
@@ -565,7 +595,10 @@ pub fn start(fleet: Arc<FleetStore>) {
                 Err(err) => {
                     tracing::warn!("cloud notices: {err:#}; retrying in {}s", backoff.as_secs());
                     std::thread::sleep(backoff);
-                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                    // Each retry asks the orchestrator for the topic, so while
+                    // nothing works the pace settles at the idle pull's.
+                    let cap = if any_working_in_cloud(&fleet) { MAX_BACKOFF } else { MAX_NOTICE_BACKOFF };
+                    backoff = (backoff * 2).min(cap);
                 }
             }
         }
@@ -582,11 +615,20 @@ mod tests {
     #[test]
     fn the_timer_is_fast_only_while_notices_are_refused() {
         let s = Duration::from_secs;
-        assert!(!poll_due(s(5), false, || true));
-        assert!(poll_due(s(20), false, || true));
-        assert!(!poll_due(s(20), false, || false), "no node in the cloud, notices working: no timer");
-        assert!(poll_due(s(5), true, || false), "refused: pull even with no node in the cloud");
-        assert!(!poll_due(s(4), true, || true));
+        assert!(!poll_due(s(5), false, true, || true));
+        assert!(poll_due(s(20), false, true, || true));
+        assert!(poll_due(s(5), true, true, || false), "refused while a node works: pull fast");
+        assert!(!poll_due(s(4), true, true, || true));
+    }
+
+    #[test]
+    fn with_no_node_working_the_orchestrator_is_pulled_from_at_most_every_five_minutes() {
+        let s = Duration::from_secs;
+        assert!(!poll_due(s(20), false, false, || true), "idle: not the fast pace");
+        assert!(!poll_due(s(60), true, false, || true), "refused but idle: still not fast");
+        assert!(!poll_due(s(299), false, false, || true));
+        assert!(poll_due(s(300), false, false, || true));
+        assert!(!poll_due(s(300), false, false, || false), "no node in the cloud: no timer");
     }
 
     fn feed(waited: bool, changes: usize) -> cloud_sync::Feed {
