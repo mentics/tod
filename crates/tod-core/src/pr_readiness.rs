@@ -2662,8 +2662,9 @@ pub trait PrFeed: Send + Sync {
     fn merge(&self, _pr: &tod_store::github::NodePr) -> Result<tod_store::github::PrMerge, String> {
         Err("this feed does not read merges".to_string())
     }
-    /// The published releases of the pull request's repository, newest first.
-    fn releases(&self, _pr: &tod_store::github::NodePr) -> Result<Vec<tod_store::github::Release>, String> {
+    /// The published releases of the pull request's repository, newest first,
+    /// back to the pull request's merge.
+    fn releases(&self, _pr: &tod_store::github::NodePr, _merge: &tod_store::github::PrMerge) -> Result<Vec<tod_store::github::Release>, String> {
         Err("this feed does not read releases".to_string())
     }
     /// The pull request's review threads as they are now, never cached: what
@@ -2733,8 +2734,12 @@ impl PrFeed for GithubFeed {
         self.0.get_pr_merge(&pr.owner, &pr.repo, pr.pr_number).map_err(|err| err.to_string())
     }
 
-    fn releases(&self, pr: &tod_store::github::NodePr) -> Result<Vec<tod_store::github::Release>, String> {
-        self.0.list_releases(&pr.owner, &pr.repo).map_err(|err| err.to_string())
+    fn releases(
+        &self,
+        pr: &tod_store::github::NodePr,
+        merge: &tod_store::github::PrMerge,
+    ) -> Result<Vec<tod_store::github::Release>, String> {
+        self.0.list_releases(&pr.owner, &pr.repo, merge.merged_at.as_deref()).map_err(|err| err.to_string())
     }
 
     fn snapshot(&self, pr: &tod_store::github::NodePr) -> Result<PrSnapshot, String> {
