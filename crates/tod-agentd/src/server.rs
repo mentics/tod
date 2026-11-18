@@ -249,7 +249,13 @@ fn watch_billing(shared: Arc<Shared>, root: std::path::PathBuf) {
                         if let Err(err) = bw::record_alert(&root) {
                             tracing::error!("billing watch: could not record the alert: {err:#}");
                         }
-                        bw::notify(&reading.over.join("; "));
+                        let mut message = reading.over.join("; ");
+                        let others = bw::running_other_daemons();
+                        if !others.is_empty() {
+                            message.push_str(&format!(". Other tod-agentd daemons running: {}", others.join(", ")));
+                            tracing::warn!("billing watch: other tod-agentd daemons running: {}", others.join(", "));
+                        }
+                        bw::notify(&message);
                     }
                 }
                 Err(err) => {

@@ -206,6 +206,36 @@ static OPEN_ALERT: std::sync::Mutex<Option<std::process::Child>> = std::sync::Mu
 /// on macOS a dialog that **stays until the user dismisses it** (a banner
 /// notification goes away on its own). While one is still open, a repeat adds
 /// no second dialog. A dialog that cannot be shown is itself logged.
+/// The other `tod-agentd` daemons in a process listing (`ps -axo pid=,command=`
+/// lines), as `pid N (data root)`: any but `own_pid`. A test root's daemon is
+/// legitimate, but one nobody remembers keeps polling the orchestrator, whose
+/// sandbox bills while awake, so a high rate names them.
+pub fn other_daemons(listing: &str, own_pid: u32) -> Vec<String> {
+    listing
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim_start();
+            let (pid, command) = line.split_once(char::is_whitespace)?;
+            let pid: u32 = pid.parse().ok()?;
+            let program = command.split_whitespace().next()?;
+            let name = program.rsplit('/').next()?;
+            if pid == own_pid || !name.starts_with("tod-agentd") {
+                return None;
+            }
+            let root = command.split_once("--data-root ").map_or("?", |(_, r)| r.trim());
+            Some(format!("pid {pid} ({root})"))
+        })
+        .collect()
+}
+
+/// [`other_daemons`] of the machine now; empty where `ps` is not there.
+pub fn running_other_daemons() -> Vec<String> {
+    let Ok(out) = std::process::Command::new("ps").args(["-axo", "pid=,command="]).output() else {
+        return Vec::new();
+    };
+    other_daemons(&String::from_utf8_lossy(&out.stdout), std::process::id())
+}
+
 pub fn notify(message: &str) {
     let message = &format!("{message} ({})", chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z"));
     crate::logging::buffer::record(
@@ -236,6 +266,18 @@ pub fn notify(message: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn other_daemons_are_named_by_pid_and_root() {
+        let ps = "  101 /Users/me/.config/tod/daemon/tod-agentd-abc --data-root /Users/me/.config/tod\n\
+                  202 /Users/me/.local/share/tod-live-verify/daemon/tod-agentd-def --data-root /Users/me/.local/share/tod-live-verify\n\
+                  303 /usr/bin/vim tod-agentd.rs\n\
+                  404 tod-agentd-ghi\n";
+        assert_eq!(
+            super::other_daemons(ps, 101),
+            vec!["pid 202 (/Users/me/.local/share/tod-live-verify)".to_string(), "pid 404 (?)".to_string()]
+        );
+    }
+
     use super::*;
 
     const MIN: i64 = 60_000;
