@@ -227,7 +227,7 @@ pub fn sync_now(fleet: &FleetStore, root: &std::path::Path, node: Option<Uuid>) 
             match cloud_sync::lost::check_marked_now(fleet) {
                 Ok(Some(done)) if done.replaced > 0 => msg.push_str("Its sandbox was gone; a new one was made."),
                 Ok(Some(_)) => {
-                    let why = cloud_sync::lost::note(&node.to_string()).unwrap_or_else(|| "nothing was replaced".into());
+                    let why = cloud_sync::lost::note(&node.to_string()).unwrap_or_else(|| "nothing was replaced, and the check recorded no reason (the log panel has the orchestrator's side)".into());
                     return Err(describe("Replacing its sandbox failed", &anyhow::anyhow!(why)));
                 }
                 Ok(None) => msg.push_str("Its sandbox is gone; another check is already making a new one."),

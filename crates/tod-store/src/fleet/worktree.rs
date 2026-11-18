@@ -554,14 +554,17 @@ for sp in $paths; do
   ) &
   pids="$pids $!"
 done
-rc=0 fetch=""
+rc=0 fetch="" careful=""
 for pid in $pids; do
   wait "$pid"; s=$?
   [ "$s" -eq {FETCH_FAILED_EXIT} ] && fetch=1
-  [ "$s" -ne 0 ] && rc=1
+  [ "$s" -eq {CAREFUL_EXIT} ] && careful=1
+  [ "$s" -ne 0 ] && [ "$s" -ne {CAREFUL_EXIT} ] && rc=1
 done
 [ -n "$fetch" ] && exit {FETCH_FAILED_EXIT}
-exit $rc"#
+[ "$rc" -ne 0 ] && exit 1
+[ -n "$careful" ] && exit {CAREFUL_EXIT}
+exit 0"#
     )
 }
 
