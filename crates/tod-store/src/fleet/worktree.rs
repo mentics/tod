@@ -1206,21 +1206,62 @@ pub fn remove_git_worktree(repo: &Workdir, worktree: &Workdir) -> Result<()> {
 
 /// Forget worktrees of `repo` whose folders no longer exist.
 ///
-/// In a container or sandbox this is git's own `git worktree prune`. On this
-/// machine it is not: a repository bind-mounted into a dev container also
-/// holds the registrations of worktrees made in the container (Treehouse's
-/// slots under the container user's home), which this machine cannot see,
-/// and a plain prune here would delete them while they are in use. So only
-/// a registration whose folder's parent exists here and whose folder does
-/// not is forgotten ([`prune_host_registrations`]).
+/// Never git's own `git worktree prune`: a repository bind-mounted into a dev
+/// container holds the registrations of worktrees made on both sides
+/// (Treehouse's slots under the container user's home, worktrees under this
+/// machine's home), and each side sees only its own folders. A plain prune on
+/// either side deletes the other's registrations while they are in use. So
+/// only a registration whose folder's parent exists where the prune runs and
+/// whose folder does not is forgotten: [`prune_host_registrations`] on this
+/// machine, [`PRUNE_REGISTRATIONS_SH`] in a container or sandbox.
 pub fn prune_git_worktrees(repo: &Workdir) -> Result<()> {
+    prune_registrations(repo, None)
+}
+
+/// [`prune_git_worktrees`], also forgetting `named` (a worktree folder git
+/// just refused to add at, so known to be on the side the prune runs on)
+/// when it is missing, whatever its parent.
+fn prune_registrations(repo: &Workdir, named: Option<&Path>) -> Result<()> {
     match repo {
-        Workdir::Host(dir) => prune_host_registrations(dir, None),
+        Workdir::Host(dir) => prune_host_registrations(dir, named),
         Workdir::Container { .. } | Workdir::Sandbox { .. } => {
-            run_git(repo, &["worktree", "prune"]).map(|_| ())
+            let named = named.map(|path| path.to_string_lossy().into_owned()).unwrap_or_default();
+            let output = repo.output("sh", &["-c", PRUNE_REGISTRATIONS_SH, "sh", &named])?;
+            if !output.status.success() {
+                bail!(
+                    "prune worktree registrations in {repo} failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+            Ok(())
         }
     }
 }
+
+/// [`prune_host_registrations`]'s rule as a POSIX shell script, run in the
+/// repository's directory inside a container or sandbox. `$1` is the folder
+/// git named (empty for none).
+const PRUNE_REGISTRATIONS_SH: &str = r#"set -u
+named="$1"
+common=$(git -c safe.directory='*' rev-parse --path-format=absolute --git-common-dir) || exit 1
+for admin in "$common"/worktrees/*/; do
+  [ -d "$admin" ] || continue
+  admin="${admin%/}"
+  [ -f "$admin/gitdir" ] || continue
+  [ -e "$admin/locked" ] && continue
+  target=$(cat "$admin/gitdir")
+  [ -n "$target" ] || continue
+  case "$target" in
+    /*) ;;
+    *) target="$admin/$target" ;;
+  esac
+  target="${target%/.git}"
+  if [ -e "$target" ] || [ -L "$target" ]; then continue; fi
+  if [ -d "$(dirname "$target")" ] || [ "$target" = "$named" ]; then
+    rm -rf "$admin" || exit 1
+  fi
+done
+"#;
 
 /// Forget the worktree registrations of the repository at `repo` (on this
 /// machine) whose worktree folder's parent exists here while the folder
@@ -1315,31 +1356,29 @@ fn stale_worktree_path(message: &str) -> Option<PathBuf> {
 /// would miss it, and the retry would fail again with the same error, just
 /// deeper in the setup (submodule init instead of the top-level checkout).
 ///
-/// On this machine every repository is pruned by [`prune_host_registrations`],
-/// with `named` (the folder git refused to add at) forgotten whatever its
-/// parent, so a dev container's worktrees in the same repositories survive.
+/// Every repository is pruned by [`prune_registrations`], with `named` (the
+/// folder git refused to add at) forgotten whatever its parent, so worktrees
+/// made on the other side of a dev container's bind mount survive.
 fn prune_worktrees_recursive(repo: &Workdir, named: Option<&Path>) {
-    let Workdir::Host(dir) = repo else {
-        if let Err(err) = prune_git_worktrees(repo) {
-            tracing::warn!("prune worktrees in {repo}: {err:#}");
-        }
-        // A submodule not checked out here has nothing of its own to prune yet,
-        // and `git submodule foreach` merely skips it — nothing to report.
-        let _ = run_git(
-            repo,
-            &["submodule", "foreach", "--recursive", "git worktree prune"],
-        );
-        return;
-    };
-    if let Err(err) = prune_host_registrations(dir, named) {
+    if let Err(err) = prune_registrations(repo, named) {
         tracing::warn!("prune worktrees in {repo}: {err:#}");
     }
-    // As above: a submodule not checked out is skipped, with nothing to report.
-    let Ok(listing) = run_git(repo, &["submodule", "foreach", "--quiet", "--recursive", "pwd"]) else {
-        return;
+    // A submodule not checked out here has nothing of its own to prune yet,
+    // and `git submodule foreach` merely skips it. `git rev-parse` (not the
+    // shell's `pwd`) so the path is git's native one on Windows too.
+    let listing = match run_git(
+        repo,
+        &["submodule", "foreach", "--quiet", "--recursive", "git rev-parse --show-toplevel"],
+    ) {
+        Ok(listing) => listing,
+        Err(err) => {
+            tracing::warn!("list submodules to prune in {repo}: {err:#}");
+            return;
+        }
     };
     for submodule in listing.lines().map(str::trim).filter(|line| !line.is_empty()) {
-        if let Err(err) = prune_host_registrations(Path::new(submodule), named) {
+        let submodule = repo.at(submodule);
+        if let Err(err) = prune_registrations(&submodule, named) {
             tracing::warn!("prune worktrees in {submodule}: {err:#}");
         }
     }
@@ -2253,6 +2292,64 @@ git -c user.name=t -c user.email=t@t commit -q -m 'add sub'"#;
         assert!(!stale_admin.exists(), "a missing host worktree stayed registered");
         assert!(!relative_admin.exists(), "a relative gitdir was not followed");
         assert!(locked_admin.is_dir(), "a locked worktree was deregistered");
+        assert!(alive_admin.is_dir(), "a live worktree was deregistered");
+    }
+
+    /// The script a container or sandbox prunes with, run here on the same
+    /// layout as [`host_prune_keeps_registrations_this_machine_cannot_see`]:
+    /// a host-made worktree (under a directory the container lacks) is kept.
+    #[cfg(unix)]
+    #[test]
+    fn container_prune_keeps_registrations_the_container_cannot_see() {
+        let repo = init_temp_repo();
+        let parent = crate::fleet::test_util::scratch_dir("tod-wt-side-");
+        let host_made = parent.join("host");
+        add_host_worktree(&repo, &host_made, "h");
+        let host_admin = registration_of(&repo, &host_made);
+        fs::write(host_admin.join("gitdir"), "/nonexistent-tod-test/Users/me/wt/host/.git\n").unwrap();
+        let stale = parent.join("stale");
+        add_host_worktree(&repo, &stale, "s");
+        let stale_admin = registration_of(&repo, &stale);
+        fs::remove_dir_all(&stale).unwrap();
+        let relative = parent.join("relative");
+        add_host_worktree(&repo, &relative, "r");
+        let relative_admin = registration_of(&repo, &relative);
+        fs::remove_dir_all(&relative).unwrap();
+        let depth = relative_admin.components().count() - 1;
+        let rel = "../".repeat(depth) + parent.strip_prefix("/").unwrap().to_str().unwrap() + "/relative/.git";
+        fs::write(relative_admin.join("gitdir"), rel).unwrap();
+        let locked = parent.join("locked");
+        add_host_worktree(&repo, &locked, "l");
+        let locked_admin = registration_of(&repo, &locked);
+        fs::write(locked_admin.join("locked"), "").unwrap();
+        fs::remove_dir_all(&locked).unwrap();
+        let gone_pool = parent.join("pool");
+        let named = gone_pool.join("named");
+        add_host_worktree(&repo, &named, "n");
+        let named_admin = registration_of(&repo, &named);
+        // As git names it in its refusal: the path it registered (on macOS
+        // the temp dir's real `/private/...` path).
+        let named = PathBuf::from(
+            fs::read_to_string(named_admin.join("gitdir")).unwrap().trim().trim_end_matches("/.git"),
+        );
+        fs::remove_dir_all(&gone_pool).unwrap();
+        let alive = parent.join("alive");
+        add_host_worktree(&repo, &alive, "a");
+        let alive_admin = registration_of(&repo, &alive);
+
+        let out = StdCommand::new("sh")
+            .args(["-c", PRUNE_REGISTRATIONS_SH, "sh"])
+            .arg(&named)
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+        assert!(host_admin.is_dir(), "a host-made worktree was deregistered");
+        assert!(!stale_admin.exists(), "a missing worktree stayed registered");
+        assert!(!relative_admin.exists(), "a relative gitdir was not followed");
+        assert!(locked_admin.is_dir(), "a locked worktree was deregistered");
+        assert!(!named_admin.exists(), "the worktree git named stayed registered");
         assert!(alive_admin.is_dir(), "a live worktree was deregistered");
     }
 
