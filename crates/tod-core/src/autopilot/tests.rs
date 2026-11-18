@@ -424,7 +424,7 @@ impl crate::pr_readiness::PrFeed for FinishedGithub {
         Ok(finished_merge())
     }
 
-    fn releases(&self, _: &tod_store::github::NodePr) -> Result<Vec<tod_store::github::Release>, String> {
+    fn releases(&self, _: &tod_store::github::NodePr, _: &tod_store::github::PrMerge) -> Result<Vec<tod_store::github::Release>, String> {
         Ok(finished_releases())
     }
 }
@@ -449,7 +449,7 @@ impl crate::pr_readiness::PrFeed for FailingGithub {
         Err(self.error.lock().unwrap().clone())
     }
 
-    fn releases(&self, _: &tod_store::github::NodePr) -> Result<Vec<tod_store::github::Release>, String> {
+    fn releases(&self, _: &tod_store::github::NodePr, _: &tod_store::github::PrMerge) -> Result<Vec<tod_store::github::Release>, String> {
         Err(self.error.lock().unwrap().clone())
     }
 }
@@ -1192,7 +1192,7 @@ impl crate::pr_readiness::PrFeed for Sim {
         Ok(finished_merge())
     }
 
-    fn releases(&self, _: &tod_store::github::NodePr) -> Result<Vec<tod_store::github::Release>, String> {
+    fn releases(&self, _: &tod_store::github::NodePr, _: &tod_store::github::PrMerge) -> Result<Vec<tod_store::github::Release>, String> {
         Ok(finished_releases())
     }
 
@@ -2028,7 +2028,7 @@ impl crate::pr_readiness::PrFeed for AfterReview {
         })
     }
 
-    fn releases(&self, _: &tod_store::github::NodePr) -> Result<Vec<tod_store::github::Release>, String> {
+    fn releases(&self, _: &tod_store::github::NodePr, _: &tod_store::github::PrMerge) -> Result<Vec<tod_store::github::Release>, String> {
         Ok(self
             .notes
             .lock()

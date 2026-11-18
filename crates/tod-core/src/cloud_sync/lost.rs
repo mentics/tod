@@ -520,11 +520,13 @@ pub fn heal_deleted_flags(fleet: &FleetStore) -> Result<Vec<String>> {
 }
 
 /// Keeps the lost rows whose node has work to do **right now**: its run is
-/// `Working` or `Starting` (or, for a mark the orchestrator brought, `Waiting`). A sandbox is never made ahead of need. A node
-/// that is stopped, paused, failed, done, or waiting (on the user, or on
-/// something outside that wakes it: the wake finds the sandbox gone and
-/// makes one then, `wake_node_requesting`) is left without one until it
-/// runs again; so is a node with no run row at all.
+/// `Working` or `Starting`. A sandbox is never made ahead of need, and a
+/// mark the orchestrator brought is not need: it only says a wake found the
+/// sandbox gone. A node that is stopped, paused, failed, done, or waiting
+/// (on the user, a bot, CI, a timer) is left without one until a real
+/// stimulus makes it (the user's answer or Start, `wake_node_requesting`);
+/// so is a node with no run row at all. Idle waiting nodes whose sandboxes
+/// the idle prune removed must never be remade in bulk.
 fn wanted_to_run(fleet: &FleetStore, rows: Vec<CloudNodeRow>, check: Check) -> Result<Vec<CloudNodeRow>> {
     use tod_store::run_state::Phase;
     let mut kept = Vec::new();
@@ -536,11 +538,13 @@ fn wanted_to_run(fleet: &FleetStore, rows: Vec<CloudNodeRow>, check: Check) -> R
             continue;
         }
         // A mark the orchestrator brought (`Check::Marked`) means a wake or a
-        // webhook found the sandbox gone: something needs the node, so a
-        // waiting node gets one. A look at the listing (`Check::Full`) is no
-        // stimulus: only a node actually at work gets one then.
+        // webhook found the sandbox gone. That is not work: a waiting node
+        // (CI, a bot, a timer, the user) stays without a sandbox until a real
+        // stimulus makes one, and only a node whose run is actually at work
+        // (`Working`, `Starting`) gets one here. A look at the listing
+        // (`Check::Full`) is no stimulus at all.
         let needs = |p: Phase| match check {
-            Check::Marked => matches!(p, Phase::Working | Phase::Starting | Phase::Waiting),
+            Check::Marked => matches!(p, Phase::Working | Phase::Starting),
             // The app's start makes nothing: it cannot tell a node that is
             // still at work from one whose agent finished while it was
             // closed, and a missing sandbox most likely means it finished.
@@ -1934,10 +1938,9 @@ mod tests {
             wanted_to_run(&fx.fleet, vec![row.clone()], Check::Full).unwrap().is_empty(),
             "a node waiting on GitHub has no work now: no sandbox ahead of need"
         );
-        assert_eq!(
-            wanted_to_run(&fx.fleet, vec![row.clone()], Check::Marked).unwrap().len(),
-            1,
-            "a wake or webhook that found the sandbox gone is a stimulus"
+        assert!(
+            wanted_to_run(&fx.fleet, vec![row.clone()], Check::Marked).unwrap().is_empty(),
+            "a wake that found the sandbox gone is not work: a waiting node gets no sandbox"
         );
         let working = tod_store::run_state::Draft { phase: tod_store::run_state::Phase::Working, ..crate::run_state::waiting_outside("CI") };
         run_row(&fx, working);

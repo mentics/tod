@@ -255,7 +255,7 @@ fn look_at_github(
             standing.push(format!("{label} merged (this repository does not release)"));
             continue;
         }
-        let releases = match feed.releases(pr) {
+        let releases = match feed.releases(pr, &merge) {
             Ok(releases) => releases,
             Err(err) => return Ok(GithubCheck::Unreadable(format!("releases of {label} not readable: {err}"))),
         };
