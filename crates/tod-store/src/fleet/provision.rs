@@ -1860,18 +1860,22 @@ fn location_state_is_clean(dir: &Workdir) -> Result<bool> {
 /// needed), never skip a push that is.
 fn needs_push(dir: &Workdir) -> Result<bool> {
     for repo in repos_deepest_first(dir)? {
-        let Some(branch) = worktree::current_branch(&repo) else {
-            // A submodule on a detached HEAD has nothing of its own to push;
-            // the checkout itself was checked by the caller.
-            continue;
-        };
-        let head = repo.git(&["rev-parse", "HEAD"])?;
-        let tracking = repo.git(&["rev-parse", "--verify", "-q", &format!("refs/remotes/origin/{branch}")]).ok();
-        if tracking.as_deref().map(str::trim) != Some(head.trim()) {
+        if repo_needs_push(&repo)? {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+/// Whether `repo`'s HEAD is something its `origin/<branch>` does not have. A
+/// repository on a detached HEAD has nothing of its own to push.
+fn repo_needs_push(repo: &Workdir) -> Result<bool> {
+    let Some(branch) = worktree::current_branch(repo) else {
+        return Ok(false);
+    };
+    let head = repo.git(&["rev-parse", "HEAD"])?;
+    let tracking = repo.git(&["rev-parse", "--verify", "-q", &format!("refs/remotes/origin/{branch}")]).ok();
+    Ok(tracking.as_deref().map(str::trim) != Some(head.trim()))
 }
 
 /// Push the branch of `dir` and of each submodule that is on one (a
@@ -1879,6 +1883,12 @@ fn needs_push(dir: &Workdir) -> Result<bool> {
 /// submodules first.
 fn push_branches(dir: &Workdir) -> Result<()> {
     for repo in repos_deepest_first(dir)? {
+        // A repository whose commits the remote already has is left alone: a
+        // push of it is refused as "fetch first" when someone else has since
+        // added to the branch, though there is nothing of ours to send.
+        if !repo_needs_push(&repo)? {
+            continue;
+        }
         if repo == *dir {
             push_branch(&repo)?;
         } else if let Some(branch) = worktree::current_branch(&repo) {
@@ -2542,6 +2552,29 @@ mod tests {
         push_branches(&dir).unwrap();
         assert!(!needs_push(&dir).unwrap());
         assert!(git(&remote, &["log", "--format=%s", "task/x"]).contains("the fix"));
+    }
+
+    /// Seen live: a submodule whose branch someone else had since added to was
+    /// pushed every few seconds and refused ("fetch first") each time, though
+    /// this side had nothing new for it. A repository whose commits the remote
+    /// already has is left alone.
+    #[test]
+    fn a_branch_the_remote_has_moved_on_is_not_pushed_when_nothing_is_new() {
+        let (tmp, remote, work) = unpushed_fixture();
+        let dir = Workdir::host(&work);
+        push_branches(&dir).unwrap();
+        // Someone else adds to the branch on the remote.
+        let other = tmp.path().join("other");
+        git(tmp.path(), &["clone", "-q", "-b", "task/x", &remote.to_string_lossy(), &other.to_string_lossy()]);
+        git(&other, &["config", "user.email", "o@example.com"]);
+        git(&other, &["config", "user.name", "o"]);
+        git(&other, &["commit", "-q", "--allow-empty", "-m", "theirs"]);
+        git(&other, &["push", "-q", "origin", "task/x"]);
+        assert!(!needs_push(&dir).unwrap());
+        push_branches(&dir).expect("nothing of ours to send, so the refusal is not hit");
+        // A commit of ours on top of theirs-unseen is a real divergence, and is refused loudly.
+        git(&work, &["commit", "-q", "--allow-empty", "-m", "ours"]);
+        assert!(push_branches(&dir).is_err());
     }
 
     /// Seen live (ENG-2287): commits that only a sandbox had went with the

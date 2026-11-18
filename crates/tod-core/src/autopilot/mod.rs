@@ -101,6 +101,10 @@ pub enum Outcome {
 pub enum Boundary {
     /// Before deciding the next step (so also after each step).
     Step,
+    /// A slice of sleep between polls (every half second): only the hook's
+    /// stop and request checks matter. Nothing is pushed, saved or counted as
+    /// a step: the run did no work since the last [`Self::Step`].
+    Wait,
     /// An agent turn ended inside a conversation (the protocol may already
     /// have sent the next one).
     Turn,
@@ -2446,7 +2450,7 @@ impl Autopilot {
         let slice = Duration::from_millis(500).min(interval);
         let mut stop = None;
         while start.elapsed() < interval {
-            if let Some(reason) = hook.at(fleet, Boundary::Step)? {
+            if let Some(reason) = hook.at(fleet, Boundary::Wait)? {
                 stop = Some(reason);
                 break;
             }

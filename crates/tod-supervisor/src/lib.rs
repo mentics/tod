@@ -389,7 +389,7 @@ impl StepHook for Hook<'_> {
         // run-end push still reports it). At a turn too: an implement or fix turn's commits (in a submodule,
         // the parent records only their id) must not wait for the step to
         // end, with the sandbox idle-reclaimed in between.
-        if self.push_branch {
+        if self.push_branch && boundary != Boundary::Wait {
             // A failure stops the run with the repositories named: work that
             // cannot reach the remote is not something to carry on past.
             git::push_branch(self.workspace).context("pushing the node's branch at a turn or step boundary")?;
