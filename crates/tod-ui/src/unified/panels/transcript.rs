@@ -946,7 +946,7 @@ impl TranscriptPanel {
                 false,
             ),
             CloudStatus::Deleted => ("Its cloud sandbox was deleted; run the node in the cloud to make a new one.".to_string(), true),
-            CloudStatus::Lost => ("Its cloud sandbox is gone; the app makes a new one at its next sync.".to_string(), true),
+            CloudStatus::Lost => ("Its cloud sandbox is gone; the app makes a new one when the node next has work.".to_string(), true),
         };
         let el = div().flex_none().px_2().py_1();
         let el = if error { crate::ui::style::text_error(el) } else { crate::ui::style::text_muted(el) };

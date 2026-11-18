@@ -541,7 +541,7 @@ fn wanted_to_run(fleet: &FleetStore, rows: Vec<CloudNodeRow>, check: Check) -> R
         // (`Working`, `Starting`) gets one here. A look at the listing
         // (`Check::Full`) is no stimulus at all.
         let needs = |p: Phase| match check {
-            Check::Marked => matches!(p, Phase::Working | Phase::Starting),
+            Check::Marked => run_needs_sandbox(p),
             // The app's start makes nothing: it cannot tell a node that is
             // still at work from one whose agent finished while it was
             // closed, and a missing sandbox most likely means it finished.
@@ -556,6 +556,31 @@ fn wanted_to_run(fleet: &FleetStore, rows: Vec<CloudNodeRow>, check: Check) -> R
         kept.push(row);
     }
     Ok(kept)
+}
+
+/// Whether a run in `phase` is at work, so a check after a sync replaces its
+/// lost sandbox ([`wanted_to_run`]).
+fn run_needs_sandbox(phase: tod_store::run_state::Phase) -> bool {
+    use tod_store::run_state::Phase;
+    matches!(phase, Phase::Working | Phase::Starting)
+}
+
+/// Whether the check after a sync would replace `node_id`'s lost sandbox:
+/// `None` when it would, else why not (for the user: a node with nothing at
+/// work gets one only when it has work, or when the user starts it). Reads
+/// the store only.
+pub fn why_not_replaced_at_sync(fleet: &FleetStore, node_id: uuid::Uuid) -> Result<Option<String>> {
+    if fleet.get_node(&node_id.to_string())?.is_some_and(|n| {
+        crate::task::model::lifecycle_rank(&n.lifecycle) >= crate::task::model::lifecycle_rank(tod_store::lifecycle_config::FINAL_PHASE)
+    }) {
+        return Ok(Some(format!("the node is {}, so it needs no sandbox", tod_store::lifecycle_config::FINAL_PHASE)));
+    }
+    let run = fleet.read(|conn| tod_store::run_state::get(conn, node_id))?;
+    Ok(match run {
+        Some(r) if run_needs_sandbox(r.phase) => None,
+        Some(r) => Some(format!("nothing is at work for the node (its run is {})", r.phase.as_str())),
+        None => Some("nothing is at work for the node (it has no run)".to_string()),
+    })
 }
 
 /// Replaces `row`'s lost sandbox under a `cloud_repair` lease. Whether it did;
@@ -1957,6 +1982,25 @@ mod tests {
         assert!(ok && made == 1);
         let note = note(&fx.id()).unwrap();
         assert!(note.contains("made a new one, tod-new"), "{note}");
+    }
+
+    /// Sync now on a lost node that is only waiting: the check would make
+    /// nothing, and Sync now must say why rather than "replacing failed"
+    /// (seen live on a node waiting for `ready_for_review`).
+    #[test]
+    fn why_not_replaced_at_sync_agrees_with_the_marked_check() {
+        let fx = fx();
+        let row = lost_node(&fx);
+        let why = why_not_replaced_at_sync(&fx.fleet, fx.node).unwrap().expect("no run: not replaced");
+        assert!(why.contains("no run"), "{why}");
+        run_row(&fx, crate::run_state::waiting_outside("CI"));
+        let why = why_not_replaced_at_sync(&fx.fleet, fx.node).unwrap().expect("waiting: not replaced");
+        assert!(why.contains("its run is waiting"), "{why}");
+        assert!(wanted_to_run(&fx.fleet, vec![row.clone()], Check::Marked).unwrap().is_empty());
+        let working = tod_store::run_state::Draft { phase: tod_store::run_state::Phase::Working, ..crate::run_state::waiting_outside("CI") };
+        run_row(&fx, working);
+        assert_eq!(why_not_replaced_at_sync(&fx.fleet, fx.node).unwrap(), None);
+        assert_eq!(wanted_to_run(&fx.fleet, vec![row], Check::Marked).unwrap().len(), 1);
     }
 
     #[test]
