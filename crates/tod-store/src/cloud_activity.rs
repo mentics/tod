@@ -171,6 +171,18 @@ pub fn get(conn: &Connection, node: Uuid) -> Result<Option<CloudBeat>> {
         .optional()?)
 }
 
+/// Whether any node's supervisor is at work now ([`CloudBeat::is_live`]):
+/// the one question the app's and daemon's cloud polling ask, so they hold
+/// the orchestrator's connections open only while something is running.
+pub fn any_live(conn: &Connection, now_ms: i64) -> Result<bool> {
+    if !has_table(conn)? {
+        return Ok(false);
+    }
+    Ok(conn
+        .prepare("SELECT 1 FROM cloud_activity WHERE what <> ?1 AND heartbeat_at >= ?2 LIMIT 1")?
+        .exists(params![IDLE_WHAT, now_ms - STALE_AFTER_MS])?)
+}
+
 /// The rows of any of `node_ids`, live or stale.
 pub fn list_for_nodes(conn: &Connection, node_ids: &[Uuid]) -> Result<Vec<CloudBeat>> {
     if node_ids.is_empty() || !has_table(conn)? {
@@ -218,6 +230,22 @@ mod tests {
         // It travels in the synced change log with the rest of the row.
         let changes = crate::sync::export_changes(&conn, 0).unwrap();
         assert!(changes.iter().any(|c| c.table == TABLE));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn any_live_is_true_only_for_a_fresh_beat_of_work() {
+        let dir = tod_test_util::scratch_dir(format!("tod-cloud-activity-live-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = schema::open_writer_connection(&dir.join("tod.db")).unwrap();
+        assert!(!any_live(&conn, 1_000).unwrap(), "no rows");
+        let node = Uuid::new_v4();
+        NodeRepo::new(&conn).create_with_id(node, "n", "N").unwrap();
+        beat(&conn, node, "planning", 1_000).unwrap();
+        assert!(any_live(&conn, 1_000 + STALE_AFTER_MS).unwrap());
+        assert!(!any_live(&conn, 1_000 + STALE_AFTER_MS + 1).unwrap(), "a beat that stopped is not work");
+        idle(&conn, node, 2_000).unwrap();
+        assert!(!any_live(&conn, 2_001).unwrap(), "idle is asleep, not working");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -70,6 +70,9 @@ fn process_env<'a>(spec: &Spec<'a>) -> Vec<(&'static str, &'a str)> {
         ("TOD_ORCHESTRATOR_BLAXEL_WORKSPACE", spec.blaxel_workspace),
         ("TOD_ORCHESTRATOR_BLAXEL_TOKEN", spec.blaxel_token),
         (crate::node::GITHUB_AUTH_ENV, crate::node::GITHUB_AUTH_ROUTED),
+        // Its own sandbox, so it can make a schedule that wakes it between
+        // wakes and sleep meanwhile (`tod_orchestrator::wakes::SelfWake`).
+        ("TOD_ORCHESTRATOR_SANDBOX", spec.name),
     ];
     env.extend(crate::provision::local_proxy_env());
     env
@@ -431,6 +434,7 @@ mod tests {
         let env = process_env(&spec);
         assert_eq!(env[0], ("TOD_ORCHESTRATOR_BLAXEL_WORKSPACE", "ws"));
         assert_eq!(env[1], ("TOD_ORCHESTRATOR_BLAXEL_TOKEN", "tok"));
+        assert!(env.contains(&("TOD_ORCHESTRATOR_SANDBOX", "orch-x")), "it knows which sandbox it is: {env:?}");
         assert!(!start_command().contains("tok"), "the token stays off the command line");
         let body = create_body(&spec);
         assert_eq!(body["metadata"]["name"], "orch-x");

@@ -99,7 +99,17 @@ caller get an error, naming how many machines were asked.
 
 ### The daemon (`tod_core::db_broker`, run by `tod-agentd`)
 
-Holds a 25 s long poll on the broker while any `[[database]]` is declared.
+Holds a 25 s long poll on the broker while any `[[database]]` or `[[service]]`
+is declared **and a cloud node's supervisor is at work** (a fresh
+`cloud_activity` beat, `tod_store::cloud_activity::any_live`, which reaches
+the machine through the synced feed), plus a minute after the last work and
+while a forward is still open. A long poll re-issued back to back keeps the
+orchestrator awake (and billed) for ever, and only a working node's agent
+asks, so while every node is asleep nothing connects to the orchestrator. A
+request that comes with no machine polling is held by the orchestrator for its
+grace period (60 s), which covers the beat's trip to the machine; a request
+from a node that is not working (a hand-opened shell in its sandbox) can fail
+with the broker's retryable "no machine is polling" until one is.
 For each request it:
 
 1. answers only a **declared database** and only for a **node it knows runs in
