@@ -362,6 +362,9 @@ impl<F: FnMut(LocalEvent)> StepHook for Hook<'_, F> {
 
     fn at(&mut self, fleet: &FleetStore, boundary: Boundary) -> Result<Option<String>> {
         if boundary == Boundary::Step {
+            // Pushing can take seconds in a checkout with submodules: say so
+            // rather than leave "deciding the next step" on screen.
+            self.say("saving the branch to GitHub");
             push_branch(fleet, self.node);
             if !self.waiting {
                 // A group of skills run in its own session said so at the last

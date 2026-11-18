@@ -1832,7 +1832,13 @@ pub fn push_node_branch(fleet: &FleetStore, node_id: &str) -> Result<Option<Stri
     if matches!(branch.as_str(), "main" | "master") || default.as_deref() == Some(branch.as_str()) {
         bail!("{branch} is a default branch; a node pushes only its own");
     }
-    push_branches(&dir)?;
+    // The autopilot calls this at every step, and a push costs seconds in
+    // each repository (the fetch of submodule commits, the network, the LFS
+    // pre-push hook) even when it has nothing to send, so it runs only when a
+    // repository's HEAD is not what its remote-tracking branch already has.
+    if needs_push(&dir)? {
+        push_branches(&dir)?;
+    }
     // Everything is committed and pushed: a checkpoint of work that has
     // since been committed would only bring it back a second time.
     if location.sandbox().is_some() && location_state_is_clean(&dir)? {
@@ -1845,6 +1851,27 @@ fn location_state_is_clean(dir: &Workdir) -> Result<bool> {
     let mut lines = dir.git(&["status", "--porcelain", "--ignore-submodules=all"])?.lines().count();
     lines += submodule_dirty_lines(dir)?.len();
     Ok(lines == 0)
+}
+
+/// Whether any repository of the checkout (itself, or a submodule that is on a
+/// branch) has a HEAD that its `origin/<branch>` does not: a commit to push,
+/// or a branch the remote lacks. Reads only local refs, so a stale
+/// remote-tracking ref can only make this say yes (a push that is not
+/// needed), never skip a push that is.
+fn needs_push(dir: &Workdir) -> Result<bool> {
+    for repo in repos_deepest_first(dir)? {
+        let Some(branch) = worktree::current_branch(&repo) else {
+            // A submodule on a detached HEAD has nothing of its own to push;
+            // the checkout itself was checked by the caller.
+            continue;
+        };
+        let head = repo.git(&["rev-parse", "HEAD"])?;
+        let tracking = repo.git(&["rev-parse", "--verify", "-q", &format!("refs/remotes/origin/{branch}")]).ok();
+        if tracking.as_deref().map(str::trim) != Some(head.trim()) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Push the branch of `dir` and of each submodule that is on one (a
@@ -2494,6 +2521,27 @@ mod tests {
         git(&work, &["config", "user.name", "t"]);
         git(&work, &["checkout", "-q", "-b", "task/x"]);
         (tmp, remote, work)
+    }
+
+    /// Seen live: the autopilot pushes the node's branch at every step, and a
+    /// push costs seconds per repository even with nothing to send (the LFS
+    /// pre-push hook, the network), which left "deciding the next step" on
+    /// screen for a minute. A push now runs only when a repository's HEAD is
+    /// not what its remote-tracking branch has.
+    #[test]
+    fn a_branch_already_on_the_remote_is_not_pushed_again() {
+        let (_tmp, remote, work) = unpushed_fixture();
+        let dir = Workdir::host(&work);
+        // A branch the remote lacks.
+        assert!(needs_push(&dir).unwrap());
+        push_branches(&dir).unwrap();
+        assert!(!needs_push(&dir).unwrap());
+        // A commit it lacks.
+        git(&work, &["commit", "-q", "--allow-empty", "-m", "the fix"]);
+        assert!(needs_push(&dir).unwrap());
+        push_branches(&dir).unwrap();
+        assert!(!needs_push(&dir).unwrap());
+        assert!(git(&remote, &["log", "--format=%s", "task/x"]).contains("the fix"));
     }
 
     /// Seen live (ENG-2287): commits that only a sandbox had went with the
