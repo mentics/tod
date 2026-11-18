@@ -146,7 +146,18 @@ the reason logged at info):
   `sandboxes.toml` declares a `[[database]]` keeps its daemon up while the app
   is closed: answering a cloud node's `tod-cli db` is that feature
   (`doc/cloud-sandboxes/database-access.md`). An unreadable `sandboxes.toml`
-  counts as declaring one.
+  counts as declaring one; or
+- when a newer build exists and no client has been connected for 30 minutes
+  (`lifetime::STALE_GRACE`) **and** no run is in progress, broker or not: a
+  newer build copy sits beside it in `daemon/`, or the `tod-agentd` it was
+  started from (`TOD_PROGRAM_DIR`) was rebuilt or updated since. Nothing
+  restarts an old build nobody uses, and one left serving the broker kept
+  polling the orchestrator on old rules (and kept its sandbox awake).
+
+**One per root, the newest.** A daemon that starts and finds another holding
+the root's lock compares build times (`Info::built_at`): when the other is
+older it asks it to `quit`, waits for it to drain, and takes over
+(`server::replace_older`); when it is the same or newer, it exits quietly.
 
 On start the daemon removes the build copies in `<root>/daemon/` other than the
 one it runs from and the 3 newest, and logs each. `agentd.lock` and

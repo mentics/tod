@@ -65,7 +65,7 @@ pub fn run(data_root: &Path) -> Result<bool> {
         .read(true)
         .write(true)
         .open(paths.daemon_lock())?;
-    if lock.try_lock_exclusive().is_err() {
+    if lock.try_lock_exclusive().is_err() && !replace_older(data_root, &paths, &lock)? {
         return Ok(false);
     }
 
@@ -170,6 +170,22 @@ pub fn run(data_root: &Path) -> Result<bool> {
     drop(lock);
     eprintln!("tod-agentd {stamp} stopped");
     Ok(true)
+}
+
+/// Another daemon holds the data root. When it is an older build than this
+/// one, asks it to drain and quit, and takes the lock once it has. `false`
+/// when it is the same build or newer (this one exits quietly), or answers
+/// no more and holds the lock regardless.
+fn replace_older(data_root: &Path, paths: &Paths, lock: &std::fs::File) -> Result<bool> {
+    let (_, built_at) = identity();
+    let Some(other) = tod_agentd_client::Info::read(paths) else { return Ok(false) };
+    if other.built_at >= built_at {
+        return Ok(false);
+    }
+    eprintln!("tod-agentd: pid {} is an older build ({} < {built_at}); asking it to quit", other.pid, other.built_at);
+    tod_agentd_client::client::quit(data_root).context("ask the older daemon to quit")?;
+    // `quit` returns when its lock is free or another daemon serves.
+    Ok(lock.try_lock_exclusive().is_ok())
 }
 
 /// How long after start the first pass waits (the start's sync pulls first),
@@ -308,7 +324,11 @@ fn watch_lifetime(shared: Arc<Shared>, root: std::path::PathBuf, port: u16) {
         };
         // Re-read: a database or service may have been declared since the daemon started.
         let polls = polls_broker || tod_core::db_broker::declares_access(&root);
-        if let Some(reason) = lifetime::should_exit(Instant::now(), last, runs, polls, root.exists(), idle) {
+        let stale = std::env::current_exe().ok().and_then(|exe| {
+            let program = std::env::var_os("TOD_PROGRAM_DIR").map(std::path::PathBuf::from);
+            lifetime::stale_reason(Paths::new(&root).dir(), &exe, program.as_deref())
+        });
+        if let Some(reason) = lifetime::should_exit(Instant::now(), last, runs, polls, root.exists(), stale.as_deref(), idle) {
             tracing::info!("tod-agentd: exiting: {reason}");
             shared.quit.store(true, Ordering::SeqCst);
             // Wake the accept loop so it sees the flag.
