@@ -257,7 +257,19 @@ pub fn load_runner(fleet: &tod_store::fleet::FleetStore, node_id: Uuid) -> Runne
         .flatten()
         .map(|n| n.lifecycle)
         .unwrap_or_default();
+    // A row left behind by a node that has since left the cloud says nothing
+    // about where it runs now (the next sync drops it).
     facts.cloud = crate::cloud_sync::cloud_node(fleet, &id);
+    if facts.cloud.is_some() {
+        match crate::cloud_sync::lost::left_the_cloud(fleet, node_id) {
+            Ok(true) => facts.cloud = None,
+            Ok(false) => {}
+            Err(err) => {
+                tracing::error!("could not read where node {node_id} runs: {err:#}");
+                facts.error = Some(format!("Could not read where this node runs: {err:#}"));
+            }
+        }
+    }
     match crate::node_problems::for_node(fleet, node_id) {
         Ok(problems) => facts.problems = problems,
         Err(err) => {
