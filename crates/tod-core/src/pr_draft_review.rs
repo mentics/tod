@@ -276,6 +276,30 @@ pub fn owed(conn: &Connection, node: Uuid, live: &[LivePr], feed: &dyn PrFeed) -
     Ok(if round_clean(&findings, &latest) { Owed::Clear } else { Owed::Review })
 }
 
+/// Carries the latest review's heads over to the pull request's current ones,
+/// once [`owed`] has said that nothing is owed: the head moved only by merging
+/// the base in, which is the change already reviewed. The
+/// `pr-pr_review.own-review` gate ([`gate`]) compares heads exactly, so without
+/// this the review would be called clear here and the gate would then refuse
+/// it as "not reviewed the current head", with no review ever started.
+pub fn carry_heads(fleet: &FleetStore, node: Uuid, live: &[LivePr]) -> Result<()> {
+    let current = current_heads(live);
+    let carried = fleet.read(|conn| {
+        let Some(latest) = latest_review(conn, node)? else { return Ok(None) };
+        Ok(match reviewed_heads(conn, latest.id)? {
+            Some(reviewed) if reviewed != current => Some(latest.id),
+            _ => None,
+        })
+    })?;
+    if let Some(conversation_id) = carried {
+        fleet.interview(
+            ACTOR,
+            InterviewCommand::RecordConversationReport { conversation_id, body: heads_report(&current) },
+        )?;
+    }
+    Ok(())
+}
+
 /// The branch's own change against `base` (a branch of `origin`), as a
 /// fingerprint: the changed lines (committed or not, against the merge base
 /// of `origin/<base>` and `HEAD`) and the untracked files, without hunk

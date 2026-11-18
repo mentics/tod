@@ -2301,7 +2301,10 @@ impl Autopilot {
         }
         pr_draft_review::sync_resolved(fleet, node, live)?;
         match fleet.read(|conn| pr_draft_review::owed(conn, node, live, feed))? {
-            Owed::Clear => Ok(OwnReview::Clear),
+            Owed::Clear => {
+                pr_draft_review::carry_heads(fleet, node, live)?;
+                Ok(OwnReview::Clear)
+            }
             Owed::Post(findings) => {
                 hook.working_on("posting tod's code review on the pull request");
                 match pr_draft_review::post(fleet, feed, live, &findings) {

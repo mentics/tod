@@ -4685,6 +4685,35 @@ fn a_head_that_only_merges_the_base_in_is_not_reviewed_again() {
     assert_eq!(reviews, 1, "one review covers every merge of the base: {outcome:?}");
 }
 
+/// Seen live: Start did nothing but fail the gate ("has not reviewed the
+/// pull request's current head"). The review was called clear because only
+/// the base had been merged in, while the gate compared heads exactly, so no
+/// review was ever started. The cleared review now covers the new head.
+#[test]
+fn a_review_cleared_across_a_merge_of_the_base_passes_the_gate_on_the_new_head() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    let feed = Arc::new(MovingHeadFeed {
+        inner: OwnReviewFeed::new(false),
+        reads: Default::default(),
+        moves: 4,
+        merge_only: true,
+    });
+    crate::pr_readiness::set_feed_override(Some(feed.clone()));
+    with_pr_draft_review(&fx);
+    a_finding_before_the_pull_request(&fx);
+    linked_to_prs(&fx, "pr_draft", &["https://github.com/acme/app/pull/42"]);
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let outcome = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO).run(&fx.fleet, &mut agent).unwrap();
+    assert_eq!(openings(&fx, ProtocolKind::Review).len(), 1, "{outcome:?}");
+    // By now the head has moved on, by merges of the base, and stays there.
+    let outcome = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO).run(&fx.fleet, &mut agent).unwrap();
+    assert_eq!(openings(&fx, ProtocolKind::Review).len(), 1, "{outcome:?}");
+    let heads = [("acme/app#42".to_string(), "head0004".to_string())].into();
+    let gate = fx.fleet.read(|conn| crate::pr_draft_review::gate(conn, fx.node, &heads)).unwrap();
+    assert!(gate.is_ok(), "{gate:?} {outcome:?}");
+}
+
 /// A base that moved is not work: no agent turn, no review, nothing woken.
 #[test]
 fn a_pull_request_only_behind_its_base_is_not_worked_on() {
