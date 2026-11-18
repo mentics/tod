@@ -1516,12 +1516,12 @@ impl TaskPanel {
             let replacing = standing.as_ref().is_some_and(|s| matches!(s.actor, NextActor::Working { .. }));
             if cloud.lost_at.is_some() && !replacing {
                 // What woke it (a release, a merge) found nothing there: the
-                // orchestrator marked it, and the app makes a new one at its
-                // next sync, so a closed app leaves the node waiting for it.
+                // orchestrator marked it, and the app makes a new one when the
+                // node next has work (a sync does only for a node at work).
                 if tod_core::cloud_sync::sandbox_deleted_by_user(self.fleet.paths().root(), &self.node_id.to_string()) {
                     text.push_str(", its sandbox was deleted: Start makes a new one");
                 } else {
-                    text.push_str(", its sandbox is gone: the app makes a new one when it next syncs");
+                    text.push_str(", its sandbox is gone: the app makes a new one when the node next has work");
                 }
             }
             line = line.child(sep()).child(style::text_muted(div().flex_auto().min_w(gpui::px(160.))).child(

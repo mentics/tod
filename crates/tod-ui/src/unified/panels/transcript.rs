@@ -108,6 +108,8 @@ pub struct TranscriptPanel {
     _items: gpui::Task<()>,
     /// Scroll position of the list of the watched node's conversations.
     runs_scroll: ScrollHandle,
+    /// Scroll position of a gate check's or command round's entry.
+    entry_scroll: ScrollHandle,
     _sync: gpui::Task<()>,
 }
 
@@ -247,6 +249,7 @@ impl TranscriptPanel {
             _load: gpui::Task::ready(()),
             _items: gpui::Task::ready(()),
             runs_scroll: ScrollHandle::new(),
+            entry_scroll: ScrollHandle::new(),
             _sync: gpui::Task::ready(()),
         };
         let mut fleet_rx = this.fleet.subscribe_changes();
@@ -632,7 +635,7 @@ impl TranscriptPanel {
         let watching = self.watching.as_ref()?;
         let item = watching.items.iter().find(|i| i.id == id)?;
         let entry = item.entry()?;
-        let mut body = div().id("activity-entry").size_full().overflow_y_scroll().flex().flex_col().gap_2().p_2();
+        let mut body = div().id("activity-entry").size_full().overflow_y_scroll().track_scroll(&self.entry_scroll).flex().flex_col().gap_2().p_2();
         body = body.child(
             style::text_dense_muted(div())
                 .child(format!("{} \u{b7} {}", entry.title, format_time(entry.at))),
@@ -714,7 +717,22 @@ impl TranscriptPanel {
             }
             ItemKind::Session => return None,
         }
-        Some(body.into_any_element())
+        Some(
+            div()
+                .size_full()
+                .relative()
+                .child(body)
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .right_0()
+                        .bottom_0()
+                        .left_0()
+                        .child(Scrollbar::vertical(&self.entry_scroll)),
+                )
+                .into_any_element(),
+        )
     }
 
     /// The turn `node`'s cloud supervisor has in flight, as it last sent it
@@ -946,7 +964,7 @@ impl TranscriptPanel {
                 false,
             ),
             CloudStatus::Deleted => ("Its cloud sandbox was deleted; run the node in the cloud to make a new one.".to_string(), true),
-            CloudStatus::Lost => ("Its cloud sandbox is gone; the app makes a new one at its next sync.".to_string(), true),
+            CloudStatus::Lost => ("Its cloud sandbox is gone; the app makes a new one when the node next has work.".to_string(), true),
         };
         let el = div().flex_none().px_2().py_1();
         let el = if error { crate::ui::style::text_error(el) } else { crate::ui::style::text_muted(el) };

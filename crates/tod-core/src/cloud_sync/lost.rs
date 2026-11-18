@@ -12,7 +12,9 @@
 //! - [`stop_running_in_cloud`] is the user leaving the cloud: the row goes
 //!   (optionally the sandbox too) and the change is synced.
 //! - [`retire_done`] drops the row of a node that reached `done`, at the end
-//!   of every sync; its sandbox is left to Blaxel's standby.
+//!   of every sync; its sandbox is left to Blaxel's standby. It drops the row
+//!   of a node that [left the cloud](left_the_cloud) too (a lost node moved
+//!   to a dev container, say), which is never given a new sandbox.
 //!
 //! Everything here blocks on the network or the database: never call it on
 //! the UI thread ([`spawn_check`] runs on a thread of its own).
@@ -232,12 +234,35 @@ pub fn adopt_legacy_records(fleet: &FleetStore) -> Result<usize> {
     Ok(adopted)
 }
 
-/// Drops the `cloud_nodes` row of every node that reached `done`.
+/// Whether `node` has left the cloud while a `cloud_nodes` row stayed behind:
+/// its Files (its own or inherited) no longer run in a cloud sandbox, and its
+/// location names no sandbox (so no sandbox is orphaned by dropping the row).
+/// This is a node whose sandbox was lost and that was then moved, or given a
+/// location, somewhere else: a dev container, a worktree on this machine.
+pub fn left_the_cloud(fleet: &FleetStore, node: uuid::Uuid) -> Result<bool> {
+    let id = node.to_string();
+    let in_sandbox = fleet
+        .resolve_files_for_node(&id)
+        .with_context(|| format!("read the Files of node {id}"))?
+        .is_some_and(|files| files.runs_in_sandbox());
+    if in_sandbox {
+        return Ok(false);
+    }
+    let location = tod_store::fleet::provision::node_location(fleet, &id)
+        .with_context(|| format!("read the location of node {id}"))?;
+    Ok(!location.is_some_and(|l| l.sandbox().is_some()))
+}
+
+/// Drops the `cloud_nodes` row of every node that reached `done`, and of
+/// every node that [left the cloud](left_the_cloud).
 pub fn retire_done(fleet: &FleetStore) -> Result<usize> {
     let rows = fleet.read(cloud_nodes::list)?;
     let mut done = Vec::new();
     for row in rows {
         if fleet.get_node(&row.node_id.to_string())?.is_some_and(|t| t.lifecycle == "done") {
+            done.push(row.node_id);
+        } else if left_the_cloud(fleet, row.node_id)? {
+            tracing::info!("cloud: node {} no longer runs in a sandbox; dropping its cloud record", row.node_id);
             done.push(row.node_id);
         }
     }
@@ -534,6 +559,11 @@ fn wanted_to_run(fleet: &FleetStore, rows: Vec<CloudNodeRow>, check: Check) -> R
         }) {
             continue;
         }
+        // A node that now runs elsewhere gets no sandbox, whatever its run
+        // is doing: its row goes at the end of the sync.
+        if left_the_cloud(fleet, row.node_id)? {
+            continue;
+        }
         // A mark the orchestrator brought (`Check::Marked`) means a wake or a
         // webhook found the sandbox gone. That is not work: a waiting node
         // (CI, a bot, a timer, the user) stays without a sandbox until a real
@@ -541,7 +571,7 @@ fn wanted_to_run(fleet: &FleetStore, rows: Vec<CloudNodeRow>, check: Check) -> R
         // (`Working`, `Starting`) gets one here. A look at the listing
         // (`Check::Full`) is no stimulus at all.
         let needs = |p: Phase| match check {
-            Check::Marked => matches!(p, Phase::Working | Phase::Starting),
+            Check::Marked => run_needs_sandbox(p),
             // The app's start makes nothing: it cannot tell a node that is
             // still at work from one whose agent finished while it was
             // closed, and a missing sandbox most likely means it finished.
@@ -556,6 +586,31 @@ fn wanted_to_run(fleet: &FleetStore, rows: Vec<CloudNodeRow>, check: Check) -> R
         kept.push(row);
     }
     Ok(kept)
+}
+
+/// Whether a run in `phase` is at work, so a check after a sync replaces its
+/// lost sandbox ([`wanted_to_run`]).
+fn run_needs_sandbox(phase: tod_store::run_state::Phase) -> bool {
+    use tod_store::run_state::Phase;
+    matches!(phase, Phase::Working | Phase::Starting)
+}
+
+/// Whether the check after a sync would replace `node_id`'s lost sandbox:
+/// `None` when it would, else why not (for the user: a node with nothing at
+/// work gets one only when it has work, or when the user starts it). Reads
+/// the store only.
+pub fn why_not_replaced_at_sync(fleet: &FleetStore, node_id: uuid::Uuid) -> Result<Option<String>> {
+    if fleet.get_node(&node_id.to_string())?.is_some_and(|n| {
+        crate::task::model::lifecycle_rank(&n.lifecycle) >= crate::task::model::lifecycle_rank(tod_store::lifecycle_config::FINAL_PHASE)
+    }) {
+        return Ok(Some(format!("the node is {}, so it needs no sandbox", tod_store::lifecycle_config::FINAL_PHASE)));
+    }
+    let run = fleet.read(|conn| tod_store::run_state::get(conn, node_id))?;
+    Ok(match run {
+        Some(r) if run_needs_sandbox(r.phase) => None,
+        Some(r) => Some(format!("nothing is at work for the node (its run is {})", r.phase.as_str())),
+        None => Some("nothing is at work for the node (it has no run)".to_string()),
+    })
 }
 
 /// Replaces `row`'s lost sandbox under a `cloud_repair` lease. Whether it did;
@@ -1929,6 +1984,54 @@ mod tests {
     }
 
     #[test]
+    fn a_lost_node_moved_to_a_dev_container_loses_its_cloud_row_and_gets_no_sandbox() {
+        use crate::runner_place::test_support::{sandbox, set_files};
+        use tod_store::fleet::DevContainerSetting;
+        let fx = fx();
+        // Lost while in the cloud: the location is gone, the row stays.
+        set_files(&fx.fleet, fx.node, sandbox(), true);
+        fx.raw_row("node-gone");
+        let conn = rusqlite::Connection::open(fx.fleet.paths().db()).unwrap();
+        cloud_nodes::mark_lost(&conn, fx.node, 5).unwrap();
+        drop(conn);
+        let row = fx.row().unwrap();
+        assert!(!left_the_cloud(&fx.fleet, fx.node).unwrap(), "still in the cloud: Start makes a new sandbox");
+        assert_eq!(retire_done(&fx.fleet).unwrap(), 0);
+        assert!(fx.row().is_some());
+
+        // Moved to a dev container and set to work there.
+        let container = DevContainerSetting { container: Some("app-1".into()), ..Default::default() };
+        set_files(&fx.fleet, fx.node, Some(container), true);
+        run_row(&fx, tod_store::run_state::Draft { phase: tod_store::run_state::Phase::Working, ..crate::run_state::waiting_outside("CI") });
+        assert!(left_the_cloud(&fx.fleet, fx.node).unwrap());
+        assert!(
+            wanted_to_run(&fx.fleet, vec![row], Check::Marked).unwrap().is_empty(),
+            "a node at work in a dev container is never given a sandbox"
+        );
+        assert!(load_cloud(&fx).is_none(), "the panel does not say it is in the cloud");
+        assert_eq!(retire_done(&fx.fleet).unwrap(), 1);
+        assert!(fx.row().is_none());
+    }
+
+    #[test]
+    fn a_row_whose_location_still_names_a_sandbox_is_kept_wherever_the_files_point() {
+        let fx = fx();
+        // No Files capability, but the location records a sandbox: dropping
+        // the row would lose track of that sandbox.
+        fx.locate("node-up");
+        fx.cloud_row();
+        assert!(!left_the_cloud(&fx.fleet, fx.node).unwrap());
+        assert_eq!(retire_done(&fx.fleet).unwrap(), 0);
+        assert!(fx.row().is_some());
+    }
+
+    fn load_cloud(fx: &Fx) -> Option<cloud_nodes::CloudNodeRow> {
+        let facts = crate::runner_menu::load_runner(&fx.fleet, fx.node);
+        assert_eq!(facts.error, None);
+        facts.cloud.map(|_| fx.row().unwrap())
+    }
+
+    #[test]
     fn a_running_node_whose_sandbox_was_pruned_gets_a_new_one_and_the_note_says_so() {
         let fx = fx();
         let row = lost_node(&fx);
@@ -1957,6 +2060,25 @@ mod tests {
         assert!(ok && made == 1);
         let note = note(&fx.id()).unwrap();
         assert!(note.contains("made a new one, tod-new"), "{note}");
+    }
+
+    /// Sync now on a lost node that is only waiting: the check would make
+    /// nothing, and Sync now must say why rather than "replacing failed"
+    /// (seen live on a node waiting for `ready_for_review`).
+    #[test]
+    fn why_not_replaced_at_sync_agrees_with_the_marked_check() {
+        let fx = fx();
+        let row = lost_node(&fx);
+        let why = why_not_replaced_at_sync(&fx.fleet, fx.node).unwrap().expect("no run: not replaced");
+        assert!(why.contains("no run"), "{why}");
+        run_row(&fx, crate::run_state::waiting_outside("CI"));
+        let why = why_not_replaced_at_sync(&fx.fleet, fx.node).unwrap().expect("waiting: not replaced");
+        assert!(why.contains("its run is waiting"), "{why}");
+        assert!(wanted_to_run(&fx.fleet, vec![row.clone()], Check::Marked).unwrap().is_empty());
+        let working = tod_store::run_state::Draft { phase: tod_store::run_state::Phase::Working, ..crate::run_state::waiting_outside("CI") };
+        run_row(&fx, working);
+        assert_eq!(why_not_replaced_at_sync(&fx.fleet, fx.node).unwrap(), None);
+        assert_eq!(wanted_to_run(&fx.fleet, vec![row], Check::Marked).unwrap().len(), 1);
     }
 
     #[test]
