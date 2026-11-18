@@ -108,7 +108,13 @@ pub fn confirm_listing(
             }
         };
         if let Some(info) = found {
-            tracing::warn!("cloud: Blaxel's listing lacked sandbox {name} but it exists ({}); keeping it", info.status);
+            if super::sandbox_is_dead(&info) {
+                // Expected: the listing leaves out sandboxes that can no
+                // longer run (a retired one stays TERMINATED for a while).
+                tracing::debug!("cloud: sandbox {name} is {} (not in Blaxel's listing)", info.status);
+            } else {
+                tracing::warn!("cloud: Blaxel's listing lacked sandbox {name} but it exists ({}); keeping it", info.status);
+            }
             listing.push(info);
         }
     }
@@ -248,11 +254,14 @@ pub fn retire_done(fleet: &FleetStore) -> Result<usize> {
 
 /// The rows of `rows` whose node's Files location records the sandbox the
 /// row's copy names. A row whose copy differs from its location is reported
-/// to the user naming both and left alone, never silently fixed; so is a live
-/// row of this client's whose node has no location sandbox (a record made
-/// before the location was the one record). A row that is lost or was deleted
-/// on purpose, or another client's (it has no location here and this machine
-/// does not act on its sandbox), is skipped without a word.
+/// to the user naming both and left alone, never silently fixed. A row whose
+/// node has no location sandbox is kept only when it is marked lost (a
+/// replacement makes it again); any other is skipped without a word: a live
+/// one of this client's is what an idle retirement leaves (`sandbox_retire`
+/// forgets the location and deliberately leaves the row unmarked, so the next
+/// wake makes a new sandbox), one deleted on purpose waits for a Start, and
+/// another client's is not this machine's to act on. An old record no
+/// location ever followed is the adopt pass's to report (`adopt`).
 pub fn located_rows(fleet: &FleetStore, rows: Vec<CloudNodeRow>, root: &std::path::Path) -> Result<Vec<CloudNodeRow>> {
     let me = super::client_id(root)?;
     let mut consistent = Vec::new();
@@ -275,26 +284,14 @@ pub fn located_rows(fleet: &FleetStore, rows: Vec<CloudNodeRow>, root: &std::pat
             )?,
             None => {
                 let mine = row.ownership.owner_client.as_deref().is_none_or(|owner| owner == me);
+                // Nothing to disagree with: an earlier report no longer stands.
+                crate::node_problems::clear(fleet, &id, tod_store::node_problems::KIND_CLOUD_RECORD)?;
                 if row.lost_at.is_some() && mine && !super::sandbox_deleted_by_user(root, &id) {
                     // Marked lost and its location is gone too (the sandbox
-                    // was removed): nothing to disagree with, and exactly
-                    // what a replacement makes again. Dropping it here left
-                    // Sync now saying "nothing was replaced".
-                    crate::node_problems::clear(fleet, &id, tod_store::node_problems::KIND_CLOUD_RECORD)?;
+                    // was removed): exactly what a replacement makes again.
+                    // Dropping it here left Sync now saying "nothing was
+                    // replaced".
                     consistent.push(row);
-                } else if row.lost_at.is_none() && mine && !super::sandbox_deleted_by_user(root, &id) {
-                    report_record_problem(
-                        fleet,
-                        &id,
-                        format!(
-                            "The cloud record of node {id} names sandbox {} but its Files location records none; \
-                             it is not acted on until the sandbox is adopted (the node's runner menu: \
-                             \"Adopt existing sandbox\") or Start makes a new one.",
-                            row.sandbox
-                        ),
-                    )?;
-                } else {
-                    crate::node_problems::clear(fleet, &id, tod_store::node_problems::KIND_CLOUD_RECORD)?;
                 }
             }
         }
@@ -1675,7 +1672,7 @@ mod tests {
         let fx = fx();
         // Before Start: an old record naming a sandbox Blaxel no longer has.
         fx.raw_row("node-old");
-        located_rows(&fx.fleet, rows_of(&fx), &fx.root).unwrap();
+        report_record_problem(&fx.fleet, &fx.id(), "an earlier report".into()).unwrap();
         crate::node_problems::report(
             &fx.fleet,
             &fx.id(),
@@ -1695,12 +1692,14 @@ mod tests {
     }
 
     #[test]
-    fn a_live_row_with_no_location_is_reported_and_a_lost_or_foreign_one_is_not() {
+    fn a_row_with_no_location_is_kept_only_when_lost_and_never_reported() {
         let fx = fx();
+        // A live row with no location: what an idle retirement leaves. Not
+        // acted on, and not a problem (the next wake makes a new sandbox).
         fx.raw_row("node-old");
+        report_record_problem(&fx.fleet, &fx.id(), "an earlier report".into()).unwrap();
         assert!(located_rows(&fx.fleet, rows_of(&fx), &fx.root).unwrap().is_empty());
-        let problems = fx.problems();
-        assert!(problems.len() == 1 && problems[0].contains("records none"), "{problems:?}");
+        assert!(fx.problems().is_empty(), "{:?}", fx.problems());
 
         // Marked lost (its sandbox is gone): nothing to say, and it is kept
         // so a replacement makes the sandbox again.
@@ -1708,7 +1707,7 @@ mod tests {
         fx.fleet.writer().flush().unwrap();
         fx.fleet.reload_if_stale().unwrap();
         assert_eq!(located_rows(&fx.fleet, rows_of(&fx), &fx.root).unwrap().len(), 1);
-        assert!(fx.problems().is_empty(), "no longer true, so the report is dropped");
+        assert!(fx.problems().is_empty());
 
         // Another client's row has no location here and is not this machine's to act on.
         let mut foreign = rows_of(&fx);
