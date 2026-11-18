@@ -1310,8 +1310,10 @@ impl TranscriptList {
                 (kind == PieceKind::Thought).then_some(IconName::Brain),
                 first_line(text),
             ),
+            // A title can be a whole multi-line command (a heredoc): the
+            // header shows it as one line, the body shows it whole.
             ReplyPart::Tool { title, status, .. } => {
-                (Some(IconName::Wrench), tool_line(title, status))
+                (Some(IconName::Wrench), first_line(&tool_line(title, status)))
             }
         };
         let mut chunk = style::chunk(v_flex()).child(self.chunk_header(
@@ -1767,5 +1769,11 @@ mod tests {
         assert!(line.len() < 1_000, "kept {} bytes", line.len());
         assert!(line.starts_with("{\"data\":\"xxx"));
         assert_eq!(first_line("  a\n b\tc "), "a b c");
+        // A multi-line tool title (a heredoc) is one header line.
+        let title = "cat > f.sh <<'EOF'\n#!/bin/bash\necho hi\nEOF";
+        assert_eq!(
+            first_line(&tool_line(title, "completed")),
+            "cat > f.sh <<'EOF' #!/bin/bash echo hi EOF · completed"
+        );
     }
 }
