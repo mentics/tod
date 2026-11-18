@@ -2036,7 +2036,9 @@ pub fn remove_location(
             if location.sandbox().is_none()
                 && let Some(repo) = location.repo_dir()
             {
-                let _ = worktree::prune_git_worktrees(&repo);
+                worktree::prune_git_worktrees(&repo).with_context(|| {
+                    format!("forget the missing {} in {repo}", location.describe())
+                })?;
             }
         }
         LocationState::Clean => {

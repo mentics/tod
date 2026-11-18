@@ -674,7 +674,7 @@ fn actor_for(facts: &Facts<'_>) -> (NextActor, i64) {
         let reason = if lost.deleted_by_user {
             "its sandbox was deleted; Start makes a new one".to_string()
         } else {
-            "its sandbox is gone; a new one is made at the next sync, or Start makes one now".to_string()
+            "its sandbox is gone; a new one is made when the node next has work, or Start makes one now".to_string()
         };
         return (NextActor::You { why: YouReason::Stopped { reason }, since: lost.since }, lost.since);
     }

@@ -251,7 +251,8 @@ pub enum CloudStatus {
     /// Nothing is running in the cloud for it (no heartbeat): it finished,
     /// is waiting, or has not started.
     Idle,
-    /// Its sandbox is gone; the app replaces it at the next sync.
+    /// Its sandbox is gone; the app makes a new one when the node next has
+    /// work (a sync replaces it only for a node at work).
     Lost,
     /// The user deleted its sandbox; nothing replaces it until they Start the
     /// node again.
@@ -278,7 +279,7 @@ impl CloudStatus {
                 doing(what)
             ),
             Self::Idle => "Nothing is running in the cloud for it now.".to_string(),
-            Self::Lost => "Its sandbox is gone; a new one is made at the next sync.".to_string(),
+            Self::Lost => "Its sandbox is gone; a new one is made when the node next has work, or Start makes one now.".to_string(),
             Self::Deleted => "Its sandbox was deleted; Start makes a new one.".to_string(),
         }
     }

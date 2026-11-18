@@ -369,12 +369,14 @@ fn adopt_each(
                 note(crate::node_problems::clear(fleet, id, tod_store::node_problems::KIND_ADOPT));
             }
             Ok(Outcome::NotNeeded) => note(crate::node_problems::clear(fleet, id, tod_store::node_problems::KIND_ADOPT)),
-            Ok(gone @ Outcome::Gone { .. }) => note(crate::node_problems::report(
-                fleet,
-                id,
-                tod_store::node_problems::KIND_ADOPT,
-                format!("The node's old sandbox was not adopted. {}", gone.message()),
-            )),
+            // Nothing to adopt and nothing for the user to do: this is what an
+            // idle retirement leaves (`sandbox_retire` deletes the sandbox and
+            // the location, not the row), and the next wake or Start makes a
+            // new sandbox either way. Telling the node would only be noise.
+            Ok(gone @ Outcome::Gone { .. }) => {
+                tracing::debug!("cloud: node {id}: {}", gone.message());
+                note(crate::node_problems::clear(fleet, id, tod_store::node_problems::KIND_ADOPT))
+            }
             Err(err) => note(crate::node_problems::report(
                 fleet,
                 id,
@@ -746,6 +748,20 @@ mod tests {
         assert_eq!(adopt_each(&fx.fleet, &fx.root, &[fx.id()], &mut fake).unwrap(), ["quiet"]);
         fx.fleet.reload_if_stale().unwrap();
         assert!(crate::node_problems::for_node(&fx.fleet, fx.node).unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_automatic_form_says_nothing_of_a_sandbox_that_is_gone_and_drops_an_earlier_word() {
+        // What an idle retirement leaves: a live row, no location, no sandbox.
+        let fx = fx2_named("retired");
+        crate::node_problems::report(&fx.fleet, &fx.id(), tod_store::node_problems::KIND_ADOPT, "earlier".into()).unwrap();
+        let mut fake = Fake::with(Vec::new());
+        assert!(adopt_each(&fx.fleet, &fx.root, &[fx.id()], &mut fake).unwrap().is_empty());
+        fx.fleet.reload_if_stale().unwrap();
+        let problems = crate::node_problems::for_node(&fx.fleet, fx.node).unwrap();
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(fx.located(), None);
+        assert_eq!(fx.row().unwrap().sandbox, "retired", "nothing written");
     }
 
     fn fx2_named(sandbox: &str) -> Fx {

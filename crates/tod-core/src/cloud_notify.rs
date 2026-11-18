@@ -83,7 +83,7 @@ fn note_degraded(root: &Path, secs: Option<u64>) {
     match secs {
         Some(secs) => {
             if !map.contains_key(root) {
-                tracing::warn!("cloud notices: the orchestrator's notices are refused; pulling every {}s for {secs}s", DEGRADED_POLL.as_secs());
+                tracing::warn!("cloud notices: the orchestrator refuses its notices for the next {secs}s; pulling every {}s meanwhile", DEGRADED_POLL.as_secs());
             }
             map.insert(root.to_path_buf(), Instant::now() + Duration::from_secs(secs));
         }

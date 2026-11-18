@@ -221,13 +221,24 @@ pub fn sync_now(fleet: &FleetStore, root: &std::path::Path, node: Option<Uuid>) 
         && let Some(status) = cloud_sync::cloud_status(fleet, node, tod_store::outline::uuid_blob::now_ms())
     {
         msg.push_str(". ");
-        if status == cloud_sync::CloudStatus::Lost && cloud_sync::lost::any_marked(fleet) {
+        let why_not = if status == cloud_sync::CloudStatus::Lost {
+            cloud_sync::lost::why_not_replaced_at_sync(fleet, node).map_err(|err| describe("Sync failed", &err))?
+        } else {
+            None
+        };
+        if let Some(why_not) = why_not {
+            // The check after a sync replaces only a node at work: running it
+            // here made nothing and read as a failed replacement.
+            msg.push_str(&format!(
+                "Its sandbox is gone, and none is made now: {why_not}. A new one is made when the node next has work; Start makes one now."
+            ));
+        } else if status == cloud_sync::CloudStatus::Lost && cloud_sync::lost::any_marked(fleet) {
             // Sync now is the "next sync": replace it now, and say what
             // happened, not only that it was started.
             match cloud_sync::lost::check_marked_now(fleet) {
                 Ok(Some(done)) if done.replaced > 0 => msg.push_str("Its sandbox was gone; a new one was made."),
                 Ok(Some(_)) => {
-                    let why = cloud_sync::lost::note(&node.to_string()).unwrap_or_else(|| "nothing was replaced".into());
+                    let why = cloud_sync::lost::note(&node.to_string()).unwrap_or_else(|| "nothing was replaced, and the check recorded no reason (the log panel has the orchestrator's side)".into());
                     return Err(describe("Replacing its sandbox failed", &anyhow::anyhow!(why)));
                 }
                 Ok(None) => msg.push_str("Its sandbox is gone; another check is already making a new one."),

@@ -101,6 +101,8 @@ pub struct Due {
     pub node_id: String,
     pub title: String,
     pub sandbox: String,
+    /// It reached the final phase; otherwise it is idle (nothing in flight).
+    pub done: bool,
 }
 
 /// The nodes whose sandbox should be deleted now: every Files location that
@@ -159,7 +161,8 @@ pub fn due(fleet: &FleetStore) -> Result<Vec<Due>> {
         }
         facts.runner_blocker = lost::runner_blocker(fleet, &node)?;
         if decide(&facts) == Decision::Retire {
-            out.push(Due { node_id: node, title: task.title, sandbox: facts.sandbox.unwrap_or_default() });
+            let done = crate::task::model::lifecycle_rank(&facts.lifecycle) >= final_rank;
+            out.push(Due { node_id: node, title: task.title, sandbox: facts.sandbox.unwrap_or_default(), done });
         }
     }
     Ok(out)
@@ -277,7 +280,8 @@ pub fn retire_due_with(
             }
             Ok(message) => {
                 stopped().get_or_insert_with(Default::default).remove(&item.node_id);
-                tracing::info!("sandbox retire: {} reached {FINAL_PHASE}: {message}", item.title);
+                let why = if item.done { format!("reached {FINAL_PHASE}") } else { "is idle".to_string() };
+                tracing::info!("sandbox retire: {} {why}: {message}", item.title);
                 report.deleted.push(message);
                 note(crate::node_problems::clear(fleet, &item.node_id, KIND_SANDBOX_RETIRE));
             }

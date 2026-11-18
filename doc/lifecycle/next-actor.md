@@ -485,7 +485,7 @@ deleted when the run stops, and each write is pushed at once
   wakes the supervisor);
 - the node's sandbox gone (`cloud_nodes.lost_at`): `You::Stopped`, "its sandbox
   was deleted; Start makes a new one" (or "is gone; a new one is
-  made at the next sync, or Start makes one now");
+  made when the node next has work, or Start makes one now");
 - an idle row with none of these, or no row: whatever the node's waits,
   requests and last outcome say, as before (a node that finished or waits on
   GitHub is `Others`, not `Working`).
