@@ -1119,3 +1119,45 @@ fn an_image_location_without_a_url_says_where_to_give_one() {
     assert!(!err.contains("set the Files directory to"), "{err}");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+mod push_urgency {
+    use super::super::push_is_urgent;
+    use crate::impact::OutlineView;
+    use tod_store::sync::Change;
+    use uuid::Uuid;
+
+    struct Flat;
+    impl OutlineView for Flat {
+        fn ancestors(&self, _: Uuid) -> Vec<Uuid> {
+            Vec::new()
+        }
+        fn referenced(&self, _: Uuid) -> Vec<Uuid> {
+            Vec::new()
+        }
+    }
+
+    fn change(node: Option<Uuid>, table: &str) -> Change {
+        Change { seq: 1, node_id: node, table: table.into(), key: Default::default(), before: None, after: None }
+    }
+
+    #[test]
+    fn what_only_a_local_node_changed_waits_for_the_batch() {
+        let (local, cloud) = (Uuid::new_v4(), Uuid::new_v4());
+        let pending = [change(Some(local), "waits"), change(Some(local), "run_state"), change(Some(local), "node_obligations")];
+        assert!(!push_is_urgent(&pending, &[cloud], &Flat, false));
+        assert!(!push_is_urgent(&pending, &[], &Flat, false), "no node in the cloud, nobody to wake");
+    }
+
+    #[test]
+    fn a_change_to_a_cloud_node_or_to_no_node_goes_at_once() {
+        let (local, cloud) = (Uuid::new_v4(), Uuid::new_v4());
+        assert!(push_is_urgent(&[change(Some(local), "waits"), change(Some(cloud), "decision_answers")], &[cloud], &Flat, false));
+        assert!(push_is_urgent(&[change(None, "settings")], &[cloud], &Flat, false));
+    }
+
+    #[test]
+    fn everything_goes_at_once_while_a_cloud_node_works() {
+        let local = Uuid::new_v4();
+        assert!(push_is_urgent(&[change(Some(local), "waits")], &[Uuid::new_v4()], &Flat, true));
+    }
+}
