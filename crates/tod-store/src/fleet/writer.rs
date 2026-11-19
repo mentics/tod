@@ -105,6 +105,11 @@ pub enum FleetMutation {
         node_id: String,
         at: i64,
     },
+    /// Something launched from or opened a node's files location at `at` (ms).
+    MarkFilesUsed {
+        node_id: String,
+        at: i64,
+    },
     // --- Agent capability (immediate) ---
     /// Platform / model / effort for a node; `None` follows settings.
     UpsertNodeAgent {
@@ -309,6 +314,7 @@ impl FleetMutation {
                 | FleetMutation::RecordFilesLocation { .. }
                 | FleetMutation::DeleteFilesLocation { .. }
                 | FleetMutation::MarkFilesCredsSynced { .. }
+                | FleetMutation::MarkFilesUsed { .. }
                 | FleetMutation::RecordBranchStarts { .. }
                 | FleetMutation::UpsertNodeAgent { .. }
                 | FleetMutation::UpdateAgentRunReconnect { .. }
@@ -421,6 +427,9 @@ impl FleetMutation {
             }
             FleetMutation::MarkFilesCredsSynced { node_id, at } => {
                 crate::fleet::repos::files_location::FilesLocationRepo::new(conn).mark_creds_synced(node_id, *at)?;
+            }
+            FleetMutation::MarkFilesUsed { node_id, at } => {
+                crate::fleet::repos::files_location::FilesLocationRepo::new(conn).mark_used(node_id, *at)?;
             }
             FleetMutation::UpsertNodeAgent {
                 node_id,

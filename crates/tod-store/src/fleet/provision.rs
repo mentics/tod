@@ -44,6 +44,76 @@ pub fn resolve_launch_cwd_with(
     node_id: &str,
     progress: &mut dyn FnMut(&str),
 ) -> Result<(Workdir, Vec<String>)> {
+    // A worktree already made is used under the node's lock, which a release of
+    // its lease ([`release_parked_worktree`]) also holds for all of its work: a
+    // launch and a release never interleave, so the directory returned here is
+    // the node's own while its caller starts using it. The use is stamped
+    // ([`RELEASE_IDLE_MS`]) so a release also keeps off it while whatever was
+    // launched (a shell, an editor, an agent, a run) is being registered or
+    // used. Sandboxes are not given back, and their refresh below may take the
+    // lock itself, so they stay outside it.
+    {
+        let lock = node_lock(node_id);
+        let _held = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let files = resolve_files(fleet, node_id)?;
+        if let FilesDirectory::Ready(dir) = files.directory()
+            && dir.sandbox_name().is_none()
+        {
+            mark_used(fleet, node_id)?;
+            let warnings = put_on_branch(&files, &dir, progress)?;
+            return Ok((dir, warnings));
+        }
+    }
+    resolve_launch_cwd_unlocked(fleet, node_id, progress)
+}
+
+/// Records that something used `node_id`'s files location just now.
+fn mark_used(fleet: &FleetStore, node_id: &str) -> Result<()> {
+    fleet.enqueue(FleetMutation::MarkFilesUsed { node_id: node_id.to_string(), at: crate::outline::uuid_blob::now_ms() })?;
+    fleet.writer().flush()?;
+    Ok(())
+}
+
+/// How long a worktree must have gone unused (no launch, shell, editor,
+/// terminal, check or run resolved its directory) before a parked node's lease
+/// is given back. Long, because an editor or a terminal handoff stays open on
+/// the directory with nothing in the store that says so: a person reading or
+/// editing there is "using" it for hours after the open.
+pub const RELEASE_IDLE_MS: i64 = 2 * 60 * 60 * 1000;
+
+/// Puts the checkout on the node's branch, and its submodules (a submodule can
+/// lose the branch after the location was made, so every launch puts it back;
+/// a shell or editor opened on the node relies on it).
+fn put_on_branch(files: &ResolvedFiles, dir: &Workdir, progress: &mut dyn FnMut(&str)) -> Result<Vec<String>> {
+    if !files.per_node() {
+        return Ok(Vec::new());
+    }
+    let branch = files
+        .branch()
+        .map(str::to_string)
+        .filter(|b| !b.is_empty())
+        .or_else(|| worktree::current_branch(dir));
+    let Some(branch) = branch else { return Ok(Vec::new()) };
+    // The checkout itself first: a made location can sit on the default branch
+    // (only its submodules were ever put back), and the supervisor refuses to
+    // push that. Never a warning: nothing runs on it.
+    worktree::ensure_on_branch(dir, &branch)?;
+    progress("Checking the submodules…");
+    match worktree::branch_submodules(dir, &branch) {
+        Ok(warnings) => Ok(warnings),
+        // The sandbox expired: not a submodule problem. Failing here lets
+        // `retry_if_sandbox_lost` recover, instead of a shell opening on a
+        // sandbox that is not there.
+        Err(err) if sandbox_is_gone(&err) => Err(err),
+        Err(err) => Ok(vec![format!("{err:#}")]),
+    }
+}
+
+fn resolve_launch_cwd_unlocked(
+    fleet: &FleetStore,
+    node_id: &str,
+    progress: &mut dyn FnMut(&str),
+) -> Result<(Workdir, Vec<String>)> {
     let files = resolve_files(fleet, node_id)?;
     match files.directory() {
         FilesDirectory::Ready(dir) => {
@@ -77,38 +147,12 @@ pub fn resolve_launch_cwd_with(
                     }
                 }
             }
-            // A submodule can lose the branch after the location was made (a
-            // base merge, `git submodule update`, a pull request's work that
-            // started elsewhere), so every launch puts it back. This is what a
-            // shell or editor opened on the node relies on.
-            let warnings = if files.per_node() {
-                let branch = files
-                    .branch()
-                    .map(str::to_string)
-                    .filter(|b| !b.is_empty())
-                    .or_else(|| worktree::current_branch(&dir));
-                match branch {
-                    Some(branch) => {
-                        // The checkout itself first: a made location can sit
-                        // on the default branch (only its submodules were
-                        // ever put back), and the supervisor refuses to push
-                        // that. Never a warning: nothing runs on it.
-                        worktree::ensure_on_branch(&dir, &branch)?;
-                        progress("Checking the submodules…");
-                        match worktree::branch_submodules(&dir, &branch) {
-                            Ok(warnings) => warnings,
-                            // The sandbox expired: not a submodule problem. Failing here
-                            // lets `retry_if_sandbox_lost` recover, instead of a shell
-                            // opening on a sandbox that is not there.
-                            Err(err) if sandbox_is_gone(&err) => return Err(err),
-                            Err(err) => vec![format!("{err:#}")],
-                        }
-                    }
-                    None => Vec::new(),
-                }
-            } else {
-                Vec::new()
-            };
+            // Made between the locked look above and this one (a worktree):
+            // go through the lock again.
+            if dir.sandbox_name().is_none() {
+                return resolve_launch_cwd_with(fleet, node_id, progress);
+            }
+            let warnings = put_on_branch(&files, &dir, progress)?;
             Ok((dir, warnings))
         }
         FilesDirectory::Missing(reason) => bail!("{reason}"),
@@ -302,7 +346,12 @@ pub fn make_location(
     // Another launch may have made it while this one waited.
     let files = resolve_files(fleet, node_id)?;
     match files.directory() {
-        FilesDirectory::Ready(dir) => return Ok((dir, Vec::new())),
+        FilesDirectory::Ready(dir) => {
+            if dir.sandbox_name().is_none() {
+                mark_used(fleet, node_id)?;
+            }
+            return Ok((dir, Vec::new()));
+        }
         FilesDirectory::Missing(reason) => bail!("{reason}"),
         FilesDirectory::NotMade => {}
     }
@@ -481,6 +530,9 @@ pub fn release_parked_worktree(
 ) -> Result<Release> {
     let lock = node_lock(node_id);
     let _held = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Everything below is read under the lock, so a launch that resolved this
+    // directory first is seen (its stamp), and one that comes later waits and
+    // then finds the location not made.
     let Some(location) = node_location(fleet, node_id)? else {
         return Ok(Release::Kept("no files of its own".into()));
     };
@@ -489,6 +541,17 @@ pub fn release_parked_worktree(
     };
     if location.sandbox().is_some() {
         return Ok(Release::Kept("its files are a sandbox".into()));
+    }
+    let used_at = fleet
+        .read(|c| FilesLocationRepo::new(c).used_at(node_id))?
+        .context("the location vanished while it was being read")?;
+    let idle = crate::outline::uuid_blob::now_ms() - used_at;
+    if idle < RELEASE_IDLE_MS {
+        return Ok(Release::Kept(format!(
+            "used {} minute(s) ago (released after {} minutes unused)",
+            idle.max(0) / 60_000,
+            RELEASE_IDLE_MS / 60_000
+        )));
     }
     let dir = location_dir(&location)?;
     match location_state(fleet, paths, node_id)? {
@@ -507,6 +570,30 @@ pub fn release_parked_worktree(
         .with_context(|| format!("give back the lease of {}", location.describe()))?;
     forget_removed_location(fleet, node_id, &location)?;
     Ok(Release::Released)
+}
+
+/// The head commit of `node_id`'s branch on `origin`, for a node whose
+/// worktree is not made (never, or given back by [`release_parked_worktree`]),
+/// asked of the remote without making anything: no lease, no checkout. `None`
+/// when the node's files are made, a sandbox or shared, when it has no branch
+/// or repository yet, or when the remote does not have the branch. An error
+/// (the remote cannot be reached) is returned, never read as "unchanged".
+/// Network: not on the UI thread.
+pub fn unmade_branch_head(fleet: &FleetStore, node_id: &str) -> Result<Option<String>> {
+    let files = resolve_files(fleet, node_id)?;
+    if !files.per_node() || files.runs_in_sandbox() || files.stale_location.is_some() {
+        return Ok(None);
+    }
+    if !matches!(files.directory(), FilesDirectory::NotMade) {
+        return Ok(None);
+    }
+    let (Some(branch), Some(repo)) = (files.branch(), files.repo_dir()) else {
+        return Ok(None);
+    };
+    let listed = repo
+        .git(&["ls-remote", "origin", &format!("refs/heads/{branch}")])
+        .with_context(|| format!("ask origin for the head of {branch} in {repo}"))?;
+    Ok(listed.lines().next().and_then(|line| line.split_whitespace().next()).map(str::to_string))
 }
 
 /// The longest a sandbox name made here may be (the name also goes into the
@@ -3685,6 +3772,11 @@ mod tests {
         location.worktree_lease_holder = Some("tod-x".into());
         record(&store, &location).unwrap();
 
+        // Just made: in use, so kept whatever its state.
+        let kept = release_parked_worktree(&store, &paths, &settings, &child).unwrap();
+        assert!(matches!(&kept, Release::Kept(why) if why.contains("minute(s) ago")), "{kept:?}");
+        age_location(&store, &child);
+
         // Dirty: kept.
         std::fs::write(dir_path.join("work.txt"), "wip").unwrap();
         let kept = release_parked_worktree(&store, &paths, &settings, &child).unwrap();
@@ -3718,5 +3810,153 @@ mod tests {
         drop(store);
         crate::paths::clear_data_root_override();
         cleanup_fleet_root(&root);
+    }
+
+    /// Pretends nothing has used `node`'s location for a day.
+    fn age_location(store: &FleetStore, node: &str) {
+        let conn = rusqlite::Connection::open(store.paths().db()).unwrap();
+        conn.execute(
+            "UPDATE node_files_locations SET used_at = ?1 WHERE node_id = ?2",
+            rusqlite::params![crate::outline::uuid_blob::now_ms() - 24 * 3600 * 1000, crate::fleet::repos::node_id_blob(node).unwrap()],
+        )
+        .unwrap();
+        drop(conn);
+        store.reload_if_stale().unwrap();
+    }
+
+    /// A made, leased, idle, clean and pushed worktree for the node, with a
+    /// fake Treehouse that logs what it is asked.
+    struct Parked {
+        root: std::path::PathBuf,
+        store: FleetStore,
+        paths: TodPaths,
+        settings: TodSettings,
+        node: String,
+        log: std::path::PathBuf,
+    }
+
+    fn parked_worktree() -> Parked {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_fleet_root();
+        let (repo, _origin) = repo_with_origin(&root);
+        crate::paths::set_data_root(root.join("data"));
+        let paths = TodPaths::discover().unwrap();
+        let log = root.join("treehouse.log");
+        let fake = root.join("treehouse");
+        std::fs::write(&fake, format!("#!/bin/sh\necho \"$@\" >> {}\nexit 0\n", log.display())).unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let settings = TodSettings {
+            worktree_backend: WorktreeBackend::GitOnly,
+            fleet_storage_root: Some(root.join("data")),
+            treehouse_executable: Some(fake),
+            ..TodSettings::default()
+        };
+        settings.save(&paths).unwrap();
+        let store = FleetStore::open(root.join("fleet")).unwrap();
+        let (_parent, node) = tree(&store, &repo);
+        let (dir, _) = make_location(&store, &paths, &settings, &node, &mut |_| {}).unwrap();
+        let dir_path = dir.host_path().unwrap().to_path_buf();
+        git(&dir_path, &["config", "user.email", "t@example.com"]);
+        git(&dir_path, &["config", "user.name", "t"]);
+        let mut location = node_location(&store, &node).unwrap().unwrap();
+        location.worktree_lease_id = Some("lease-1".into());
+        location.worktree_lease_holder = Some("tod-x".into());
+        record(&store, &location).unwrap();
+        let slug = store.get_node(&node).unwrap().unwrap().slug;
+        git(&dir_path, &["push", "-q", "origin", &format!("task/{slug}")]);
+        age_location(&store, &node);
+        Parked { root, store, paths, settings, node, log }
+    }
+
+    fn done_with(p: Parked) {
+        let Parked { root, store, .. } = p;
+        drop(store);
+        crate::paths::clear_data_root_override();
+        cleanup_fleet_root(&root);
+    }
+
+    /// Runs `f` on another thread and says whether it finished within `wait`.
+    fn finishes_within<T: Send + 'static>(
+        wait: Duration,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> (bool, std::thread::JoinHandle<T>) {
+        let (done, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let out = f();
+            done.send(()).ok();
+            out
+        });
+        (rx.recv_timeout(wait).is_ok(), handle)
+    }
+
+    /// Shepherd gap 68 review, point 2: a release and a launch cannot
+    /// interleave. A launch on a made worktree and a release both hold the
+    /// node's lock; and a release re-reads the location's use under it, so a
+    /// launch that came in while the release waited keeps the lease.
+    #[test]
+    fn a_launch_and_a_release_of_the_same_worktree_do_not_interleave() {
+        let p = parked_worktree();
+        let (store, paths, settings, node) = (Arc::new(p.store), p.paths.clone(), p.settings.clone(), p.node.clone());
+        // A release that waited for the lock sees the use made meanwhile.
+        let lock = node_lock(&node);
+        let held = lock.lock().unwrap();
+        let (rel_store, rel_node, rel_paths, rel_settings) = (store.clone(), node.clone(), paths.clone(), settings.clone());
+        let (done, release) = finishes_within(Duration::from_millis(400), move || {
+            release_parked_worktree(&rel_store, &rel_paths, &rel_settings, &rel_node)
+        });
+        assert!(!done, "a release did not wait for the node's lock");
+        // And a launch waits for a release in progress.
+        let (launch_store, launch_node) = (store.clone(), node.clone());
+        let (done, launch) =
+            finishes_within(Duration::from_millis(400), move || resolve_launch_cwd(&launch_store, &launch_node));
+        assert!(!done, "the launch of a made worktree did not wait for the node's lock");
+        drop(held);
+        launch.join().unwrap().unwrap();
+        let kept = release.join().unwrap().unwrap();
+        // Whichever got the lock first, the lease is not returned from under the launch.
+        match &kept {
+            Release::Kept(why) => assert!(why.contains("minute(s) ago"), "{kept:?}"),
+            Release::Released => {
+                // The release won the lock: the launch then found the location not made and made it again.
+                assert!(launch_cwd_if_made(&store, &node).unwrap().is_some(), "the launch's directory is gone");
+            }
+        }
+        drop(store);
+        crate::paths::clear_data_root_override();
+        cleanup_fleet_root(&p.root);
+    }
+
+    /// Point 3: whatever resolves the directory (an editor, a terminal, a
+    /// handoff, a shell all do, through `resolve_launch_cwd`) keeps a release
+    /// off it for [`RELEASE_IDLE_MS`]; unused for longer, it is given back.
+    #[test]
+    fn a_worktree_opened_lately_is_kept_and_an_idle_one_is_released() {
+        let p = parked_worktree();
+        // Idle and clean and pushed: would be released. Open it first.
+        resolve_launch_cwd(&p.store, &p.node).unwrap();
+        let kept = release_parked_worktree(&p.store, &p.paths, &p.settings, &p.node).unwrap();
+        assert!(matches!(&kept, Release::Kept(why) if why.contains("minute(s) ago")), "{kept:?}");
+        // Idle again: given back.
+        age_location(&p.store, &p.node);
+        assert_eq!(release_parked_worktree(&p.store, &p.paths, &p.settings, &p.node).unwrap(), Release::Released);
+        assert!(std::fs::read_to_string(&p.log).unwrap().contains("return"));
+        // A launch makes it again, and that counts as a use.
+        resolve_launch_cwd(&p.store, &p.node).unwrap();
+        let kept = release_parked_worktree(&p.store, &p.paths, &p.settings, &p.node).unwrap();
+        assert!(matches!(&kept, Release::Kept(_)), "{kept:?}");
+        done_with(p);
+    }
+
+    /// The pushed head of a node whose worktree is not made is read from the
+    /// remote, with nothing made; a made one says nothing.
+    #[test]
+    fn the_pushed_head_of_an_unmade_worktree_is_read_without_making_it() {
+        let p = parked_worktree();
+        assert_eq!(unmade_branch_head(&p.store, &p.node).unwrap(), None, "made: not asked");
+        assert_eq!(release_parked_worktree(&p.store, &p.paths, &p.settings, &p.node).unwrap(), Release::Released);
+        let head = unmade_branch_head(&p.store, &p.node).unwrap().expect("the branch is on origin");
+        assert_eq!(head.len(), 40, "{head}");
+        assert_eq!(launch_cwd_if_made(&p.store, &p.node).unwrap(), None, "reading the head made nothing");
+        done_with(p);
     }
 }

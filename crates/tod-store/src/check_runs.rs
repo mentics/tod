@@ -26,6 +26,7 @@ pub const CREATE_TABLE: &str = "
         verdict     TEXT NOT NULL CHECK (verdict IN ('passed','failed','broken','skipped')),
         output      TEXT NOT NULL,
         ran_at      INTEGER NOT NULL,
+        tree_key    TEXT NOT NULL DEFAULT '',
         PRIMARY KEY (node_id, phase, dir, command)
     );";
 
@@ -41,6 +42,10 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         }
     }
     conn.execute_batch(CREATE_TABLE)?;
+    let has_key = conn.prepare("SELECT 1 FROM pragma_table_info('check_runs') WHERE name = 'tree_key'")?.exists([])?;
+    if !has_key {
+        conn.execute_batch("ALTER TABLE check_runs ADD COLUMN tree_key TEXT NOT NULL DEFAULT '';")?;
+    }
     Ok(())
 }
 
@@ -88,6 +93,13 @@ pub struct CheckRun {
     /// The tail of its output, or why it could not run.
     pub output: String,
     pub ran_at: i64,
+    /// Names the committed tree and the check's definition this run was judged
+    /// against, set only when the files were exactly a commit (nothing
+    /// uncommitted or untracked): `tod_core::checks::tree_key`. A run with the
+    /// key of a pushed branch head answers for that head without any
+    /// checkout, so a parked node need not lease a worktree to know its checks
+    /// are current. Empty when the files were not a clean commit.
+    pub tree_key: String,
 }
 
 pub struct CheckRunRepo<'a> {
@@ -102,11 +114,11 @@ impl<'a> CheckRunRepo<'a> {
     /// Record a run, replacing the last one of the same command in the phase.
     pub fn record(&self, run: &CheckRun) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO check_runs (node_id, phase, dir, command, label, fingerprint, verdict, output, ran_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "INSERT INTO check_runs (node_id, phase, dir, command, label, fingerprint, verdict, output, ran_at, tree_key)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(node_id, phase, dir, command) DO UPDATE SET
                  label = excluded.label, fingerprint = excluded.fingerprint, verdict = excluded.verdict,
-                 output = excluded.output, ran_at = excluded.ran_at",
+                 output = excluded.output, ran_at = excluded.ran_at, tree_key = excluded.tree_key",
             params![
                 uuid_to_blob(run.node_id),
                 run.phase,
@@ -116,7 +128,8 @@ impl<'a> CheckRunRepo<'a> {
                 run.fingerprint,
                 run.verdict.as_str(),
                 run.output,
-                run.ran_at
+                run.ran_at,
+                run.tree_key
             ],
         )?;
         Ok(())
@@ -142,7 +155,7 @@ impl<'a> CheckRunRepo<'a> {
     }
 }
 
-const COLUMNS: &str = "node_id, phase, command, label, fingerprint, verdict, output, ran_at, dir";
+const COLUMNS: &str = "node_id, phase, command, label, fingerprint, verdict, output, ran_at, dir, tree_key";
 
 fn row(r: &Row<'_>) -> rusqlite::Result<Result<CheckRun>> {
     let node: Vec<u8> = r.get(0)?;
@@ -157,6 +170,7 @@ fn row(r: &Row<'_>) -> rusqlite::Result<Result<CheckRun>> {
         output: r.get(6)?,
         ran_at: r.get(7)?,
         dir: r.get(8)?,
+        tree_key: r.get(9)?,
     };
     Ok(Verdict::parse(&verdict).map(|verdict| CheckRun { verdict, ..run }))
 }

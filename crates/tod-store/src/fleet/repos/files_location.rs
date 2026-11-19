@@ -32,11 +32,24 @@ CREATE TABLE IF NOT EXISTS node_files_locations (
     sandbox               TEXT,
     created_at            INTEGER NOT NULL,
     updated_at            INTEGER NOT NULL,
-    creds_synced_at       INTEGER NOT NULL DEFAULT 0
+    creds_synced_at       INTEGER NOT NULL DEFAULT 0,
+    used_at               INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_node_files_locations_source
     ON node_files_locations(source_node_id);
 ";
+
+/// Adds `used_at` (machine-local, no schema version) to a table from before it
+/// existed. Every location already there starts as used now, so a deploy does
+/// not make the worktrees someone has open look idle.
+pub fn ensure_used_at(conn: &Connection) -> Result<()> {
+    let has = conn.prepare("SELECT 1 FROM pragma_table_info('node_files_locations') WHERE name = 'used_at'")?.exists([])?;
+    if !has {
+        conn.execute_batch("ALTER TABLE node_files_locations ADD COLUMN used_at INTEGER NOT NULL DEFAULT 0;")?;
+        conn.execute("UPDATE node_files_locations SET used_at = ?1", params![now_ms()])?;
+    }
+    Ok(())
+}
 
 /// The Files settings that decide what a node's location is, as one string:
 /// two locations made from the same key are interchangeable. The branch is
@@ -178,8 +191,8 @@ impl<'a> FilesLocationRepo<'a> {
         self.conn.execute(
             "INSERT INTO node_files_locations
                (node_id, source_node_id, recipe, worktree_path, worktree_lease_id,
-                worktree_lease_holder, sandbox, created_at, updated_at, repo, container)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                worktree_lease_holder, sandbox, created_at, updated_at, repo, container, used_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?9)
              ON CONFLICT(node_id) DO UPDATE SET
                source_node_id = excluded.source_node_id,
                recipe = excluded.recipe,
@@ -220,6 +233,28 @@ impl<'a> FilesLocationRepo<'a> {
             )
             .optional()?
             .unwrap_or(0))
+    }
+
+    /// When something last launched from, opened or ran in this location
+    /// (ms; `None` without one). A parked node's worktree is given back to the
+    /// pool only once this is long past (`provision::release_parked_worktree`).
+    pub fn used_at(&self, node_id: &str) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT used_at FROM node_files_locations WHERE node_id = ?1",
+                params![node_id_blob(node_id)?],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn mark_used(&self, node_id: &str, at: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE node_files_locations SET used_at = MAX(used_at, ?2) WHERE node_id = ?1",
+            params![node_id_blob(node_id)?, at],
+        )?;
+        Ok(())
     }
 
     pub fn mark_creds_synced(&self, node_id: &str, at: i64) -> Result<()> {

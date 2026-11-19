@@ -120,6 +120,20 @@ impl Tree {
         Ok(Self { repos, fingerprints: Default::default(), changes: Default::default() })
     }
 
+    /// The root's `HEAD` commit when the files are exactly that commit:
+    /// nothing uncommitted or untracked in the repository or any submodule
+    /// (`git status` covers them all). Gitignored files are not looked at, as
+    /// in [`repo_fingerprint`]. `None` otherwise.
+    fn clean_head(&self) -> Result<Option<String>> {
+        let root = &self.repos[0].1;
+        let status = root.git_output(&["status", "--porcelain"])?;
+        anyhow::ensure!(status.status.success(), "git status failed in {root}: {}", String::from_utf8_lossy(&status.stderr).trim());
+        if !status.stdout.iter().all(u8::is_ascii_whitespace) {
+            return Ok(None);
+        }
+        Ok(Some(root.git(&["rev-parse", "HEAD"]).with_context(|| format!("read HEAD in {root}"))?))
+    }
+
     fn fingerprint_of(&self, index: usize) -> Result<String> {
         if let Some(found) = self.fingerprints.borrow().get(&index) {
             return Ok(found.clone());
@@ -641,6 +655,7 @@ fn ensure_setup(fleet: &FleetStore, node: Uuid, key: &str, dir: &str, cwd: &Work
         verdict,
         output,
         ran_at: tod_store::check_runs::now(),
+        tree_key: String::new(),
     };
     fleet.enqueue(tod_store::fleet::FleetMutation::RecordCheckRun(Box::new(run.clone())))?;
     fleet.writer().flush()?;
@@ -799,6 +814,49 @@ impl Round {
     }
 }
 
+/// Names a committed tree and what a check is, as a run records it
+/// ([`CheckRun::tree_key`]): the head commit and every setting of the check
+/// that decides what it does here.
+pub fn tree_key(head: &str, check: &Check) -> String {
+    let text = format!(
+        "tree\0{head}\0{}\0{}\0{}\0{}\0{}\0{}",
+        check.label, check.command, check.dir, check.changed, check.pattern, check.setup
+    );
+    hex(&Sha256::digest(text.as_bytes()))
+}
+
+/// The round for a node whose worktree is not made, answered without making
+/// it, when that is certain: every check's latest run passed (or did not
+/// apply) against exactly the commit now at the head of the node's branch on
+/// `origin`, and the check is as it was then ([`tree_key`]). `None` when
+/// the files are made (then they are looked at as they are), or when any check
+/// has no such run: the caller makes the files and looks properly. A node
+/// parked for days on a review is woken often (a webhook, a timer); without
+/// this each wake leased a pool worktree, which the daemon's release then took
+/// back (shepherd gap 68).
+fn current_without_files(fleet: &FleetStore, node: Uuid, key: &str, checks: &[Check]) -> Result<Option<Round>> {
+    let Some(head) = tod_store::fleet::provision::unmade_branch_head(fleet, &node.to_string())
+        .context("find out whether the pushed branch changed since the checks last ran")?
+    else {
+        return Ok(None);
+    };
+    let mut runs = Vec::new();
+    for check in checks {
+        let latest = fleet.read(|conn| CheckRunRepo::new(conn).latest(node, key, &clean_dir(&check.dir), &check.command))?;
+        match latest {
+            Some(run)
+                if run.tree_key == tree_key(&head, check)
+                    && run.label == check.label
+                    && matches!(run.verdict, Verdict::Passed | Verdict::Skipped) =>
+            {
+                runs.push(run)
+            }
+            _ => return Ok(None),
+        }
+    }
+    Ok(Some(Round { fingerprint: format!("head {head}"), runs }))
+}
+
 /// Run the checks configured for `state` whose latest run was against other
 /// files than these (or never happened), and return every check's latest run.
 /// Does nothing, and returns an empty round, when none is configured. Git,
@@ -809,9 +867,14 @@ pub fn run_stale(fleet: &FleetStore, node: Uuid, state: &str) -> Result<Round> {
     if checks.is_empty() {
         return Ok(Round::default());
     }
+    // Current runs of a node with no worktree need none made to say so.
+    if let Some(round) = current_without_files(fleet, node, key, &checks)? {
+        return Ok(round);
+    }
     let cwd = tod_store::fleet::provision::resolve_launch_cwd(fleet, &node.to_string())
         .with_context(|| format!("find the files to run the {state} checks in"))?;
     let tree = Tree::new(&cwd)?;
+    let clean_head = tree.clean_head()?;
     let mut round = Round { fingerprint: tree.fingerprint_all()?, runs: Vec::new() };
     // The commands this round actually ran, for the node's activity.
     let mut ran: Vec<tod_store::node_timeline::CommandResult> = Vec::new();
@@ -819,8 +882,27 @@ pub fn run_stale(fleet: &FleetStore, node: Uuid, state: &str) -> Result<Round> {
         let dir = clean_dir(&check.dir);
         let assessment = assess(&tree, check)?;
         let latest = fleet.read(|conn| CheckRunRepo::new(conn).latest(node, key, &dir, &check.command))?;
+        let key_now = clean_head.as_deref().map(|head| tree_key(head, check));
         let run = match latest {
-            Some(run) if run.fingerprint == assessment.fingerprint && run.label == check.label && reusable(&run) => run,
+            // Current: the same files, or the same commit (a worktree made
+            // again elsewhere has other paths, so another fingerprint).
+            Some(run)
+                if run.label == check.label
+                    && reusable(&run)
+                    && (run.fingerprint == assessment.fingerprint || key_now.as_deref().is_some_and(|k| run.tree_key == k)) =>
+            {
+                match key_now {
+                    // Remember which commit it answers for, so a later look
+                    // needs no files ([`current_without_files`]).
+                    Some(k) if run.tree_key != k => {
+                        let run = CheckRun { tree_key: k, ..run };
+                        fleet.enqueue(tod_store::fleet::FleetMutation::RecordCheckRun(Box::new(run.clone())))?;
+                        fleet.writer().flush()?;
+                        run
+                    }
+                    _ => run,
+                }
+            }
             _ => {
                 let (verdict, output) = if assessment.applicable {
                     let at = cwd.join(&dir);
@@ -858,6 +940,7 @@ pub fn run_stale(fleet: &FleetStore, node: Uuid, state: &str) -> Result<Round> {
                     verdict,
                     output,
                     ran_at: tod_store::check_runs::now(),
+                    tree_key: key_now.unwrap_or_default(),
                 };
                 fleet.enqueue(tod_store::fleet::FleetMutation::RecordCheckRun(Box::new(run.clone())))?;
                 fleet.writer().flush()?;
@@ -1235,6 +1318,7 @@ mod tests {
             verdict,
             output: "the command did not finish in 10 minutes and was stopped".into(),
             ran_at: 0,
+            tree_key: String::new(),
         };
         assert!(!reusable(&run(Verdict::Broken)));
         assert!(reusable(&run(Verdict::Passed)) && reusable(&run(Verdict::Failed)) && reusable(&run(Verdict::Skipped)));
@@ -1253,6 +1337,7 @@ mod tests {
             verdict,
             output: output.into(),
             ran_at: tod_store::check_runs::now(),
+            tree_key: String::new(),
         };
         assert!(is_memory_kill(&run(Verdict::Broken, "Killed for memory (SIGKILL).")));
         assert!(!is_memory_kill(&run(Verdict::Broken, "no such directory")));

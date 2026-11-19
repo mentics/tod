@@ -504,8 +504,17 @@ Nothing starts or builds a container; tod only uses a running one.
   A lease is not held while a node is parked: the daemon's minute pass
   (`tod_core::worktree_release`) gives back the lease of a node at `pr_draft`
   or later that nothing works on, when its checkout is clean and pushed
-  (`provision::release_parked_worktree`); its location is then "not made yet"
-  and the next launch leases again. A full pool's error names the holders.
+  (`provision::release_parked_worktree`) and has gone unused for
+  `RELEASE_IDLE_MS` (2 hours: every `resolve_launch_cwd`, so every shell,
+  editor, terminal, handoff, check and run, stamps `node_files_locations.used_at`,
+  which is how an editor left open is seen); a launch on a made worktree and a
+  release both hold the node's lock. Its location is then "not made yet" and the
+  next launch leases again, but a wake-up never does: the gate's checks are
+  answered for an unmade worktree from the pushed head
+  (`provision::unmade_branch_head`, `checks::current_without_files`, against the
+  `tree_key` of the run), leasing only when a check has to run. Gitignored
+  files (`.env`, build outputs) are lost with the released worktree, as with
+  `remove_location`. A full pool's error names the holders.
   Wherever it runs, a lease asks for `--submodules` when the repository has
   a `.gitmodules`, and a new git worktree runs `git submodule update --init
   --recursive`. Either way `ensure_worktree` then initializes any submodule

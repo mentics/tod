@@ -34,8 +34,13 @@ pub struct Released {
 }
 
 /// The nodes holding a Treehouse lease that are parked: at `pr_draft` or
-/// later, nothing automated working on them, no runner.
+/// later, nothing automated working on them, no runner, and their location
+/// unused for [`provision::RELEASE_IDLE_MS`].
 pub fn due(fleet: &FleetStore) -> Result<Vec<(String, String)>> {
+    // Another process (the app) stamps a location's use: look at the store as
+    // it is now.
+    fleet.reload_if_stale()?;
+    let now = tod_store::outline::uuid_blob::now_ms();
     let leased: Vec<tod_store::fleet::FilesLocation> = fleet
         .read(|c| tod_store::fleet::repos::files_location::FilesLocationRepo::new(c).list_all())?
         .into_iter()
@@ -48,6 +53,14 @@ pub fn due(fleet: &FleetStore) -> Result<Vec<(String, String)>> {
     let standings = crate::next_actor::compute(fleet, fleet.paths().root())?;
     let from = crate::task::model::lifecycle_rank(PARKED_FROM);
     for location in leased {
+        // Used lately (a launch, shell, editor, terminal, check or run): in
+        // use, and an editor or terminal left open leaves nothing else behind.
+        let used_at = fleet
+            .read(|c| tod_store::fleet::repos::files_location::FilesLocationRepo::new(c).used_at(&location.node_id))?
+            .unwrap_or(0);
+        if now - used_at < provision::RELEASE_IDLE_MS {
+            continue;
+        }
         let Some(task) = fleet.get_node(&location.node_id)? else { continue };
         if crate::task::model::lifecycle_rank(&task.lifecycle) < from {
             continue;
@@ -97,5 +110,230 @@ pub fn release_due(fleet: &FleetStore) -> Result<Released> {
     match first_error {
         Some(err) => Err(err),
         None => Ok(report),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::interview::test_support::{Fixture, fixture};
+    use std::path::{Path, PathBuf};
+    use tod_store::TodPaths;
+    use tod_store::fleet::provision;
+    use tod_store::outline::{Capability, OutlineMutation};
+    use tod_store::settings::{TodSettings, WorktreeBackend};
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.email=t@example.com", "-c", "user.name=t", "-c", "commit.gpgsign=false"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    struct Parked {
+        fx: Fixture,
+        repo: PathBuf,
+        origin: PathBuf,
+        log: PathBuf,
+        branch: String,
+        node: String,
+    }
+
+    /// A node in `state` whose own worktree (a git worktree, said to be a
+    /// Treehouse lease) is made, clean and pushed, with a `true` check
+    /// configured for `pr_draft` that has already passed for its head.
+    fn parked(state: &str) -> Parked {
+        use std::os::unix::fs::PermissionsExt;
+        let fx = fixture();
+        let root = fx.root.clone();
+        tod_store::paths::set_data_root(root.clone());
+        let paths = TodPaths::discover().unwrap();
+        let origin = root.join("origin.git");
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&origin, &["init", "-q", "--bare", "-b", "main"]);
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        git(&repo, &["remote", "add", "origin", &origin.to_string_lossy()]);
+        git(&repo, &["push", "-q", "-u", "origin", "main"]);
+        let log = root.join("treehouse.log");
+        let fake = root.join("fake-treehouse");
+        std::fs::write(&fake, format!("#!/bin/sh\necho \"$@\" >> {}\nexit 0\n", log.display())).unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut settings = TodSettings::default();
+        settings.worktree_backend = WorktreeBackend::GitOnly;
+        settings.fleet_storage_root = Some(root.join("worktrees"));
+        settings.treehouse_executable = Some(fake);
+        settings.save(&paths).unwrap();
+        let (fleet, node) = (&fx.fleet, fx.node);
+        fleet
+            .enqueue_outline(OutlineMutation::EnableCapabilities {
+                node_id: node,
+                capabilities: vec![Capability::Files, Capability::Lifecycle, Capability::LifecycleConfig],
+            })
+            .unwrap();
+        fleet.enqueue_outline(OutlineMutation::SetLifecycle { node_id: node, state: state.into() }).unwrap();
+        fleet
+            .enqueue_outline(OutlineMutation::SetNodeLifecycleChecks {
+                node_id: node,
+                checks: [(
+                    "pr_draft".to_string(),
+                    vec![tod_store::lifecycle_config::Check { label: "lint".into(), command: "true".into(), ..Default::default() }],
+                )]
+                .into(),
+            })
+            .unwrap();
+        fleet.writer().flush().unwrap();
+        tod_store::fleet::places::pick_matching(
+            fleet,
+            &node.to_string(),
+            &tod_store::fleet::FilesPlace {
+                repo: Some(repo.to_string_lossy().into_owned()),
+                use_worktree: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        fleet.writer().flush().unwrap();
+        fleet.reload_if_stale().unwrap();
+        // The check runs once, in a worktree made for it, and passes.
+        let round = crate::checks::run_stale(fleet, node, "pr_draft").unwrap();
+        assert!(round.clear() && round.runs.len() == 1, "{round:?}");
+        let node = node.to_string();
+        let mut location = provision::node_location(fleet, &node).unwrap().unwrap();
+        location.worktree_lease_id = Some("lease-1".into());
+        location.worktree_lease_holder = Some("tod-x".into());
+        fleet.enqueue(tod_store::fleet::FleetMutation::RecordFilesLocation { location: location.clone() }).unwrap();
+        fleet.writer().flush().unwrap();
+        let dir = location.directory().unwrap();
+        let dir = dir.host_path().unwrap().to_path_buf();
+        let branch = git(&dir, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        git(&dir, &["push", "-q", "origin", &branch]);
+        let parked = Parked { fx, repo, origin, log, branch, node };
+        parked.idle();
+        parked
+    }
+
+    impl Parked {
+        /// Nothing has used the worktree for a day.
+        fn idle(&self) {
+            self.set_used(tod_store::outline::uuid_blob::now_ms() - 24 * 3600 * 1000);
+        }
+
+        fn set_used(&self, at: i64) {
+            let conn = rusqlite::Connection::open(self.fx.fleet.paths().db()).unwrap();
+            conn.execute("UPDATE node_files_locations SET used_at = ?1", [at]).unwrap();
+            drop(conn);
+            self.fx.fleet.reload_if_stale().unwrap();
+        }
+
+        fn made(&self) -> bool {
+            provision::launch_cwd_if_made(&self.fx.fleet, &self.node).unwrap().is_some()
+        }
+    }
+
+    impl Drop for Parked {
+        fn drop(&mut self) {
+            tod_store::paths::clear_data_root_override();
+        }
+    }
+
+    fn treehouse_calls(p: &Parked) -> Vec<String> {
+        std::fs::read_to_string(&p.log).map(|t| t.lines().map(str::to_string).collect()).unwrap_or_default()
+    }
+
+    /// Shepherd gap 68 review, point 1: a parked node with checks that passed
+    /// for its pushed head, woken again and again (a webhook, a timer),
+    /// never leases a worktree; a new head makes one, once, and runs the
+    /// check again.
+    #[test]
+    fn a_parked_node_whose_checks_passed_for_its_head_never_leases_a_worktree_when_woken() {
+        let p = parked("pr_draft");
+        let leased_dir = provision::node_location(&p.fx.fleet, &p.node).unwrap().unwrap().directory().unwrap();
+        let leased_dir = leased_dir.host_path().unwrap().to_path_buf();
+        let released = release_due(&p.fx.fleet).unwrap();
+        assert_eq!(released.released.len(), 1, "{released:?}");
+        assert!(!p.made());
+        let first_ran = p.fx.fleet.read(|c| tod_store::check_runs::CheckRunRepo::new(c).latest(p.fx.node, "pr_draft", "", "true")).unwrap().unwrap();
+        for wake in 0..6 {
+            let round = crate::checks::run_stale(&p.fx.fleet, p.fx.node, "pr_draft").unwrap();
+            assert!(round.clear() && round.runs.len() == 1, "wake {wake}: {round:?}");
+            assert!(!p.made(), "wake {wake} leased a worktree again");
+        }
+        assert_eq!(treehouse_calls(&p).len(), 1, "only the one return: {:?}", treehouse_calls(&p));
+        let after = p.fx.fleet.read(|c| tod_store::check_runs::CheckRunRepo::new(c).latest(p.fx.node, "pr_draft", "", "true")).unwrap().unwrap();
+        assert_eq!(after.ran_at, first_ran.ran_at, "the check was not run again");
+
+        // The branch moves (a person pushed): the next look needs the files,
+        // makes them, and runs the check.
+        let other = p.fx.root.join("other");
+        git(&p.fx.root, &["clone", "-q", p.origin.to_str().unwrap(), other.to_str().unwrap()]);
+        git(&other, &["checkout", "-q", &p.branch]);
+        std::fs::write(other.join("new.txt"), "n").unwrap();
+        git(&other, &["add", "."]);
+        git(&other, &["commit", "-qm", "a person's commit"]);
+        git(&other, &["push", "-q", "origin", &p.branch]);
+        // (The fake Treehouse leaves the worktree and its local branch behind;
+        // the real pool's checkout starts from the remote's.)
+        git(&p.repo, &["worktree", "remove", "--force", leased_dir.to_str().unwrap()]);
+        git(&p.repo, &["branch", "-q", "-D", &p.branch]);
+        let round = crate::checks::run_stale(&p.fx.fleet, p.fx.node, "pr_draft").unwrap();
+        assert!(round.clear(), "{round:?}");
+        assert!(p.made(), "a moved head needs its files");
+        assert!(round.runs[0].ran_at > first_ran.ran_at, "the check ran again for the new head");
+    }
+
+    /// `due` and `release_due`: Working nodes, a node before `pr_draft` and a
+    /// node used lately are skipped; a parked idle clean pushed one is released.
+    #[test]
+    fn only_a_parked_idle_clean_pushed_node_is_released() {
+        // A node before pr_draft: skipped.
+        let p = parked("active");
+        assert!(due(&p.fx.fleet).unwrap().is_empty());
+        assert_eq!(release_due(&p.fx.fleet).unwrap(), Released::default());
+        assert!(p.made());
+        drop(p);
+
+        // A node used lately: skipped, whatever its state.
+        let p = parked("pr_draft");
+        p.set_used(tod_store::outline::uuid_blob::now_ms() - 60_000);
+        assert!(due(&p.fx.fleet).unwrap().is_empty());
+        assert!(release_due(&p.fx.fleet).unwrap().released.is_empty());
+        assert!(p.made());
+
+        // A node being worked on by the app: skipped.
+        p.idle();
+        let node = p.fx.node;
+        let lease = tod_store::activity::ActivityLease::start(&p.fx.fleet, node, tod_store::activity::KIND_RUN, "test-run").unwrap();
+        p.fx.fleet.writer().flush().unwrap();
+        p.fx.fleet.reload_if_stale().unwrap();
+        assert!(due(&p.fx.fleet).unwrap().is_empty(), "a node with a live run is not due");
+        assert!(p.made());
+        lease.end(&p.fx.fleet).unwrap();
+        drop(p);
+
+        // Parked, idle, clean and pushed: released; a dirty one is kept.
+        let p = parked("pr_draft");
+        let dir = provision::node_location(&p.fx.fleet, &p.node).unwrap().unwrap().directory().unwrap();
+        let dir = dir.host_path().unwrap().to_path_buf();
+        std::fs::write(dir.join("wip.txt"), "wip").unwrap();
+        assert_eq!(due(&p.fx.fleet).unwrap().len(), 1);
+        let report = release_due(&p.fx.fleet).unwrap();
+        assert!(report.released.is_empty() && report.kept.len() == 1, "{report:?}");
+        assert!(report.kept[0].1.contains("uncommitted"), "{report:?}");
+        assert!(p.made());
+        std::fs::remove_file(dir.join("wip.txt")).unwrap();
+        let report = release_due(&p.fx.fleet).unwrap();
+        assert_eq!(report.released.len(), 1, "{report:?}");
+        assert!(!p.made());
+        assert_eq!(treehouse_calls(&p).len(), 1);
+        // Nothing left to release.
+        assert!(due(&p.fx.fleet).unwrap().is_empty());
     }
 }
