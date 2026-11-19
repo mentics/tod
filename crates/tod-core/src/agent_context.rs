@@ -306,7 +306,9 @@ mod tests {
     fn implement_renders_plan_then_own_obligations_then_ancestors() {
         let blocks = IMPLEMENT_SESSION.blocks;
         let pos = |b: &DynamicBlock| blocks.iter().position(|x| x == b).unwrap();
-        assert!(pos(&DynamicBlock::Plan) < pos(&DynamicBlock::AncestorContext));
+        // The plan changes as steps are worked, so it comes after the
+        // stable blocks (ancestors, skills) to keep the cached prefix long.
+        assert!(pos(&DynamicBlock::AncestorContext) < pos(&DynamicBlock::Plan));
         assert!(
             blocks
                 .iter()

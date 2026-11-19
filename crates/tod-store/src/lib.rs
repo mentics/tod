@@ -8,6 +8,7 @@ pub mod cloud_activity;
 pub mod cloud_nodes;
 pub mod conversation;
 pub mod conversation_live;
+pub mod conversation_usage;
 pub mod cloudflare_access;
 pub mod credentials;
 pub mod deferrals;

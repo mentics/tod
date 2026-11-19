@@ -180,6 +180,34 @@ fn resolve_git_bash_path() -> Option<PathBuf> {
     candidates.into_iter().find(is_bash)
 }
 
+/// Claude Code's switch for the git status snapshot (current branch, status,
+/// recent commits) it puts ahead of the first user message, together with its
+/// built-in commit and pull-request instructions
+/// (<https://code.claude.com/docs/en/env-vars>).
+pub const CLAUDE_DISABLE_GIT_INSTRUCTIONS: &str = "CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS";
+
+/// The environment tod adds to every agent it launches, ahead of the
+/// caller's own (which wins), so the prompt cache can hit across sessions.
+///
+/// Claude Code's cache is a prefix cache, and "sequential sessions share the
+/// prefix only when the git status snapshot taken at startup matches"
+/// (<https://code.claude.com/docs/en/prompt-caching>). That snapshot changes
+/// after every commit, and everything after it, tod's whole opening included,
+/// is then written to the cache again at full price. Turning it off leaves
+/// nothing git-shaped that varies between sessions on a node. The commit and
+/// pull-request instructions go with it (one switch for both is all that is
+/// documented); tod's own agent context carries the rules for both
+/// (`workspace/codebase`, the PR surface), and the working directory is still
+/// given to the agent by Claude Code itself.
+pub fn cache_env(host: AcpHost, env: &[(String, String)]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    if host == AcpHost::Claude && !env.iter().any(|(k, _)| k == CLAUDE_DISABLE_GIT_INSTRUCTIONS) {
+        out.push((CLAUDE_DISABLE_GIT_INSTRUCTIONS.to_string(), "1".to_string()));
+    }
+    out.extend(env.iter().cloned());
+    out
+}
+
 /// Spawn an ACP server process (Cursor/Claude `… acp`, or a standalone adapter).
 pub fn spawn_acp_process(
     host: AcpHost,
@@ -187,6 +215,8 @@ pub fn spawn_acp_process(
     env: &[(String, String)],
 ) -> Result<crate::process_tree::AgentProcess> {
     use std::process::{Command, Stdio};
+
+    let env = &cache_env(host, env);
 
     let use_subcommand = host.uses_acp_subcommand(agent_bin);
     let subcommand = "acp";
@@ -315,6 +345,8 @@ pub fn spawn_acp_in_sandbox(
 ) -> Result<crate::process_tree::AgentProcess> {
     use std::process::Stdio;
 
+    let env = &cache_env(host, env);
+
     let args: Vec<String> = if host.uses_acp_subcommand(Path::new(agent_bin)) {
         vec!["acp".to_string()]
     } else {
@@ -348,6 +380,8 @@ pub fn spawn_acp_in_container(
     env: &[(String, String)],
 ) -> Result<crate::process_tree::AgentProcess> {
     use std::process::Stdio;
+
+    let env = &cache_env(host, env);
 
     let args: Vec<String> = if host.uses_acp_subcommand(Path::new(agent_bin)) {
         vec!["acp".to_string()]
@@ -387,6 +421,21 @@ pub fn spawn_acp_in_container(
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn claude_is_launched_without_the_git_status_snapshot_and_cursor_is_not() {
+        let env = vec![("A".to_string(), "b".to_string())];
+        let claude = cache_env(AcpHost::Claude, &env);
+        assert!(claude.contains(&(CLAUDE_DISABLE_GIT_INSTRUCTIONS.to_string(), "1".to_string())));
+        assert!(claude.contains(&env[0]));
+        assert_eq!(cache_env(AcpHost::Cursor, &env), env);
+    }
+
+    #[test]
+    fn a_callers_own_value_for_it_wins() {
+        let env = vec![(CLAUDE_DISABLE_GIT_INSTRUCTIONS.to_string(), "0".to_string())];
+        assert_eq!(cache_env(AcpHost::Claude, &env), env);
+    }
 
     #[test]
     fn agent_platform_default_is_claude() {

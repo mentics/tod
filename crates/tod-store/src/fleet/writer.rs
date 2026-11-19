@@ -283,6 +283,8 @@ pub enum FleetMutation {
         node: uuid::Uuid,
         kind: String,
     },
+    /// What a finished agent turn spent (`crate::conversation_usage`).
+    RecordTurnUsage(crate::conversation_usage::TurnUsage),
     // --- Outline (tree / lists) ---
     Outline(OutlineMutation),
     // --- Interview sessions (immediate) ---
@@ -354,6 +356,7 @@ impl FleetMutation {
                 | FleetMutation::SetGitIdentity { .. }
                 | FleetMutation::RecordNodeProblem { .. }
                 | FleetMutation::ClearNodeProblem { .. }
+                | FleetMutation::RecordTurnUsage(_)
         )
     }
 
@@ -643,6 +646,9 @@ impl FleetMutation {
             }
             FleetMutation::ClearNodeProblem { node, kind } => {
                 crate::node_problems::NodeProblemRepo::new(conn).clear(*node, kind)?;
+            }
+            FleetMutation::RecordTurnUsage(turn) => {
+                crate::conversation_usage::record(conn, turn)?;
             }
             FleetMutation::Outline(_) => {}
         }

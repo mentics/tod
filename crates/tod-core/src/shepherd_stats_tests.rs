@@ -87,6 +87,36 @@ fn cost_counts_sessions_turns_and_tool_calls_per_node_and_phase() {
 }
 
 #[test]
+fn cost_shows_the_tokens_recorded_per_turn_and_the_cache_share() {
+    use tod_store::conversation_usage::{TurnUsage, record};
+    let f = fx();
+    let n = node(&f.conn, "alpha");
+    let c = conversation(&f.conn, n, "phase", "design", 1000, 2000);
+    for (input, read, write) in [(10, 0, 1000), (5, 900, 100)] {
+        record(
+            &f.conn,
+            &TurnUsage {
+                conversation_id: c,
+                at_ms: 1,
+                phase: Some("design".into()),
+                model: None,
+                counts: tod_agent::TokenCounts { requests: 1, input, cache_read: read, cache_write: write, output: 7, ..Default::default() },
+            },
+        )
+        .unwrap();
+    }
+    conversation(&f.conn, n, "implementation", "", 1000, 2000);
+    let stats = all(&f.conn);
+    let cost = stats.cost.as_ref().unwrap();
+    let design = cost.rows.iter().find(|r| r.phase == "phase:design").unwrap();
+    assert_eq!((design.input_tokens, design.cache_read_tokens, design.cache_write_tokens, design.output_tokens), (15, 900, 1100, 14));
+    assert!((design.cache_read_share().unwrap() - 900.0 / 2015.0).abs() < 1e-9);
+    let text = stats.text();
+    assert!(text.contains("cached 45%"), "{text}");
+    assert!(text.contains("no tokens recorded"), "a session with none says so, not zero: {text}");
+}
+
+#[test]
 fn an_idle_gap_between_turns_is_not_counted_as_wall_time() {
     let f = fx();
     let n = node(&f.conn, "alpha");
