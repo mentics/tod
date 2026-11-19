@@ -488,6 +488,9 @@ fn bare() -> Fixture {
     let workspace = fx.root.join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
     init_workspace_repo(&workspace);
+    // What the node's agent leaves behind: its work, uncommitted. A node whose
+    // checkout holds none of it is not done (`crate::lost_work::code_missing`).
+    std::fs::write(workspace.join("work.txt"), "the node's work").unwrap();
     fx.fleet
         .enqueue_outline(OutlineMutation::EnableCapabilities {
             node_id: fx.node,

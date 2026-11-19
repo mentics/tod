@@ -21,6 +21,15 @@
 //! A reviewer or verifier who finds the checkout missing the change used to
 //! have only the user to ask, and the answer "send it back" moved nothing.
 //!
+//! Three places refuse to take "the steps are done" on trust, where the work
+//! cannot yet have been merged ([`shows_no_work`], [`code_missing`]): the
+//! implement protocol does not finish while the branch holds none of it, the
+//! `active` and `verifying` gates carry a `work-on-branch` criterion
+//! ([`gate_criterion`]) whose failure reopens the implementation, and the
+//! pre-turn [`check`] in `verifying` calls a branch with no birth record and no
+//! work lost (no pull request can have merged it). A plan step saying "no code
+//! change" exempts the node.
+//!
 //! **A stub is a recorded fact, never a guess.** tod records the commit the
 //! node's branch was born at when it makes the checkout
 //! ([`tod_store::branch_starts`]); a branch still at that commit never held
@@ -532,15 +541,122 @@ pub fn check(fleet: &FleetStore, node: Uuid, state: &str) -> Result<Finding> {
         return Ok(Finding::NotLooked);
     }
     match inspect_node(fleet, node)? {
-        Some(repos) => Ok(conclude(&repos, done)),
+        // In `verifying` no pull request exists yet, so a branch that merely
+        // proves nothing cannot be work merged and deleted: with none of the
+        // work in any repository it is lost ([`shows_no_work`]).
+        Some(repos) => match conclude(&repos, done) {
+            Finding::Unproven(_) if state == "verifying" && shows_no_work(&repos) && code_missing(fleet, node)?.is_some() => {
+                Ok(Finding::Lost(Proof { repos: repos.iter().map(|(name, _)| name.clone()).collect(), done_steps: done }))
+            }
+            finding => Ok(finding),
+        },
         None => Ok(Finding::NotLooked),
     }
+}
+
+/// Whether `repos` show none of the node's work in any repository: no commit
+/// beyond the base, nothing uncommitted, and no sign the branch was merged.
+/// Unlike [`is_lost`] this does not need every repository *proven* untouched:
+/// a repository that proves nothing (no record of where its branch started)
+/// counts as showing nothing. It is for the places where the node cannot
+/// legitimately have its work merged yet (finishing implementation, the
+/// `active` and `verifying` gates), so the ambiguity [`Finding::Unproven`]
+/// guards against (a branch merged by fast-forward and deleted) does not
+/// arise; a node whose work was merged by hand outside the process is reopened
+/// once and then stops for the user ([`crate::autopilot`]). Empty `repos` (no
+/// checkout to look at) say nothing and are not "no work".
+pub fn shows_no_work(repos: &[(String, RepoState)]) -> bool {
+    !repos.is_empty()
+        && !repos.iter().any(|(_, s)| matches!(s, RepoState::OwnCommits | RepoState::Dirty | RepoState::BranchBehindBase))
+}
+
+/// The phrase a plan step uses to say the node changes no code, so a clean
+/// branch is what it should have.
+pub const NO_CODE_CHANGE_PHRASE: &str = "no code change";
+
+/// Whether a plan step says outright that the work changes no code.
+pub fn plan_declares_no_code(fleet: &FleetStore, node: Uuid) -> Result<bool> {
+    fleet.read(|conn| {
+        Ok(PlanStepRepo::new(conn)
+            .list_for_node(node)?
+            .iter()
+            .any(|s| s.body.to_lowercase().contains(NO_CODE_CHANGE_PHRASE)))
+    })
+}
+
+/// The node's implementation is claimed done (steps marked done, no step
+/// saying the node changes no code) yet its checkout shows none of the work
+/// ([`shows_no_work`]): what the implement protocol must not finish on and
+/// the `active` and `verifying` gates must not pass. `None` when the work is
+/// there, nothing is claimed done, the plan declares no code change, or there
+/// is no checkout yet. Runs git: never on the UI thread.
+pub fn code_missing(fleet: &FleetStore, node: Uuid) -> Result<Option<Proof>> {
+    let done = done_steps(fleet, node)?;
+    if done == 0 || plan_declares_no_code(fleet, node)? {
+        return Ok(None);
+    }
+    // No Files at all: no checkout to hold work, and a launch says so itself.
+    if fleet.resolve_files_for_node(&node.to_string())?.is_none() {
+        return Ok(None);
+    }
+    let Some((cwd, repos)) = inspect_node_at(fleet, node)? else { return Ok(None) };
+    // A checkout with no `origin` has no base to compare with: it proves nothing.
+    if repos.is_empty() || default_ref(&cwd)?.is_none() {
+        return Ok(None);
+    }
+    Ok(shows_no_work(&repos).then(|| Proof { repos: repos.iter().map(|(name, _)| name.clone()).collect(), done_steps: done }))
+}
+
+/// The slug of the gate criterion [`gate_criterion`] adds. It is not a row of
+/// the catalog (like a check's), so `settle_gate` never saves it.
+pub const WORK_CRITERION_SLUG: &str = "work-on-branch";
+
+/// Whether `criterion` is the one [`gate_criterion`] adds.
+pub fn is_work_criterion(criterion: &tod_store::outline::GateCriterion) -> bool {
+    criterion.slug == WORK_CRITERION_SLUG
+}
+
+/// The gate criterion "the implementation is on the node's branch", for the
+/// gates out of `active` and `verifying`; `None` elsewhere or when nothing is
+/// claimed done.
+pub fn gate_criterion(fleet: &FleetStore, node: Uuid, from: &str, to: &str) -> Result<Option<crate::phase::CriterionCheck>> {
+    if !matches!(from, "active" | "verifying") || done_steps(fleet, node)? == 0 {
+        return Ok(None);
+    }
+    let (outcome, detail) = match code_missing(fleet, node)? {
+        None => (tod_store::outline::OUTCOME_PASS, String::new()),
+        Some(proof) => (
+            tod_store::outline::OUTCOME_FAIL,
+            format!(
+                "The branch has no commit beyond its base and nothing uncommitted in {}: the implementation is not there.",
+                proof.repos.join(", ")
+            ),
+        ),
+    };
+    Ok(Some(crate::phase::CriterionCheck {
+        criterion: tod_store::outline::GateCriterion {
+            id: Uuid::from_u128(0x7f3a_90d1_5c2e_4b6a_8e11_0000_0000_0057),
+            from_state: from.to_string(),
+            to_state: to.to_string(),
+            slug: WORK_CRITERION_SLUG.to_string(),
+            label: "The implementation is on the node's branch".to_string(),
+            sort_order: 900,
+            active: true,
+        },
+        outcome,
+        detail,
+    }))
 }
 
 /// What each repository of the node's checkout (the checkout itself and every
 /// submodule) holds of its work; `None` when the checkout is not made yet. Any
 /// error (a stale location, Files missing, a git failure) is the caller's.
 fn inspect_node(fleet: &FleetStore, node: Uuid) -> Result<Option<Vec<(String, RepoState)>>> {
+    Ok(inspect_node_at(fleet, node)?.map(|(_, repos)| repos))
+}
+
+/// [`inspect_node`], with the directory it looked in.
+fn inspect_node_at(fleet: &FleetStore, node: Uuid) -> Result<Option<(Workdir, Vec<(String, RepoState)>)>> {
     let Some(cwd) = tod_store::fleet::provision::launch_cwd_if_made(fleet, &node.to_string())? else {
         return Ok(None);
     };
@@ -549,7 +665,8 @@ fn inspect_node(fleet: &FleetStore, node: Uuid) -> Result<Option<Vec<(String, Re
         Some(branch) => fleet.read(|conn| tod_store::branch_starts::get(conn, &node.to_string(), branch))?,
         None => BranchStarts::default(),
     };
-    Ok(Some(inspect(&cwd, branch.as_deref(), &starts)?))
+    let repos = inspect(&cwd, branch.as_deref(), &starts)?;
+    Ok(Some((cwd, repos)))
 }
 
 /// The title of the note [`record_replacement`] leaves on the node's activity:

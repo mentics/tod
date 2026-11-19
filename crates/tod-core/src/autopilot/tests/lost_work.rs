@@ -540,3 +540,92 @@ fn a_submodule_with_no_commit_of_the_nodes_own_is_lost_work_only_when_steps_were
     let only_root = vec![(".".to_string(), RepoState::Untouched)];
     assert!(lost_submodules(&only_root, 2).is_empty(), "the checkout itself is not a submodule");
 }
+
+fn in_state_with_done_steps(fx: &Fixture, state: &str) {
+    fx.fleet.enqueue_outline(OutlineMutation::SetLifecycle { node_id: fx.node, state: state.into() }).unwrap();
+    fx.fleet.writer().flush().unwrap();
+    let conn = rusqlite::Connection::open(fx.fleet.paths().db()).unwrap();
+    conn.execute("UPDATE node_plan_steps SET status = 'verified'", []).unwrap();
+    drop(conn);
+    fx.fleet.reload_if_stale().ok();
+}
+
+/// Gap 57 (ENG-3311): steps verified, the checkout holds none of the work, and
+/// nothing records where the branch started (a node moved to a new checkout).
+/// The branch proves nothing in general, but in `verifying` no pull request can
+/// have merged it, so it is lost; in `review` it stays unproven.
+#[test]
+fn verifying_with_no_work_on_a_branch_with_no_birth_record_is_lost() {
+    let fx = setup();
+    workspace_is_a_clone(&fx);
+    let conn = rusqlite::Connection::open(fx.fleet.paths().db()).unwrap();
+    conn.execute("DELETE FROM node_branch_starts", []).unwrap();
+    drop(conn);
+    in_state_with_done_steps(&fx, "verifying");
+    let finding = crate::lost_work::check(&fx.fleet, fx.node, "verifying").unwrap();
+    assert!(matches!(finding, crate::lost_work::Finding::Lost(_)), "{finding:?}");
+    let finding = crate::lost_work::check(&fx.fleet, fx.node, "review").unwrap();
+    assert!(matches!(finding, crate::lost_work::Finding::Unproven(_)), "{finding:?}");
+}
+
+#[test]
+fn the_work_gate_criterion_fails_on_a_branch_without_the_work_and_passes_with_it() {
+    let fx = setup();
+    let workspace = workspace_is_a_clone(&fx);
+    let conn = rusqlite::Connection::open(fx.fleet.paths().db()).unwrap();
+    conn.execute("DELETE FROM node_branch_starts", []).unwrap();
+    drop(conn);
+    in_state_with_done_steps(&fx, "verifying");
+    assert!(crate::lost_work::code_missing(&fx.fleet, fx.node).unwrap().is_some());
+    let c = crate::lost_work::gate_criterion(&fx.fleet, fx.node, "verifying", "review").unwrap().expect("a criterion");
+    assert_eq!(c.outcome, tod_store::outline::OUTCOME_FAIL);
+    assert!(crate::lost_work::is_work_criterion(&c.criterion));
+    // Not looked at where the claim is not made.
+    assert!(crate::lost_work::gate_criterion(&fx.fleet, fx.node, "review", "pr").unwrap().is_none());
+    // Uncommitted work counts: it is in the branch's checkout.
+    std::fs::write(workspace.join("work"), "w").unwrap();
+    assert!(crate::lost_work::code_missing(&fx.fleet, fx.node).unwrap().is_none());
+    let c = crate::lost_work::gate_criterion(&fx.fleet, fx.node, "verifying", "review").unwrap().expect("a criterion");
+    assert_eq!(c.outcome, tod_store::outline::OUTCOME_PASS);
+}
+
+#[test]
+fn a_plan_that_says_no_code_change_needs_no_work_on_the_branch() {
+    let fx = setup();
+    workspace_is_a_clone(&fx);
+    in_state_with_done_steps(&fx, "verifying");
+    let conn = rusqlite::Connection::open(fx.fleet.paths().db()).unwrap();
+    conn.execute("UPDATE node_plan_steps SET body = 'Confirm the setting. No code change.' WHERE rowid = (SELECT MIN(rowid) FROM node_plan_steps)", []).unwrap();
+    drop(conn);
+    fx.fleet.reload_if_stale().ok();
+    assert!(crate::lost_work::code_missing(&fx.fleet, fx.node).unwrap().is_none());
+}
+
+/// Gap 57: the implement protocol is done when the steps are closed and the
+/// tests green, but not while the branch holds none of the work.
+#[test]
+fn implementation_is_not_done_while_the_branch_holds_none_of_the_work() {
+    use crate::conversation::implement::{ImplementationProtocol, TestRun};
+    use crate::conversation::protocol::{Next, Protocol, ProtocolEnv, Stop, TurnContext};
+    let fx = setup();
+    let workspace = workspace_is_a_clone(&fx);
+    in_state_with_done_steps(&fx, "active");
+    let media = crate::media::MediaPaths::discover().expect("media paths");
+    let run = TestRun { command: "t".into(), passed: 3, failed: 0, errors: 0 };
+    let report = serde_json::to_value(&run).unwrap();
+    let decide = || {
+        let env = ProtocolEnv {
+            fleet: &fx.fleet,
+            media: &media,
+            data_root: &fx.root,
+            conversation_id: uuid::Uuid::new_v4(),
+            focus: tod_store::conversation::Focus::Node(fx.node),
+        };
+        ImplementationProtocol
+            .next(&TurnContext { env: &env, report: Some(&report), continuations: 0, progressed: true })
+            .unwrap()
+    };
+    assert!(matches!(decide(), Next::Continue { .. }));
+    std::fs::write(workspace.join("work"), "w").unwrap();
+    assert!(matches!(decide(), Next::Done(Stop::Complete)));
+}

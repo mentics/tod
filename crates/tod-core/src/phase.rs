@@ -202,13 +202,21 @@ fn settle_gate_unleased(fleet: &FleetStore, node: Uuid, branch_template: &str) -
     }
     // Derived criteria may read GitHub: not under the projection lock, which
     // the UI thread reads through.
-    let gate = fleet.read_detached(|conn| check_gate(conn, node, &from))?;
+    let mut gate = fleet.read_detached(|conn| check_gate(conn, node, &from))?;
+    // The implementation must be on the node's branch before the node leaves
+    // `active` or `verifying`: steps marked done on a branch that holds none
+    // of the work (lost with a sandbox or a replaced checkout) do not count.
+    if let Some(to) = gate.to.clone()
+        && let Some(work) = crate::lost_work::gate_criterion(fleet, node, &from, &to)?
+    {
+        gate.criteria.push(work);
+    }
     let rows: Vec<(Uuid, String, Option<String>, String)> = gate
         .criteria
         .iter()
         .filter(|c| c.outcome != OUTCOME_WAIVED)
         // A check is not a row of the catalog: nothing to save it against.
-        .filter(|c| !crate::checks::is_check_criterion(&c.criterion))
+        .filter(|c| !crate::checks::is_check_criterion(&c.criterion) && !crate::lost_work::is_work_criterion(&c.criterion))
         .map(|c| {
             (
                 c.criterion.id,

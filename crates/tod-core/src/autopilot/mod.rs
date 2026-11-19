@@ -932,6 +932,11 @@ impl Autopilot {
             }
             crate::lost_work::Finding::NotLooked | crate::lost_work::Finding::Kept => return Ok(ChecksStep::Proceed),
         };
+        self.reopen_with(fleet, hook, lifecycle, &proof)
+    }
+
+    /// Reopen the implementation for `proof`: once, then a stop for the user.
+    fn reopen_with<H: StepHook + ?Sized>(&mut self, fleet: &FleetStore, hook: &mut H, lifecycle: &str, proof: &crate::lost_work::Proof) -> Result<ChecksStep> {
         hook.working_on("reopening the implementation: the node's code is not on its branch");
         if self.state.loops.lost_work_reopens >= 1 {
             // The first reopening did not stick: rebuilding made no commits,
@@ -940,7 +945,7 @@ impl Autopilot {
             self.save()?;
             return Ok(ChecksStep::Stop(Outcome::NeedsHuman { reason: NeedsHuman::LostWork { why: proof.why(lifecycle) } }));
         }
-        crate::lost_work::reopen(fleet, self.node, lifecycle, &proof)?;
+        crate::lost_work::reopen(fleet, self.node, lifecycle, proof)?;
         self.state.loops.lost_work_reopens += 1;
         self.lost_checked = None;
         self.record(fleet, "lost_work", lifecycle, None)?;
@@ -1074,6 +1079,17 @@ impl Autopilot {
         // fix agent.
         if !gate.clear() && gate.failing().all(|c| crate::checks::is_check_criterion(&c.criterion)) {
             return Ok(None);
+        }
+        // The gate found the implementation missing from the branch: rebuilt,
+        // never asked about (once; the second time the run stops).
+        if !gate.clear()
+            && gate.failing().any(|c| crate::lost_work::is_work_criterion(&c.criterion))
+            && let Some(proof) = crate::lost_work::code_missing(fleet, self.node)?
+        {
+            match self.reopen_with(fleet, hook, from, &proof)? {
+                ChecksStep::Stop(outcome) => return Ok(Some(outcome)),
+                ChecksStep::Fixed | ChecksStep::Proceed => return Ok(None),
+            }
         }
         if !gate.clear() {
             let failing: Vec<String> = gate

@@ -243,7 +243,18 @@ impl Protocol for ImplementationProtocol {
         let needs_user = steps.iter().any(|linked| needs_user(&linked.step.status));
         let tests = turn.report.and_then(TestRun::from_report);
         if open.is_empty() && (needs_user || tests.as_ref().is_some_and(TestRun::green)) {
-            return Ok(Next::Done(Stop::Complete));
+            // Steps closed and tests green are claims: the work must also be
+            // on the branch, or it is lost with the checkout.
+            if crate::lost_work::code_missing(turn.env.fleet, node)?.is_none() {
+                return Ok(Next::Done(Stop::Complete));
+            }
+            if let Some(done) = cap_or_stall(turn) {
+                return Ok(done);
+            }
+            return Ok(Next::Continue {
+                message: MISSING_WORK_MESSAGE.to_string(),
+                reason: "the work is not on the branch".to_string(),
+            });
         }
         if let Some(done) = cap_or_stall(turn) {
             return Ok(done);
@@ -256,6 +267,13 @@ impl Protocol for ImplementationProtocol {
         })
     }
 }
+
+/// What the agent is told when it calls the work done but the branch holds none of it.
+const MISSING_WORK_MESSAGE: &str = "The branch holds none of your work: it has no commit beyond its base and nothing \
+     uncommitted in this checkout, so the changes are not where the task's branch points (a different directory, or \
+     lost). Make the changes in this working directory, commit them on the task's branch and push it, then run the \
+     tests again and record the result. If the plan really changes no code, say \"no code change\" in the plan \
+     step.\n\n";
 
 /// A short account of why the loop is continuing, for the journey.
 fn continuation_reason(open: &[&PlanStepWithLinks], tests: Option<&TestRun>) -> String {
