@@ -56,6 +56,9 @@
 //! - `node_files_locations` (`tod_store::fleet::repos::files_location`, the
 //!   worktree or sandbox made for each node), created by
 //!   [`files_locations_triggers_sql`] in the v75 migration.
+//! - `pr_pushes` (`tod_store::pr_pushes`, each head a node's pull request
+//!   was seen at; insert-only), created by [`pr_pushes_triggers_sql`] in the
+//!   v102 migration.
 //!
 //! Deliberately excluded, with reasons:
 //! - `node_plan_step_deps`, `node_plan_step_obligations`, `node_plan_step_notes`
@@ -303,6 +306,11 @@ pub fn waits_triggers_sql() -> String {
 /// one is an update).
 pub fn node_requests_triggers_sql() -> String {
     simple_id_triggers("node_requests")
+}
+
+/// Triggers for `pr_pushes` (each head a node's pull request was seen at).
+pub fn pr_pushes_triggers_sql() -> String {
+    simple_id_triggers("pr_pushes")
 }
 
 /// Triggers for `run_state` (one row per node, keyed by `node_id`).

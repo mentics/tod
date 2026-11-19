@@ -237,6 +237,12 @@ pub enum FleetMutation {
     RecordCheckRun(Box<crate::check_runs::CheckRun>),
     /// Something to show in the node's activity (`crate::node_timeline`).
     RecordTimeline(Box<crate::node_timeline::TimelineEntry>),
+    /// A head a node's pull request was seen at (`crate::pr_pushes`), with
+    /// the activity note an unreviewed one leaves, written together.
+    RecordPrPush {
+        push: Box<crate::pr_pushes::PrPush>,
+        note: Option<Box<crate::node_timeline::TimelineEntry>>,
+    },
     /// A gate check's result, left out when it reads as the last one did.
     RecordGateTimeline(Box<crate::node_timeline::TimelineEntry>),
     /// A git call that was retried (`crate::git_retries`).
@@ -346,6 +352,7 @@ impl FleetMutation {
                 | FleetMutation::ActivityBeat { .. }
                 | FleetMutation::RecordCheckRun(_)
                 | FleetMutation::RecordTimeline(_)
+                | FleetMutation::RecordPrPush { .. }
                 | FleetMutation::RecordGateTimeline(_)
                 | FleetMutation::ActivityEnd { .. }
                 | FleetMutation::ActivityClearLost { .. }
@@ -611,6 +618,12 @@ impl FleetMutation {
             }
             FleetMutation::RecordTimeline(entry) => {
                 crate::node_timeline::TimelineRepo::new(conn).record(entry)?;
+            }
+            FleetMutation::RecordPrPush { push, note } => {
+                crate::pr_pushes::PrPushRepo::new(conn).record(push)?;
+                if let Some(note) = note {
+                    crate::node_timeline::TimelineRepo::new(conn).record(note)?;
+                }
             }
             FleetMutation::RecordGateTimeline(entry) => {
                 crate::node_timeline::TimelineRepo::new(conn).record_gate_if_changed(entry)?;

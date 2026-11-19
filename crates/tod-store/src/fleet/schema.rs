@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 98;
+pub const CURRENT_USER_VERSION: i32 = 102;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -654,6 +654,13 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         crate::decisions::add_option_edits(conn)?;
         conn.pragma_update(None, "user_version", 98)?;
     }
+    if version < 102 {
+        // Every head a node's pull request was seen at, and whether tod's
+        // review cleared it (`crate::pr_pushes`): synced and journaled.
+        conn.execute_batch(crate::pr_pushes::CREATE_TABLE)?;
+        conn.execute_batch(&crate::journey_changes::pr_pushes_triggers_sql())?;
+        conn.pragma_update(None, "user_version", 102)?;
+    }
     // Other branches (the task panel) numbered their own steps 66–67 at the
     // same time as 66–70 above, so a store may be past a version without
     // having these. Every one is idempotent: make sure of them all.
@@ -733,6 +740,9 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     // Transient git failures that were retried: machine-local telemetry, no
     // schema version (`crate::git_retries`).
     conn.execute_batch(crate::git_retries::CREATE_TABLE)?;
+    // Pull request heads and whether tod's review cleared them (v102).
+    conn.execute_batch(crate::pr_pushes::CREATE_TABLE)?;
+    conn.execute_batch(&crate::journey_changes::pr_pushes_triggers_sql())?;
     crate::sync::install(conn)?;
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that
