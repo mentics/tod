@@ -35,8 +35,8 @@ pub fn key(actor: &NextActor) -> String {
         NextActor::You { why, .. } => format!(
             "you:{}",
             match why {
-                YouReason::Request { .. } => "request",
-                YouReason::Permission { .. } => "permission",
+                YouReason::Request { ended, .. } => return format!("you:request{}", ended_key(ended)),
+                YouReason::Permission { ended, .. } => return format!("you:permission{}", ended_key(ended)),
                 YouReason::Failed { .. } => "failed",
                 YouReason::Stopped { .. } => "stopped",
                 YouReason::Paused => "paused",
@@ -55,6 +55,15 @@ pub fn key(actor: &NextActor) -> String {
             }
         ),
         NextActor::Done => "done".to_string(),
+    }
+}
+
+/// What a request's or permission's run-end adds to its key, so a pending
+/// request whose run later fails is a change, not the same standing.
+fn ended_key(ended: &Option<Box<YouReason>>) -> String {
+    match ended.as_deref() {
+        None => String::new(),
+        Some(why) => format!("+{}", key(&NextActor::You { why: why.clone(), since: 0 }).trim_start_matches("you:")),
     }
 }
 
@@ -238,6 +247,22 @@ mod tests {
         assert_eq!(detail(&request), "2 open; the run ended: boom");
         assert_eq!(detail(&permission), "rm; the run ended: boom");
         assert_eq!(detail(&you(YouReason::Request { count: 2, ended: None })), "2 open");
-        assert_eq!(key(&request), "you:request");
+        assert_eq!(key(&request), "you:request+failed");
+        assert_eq!(key(&permission), "you:permission+failed");
+        assert_eq!(key(&you(YouReason::Request { count: 2, ended: None })), "you:request");
+    }
+
+    #[test]
+    fn a_request_whose_run_then_fails_is_a_transition() {
+        let node = Uuid::new_v4();
+        let mut tracker = ActorTracker::default();
+        let look = |ended| HashMap::from([standing(node, you(YouReason::Request { count: 1, ended }))]);
+        assert!(tracker.observe(&look(None)).is_empty());
+        let changes = tracker.observe(&look(Some(Box::new(YouReason::Failed { error: "boom".into() }))));
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].from, "you:request");
+        assert_eq!(changes[0].to, "you:request+failed");
+        assert_eq!(changes[0].detail, "1 open; the run ended: boom");
+        assert!(tracker.observe(&look(Some(Box::new(YouReason::Failed { error: "boom".into() })))).is_empty());
     }
 }

@@ -143,6 +143,18 @@ pub enum YouReason {
     NotStarted,
 }
 
+impl YouReason {
+    /// A failure: something broke or stopped, as against something asked. A
+    /// request or permission whose run also ended is one too.
+    pub fn is_failure(&self) -> bool {
+        match self {
+            YouReason::Failed { .. } | YouReason::Stopped { .. } => true,
+            YouReason::Request { ended, .. } | YouReason::Permission { ended, .. } => ended.is_some(),
+            YouReason::Paused | YouReason::NotStarted => false,
+        }
+    }
+}
+
 /// What the node waits on that is outside the user's hands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalWait {
@@ -600,7 +612,9 @@ fn starting_row<'a>(facts: &Facts<'a>) -> Option<&'a RunState> {
 
 /// How the node's run ended, when it did, and since when: its sandbox gone, a
 /// stop question the user answered "leave it", the run's own stopped row, what
-/// its supervisor left in its idle heartbeat, or the saved local run's end.
+/// its supervisor left in its idle heartbeat, or the saved local run's end,
+/// or processing or a supervisor that stopped responding (a lost lease or
+/// heartbeat).
 /// Each says why and what to do. Read both for the node's actor (when nothing
 /// is asked of the user) and beside a request, so a request never hides it.
 fn run_end(facts: &Facts<'_>) -> Option<(YouReason, i64)> {
@@ -662,6 +676,27 @@ fn run_end(facts: &Facts<'_>) -> Option<(YouReason, i64)> {
         && let Some(why) = outcome_reason(outcome)
     {
         return Some((why, *at));
+    }
+    // Processing that stopped answering: its owner died or hung. Said, not
+    // left to look like nothing is happening.
+    if let Some(lease) = facts.leases.iter().filter(|l| l.is_lifecycle()).find(|l| !l.is_live(facts.now_ms)) {
+        let error = format!(
+            "processing was lost: {} held by {} stopped responding {} ago",
+            lease.kind,
+            lease.owner,
+            format_elapsed(facts.now_ms - lease.heartbeat_at),
+        );
+        return Some((YouReason::Failed { error }, lease.heartbeat_at));
+    }
+    // The same for a supervisor in the cloud that stopped beating without
+    // ending its run: its sandbox or process died mid-run.
+    if let Some(beat) = facts.cloud.filter(|b| !b.is_idle() && !b.is_live(facts.now_ms)) {
+        let error = format!(
+            "the cloud supervisor stopped responding {} ago (last heard while {})",
+            format_elapsed(facts.now_ms - beat.heartbeat_at),
+            if beat.what.is_empty() { "working" } else { &beat.what },
+        );
+        return Some((YouReason::Failed { error }, beat.heartbeat_at));
     }
     None
 }
@@ -745,33 +780,6 @@ fn actor_for(facts: &Facts<'_>) -> (NextActor, i64) {
     // none is "not started".
     if let Some((why, since)) = run_end(facts) {
         return (NextActor::You { why, since }, since);
-    }
-    // Processing that stopped answering: its owner died or hung. Said, not
-    // left to look like nothing is happening.
-    if let Some(lease) = lifecycle_leases().find(|l| !l.is_live(facts.now_ms)) {
-        let error = format!(
-            "processing was lost: {} held by {} stopped responding {} ago",
-            lease.kind,
-            lease.owner,
-            format_elapsed(facts.now_ms - lease.heartbeat_at),
-        );
-        return (
-            NextActor::You {
-                why: YouReason::Failed { error },
-                since: lease.heartbeat_at,
-            },
-            lease.heartbeat_at,
-        );
-    }
-    // The same for a supervisor in the cloud that stopped beating without
-    // ending its run: its sandbox or process died mid-run.
-    if let Some(beat) = facts.cloud.filter(|b| !b.is_idle() && !b.is_live(facts.now_ms)) {
-        let error = format!(
-            "the cloud supervisor stopped responding {} ago (last heard while {})",
-            format_elapsed(facts.now_ms - beat.heartbeat_at),
-            if beat.what.is_empty() { "working" } else { &beat.what },
-        );
-        return (NextActor::You { why: YouReason::Failed { error }, since: beat.heartbeat_at }, beat.heartbeat_at);
     }
     // A wait recorded in a stay the node has left no longer holds anything
     // (the move that ended it may not have reached this copy of the
@@ -1217,6 +1225,26 @@ mod tests {
         assert!(error.contains("protocol:implementation"), "{error}");
         assert!(error.contains("daemon-1"), "{error}");
         assert_eq!(since, NOW - 60_000);
+    }
+
+    #[test]
+    fn a_request_never_hides_a_lost_lease_or_a_silent_supervisor() {
+        let ended = |c: &Case| match standing(c).actor {
+            NextActor::You { why: YouReason::Request { count: 1, ended }, .. } => ended.map(|b| *b),
+            other => panic!("{other:?}"),
+        };
+        let mut c = case("active");
+        c.attention = requests(Uuid::nil(), &[40]);
+        c.leases = vec![lease("protocol:implementation", 30, 60_000)];
+        let Some(YouReason::Failed { error }) = ended(&c) else { panic!("{:?}", standing(&c).actor) };
+        assert!(error.contains("processing was lost"), "{error}");
+        c.leases.clear();
+        c.cloud = Some(beat(100, tod_store::cloud_activity::STALE_AFTER_MS + 5_000));
+        let Some(YouReason::Failed { error }) = ended(&c) else { panic!("{:?}", standing(&c).actor) };
+        assert!(error.contains("cloud supervisor stopped responding"), "{error}");
+        // A live lease or heartbeat is still Working, request or not.
+        c.cloud = Some(beat(100, 5_000));
+        assert!(matches!(standing(&c).actor, NextActor::Working { what: Work::Cloud, .. }));
     }
 
     #[test]

@@ -42,10 +42,7 @@ pub fn bucket_of(standing: &NodeStanding) -> Option<Bucket> {
 /// because something was asked. Counted apart from requests so one cannot
 /// hide among the others.
 pub fn is_failure(standing: &NodeStanding) -> bool {
-    matches!(
-        &standing.actor,
-        NextActor::You { why: YouReason::Failed { .. } | YouReason::Stopped { .. }, .. }
-    )
+    matches!(&standing.actor, NextActor::You { why, .. } if why.is_failure())
 }
 
 /// An `Others` wait that is itself in trouble: retrying, or overdue.
@@ -291,7 +288,7 @@ pub fn glyph(standing: &NodeStanding) -> Option<Glyph> {
         NextActor::You { .. } if standing.deferred.is_some() => {
             (Shape::Triangle, Tone::Muted, Mark::Clock)
         }
-        NextActor::You { why: YouReason::Failed { .. } | YouReason::Stopped { .. }, .. } => {
+        NextActor::You { why, .. } if why.is_failure() => {
             (Shape::Triangle, Tone::Failure, Mark::Cross)
         }
         NextActor::You { .. } => (Shape::Triangle, Tone::NeedsYou, Mark::None),
@@ -613,6 +610,15 @@ mod tests {
         );
         assert_eq!(
             g(&you(YouReason::Stopped { reason: "budget".into() }, 1)),
+            Some((S::Triangle, T::Failure, M::Cross))
+        );
+        let ended = |why: YouReason| Some(Box::new(why));
+        assert_eq!(
+            g(&you(YouReason::Request { count: 1, ended: ended(YouReason::Failed { error: "x".into() }) }, 1)),
+            Some((S::Triangle, T::Failure, M::Cross))
+        );
+        assert_eq!(
+            g(&you(YouReason::Permission { title: "t".into(), ended: ended(YouReason::Stopped { reason: "r".into() }) }, 1)),
             Some((S::Triangle, T::Failure, M::Cross))
         );
         assert_eq!(g(&deferred(request(1))), Some((S::Triangle, T::Muted, M::Clock)));
