@@ -1019,9 +1019,12 @@ impl Autopilot {
     /// ends waiting (a timer wake a minute on) with the holder named, and
     /// looks again.
     fn files_busy(&self, fleet: &FleetStore, err: &anyhow::Error) -> Result<Outcome> {
+        self.wait_for_files(fleet, format!("another node is still making its files: {err:#}"))
+    }
+
+    fn wait_for_files(&self, fleet: &FleetStore, what: String) -> Result<Outcome> {
         const RETRY_MS: i64 = 60_000;
         let now = chrono::Utc::now().timestamp_millis();
-        let what = format!("another node is still making its files: {err:#}");
         fleet
             .interview(
                 "autopilot",
@@ -2704,6 +2707,14 @@ impl Autopilot {
                     ConversationEvent::Notice(notice) => {
                         // Errors are also in the conversation's transcript.
                         tracing::warn!(node = %self.node, ?notice, "autopilot notice");
+                    }
+                    ConversationEvent::FilesBusy { message } => {
+                        // A rotation or cold resume could not make the node's
+                        // files: wait for the holder, never a failed run.
+                        self.state.current = None;
+                        self.save()?;
+                        let what = format!("another node is still making its files: {message}");
+                        return Ok(Some(self.wait_for_files(fleet, what)?));
                     }
                     ConversationEvent::Continued => turn_ended = true,
                     ConversationEvent::Rotated => {}

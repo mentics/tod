@@ -2163,3 +2163,45 @@ fn a_rotation_followed_by_an_image_refusal_retry_marks_one_fresh_session() {
         .count();
     assert_eq!(rotations, 1);
 }
+
+/// A rotation (cold resume) whose working directory waits on a worktree lock
+/// another node holds is a wait: the event says so, no error is remembered,
+/// and the transcript gets no error row.
+#[test]
+fn a_rotation_that_finds_the_files_lock_busy_is_a_wait_not_an_error() {
+    let fx = fixture();
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut driver = ConversationDriver::new(config(&fx, 100_000), Focus::Project, ProtocolKind::Outline);
+    say(&mut driver, &fx, &mut agent, "ask Hello?");
+    let id = driver.conversation_id().unwrap();
+
+    let mut agent = FakeAgent::new(&fx.fleet);
+    agent.fail_resume = true;
+    let mut driver = ConversationDriver::open(config(&fx, 100_000), &fx.fleet, id).unwrap();
+    driver.send(&fx.fleet, &mut agent, "ask Are you back?").unwrap();
+    let before = turns(&fx, id).len();
+    // The resume fails; the fresh session's start finds the lock busy.
+    let busy: anyhow::Error = tod_store::fleet::worktree::WorktreeLockBusy {
+        repo: "/repo".into(),
+        holder: "tod-x on branch task/x, adding the worktree".into(),
+        waited: std::time::Duration::from_secs(1200),
+    }
+    .into();
+    super::driver::set_cwd_error(busy.context("find the files"));
+    let events = driver.tick(&fx.fleet, &mut agent);
+    let busy_events: Vec<_> = events
+        .iter()
+        .filter(|e| matches!(e, ConversationEvent::FilesBusy { message } if message.contains("tod-x on branch task/x")))
+        .collect();
+    assert_eq!(busy_events.len(), 1, "{events:?}");
+    assert!(!events.iter().any(|e| matches!(e, ConversationEvent::TurnFinished { .. })), "{events:?}");
+    assert_eq!(driver.status().last_error, None);
+    // The only error row is the cold resume's own note about the missing
+    // session log; the busy lock adds none.
+    let all = turns(&fx, id);
+    let errors: Vec<_> = all.iter().filter(|(r, _)| *r == TurnRole::Error).collect();
+    assert_eq!(errors.len(), 1, "{all:?}");
+    assert!(!errors[0].1.contains("tod-x"), "{all:?}");
+    // And only the rotation marker joined what was there.
+    assert_eq!(all.len(), before + 1, "{all:?}");
+}

@@ -123,6 +123,10 @@ pub struct ConversationStatus {
 pub enum ConversationEvent {
     /// A turn ended: its agent (or error) turn is in the transcript.
     TurnFinished { error: Option<String> },
+    /// The turn could not start because another node holds the repository's
+    /// worktree lock (`WorktreeLockBusy`): not a failure and not in the
+    /// transcript. The caller waits and tries again.
+    FilesBusy { message: String },
     /// The driver started a fresh agent session; a rotation turn is in the
     /// transcript.
     Rotated,
@@ -641,6 +645,12 @@ impl ConversationDriver {
         let key = self.run.as_ref().map(|run| run.key.clone());
         if let Err(err) = self.poll(fleet, agent, &mut events) {
             let error = format!("{err:#}");
+            if tod_store::fleet::worktree::is_lock_busy(&err) {
+                // Typed through the rotation and start paths: a wait, so no
+                // error is remembered and none is in the transcript.
+                events.push(ConversationEvent::FilesBusy { message: error });
+                return events;
+            }
             self.last_error = Some(error.clone());
             events.push(ConversationEvent::TurnFinished { error: Some(error) });
         }
@@ -1179,6 +1189,20 @@ impl ConversationDriver {
         )
     }
 
+    /// A turn that could not start: the error is in the transcript and the
+    /// view's last error, unless it is only the worktree lock being busy,
+    /// which the caller waits out and retries (rows per retry would bury the
+    /// transcript).
+    fn start_failed(&mut self, fleet: &FleetStore, id: Uuid, err: &anyhow::Error) -> Result<()> {
+        if tod_store::fleet::worktree::is_lock_busy(err) {
+            return Ok(());
+        }
+        let message = format!("{err:#}");
+        self.append(fleet, id, TurnRole::Error, &message)?;
+        self.last_error = Some(message);
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn start<A: AgentAccess + ?Sized>(
         &mut self,
@@ -1204,27 +1228,26 @@ impl ConversationDriver {
             // A node whose sandbox expired while it sat idle gets a new one
             // here (forked from its source, session logs restored) and the
             // turn goes on, instead of failing for the user to sort out.
-            let resolved = match self.focus.node_id() {
-                Some(node) => tod_store::fleet::provision::retry_if_sandbox_lost(fleet, &node.to_string(), || {
-                    self.protocol.cwd(&env)
-                }),
-                None => self.protocol.cwd(&env),
+            let resolved = match test_hooks::take_cwd_error() {
+                Some(err) => Err(err),
+                None => match self.focus.node_id() {
+                    Some(node) => tod_store::fleet::provision::retry_if_sandbox_lost(fleet, &node.to_string(), || {
+                        self.protocol.cwd(&env)
+                    }),
+                    None => self.protocol.cwd(&env),
+                },
             };
             let cwd = match resolved {
                 Ok(cwd) => cwd,
                 Err(err) => {
                     // Shown in the transcript and the view: the turn is not sent.
-                    let message = format!("{err:#}");
-                    self.append(fleet, id, TurnRole::Error, &message)?;
-                    self.last_error = Some(message);
+                    self.start_failed(fleet, id, &err)?;
                     return Err(err);
                 }
             };
             if let Err(err) = self.protocol.prepare(&env) {
                 let err = err.context("preparing the working directory");
-                let message = format!("{err:#}");
-                self.append(fleet, id, TurnRole::Error, &message)?;
-                self.last_error = Some(message);
+                self.start_failed(fleet, id, &err)?;
                 return Err(err);
             }
             let mut turn_env = self.protocol.turn_env(&env);
@@ -1233,9 +1256,7 @@ impl ConversationDriver {
                 Ok(progress) => progress,
                 Err(err) => {
                     let err = err.context("reading the state before the turn");
-                    let message = format!("{err:#}");
-                    self.append(fleet, id, TurnRole::Error, &message)?;
-                    self.last_error = Some(message);
+                self.start_failed(fleet, id, &err)?;
                     return Err(err);
                 }
             };
@@ -1571,3 +1592,31 @@ mod path_tests {
         assert_eq!(dirs, [Path::new("tod-bin"), Path::new("a"), Path::new("b")]);
     }
 }
+
+/// Lets a test stand for the protocol's working directory failing (a worktree
+/// lock another node holds), which a real one makes only with a git
+/// repository and a second process.
+mod test_hooks {
+    #[cfg(test)]
+    thread_local! {
+        pub static CWD_ERROR: std::cell::RefCell<Option<anyhow::Error>> = const { std::cell::RefCell::new(None) };
+    }
+
+    #[cfg(test)]
+    pub fn set_cwd_error(err: anyhow::Error) {
+        CWD_ERROR.with(|e| *e.borrow_mut() = Some(err));
+    }
+
+    #[cfg(test)]
+    pub fn take_cwd_error() -> Option<anyhow::Error> {
+        CWD_ERROR.with(|e| e.borrow_mut().take())
+    }
+
+    #[cfg(not(test))]
+    pub fn take_cwd_error() -> Option<anyhow::Error> {
+        None
+    }
+}
+
+#[cfg(test)]
+pub(crate) use test_hooks::set_cwd_error;

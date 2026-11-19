@@ -362,8 +362,14 @@ impl IncomingRunner {
         for (node, mut driver) in std::mem::take(&mut self.running) {
             let mut ended = None;
             for event in driver.tick(fleet, agent) {
-                if let ConversationEvent::TurnFinished { error } = event {
-                    ended = Some(error);
+                match event {
+                    ConversationEvent::TurnFinished { error } => ended = Some(error),
+                    // Its files are being made by another node: this check
+                    // cannot run now, and says why.
+                    ConversationEvent::FilesBusy { message } => {
+                        ended = Some(Some(format!("another node is still making its files: {message}")));
+                    }
+                    _ => {}
                 }
             }
             match ended {
