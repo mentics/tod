@@ -14,6 +14,31 @@ including `implement` (the `active` state) and `verify` (`verifying`).
 `tod-cli` cannot set them: a command is run by the app, so only the user
 configures one.
 
+## Setup: preparing a fresh worktree
+
+A node's Files directory is often a brand-new worktree with nothing installed,
+so a check that needs dependencies would time out on a cold install or fail
+for lack of them. Each check can declare a **Setup** command
+(`Check::setup`, "setup" in the editor and the YAML; blank means none): the
+command that gets `dir` ready, such as installing what the check needs. tod
+names no package manager; whatever the project declares is run.
+
+- Run by the shell in the check's `dir`, before the check, with its own
+  30-minute limit (`checks::SETUP_TIMEOUT`).
+- **Once per worktree**: a pass is recorded in `check_runs` (command
+  `setup: <command>`, fingerprinted by the directory it ran in), so later
+  rounds and other checks with the same setup in the same directory skip it. A
+  recreated worktree is a new directory and runs it again.
+- A failed or timed-out setup makes the check *broken* (the run stops for the
+  user, `NeedsHuman::CheckBroken`) with the setup's output; the check is not
+  run without it, and the next look runs the setup again.
+- Setup runs show in the node's Activity beside the checks.
+- With no Setup, a check that fails with output that points at missing
+  dependencies ("Cannot find module", "command not found", "No module named",
+  "node_modules", "Run ... install", and similar), or that times out, begins
+  its reason with that: probably missing dependencies, and to set a Setup
+  command on the check (`checks::missing_dependencies_hint`).
+
 ## What runs, and when
 
 - **Where**: the node's Files directory (this machine, a dev container, or its

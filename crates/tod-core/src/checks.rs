@@ -31,6 +31,9 @@ use uuid::Uuid;
 /// How long one check may run before it is stopped and counts as broken.
 pub const CHECK_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
+/// How long a check's setup may run (a cold dependency install is slower than a check).
+pub const SETUP_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
 /// The most of a check's output kept: its end, where tools put the summary.
 pub const OUTPUT_TAIL_BYTES: usize = 16 * 1024;
 
@@ -525,7 +528,115 @@ pub fn free_sandbox_memory(cwd: &Workdir) -> Result<MemoryFreed> {
 /// (an environment problem for the user, never a finding for the Fix agent).
 /// In a sandbox a first kill for memory frees memory and runs the check once more.
 pub fn run_command(cwd: &Workdir, check: &Check, files: &[String]) -> (Verdict, String) {
-    run_command_with(cwd, &|| run_command_once(cwd, check, files), &free_sandbox_memory)
+    let (verdict, out) = run_command_with(cwd, &|| run_command_once(cwd, check, files), &free_sandbox_memory);
+    match missing_dependencies_hint(check, verdict, &out) {
+        Some(hint) => (verdict, format!("{hint}\n\n{out}")),
+        None => (verdict, out),
+    }
+}
+
+/// Phrases tools print when what they need is not installed in the directory.
+/// Language- and tool-neutral on purpose: tod names no package manager.
+const MISSING_DEPENDENCY_MARKERS: &[&str] = &[
+    "cannot find module",
+    "cannot find package",
+    "modulenotfounderror",
+    "no module named",
+    "command not found",
+    ": not found",
+    "node_modules",
+    "no project-local",
+    "not installed",
+    "missing dependenc",
+    "install dependencies",
+];
+
+/// Whether a line of output tells the user to run an install.
+fn says_to_install(lower: &str) -> bool {
+    lower.lines().any(|l| l.contains("run ") && l.contains("install"))
+}
+
+/// When a failed or timed-out check looks like it ran in a directory with no
+/// installed dependencies, the plain reason, put ahead of the output. `None`
+/// for a pass, a memory kill, or output that does not point at it.
+pub fn missing_dependencies_hint(check: &Check, verdict: Verdict, output: &str) -> Option<String> {
+    if output.starts_with(KILLED_FOR_MEMORY) {
+        return None;
+    }
+    let lower = output.to_lowercase();
+    let setup = check.setup.trim();
+    let advice = if setup.is_empty() {
+        "The check has no Setup command: set one on the check in the lifecycle config (a command that installs what it needs; tod runs it once per worktree before the check)."
+    } else {
+        "The check's Setup command ran and passed, but the dependencies are still missing: fix the setup command in the lifecycle config."
+    };
+    match verdict {
+        Verdict::Failed => {
+            let marker = MISSING_DEPENDENCY_MARKERS.iter().find(|m| lower.contains(**m));
+            if marker.is_none() && !says_to_install(&lower) {
+                return None;
+            }
+            Some(format!(
+                "Probably missing dependencies in this worktree, not a problem with the code (the output mentions {:?}). {advice}",
+                marker.copied().unwrap_or("an install step")
+            ))
+        }
+        Verdict::Broken if lower.contains("did not finish in") => Some(format!(
+            "The check timed out. In a fresh worktree that has no installed dependencies, that is often a cold install or a hang waiting for one. {advice}"
+        )),
+        _ => None,
+    }
+}
+
+/// Run a check's `setup` once per worktree, before the check, and return `None` when the
+/// directory is ready or `Some` broken run's output when it is not. The pass is recorded in
+/// `check_runs` under the command `setup: <command>` for the phase and directory, fingerprinted
+/// by the directory it ran in (a recreated worktree is a new directory, so it runs again);
+/// only a recorded pass is reused. A failed or timed-out setup never falls back to running the
+/// check without it. Returns the command's result when it actually ran.
+fn ensure_setup(fleet: &FleetStore, node: Uuid, key: &str, dir: &str, cwd: &Workdir, check: &Check) -> Result<Option<SetupOutcome>> {
+    let setup = check.setup.trim();
+    if setup.is_empty() {
+        return Ok(None);
+    }
+    let command = format!("setup: {setup}");
+    let place = format!("{cwd:?}");
+    let latest = fleet.read(|conn| CheckRunRepo::new(conn).latest(node, key, dir, &command))?;
+    if matches!(&latest, Some(run) if run.verdict == Verdict::Passed && run.fingerprint == place) {
+        return Ok(None);
+    }
+    let (verdict, output) = run_shell(cwd, setup, &[], SETUP_TIMEOUT);
+    let verdict = if verdict == Verdict::Failed { Verdict::Broken } else { verdict };
+    let output = if verdict == Verdict::Passed {
+        output
+    } else {
+        format!(
+            "The setup `{setup}` for check `{}` {} in {}, so the check was not run. It is a fresh run, and the check will not run until the setup passes.\n\n{output}",
+            check.display(),
+            if output.contains("did not finish in") { "timed out" } else { "failed" },
+            if dir.is_empty() { "the node's files" } else { dir },
+        )
+    };
+    let run = CheckRun {
+        node_id: node,
+        phase: key.to_string(),
+        dir: dir.to_string(),
+        command,
+        label: format!("setup for {}", check.name()),
+        fingerprint: place,
+        verdict,
+        output,
+        ran_at: tod_store::check_runs::now(),
+    };
+    fleet.enqueue(tod_store::fleet::FleetMutation::RecordCheckRun(Box::new(run.clone())))?;
+    fleet.writer().flush()?;
+    Ok(Some(SetupOutcome { verdict: run.verdict, output: run.output }))
+}
+
+/// What a setup that ran came to.
+struct SetupOutcome {
+    verdict: Verdict,
+    output: String,
 }
 
 /// [`run_command`] with the run and the memory-freeing step given (for tests). `free` is
@@ -547,16 +658,21 @@ fn run_command_with(cwd: &Workdir, run: &dyn Fn() -> (Verdict, String), free: &d
 }
 
 fn run_command_once(cwd: &Workdir, check: &Check, files: &[String]) -> (Verdict, String) {
+    run_shell(cwd, &check.command, files, CHECK_TIMEOUT)
+}
+
+/// Run `command` through the shell at `cwd`, stopping it after `limit`.
+fn run_shell(cwd: &Workdir, command_text: &str, files: &[String], limit: Duration) -> (Verdict, String) {
     // `exec 2>&1` makes one stream of what a person would see in a terminal.
-    let script = format!("exec 2>&1\n{MEM_PROBE}\nexport TOD_CHANGED_FILES={}\n{}", shell_quote(&files.join("\n")), check.command);
+    let script = format!("exec 2>&1\n{MEM_PROBE}\nexport TOD_CHANGED_FILES={}\n{}", shell_quote(&files.join("\n")), command_text);
     let result = match cwd {
         Workdir::Host(path) => {
             let mut command = std::process::Command::new("sh");
             command.args(["-c", &script]).current_dir(path);
-            run_with_timeout(command, CHECK_TIMEOUT, &path.display().to_string())
+            run_with_timeout(command, limit, limit, &path.display().to_string())
         }
-        Workdir::Sandbox { .. } => cwd.output_within(CHECK_TIMEOUT, "sh", &["-c", &script]).map(|o| (exit_code(&o.status), o.stdout)),
-        Workdir::Container { container, path } => run_in_container(container, path, &script),
+        Workdir::Sandbox { .. } => cwd.output_within(limit, "sh", &["-c", &script]).map(|o| (exit_code(&o.status), o.stdout)),
+        Workdir::Container { container, path } => run_in_container(container, path, &script, limit),
     };
     match result {
         Ok((Some(code), out)) => {
@@ -565,7 +681,7 @@ fn run_command_once(cwd: &Workdir, check: &Check, files: &[String]) -> (Verdict,
             if code == 0 {
                 (Verdict::Passed, text)
             } else if killed_for_memory(code, &text) {
-                (Verdict::Broken, format!("{}\n\n{text}", memory_message(code, mem, &place_name(cwd), &check.command)))
+                (Verdict::Broken, format!("{}\n\n{text}", memory_message(code, mem, &place_name(cwd), command_text)))
             } else {
                 (Verdict::Failed, text)
             }
@@ -599,14 +715,14 @@ fn shell_quote(text: &str) -> String {
 /// deadline is a little later and stops the `docker exec` client, so a check
 /// can never hang forever either way. Exit 124 (what `timeout` returns) is a
 /// timeout, reported as a broken check.
-fn run_in_container(container: &str, path: &str, script: &str) -> Result<(Option<i32>, Vec<u8>)> {
-    let secs = CHECK_TIMEOUT.as_secs();
+fn run_in_container(container: &str, path: &str, script: &str, limit: Duration) -> Result<(Option<i32>, Vec<u8>)> {
+    let secs = limit.as_secs();
     let wrapper = format!(
         "if command -v timeout >/dev/null 2>&1; then exec timeout -k 5 {secs} sh -c \"$1\"; else exec sh -c \"$1\"; fi"
     );
     let exec = tod_agent::devcontainer::ContainerExec::connect(container)?;
     let command = exec.command(path, "sh", &["-c", &wrapper, "sh", script])?;
-    let (code, out) = run_with_timeout(command, CHECK_TIMEOUT + Duration::from_secs(30), container)?;
+    let (code, out) = run_with_timeout(command, limit + Duration::from_secs(30), limit, container)?;
     if code == Some(124) {
         anyhow::bail!("the command did not finish in {} minutes and was stopped", secs / 60);
     }
@@ -615,7 +731,7 @@ fn run_in_container(container: &str, path: &str, script: &str) -> Result<(Option
 
 /// Run `command` (stdin closed, stderr dropped: the script folds it into
 /// stdout) and collect its output, killing it after `limit`.
-fn run_with_timeout(mut command: std::process::Command, limit: Duration, what: &str) -> Result<(Option<i32>, Vec<u8>)> {
+fn run_with_timeout(mut command: std::process::Command, limit: Duration, shown: Duration, what: &str) -> Result<(Option<i32>, Vec<u8>)> {
     use std::process::Stdio;
     let mut child = command
         .stdin(Stdio::null())
@@ -637,7 +753,7 @@ fn run_with_timeout(mut command: std::process::Command, limit: Duration, what: &
         if Instant::now() >= deadline {
             child.kill().ok();
             child.wait().ok();
-            anyhow::bail!("the command did not finish in {} minutes and was stopped", CHECK_TIMEOUT.as_secs() / 60);
+            anyhow::bail!("the command did not finish in {} minutes and was stopped", shown.as_secs() / 60);
         }
         std::thread::sleep(Duration::from_millis(50));
     };
@@ -693,7 +809,28 @@ pub fn run_stale(fleet: &FleetStore, node: Uuid, state: &str) -> Result<Round> {
             Some(run) if run.fingerprint == assessment.fingerprint && run.label == check.label && reusable(&run) => run,
             _ => {
                 let (verdict, output) = if assessment.applicable {
-                    run_command(&cwd.join(&dir), check, &assessment.files)
+                    let at = cwd.join(&dir);
+                    match ensure_setup(fleet, node, key, &dir, &at, check)? {
+                        Some(setup) if setup.verdict != Verdict::Passed => {
+                            ran.push(tod_store::node_timeline::CommandResult {
+                                name: format!("setup for {}", check.display()),
+                                command: check.setup.clone(),
+                                verdict: setup.verdict.as_str().to_string(),
+                                output: setup.output.clone(),
+                            });
+                            (setup.verdict, setup.output)
+                        }
+                        Some(setup) => {
+                            ran.push(tod_store::node_timeline::CommandResult {
+                                name: format!("setup for {}", check.display()),
+                                command: check.setup.clone(),
+                                verdict: setup.verdict.as_str().to_string(),
+                                output: setup.output,
+                            });
+                            run_command(&at, check, &assessment.files)
+                        }
+                        None => run_command(&at, check, &assessment.files),
+                    }
                 } else {
                     (Verdict::Skipped, format!("nothing changed in {}", check.scope()))
                 };
@@ -857,6 +994,27 @@ pub fn record_findings(fleet: &FleetStore, node: Uuid, failed: &[&CheckRun]) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_dependencies_are_named_plainly_for_a_failure_or_a_timeout() {
+        let bare = Check { command: "x".into(), ..Check::default() };
+        let with = Check { command: "x".into(), setup: "install".into(), ..Check::default() };
+        let hint = missing_dependencies_hint(&bare, Verdict::Failed, "No project-local tool was found. Run foo install").unwrap();
+        assert!(hint.starts_with("Probably missing dependencies") && hint.contains("no Setup command"), "{hint}");
+        let hint = missing_dependencies_hint(&with, Verdict::Failed, "Error: Cannot find module 'x'").unwrap();
+        assert!(hint.contains("Setup command ran and passed"), "{hint}");
+        let hint = missing_dependencies_hint(&bare, Verdict::Broken, "the command did not finish in 10 minutes and was stopped").unwrap();
+        assert!(hint.starts_with("The check timed out") && hint.contains("no Setup command"), "{hint}");
+        // A real failure, a pass and a memory kill say nothing about dependencies.
+        assert_eq!(missing_dependencies_hint(&bare, Verdict::Failed, "1 test failed"), None);
+        assert_eq!(missing_dependencies_hint(&bare, Verdict::Passed, "node_modules ok"), None);
+        assert_eq!(missing_dependencies_hint(&bare, Verdict::Broken, "the sandbox failed"), None);
+        // The hint leads the reason a run_command failure gives.
+        let dir = tempfile::tempdir().unwrap();
+        let (verdict, out) = run_command(&Workdir::host(dir.path()), &Check { command: "no-such-command-here".into(), ..Check::default() }, &[]);
+        assert_eq!(verdict, Verdict::Failed);
+        assert!(out.starts_with("Probably missing dependencies"), "{out}");
+    }
 
     #[test]
     fn phase_key_maps_the_states_named_for_protocols() {

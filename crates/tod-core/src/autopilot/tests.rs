@@ -3159,6 +3159,58 @@ fn a_check_killed_for_memory_stops_the_run_for_the_user_and_never_reaches_the_fi
     assert_eq!(rounds, 2, "{timeline:#?}");
 }
 
+/// `with_check` with a setup command on the check (gap 62).
+fn with_check_setup(fx: &Fixture, phase: &str, label: &str, command: &str, setup: &str) {
+    with_check(fx, phase, label, command);
+    fx.fleet
+        .enqueue_outline(OutlineMutation::SetNodeLifecycleChecks {
+            node_id: fx.node,
+            checks: [(
+                phase.to_string(),
+                vec![tod_store::lifecycle_config::Check {
+                    label: label.into(),
+                    command: command.into(),
+                    setup: setup.into(),
+                    ..Default::default()
+                }],
+            )]
+            .into(),
+        })
+        .unwrap();
+    fx.fleet.writer().flush().unwrap();
+}
+
+#[test]
+fn a_checks_setup_runs_once_per_worktree_before_the_check_and_a_failed_one_stops_it() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    let workspace = fx.root.join("workspace");
+    // The check can only pass once the setup has made `ready`.
+    with_check_setup(&fx, "review", "needs deps", "test -f ready", "echo run >> setup-runs; touch ready");
+    let round = crate::checks::run_stale(&fx.fleet, fx.node, "review").unwrap();
+    assert!(round.clear(), "{round:?}");
+    // New files make the check stale; its setup is recorded, so it does not run again.
+    std::fs::write(workspace.join("edit.txt"), "changed").unwrap();
+    let again = crate::checks::run_stale(&fx.fleet, fx.node, "review").unwrap();
+    assert!(again.clear(), "{again:?}");
+    assert_eq!(std::fs::read_to_string(workspace.join("setup-runs")).unwrap().lines().count(), 1);
+
+    // A setup that fails is the check's stop: the check is not run, nothing falls back.
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    let workspace = fx.root.join("workspace");
+    with_check_setup(&fx, "review", "needs deps", "touch check-ran", "echo no network; exit 1");
+    let round = crate::checks::run_stale(&fx.fleet, fx.node, "review").unwrap();
+    let run = &round.runs[0];
+    assert_eq!(run.verdict, tod_store::check_runs::Verdict::Broken, "{run:?}");
+    assert!(run.output.contains("setup `echo no network; exit 1`") && run.output.contains("no network"), "{}", run.output);
+    assert!(!workspace.join("check-ran").exists());
+    // And the next look runs the setup again rather than reusing the failure.
+    std::fs::write(workspace.join("ok.sh"), "").unwrap();
+    let again = crate::checks::run_stale(&fx.fleet, fx.node, "review").unwrap();
+    assert_eq!(again.runs[0].verdict, tod_store::check_runs::Verdict::Broken);
+}
+
 #[test]
 fn a_recorded_timeout_is_not_the_answer_for_unchanged_files_a_retry_reruns_it() {
     let fx = setup();

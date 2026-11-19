@@ -355,6 +355,13 @@ pub struct Check {
     /// exported to the command as `TOD_CHANGED_FILES`, one per line.
     #[serde(default)]
     pub pattern: String,
+    /// A command that prepares `dir` for the check (installs dependencies,
+    /// builds a generated client): run once per worktree in `dir` before the
+    /// check, its pass recorded so it does not repeat (`checks::ensure_setup`).
+    /// Blank means the check needs none. A failed or timed-out setup is the
+    /// check's own stop, never a fallback to running the check without it.
+    #[serde(default)]
+    pub setup: String,
 }
 
 impl Check {
@@ -473,6 +480,7 @@ pub fn set_checks(conn: &Connection, node_id: Uuid, config: &Checks) -> Result<(
                 dir,
                 changed,
                 pattern: check.pattern.split_whitespace().collect::<Vec<_>>().join(" "),
+                setup: check.setup.trim().to_string(),
             });
         }
         clean.insert(phase.clone(), out);

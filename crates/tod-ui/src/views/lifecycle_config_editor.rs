@@ -81,6 +81,7 @@ struct CheckRow {
     dir: Entity<InputState>,
     changed: Entity<InputState>,
     pattern: Entity<InputState>,
+    setup: Entity<InputState>,
 }
 
 /// The label a phase is shown under.
@@ -289,6 +290,7 @@ impl LifecycleConfigEditor {
             dir: input("run in (e.g. flagship)", &check.dir, cx),
             changed: input("only if changed (default: run in)", &check.changed, cx),
             pattern: input("files (e.g. *.py)", &check.pattern, cx),
+            setup: input("setup, once per worktree (e.g. install dependencies)", &check.setup, cx),
         }
     }
 
@@ -381,7 +383,7 @@ impl LifecycleConfigEditor {
             block = block
                 .child(Textarea::new(box_).w_full().h(gpui::px(260.)))
                 .child(div().text_xs().text_color(muted).child(
-                    "YAML: a phase, then its checks (label, command, dir, changed, pattern). Apply replaces \
+                    "YAML: a phase, then its checks (label, command, dir, changed, pattern, setup). Apply replaces \
                      every check this node lists, in every phase. Empty clears them.",
                 ))
                 .child(
@@ -557,6 +559,7 @@ impl LifecycleConfigEditor {
                     dir: scope[0].clone().unwrap_or_default(),
                     changed: scope[1].clone().unwrap_or_default(),
                     pattern: scope[2].clone().unwrap_or_default(),
+                    setup: field(&row.setup).unwrap_or_default(),
                 }),
                 (label, None) => {
                     self.error = Some(format!("the check `{}` has no command", label.unwrap_or_default()));
@@ -825,6 +828,7 @@ impl LifecycleConfigEditor {
                             .child(div().flex_1().child(Input::new(&row.changed)))
                             .child(div().flex_1().child(Input::new(&row.pattern))),
                     )
+                    .child(div().w_full().child(Input::new(&row.setup)))
             }))
             .child(
                 h_flex().child(
