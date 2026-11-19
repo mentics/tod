@@ -172,7 +172,7 @@ mod tests {
     fn alt_q_walks_everything_on_the_user_oldest_first_and_skips_the_rest() {
         let ids: Vec<Uuid> = (1..=6).map(Uuid::from_u128).collect();
         let mut standings = HashMap::new();
-        standings.insert(ids[0], you_since(ids[0], 500, YouReason::Request { count: 1 }));
+        standings.insert(ids[0], you_since(ids[0], 500, YouReason::Request { count: 1, ended: None }));
         standings.insert(ids[1], you_since(ids[1], 100, YouReason::Failed { error: "x".into() }));
         standings.insert(ids[2], you_since(ids[2], 300, YouReason::NotStarted));
         // Deferred: off the list.

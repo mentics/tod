@@ -332,8 +332,13 @@ pub fn wait_kind_label(kind: WaitKind) -> &'static str {
 
 pub fn you_reason_label(why: &YouReason) -> String {
     match why {
-        YouReason::Request { count: 1 } => "1 request to answer".to_string(),
-        YouReason::Request { count } => format!("{count} requests to answer"),
+        YouReason::Request { count, ended } => {
+            let asked = if *count == 1 { "1 request to answer".to_string() } else { format!("{count} requests to answer") };
+            match ended {
+                Some(ended) => format!("{asked}; the run also ended, {}", you_reason_label(ended)),
+                None => asked,
+            }
+        }
         YouReason::Permission { title } => format!("a permission is asked: {title}"),
         YouReason::Failed { error } => format!("failed: {error}"),
         YouReason::Stopped { reason } => format!("stopped: {reason}"),
@@ -436,6 +441,15 @@ fn error_part(text: impl Into<String>) -> RunnerPart {
     RunnerPart { text: text.into(), tone: PartTone::Error }
 }
 
+/// How an ended run reads beside a request: the failure or stop, with its text.
+fn end_parts(ended: &YouReason) -> Vec<RunnerPart> {
+    match ended {
+        YouReason::Failed { error } => vec![error_part("failed"), error_part(error.clone())],
+        YouReason::Stopped { reason } => vec![error_part("stopped"), error_part(reason.clone())],
+        other => vec![part(format!("on you: {}", you_reason_label(other)))],
+    }
+}
+
 /// The task panel's runner line says who is next in these pieces: the actor,
 /// the reason, who or what, the age, the next check, the retry count and the
 /// error. Rendered from the same [`NodeStanding`] as the tree.
@@ -448,16 +462,30 @@ pub fn runner_parts(standing: &NodeStanding, now_ms: i64) -> Vec<RunnerPart> {
         }
         NextActor::You { why, since } => {
             let mut parts = Vec::new();
+            // A request does not hide how the run ended: the end comes first,
+            // in the error style, then the request.
+            let why = match why {
+                YouReason::Request { ended: Some(ended), count } => {
+                    parts.extend(end_parts(ended));
+                    parts.push(part(format!(
+                        "and {}",
+                        you_reason_label(&YouReason::Request { count: *count, ended: None })
+                    )));
+                    None
+                }
+                other => Some(other),
+            };
             match why {
-                YouReason::Failed { error } => {
+                None => {}
+                Some(YouReason::Failed { error }) => {
                     parts.push(error_part("failed"));
                     parts.push(error_part(error.clone()));
                 }
-                YouReason::Stopped { reason } => {
+                Some(YouReason::Stopped { reason }) => {
                     parts.push(error_part("stopped"));
                     parts.push(error_part(reason.clone()));
                 }
-                other => parts.push(part(format!("on you: {}", you_reason_label(other)))),
+                Some(other) => parts.push(part(format!("on you: {}", you_reason_label(other)))),
             }
             parts.push(part(format!("waiting {}", age(*since))));
             if let Some(d) = &standing.deferred {
@@ -525,7 +553,7 @@ mod tests {
     }
 
     fn request(since: i64) -> NodeStanding {
-        you(YouReason::Request { count: 1 }, since)
+        you(YouReason::Request { count: 1, ended: None }, since)
     }
 
     fn deferred(mut s: NodeStanding) -> NodeStanding {
@@ -744,6 +772,6 @@ mod tests {
             you_reason_label(&YouReason::Failed { error: "auth failed".into() }),
             "failed: auth failed"
         );
-        assert_eq!(you_reason_label(&YouReason::Request { count: 3 }), "3 requests to answer");
+        assert_eq!(you_reason_label(&YouReason::Request { count: 3, ended: None }), "3 requests to answer");
     }
 }

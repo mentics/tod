@@ -947,7 +947,7 @@ mod tests {
             },
         });
         assert_eq!(decide(&v, Some(&waiting), &[], NOW), None, "a pending wait");
-        assert_eq!(decide(&v, Some(&you(YouReason::Request { count: 1 })), &[], NOW), None, "an open request");
+        assert_eq!(decide(&v, Some(&you(YouReason::Request { count: 1, ended: None })), &[], NOW), None, "an open request");
         assert_eq!(
             decide(&v, Some(&standing(NextActor::Working { what: next_actor::Work::Runner, since: 1 })), &[], NOW),
             None,

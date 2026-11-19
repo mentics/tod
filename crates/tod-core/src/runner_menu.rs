@@ -381,6 +381,13 @@ pub fn derive_run_state(f: &RunFacts) -> RunState {
         Some(Outcome::Done) | None => {}
     }
     match f.actor {
+        // A request beside an ended run: the run's end is what the menu acts on.
+        Some(NextActor::You { why: YouReason::Request { ended: Some(ended), .. }, .. }) => match &**ended {
+            YouReason::Paused => RunState::Ended(EndedHow::Paused),
+            YouReason::Failed { .. } => RunState::Ended(EndedHow::Failed),
+            YouReason::Stopped { reason } if reason.to_lowercase().contains("budget") => RunState::Ended(EndedHow::Budget),
+            _ => RunState::Ended(EndedHow::Stopped),
+        },
         Some(NextActor::You { why, .. }) => match why {
             YouReason::Paused => RunState::Ended(EndedHow::Paused),
             YouReason::Stopped { reason } if reason.to_lowercase().contains("budget") => {
@@ -730,7 +737,7 @@ mod tests {
             })
         };
         let you = |why| NextActor::You { why, since: 1 };
-        assert_eq!(run(&you(YouReason::Request { count: 1 })), RunState::Ended(EndedHow::Request));
+        assert_eq!(run(&you(YouReason::Request { count: 1, ended: None })), RunState::Ended(EndedHow::Request));
         assert_eq!(run(&you(YouReason::NotStarted)), RunState::NeverRun);
     }
 }

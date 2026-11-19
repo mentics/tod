@@ -1971,7 +1971,7 @@ mod tests {
             (you(YouReason::Stopped { reason: "budget spent: 6 sessions".into() }), RunState::Ended(EndedHow::Budget)),
             (you(YouReason::Stopped { reason: "an agent is stuck".into() }), RunState::Ended(EndedHow::Stopped)),
             (you(YouReason::Failed { error: "x".into() }), RunState::Ended(EndedHow::Failed)),
-            (you(YouReason::Request { count: 1 }), RunState::Ended(EndedHow::Request)),
+            (you(YouReason::Request { count: 1, ended: None }), RunState::Ended(EndedHow::Request)),
             (you(YouReason::NotStarted), RunState::NeverRun),
             (NextActor::Done, RunState::Done),
         ];

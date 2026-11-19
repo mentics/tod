@@ -75,10 +75,13 @@ fn work_key(work: Work) -> String {
 pub fn detail(actor: &NextActor) -> String {
     match actor {
         NextActor::You { why, .. } => match why {
+            YouReason::Request { count, ended: Some(ended) } => {
+                format!("{count} open; the run ended: {}", detail(&NextActor::You { why: (**ended).clone(), since: 0 }))
+            }
             YouReason::Failed { error } => error.clone(),
             YouReason::Stopped { reason } => reason.clone(),
             YouReason::Permission { title } => title.clone(),
-            YouReason::Request { count } => format!("{count} open"),
+            YouReason::Request { count, .. } => format!("{count} open"),
             YouReason::Paused | YouReason::NotStarted => String::new(),
         },
         NextActor::Others { wait } => {

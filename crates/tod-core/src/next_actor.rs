@@ -122,7 +122,11 @@ impl Work {
 pub enum YouReason {
     /// Open requests (`crate::attention`): decisions, handed-back plan
     /// steps, findings. The items themselves come from `attention`.
-    Request { count: usize },
+    ///
+    /// `ended` is how the node's run ended, when it did (failed, stopped,
+    /// paused, its sandbox gone): a request never hides that, since the
+    /// answer will not make a stopped run go on by itself.
+    Request { count: usize, ended: Option<Box<YouReason>> },
     /// An agent asked for a permission nobody has granted.
     Permission { title: String },
     /// The last run failed, or the app itself did.
@@ -582,6 +586,58 @@ fn done_actor(facts: &Facts<'_>) -> (NextActor, i64) {
     (NextActor::Others { wait }, 0)
 }
 
+/// How the node's run ended, when it did, and since when: its sandbox gone, a
+/// stop question the user answered "leave it", the run's own stopped row, what
+/// its supervisor left in its idle heartbeat, or the saved local run's end.
+/// Each says why and what to do. Read both for the node's actor (when nothing
+/// is asked of the user) and beside a request, so a request never hides it.
+fn run_end(facts: &Facts<'_>) -> Option<(YouReason, i64)> {
+    let run = facts.run;
+    let run_state = facts.run_state;
+    // A replacement that failed for good is the run row's `failed` (written
+    // after the loss), which says why; the loss alone would hide it.
+    let replacement_failed = |lost: &CloudLost| {
+        run_state.is_some_and(|r| {
+            r.phase == Phase::Stopped && r.reason_kind == crate::run_state::kind::FAILED && r.updated_at >= lost.since
+        })
+    };
+    if let Some(lost) = facts.cloud_lost.filter(|l| !replacement_failed(l)) {
+        let reason = if lost.deleted_by_user {
+            "its sandbox was deleted; Start makes a new one".to_string()
+        } else {
+            "its sandbox is gone; a new one is made when the node next has work, or Start makes one now".to_string()
+        };
+        return Some((YouReason::Stopped { reason }, lost.since));
+    }
+    if let Some(answer) = facts.stop_answer {
+        let reason = format!("stopped: {}", crate::stop_questions::left_stopped_reason(&answer.kind));
+        return Some((YouReason::Stopped { reason }, answer.at));
+    }
+    // The run stopped and said why, as a row. Skipped when a later wake (an
+    // old supervisor's beat) or a later saved run speaks after it.
+    if let Some(row) = run_state
+        && let Some(why) = crate::run_state::you_reason(row)
+        && facts.cloud.is_none_or(|b| b.heartbeat_at <= row.updated_at + RUN_STATE_SKEW_MS)
+        && run.last_outcome.as_ref().is_none_or(|(_, at)| *at <= row.updated_at + RUN_STATE_SKEW_MS)
+    {
+        return Some((why, row.since));
+    }
+    if let Some(beat) = facts.cloud.filter(|b| b.is_idle())
+        && let Some(reason) = &beat.stopped
+    {
+        return Some((YouReason::Stopped { reason: reason.clone() }, beat.heartbeat_at));
+    }
+    // A row written at or after the saved run is the later word: when it did
+    // not stop the node (above), the saved run's old stop no longer holds.
+    if let Some((outcome, at)) = &run.last_outcome
+        && !run_state.is_some_and(|row| row.updated_at + RUN_STATE_SKEW_MS >= *at)
+        && let Some(why) = outcome_reason(outcome)
+    {
+        return Some((why, *at));
+    }
+    None
+}
+
 /// The actor, and when the newest thing reaching the user arrived (for the
 /// deferral's wake rule).
 fn actor_for(facts: &Facts<'_>) -> (NextActor, i64) {
@@ -627,7 +683,7 @@ fn actor_for(facts: &Facts<'_>) -> (NextActor, i64) {
             {
                 YouReason::Permission { title: first.summary.clone() }
             }
-            _ => YouReason::Request { count: requests.count },
+            _ => YouReason::Request { count: requests.count, ended: run_end(facts).map(|(why, _)| Box::new(why)) },
         };
         return (
             NextActor::You {
@@ -663,49 +719,8 @@ fn actor_for(facts: &Facts<'_>) -> (NextActor, i64) {
     // answered "leave it", or a wake that ended needing someone (what the
     // supervisor left in its idle heartbeat). Each says why and what to do;
     // none is "not started".
-    // A replacement that failed for good is the run row's `failed` (written
-    // after the loss), which says why; the loss alone would hide it.
-    let replacement_failed = |lost: &CloudLost| {
-        run_state.is_some_and(|r| {
-            r.phase == Phase::Stopped && r.reason_kind == crate::run_state::kind::FAILED && r.updated_at >= lost.since
-        })
-    };
-    if let Some(lost) = facts.cloud_lost.filter(|l| !replacement_failed(l)) {
-        let reason = if lost.deleted_by_user {
-            "its sandbox was deleted; Start makes a new one".to_string()
-        } else {
-            "its sandbox is gone; a new one is made when the node next has work, or Start makes one now".to_string()
-        };
-        return (NextActor::You { why: YouReason::Stopped { reason }, since: lost.since }, lost.since);
-    }
-    if let Some(answer) = facts.stop_answer {
-        let reason = format!("stopped: {}", crate::stop_questions::left_stopped_reason(&answer.kind));
-        return (NextActor::You { why: YouReason::Stopped { reason }, since: answer.at }, answer.at);
-    }
-    // The run stopped and said why, as a row. Skipped when a later wake (an
-    // old supervisor's beat) or a later saved run speaks after it.
-    if let Some(row) = run_state
-        && let Some(why) = crate::run_state::you_reason(row)
-        && facts.cloud.is_none_or(|b| b.heartbeat_at <= row.updated_at + RUN_STATE_SKEW_MS)
-        && run.last_outcome.as_ref().is_none_or(|(_, at)| *at <= row.updated_at + RUN_STATE_SKEW_MS)
-    {
-        return (NextActor::You { why, since: row.since }, row.since);
-    }
-    if let Some(beat) = facts.cloud.filter(|b| b.is_idle())
-        && let Some(reason) = &beat.stopped
-    {
-        return (
-            NextActor::You { why: YouReason::Stopped { reason: reason.clone() }, since: beat.heartbeat_at },
-            beat.heartbeat_at,
-        );
-    }
-    // A row written at or after the saved run is the later word: when it did
-    // not stop the node (above), the saved run's old stop no longer holds.
-    if let Some((outcome, at)) = &run.last_outcome
-        && !run_state.is_some_and(|row| row.updated_at + RUN_STATE_SKEW_MS >= *at)
-        && let Some(why) = outcome_reason(outcome)
-    {
-        return (NextActor::You { why, since: *at }, *at);
+    if let Some((why, since)) = run_end(facts) {
+        return (NextActor::You { why, since }, since);
     }
     // Processing that stopped answering: its owner died or hung. Said, not
     // left to look like nothing is happening.
@@ -1296,7 +1311,7 @@ mod tests {
     fn open_requests_are_you_since_the_oldest() {
         let mut c = case("design");
         c.attention = requests(Uuid::nil(), &[300, 200]);
-        assert_eq!(standing(&c).actor, you(YouReason::Request { count: 2 }, 200));
+        assert_eq!(standing(&c).actor, you(YouReason::Request { count: 2, ended: None }, 200));
     }
 
     fn permission_request(node: Uuid, since: i64, summary: &str) -> AttentionItem {
@@ -1335,12 +1350,35 @@ mod tests {
         let mut items = vec![permission_request(Uuid::nil(), 40, "Run `rm`")];
         items.extend(requests(Uuid::nil(), &[50]).items);
         c.attention = attention_of(Uuid::nil(), items);
-        assert_eq!(standing(&c).actor, you(YouReason::Request { count: 2 }, 40));
+        assert_eq!(standing(&c).actor, you(YouReason::Request { count: 2, ended: None }, 40));
         // An access request that is not a permission is a request too.
         let mut plain = permission_request(Uuid::nil(), 40, "needs a token");
         plain.permission = false;
         c.attention = attention_of(Uuid::nil(), vec![plain]);
-        assert_eq!(standing(&c).actor, you(YouReason::Request { count: 1 }, 40));
+        assert_eq!(standing(&c).actor, you(YouReason::Request { count: 1, ended: None }, 40));
+    }
+
+    #[test]
+    fn a_request_never_hides_that_the_run_failed_or_stopped() {
+        use crate::run_state::kind;
+        let ended = |c: &Case| match standing(c).actor {
+            NextActor::You { why: YouReason::Request { count: 1, ended }, .. } => ended.map(|b| *b),
+            other => panic!("{other:?}"),
+        };
+        let mut c = case("planning");
+        c.attention = requests(Uuid::nil(), &[40]);
+        assert_eq!(ended(&c), None, "a request alone has no end");
+        // The supervisor's stopped row (a push error), beside the request.
+        c.run_state = Some(row(Phase::Stopped, kind::FAILED, "push failed: fetch first", 800, 800));
+        assert_eq!(ended(&c), Some(YouReason::Failed { error: "push failed: fetch first".into() }));
+        // What a supervisor left in its idle heartbeat.
+        c.run_state = None;
+        c.cloud = Some(idle_beat(Some("push failed: fetch first")));
+        assert_eq!(ended(&c), Some(YouReason::Stopped { reason: "push failed: fetch first".into() }));
+        // A sandbox that is gone.
+        c.cloud = None;
+        c.cloud_lost = Some(CloudLost { since: 900, deleted_by_user: false });
+        assert!(matches!(ended(&c), Some(YouReason::Stopped { .. })));
     }
 
     #[test]
