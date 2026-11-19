@@ -2793,10 +2793,23 @@ mod tests {
     fn no_node_sandbox_is_deleted_without_the_guard() {
         for (file, source) in [("provision.rs", include_str!("provision.rs")), ("sandbox.rs", include_str!("sandbox.rs"))] {
             let production = source.split("#[cfg(test)]").next().unwrap();
-            let calls: Vec<&str> = production
-                .lines()
-                .filter(|l| !l.trim_start().starts_with("//") && (l.contains("bx.delete(") || l.contains("bx.delete_waiting_not_ready(") || l.contains("self.delete(")))
-                .collect();
+            // A delete is guarded by construction when the function holding it takes the
+            // guard's `Cleared` proof (which only `secure_sandbox_commits` can make), so
+            // those are not counted. Every other delete must be one of the named, documented
+            // unguarded ones (`allowed`); a new one fails this test.
+            let mut signature = "";
+            let mut calls: Vec<&str> = Vec::new();
+            for l in production.lines() {
+                let t = l.trim_start();
+                if t.starts_with("fn ") || t.starts_with("pub fn ") || t.starts_with("pub(super) fn ") || t.starts_with("pub(crate) fn ") {
+                    signature = t;
+                }
+                let is_delete = !t.starts_with("//")
+                    && (l.contains("bx.delete(") || l.contains("bx.delete_waiting_not_ready(") || l.contains("self.delete("));
+                if is_delete && !signature.contains("&Cleared") {
+                    calls.push(l);
+                }
+            }
             let allowed = if file == "sandbox.rs" { 2 } else { 0 };
             assert_eq!(calls.len(), allowed, "{file}: {calls:?}");
         }
