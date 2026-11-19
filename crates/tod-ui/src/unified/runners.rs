@@ -68,9 +68,15 @@ impl Host {
     fn pause(&self, node: Uuid) {
         match self {
             Host::Daemon(daemon) => {
-                let _ = daemon.runner_pause(node);
+                if let Err(err) = daemon.runner_pause(node) {
+                    tracing::error!(%node, "the daemon did not save the pause: {err:#}");
+                }
             }
-            Host::Local(runners) => runners.pause(node),
+            Host::Local(runners) => {
+                if let Err(err) = runners.pause(node) {
+                    tracing::error!(%node, "the pause was not saved: {err:#}");
+                }
+            }
         }
     }
 
@@ -89,9 +95,15 @@ impl Host {
     fn stop_now(&self, node: Uuid) {
         match self {
             Host::Daemon(daemon) => {
-                let _ = daemon.runner_stop(node);
+                if let Err(err) = daemon.runner_stop(node) {
+                    tracing::error!(%node, "the daemon did not save the stop: {err:#}");
+                }
             }
-            Host::Local(runners) => runners.stop_now(node),
+            Host::Local(runners) => {
+                if let Err(err) = runners.stop_now(node) {
+                    tracing::error!(%node, "the stop was not saved: {err:#}");
+                }
+            }
         }
     }
 

@@ -456,18 +456,18 @@ fn execute(shared: &Shared, command: Command) -> Response {
             Ok(()) => Response::ok(),
             Err(err) => failed(&format!("{err:#}")),
         },
-        Command::RunnerPause { node } => {
-            shared.runners.pause(node);
-            Response::ok()
-        }
+        Command::RunnerPause { node } => match shared.runners.pause(node) {
+            Ok(()) => Response::ok(),
+            Err(err) => failed(&format!("{err:#}")),
+        },
         Command::RunnerPollNow { node } => {
             shared.runners.poll_now(node);
             Response::ok()
         }
-        Command::RunnerStop { node } => {
-            shared.runners.stop_now(node);
-            Response::ok()
-        }
+        Command::RunnerStop { node } => match shared.runners.stop_now(node) {
+            Ok(()) => Response::ok(),
+            Err(err) => failed(&format!("{err:#}")),
+        },
         Command::RunnerSnapshot => {
             let states: Vec<RunnerState> = shared.runners.snapshot();
             Response::value(serde_json::to_value(states).unwrap_or_default())
