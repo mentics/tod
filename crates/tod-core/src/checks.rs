@@ -544,7 +544,6 @@ const MISSING_DEPENDENCY_MARKERS: &[&str] = &[
     "no module named",
     "command not found",
     ": not found",
-    "node_modules",
     "no project-local",
     "not installed",
     "missing dependenc",
@@ -589,10 +588,9 @@ pub fn missing_dependencies_hint(check: &Check, verdict: Verdict, output: &str) 
 }
 
 /// Run a check's `setup` once per worktree, before the check, and return `None` when the
-/// directory is ready or `Some` broken run's output when it is not. The pass is recorded in
-/// `check_runs` under the command `setup: <command>` for the phase and directory, fingerprinted
-/// by the directory it ran in (a recreated worktree is a new directory, so it runs again);
-/// only a recorded pass is reused. A failed or timed-out setup never falls back to running the
+/// directory is ready or `Some` broken run's output when it is not. The pass is a marker file
+/// in the worktree's git directory (so a recreated worktree at the same path runs it again),
+/// and is also shown in `check_runs` under the command `setup: <command>`. A failed or timed-out setup never falls back to running the
 /// check without it. Returns the command's result when it actually ran.
 fn ensure_setup(fleet: &FleetStore, node: Uuid, key: &str, dir: &str, cwd: &Workdir, check: &Check) -> Result<Option<SetupOutcome>> {
     let setup = check.setup.trim();
@@ -600,12 +598,25 @@ fn ensure_setup(fleet: &FleetStore, node: Uuid, key: &str, dir: &str, cwd: &Work
         return Ok(None);
     }
     let command = format!("setup: {setup}");
-    let place = format!("{cwd:?}");
-    let latest = fleet.read(|conn| CheckRunRepo::new(conn).latest(node, key, dir, &command))?;
-    if matches!(&latest, Some(run) if run.verdict == Verdict::Passed && run.fingerprint == place) {
+    // The pass is a marker inside the worktree's own git directory, so it goes when the
+    // worktree does: a recreated one at the same path (Reset environment, a removed
+    // location, a replaced sandbox) has none and runs the setup again. The database
+    // record is only for display; a path or sandbox name is not an instance.
+    let marker = format!("\"$(git rev-parse --absolute-git-dir)/tod-setup-{}\"", &hex(&Sha256::digest(setup.as_bytes()))[..16]);
+    let (present, _) = run_shell(cwd, &format!("test -f {marker}"), &[], CHECK_TIMEOUT);
+    if present == Verdict::Passed {
         return Ok(None);
     }
+    let place = format!("{cwd:?}");
     let (verdict, output) = run_shell(cwd, setup, &[], SETUP_TIMEOUT);
+    let (verdict, output) = if verdict == Verdict::Passed {
+        match run_shell(cwd, &format!("touch {marker}"), &[], CHECK_TIMEOUT) {
+            (Verdict::Passed, _) => (verdict, output),
+            (_, why) => (Verdict::Broken, format!("{output}\n\nthe setup passed but tod could not record it in the worktree's git directory: {why}")),
+        }
+    } else {
+        (verdict, output)
+    };
     let verdict = if verdict == Verdict::Failed { Verdict::Broken } else { verdict };
     let output = if verdict == Verdict::Passed {
         output

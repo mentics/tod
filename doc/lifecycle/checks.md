@@ -25,10 +25,12 @@ names no package manager; whatever the project declares is run.
 
 - Run by the shell in the check's `dir`, before the check, with its own
   30-minute limit (`checks::SETUP_TIMEOUT`).
-- **Once per worktree**: a pass is recorded in `check_runs` (command
-  `setup: <command>`, fingerprinted by the directory it ran in), so later
-  rounds and other checks with the same setup in the same directory skip it. A
-  recreated worktree is a new directory and runs it again.
+- **Once per worktree**: a pass leaves a marker file in the worktree's
+  own git directory (`tod-setup-<hash of the command>`), so later rounds and
+  other checks with the same setup skip it. The marker goes with the worktree:
+  one recreated at the same path (Reset environment, a removed location, a
+  replaced sandbox) has none and runs the setup again. The run is also shown
+  in `check_runs` (command `setup: <command>`), for display only.
 - A failed or timed-out setup makes the check *broken* (the run stops for the
   user, `NeedsHuman::CheckBroken`) with the setup's output; the check is not
   run without it, and the next look runs the setup again.

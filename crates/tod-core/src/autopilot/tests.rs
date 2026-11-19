@@ -3195,6 +3195,15 @@ fn a_checks_setup_runs_once_per_worktree_before_the_check_and_a_failed_one_stops
     assert!(again.clear(), "{again:?}");
     assert_eq!(std::fs::read_to_string(workspace.join("setup-runs")).unwrap().lines().count(), 1);
 
+    // A worktree recreated at the same path is a new instance: it runs the setup again.
+    std::fs::remove_dir_all(workspace.join(".git")).unwrap();
+    git_in(&workspace, &["init", "-q"]);
+    git_in(&workspace, &["commit", "-q", "--allow-empty", "-m", "new worktree"]);
+    std::fs::remove_file(workspace.join("ready")).unwrap();
+    let recreated = crate::checks::run_stale(&fx.fleet, fx.node, "review").unwrap();
+    assert!(recreated.clear(), "{recreated:?}");
+    assert_eq!(std::fs::read_to_string(workspace.join("setup-runs")).unwrap().lines().count(), 2);
+
     // A setup that fails is the check's stop: the check is not run, nothing falls back.
     let fx = setup();
     retire_outside_criteria(&fx);
