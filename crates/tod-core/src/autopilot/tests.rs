@@ -4583,6 +4583,8 @@ struct FailingCheckFeed {
     base_failure: std::sync::Mutex<Option<tod_store::github::BaseFailure>>,
     /// Why the failing check could not be compared with the base (`PrStatus::base_notes`).
     base_note: std::sync::Mutex<Option<String>>,
+    /// Further failing checks that are the change's own (no standing).
+    own_failing: std::sync::Mutex<Vec<String>>,
 }
 
 impl FailingCheckFeed {
@@ -4609,7 +4611,13 @@ impl crate::pr_readiness::PrFeed for FailingCheckFeed {
                 mergeable_state: Some(if fixed { "blocked" } else { "unstable" }.into()),
                 behind_by: Some(0),
                 checks: Some(if fixed { "success" } else { "failure" }.into()),
-                failing_checks: if fixed { Vec::new() } else { vec!["terraform".into()] },
+                failing_checks: if fixed {
+                    Vec::new()
+                } else {
+                    let mut all = vec!["terraform".to_string()];
+                    all.extend(self.own_failing.lock().unwrap().iter().cloned());
+                    all
+                },
                 failing_signatures: {
                     let sig = self.signature.lock().unwrap().clone();
                     if fixed || sig.is_empty() { Vec::new() } else { vec![("terraform".to_string(), sig)] }
@@ -4654,6 +4662,7 @@ fn failing_check_node(says_unrelated: bool) -> (Fixture, Arc<FailingCheckFeed>, 
         signature: std::sync::Mutex::new(String::new()),
         base_failure: std::sync::Mutex::new(None),
         base_note: std::sync::Mutex::new(None),
+        own_failing: std::sync::Mutex::new(Vec::new()),
     });
     crate::pr_readiness::set_feed_override(Some(feed.clone()));
     linked_to_prs(&fx, "pr_review", &["https://github.com/acme/app/pull/42"]);
@@ -4722,6 +4731,31 @@ fn a_check_the_agent_says_is_unrelated_is_asked_once_and_costs_no_more_turns() {
     }
     assert_eq!(agent.turns, 1);
     assert_eq!(unrelated_decisions(&fx).len(), 1);
+}
+
+/// A pending question about one check must not stop the agent from working on
+/// another failing check that is the change's own: it is sent for that one,
+/// and when it cannot fix it, that is raised as a request of its own.
+#[test]
+fn a_pending_question_about_one_check_does_not_stop_work_on_another() {
+    let (fx, feed, mut agent, sent) = failing_check_node(true);
+    let outcome = run_babysitter(&fx, &mut agent);
+    assert!(matches!(&outcome, Outcome::NeedsHuman { reason: NeedsHuman::Decision { pending: 1 } }), "{outcome:?}");
+    assert_eq!(agent.turns, 1);
+    // The change's own check starts failing too, with the question pending.
+    *feed.own_failing.lock().unwrap() = vec!["containers".to_string()];
+    let outcome = run_babysitter(&fx, &mut agent);
+    assert!(agent.turns >= 2, "the agent is sent for the other check: {outcome:?}");
+    let prompts = sent.lock().unwrap().clone();
+    assert!(prompts[1].contains("containers"), "{}", prompts[1]);
+    // The agent cannot fix it (nothing changes): that is its own request, not
+    // a silent wait on the first question.
+    let all = unrelated_decisions(&fx);
+    assert!(
+        all.iter().any(|d| d.status == "pending" && d.question.contains("containers")),
+        "{all:?} / {outcome:?}"
+    );
+    assert!(matches!(&outcome, Outcome::NeedsHuman { reason: NeedsHuman::Decision { pending: 2 } }), "{outcome:?}");
 }
 
 #[test]

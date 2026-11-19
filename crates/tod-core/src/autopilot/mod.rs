@@ -726,9 +726,6 @@ impl Autopilot {
                 if let Some(outcome) = self.withdraw_draft_bot_requests(fleet)? {
                     return self.finish(outcome);
                 }
-                pending = fleet
-                    .read(|conn| Ok(DecisionRepo::new(conn).list_pending_for_node(self.node)?))?
-                    .len();
                 // A silence question about a bot still silent does not stop
                 // the run: it parks on the bot's review (a bot that comes
                 // withdraws the question).
@@ -736,16 +733,17 @@ impl Autopilot {
                     (Some(outcome), _) => return self.finish(outcome),
                     (None, open) => open,
                 };
-                match self.tend_unrelated_check_questions(fleet)? {
+                // Likewise a check-unrelated question about one check: the
+                // babysitter excludes that check from the agent's work and
+                // waits on the answer only when nothing else is left.
+                let open_unrelated = match self.tend_unrelated_check_questions(fleet)? {
                     (Some(outcome), _) => return self.finish(outcome),
-                    (None, true) => {
-                        pending = fleet
-                            .read(|conn| Ok(DecisionRepo::new(conn).list_pending_for_node(self.node)?))?
-                            .len();
-                    }
-                    (None, false) => {}
-                }
-                pending = pending.saturating_sub(open_silence);
+                    (None, open) => open,
+                };
+                pending = fleet
+                    .read(|conn| Ok(DecisionRepo::new(conn).list_pending_for_node(self.node)?))?
+                    .len();
+                pending = pending.saturating_sub(open_silence).saturating_sub(open_unrelated);
             }
             if pending > 0 {
                 return self.finish(Outcome::NeedsHuman {
@@ -1326,6 +1324,9 @@ impl Autopilot {
             let mut pending = fleet
                 .read(|conn| Ok(DecisionRepo::new(conn).list_pending_for_node(self.node)?))?
                 .len();
+            // Pending check-unrelated questions that do not stop the run by
+            // themselves (see below).
+            let mut held_unrelated = 0usize;
             if pending > 0 {
                 // A request about a bot that does not review drafts, on a
                 // pull request that is still one, has nothing to ask.
@@ -1333,9 +1334,6 @@ impl Autopilot {
                     hook.waiting(None, None);
                     return Ok(Some(outcome));
                 }
-                pending = fleet
-                    .read(|conn| Ok(DecisionRepo::new(conn).list_pending_for_node(self.node)?))?
-                    .len();
                 let open_silence = match self.tend_silence_questions(fleet)? {
                     (Some(outcome), _) => {
                         hook.waiting(None, None);
@@ -1343,18 +1341,24 @@ impl Autopilot {
                     }
                     (None, open) => open,
                 };
-                match self.tend_unrelated_check_questions(fleet)? {
+                // A check-unrelated question that still stands excludes only
+                // its own check from the agent's work
+                // (`Assessment::checks_to_fix`); the rest of the pull request
+                // (other failing checks, threads, a base that moved) still
+                // goes to the agent. The run waits on it only once nothing
+                // else can be done (below, after the pull request is read).
+                let open_unrelated = match self.tend_unrelated_check_questions(fleet)? {
                     (Some(outcome), _) => {
                         hook.waiting(None, None);
                         return Ok(Some(outcome));
                     }
-                    (None, true) => {
-                        pending = fleet
-                            .read(|conn| Ok(DecisionRepo::new(conn).list_pending_for_node(self.node)?))?
-                            .len();
-                    }
-                    (None, false) => {}
-                }
+                    (None, open) => open,
+                };
+                pending = fleet
+                    .read(|conn| Ok(DecisionRepo::new(conn).list_pending_for_node(self.node)?))?
+                    .len();
+                held_unrelated = open_unrelated;
+                pending = pending.saturating_sub(open_unrelated);
                 pending = pending.saturating_sub(open_silence);
             }
             if pending > 0 {
@@ -1426,6 +1430,14 @@ impl Autopilot {
                     p.assessment.behind_by = None;
                 }
                 overall = pr_readiness::overall(&current);
+            }
+            // Nothing for the agent is left but a check the user is asked
+            // about: only now does the run wait on that answer.
+            if held_unrelated > 0 && !matches!(overall, PrNext::Work(_) | PrNext::Merged) {
+                hook.waiting(None, None);
+                return Ok(Some(Outcome::NeedsHuman {
+                    reason: NeedsHuman::Decision { pending: held_unrelated + pending },
+                }));
             }
             match overall {
                 PrNext::Merged => {
@@ -1528,6 +1540,14 @@ impl Autopilot {
                         self.save()?;
                     }
                     let before = self.pr_report(fleet)?;
+                    // The check-unrelated questions already pending: only one
+                    // this turn raised excuses it, not one that was waiting on
+                    // another check.
+                    let asked_before: std::collections::HashSet<Uuid> = fleet
+                        .read(|conn| Ok(crate::check_unrelated::pending(conn, node)?))?
+                        .iter()
+                        .map(|(d, _, _, _)| d.id)
+                        .collect();
                     let fingerprint: Vec<String> = live.iter().map(|p| p.fingerprint.clone()).collect();
                     if reviewed {
                         if let Some(outcome) = self.pr_change_reviewed(fleet, agent, hook, &live, phase_key, &before)? {
@@ -1576,8 +1596,9 @@ impl Autopilot {
                     let asked = fleet
                         .read(|conn| Ok(crate::check_unrelated::pending(conn, node)?))?
                         .iter()
-                        .any(|(_, pr, _, _)| {
-                            links.prs.iter().any(|p| pr_readiness::pr_label(p).eq_ignore_ascii_case(pr))
+                        .any(|(d, pr, _, _)| {
+                            !asked_before.contains(&d.id)
+                                && links.prs.iter().any(|p| pr_readiness::pr_label(p).eq_ignore_ascii_case(pr))
                         });
                     // A round that ended in a question to the user is not a
                     // round of fixing: the agent did what it could, and asking
@@ -2152,25 +2173,25 @@ impl Autopilot {
     /// or no longer linked. Returns whether any was withdrawn. `Some` outcome
     /// when GitHub could not be read, a failed look like any other: the
     /// question is left as it is.
-    fn tend_unrelated_check_questions(&self, fleet: &FleetStore) -> Result<(Option<Outcome>, bool)> {
+    fn tend_unrelated_check_questions(&self, fleet: &FleetStore) -> Result<(Option<Outcome>, usize)> {
         use crate::pr_readiness;
         use tod_store::node_timeline::{KIND_NOTE, TimelineEntry};
         let node = self.node;
         let questions = fleet.read(|conn| Ok(crate::check_unrelated::pending(conn, node)?))?;
         if questions.is_empty() {
-            return Ok((None, false));
+            return Ok((None, 0));
         }
         let settings = pr_readiness::settings_for_node(fleet, node, &self.config.data_root)?;
         let links = fleet.read(|conn| tod_store::github::NodePrRepo::new(conn).read(node))?;
         let Some(feed) = pr_readiness::feed_for(&self.config.data_root) else {
-            return Ok((Some(github_wait::github_look_failed(fleet, node, false, "GitHub credentials are not set up")?), false));
+            return Ok((Some(github_wait::github_look_failed(fleet, node, false, "GitHub credentials are not set up")?), 0));
         };
         let live = match pr_readiness::live(feed.as_ref(), &links.prs, &settings) {
             Ok(live) => live,
-            Err(err) => return Ok((Some(github_wait::github_look_failed(fleet, node, false, &err)?), false)),
+            Err(err) => return Ok((Some(github_wait::github_look_failed(fleet, node, false, &err)?), 0)),
         };
         let state = lifecycle::current_state(fleet, node)?;
-        let mut withdrew = false;
+        let mut open = 0usize;
         for (decision, pr, check, head) in questions {
             // The user may have answered the same failure on another node
             // since this was raised: that answer covers this one too.
@@ -2182,7 +2203,6 @@ impl Autopilot {
                     })?;
                     if let Some(carried) = carried {
                         crate::check_unrelated::inherit(fleet, node, decision.id, &carried, &pr, &check, &state)?;
-                        withdrew = true;
                         continue;
                     }
                 }
@@ -2235,7 +2255,8 @@ impl Autopilot {
                         let entry = TimelineEntry::new(node, KIND_NOTE, &state, title, false, detail);
                         fleet.enqueue(tod_store::fleet::FleetMutation::RecordTimeline(Box::new(entry)))?;
                         fleet.writer().flush()?;
-                        withdrew = true;
+                    } else {
+                        open += 1;
                     }
                     continue;
                 }
@@ -2249,9 +2270,8 @@ impl Autopilot {
             let entry = TimelineEntry::new(node, KIND_NOTE, &state, title, false, detail);
             fleet.enqueue(tod_store::fleet::FleetMutation::RecordTimeline(Box::new(entry)))?;
             fleet.writer().flush()?;
-            withdrew = true;
         }
-        Ok((None, withdrew))
+        Ok((None, open))
     }
 
     /// Withdraws the node's pending requests about a review bot that does

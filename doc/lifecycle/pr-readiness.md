@@ -589,6 +589,11 @@ request*.
   spreads; a changed signature, or an unknown one, asks again.
 - **Fix it here** makes the check work again, tells the agent the user
   decided so, and `checks unrelated` is refused for it afterwards.
+- A pending question excludes only its own check from the agent's work. Other
+  failing checks, threads and a moved base still go to the agent (both the
+  run loop and `babysit` leave the open question out of the pending count);
+  the run waits on the user only when nothing else is left. A turn is excused
+  as "asked" only by a question that turn raised, not by one already pending.
 - A pending question whose check no longer fails, or whose pull request is
   merged or unlinked, is withdrawn with a note
   (`Autopilot::tend_unrelated_check_questions`).
