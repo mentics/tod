@@ -194,6 +194,28 @@ pub fn reason_label(reason: RequestReason) -> &'static str {
     }
 }
 
+/// What picking each option changes in the node's obligations, shown above
+/// the options so the user knows what answering approves
+/// (`Decision::edits`; applied as the user's own edit when answered).
+fn edit_preview(decision: &Decision) -> Option<String> {
+    if decision.edits.is_empty() {
+        return None;
+    }
+    let mut out = String::from("Answering edits the obligations as your own change (reversible in the change set):");
+    for edit in &decision.edits {
+        out.push_str(&format!(
+            "\n\n**Option {}** changes obligation {}",
+            edit.option,
+            tod_store::interview::short_id(edit.obligation_id)
+        ));
+        if let Some(was) = &edit.was {
+            out.push_str(&format!("\n\nfrom: {}", was.trim()));
+        }
+        out.push_str(&format!("\n\nto: {}", edit.body.trim()));
+    }
+    Some(out)
+}
+
 /// When a request was raised (`AttentionItem::since`), as its footer shows
 /// it: the time of day when it was raised today, else the date and time, in
 /// local time. `today` is the day the footer is drawn on, so the label does
@@ -1512,6 +1534,14 @@ impl Requests {
                     cx,
                 )))
             })
+            .when_some(edit_preview(&decision), |el, text| {
+                el.child(style::text_muted(div().text_sm()).child(selectable_markdown(
+                    SharedString::from(format!("unified-decisions-edits-{}", decision.id)),
+                    text,
+                    window,
+                    cx,
+                )))
+            })
             .when(tod_core::environment_request::is_request(&decision), |el| {
                 el.child(self.render_credential_buttons(&decision, cx))
             })
@@ -1826,6 +1856,7 @@ mod tests {
             created_at: asked.timestamp_millis(),
             reason: "intent".into(),
             moves: Vec::new(),
+            edits: Vec::new(),
             blocks: Vec::new(),
             new_evidence: String::new(),
         };
@@ -1841,6 +1872,37 @@ mod tests {
             log_times_label(&decision, &answer, answered.date_naive()),
             "Asked Nov 4 08:05 · Answered 14:32 · user"
         );
+    }
+
+    #[test]
+    fn the_options_obligation_edits_are_shown_with_the_request() {
+        let mut decision = Decision {
+            id: Uuid::new_v4(),
+            node_id: Uuid::new_v4(),
+            conversation_id: None,
+            protocol: None,
+            question: "Which check?".into(),
+            options: vec!["a".into(), "b".into()],
+            evidence: Vec::new(),
+            status: "pending".into(),
+            created_at: 0,
+            reason: "intent".into(),
+            moves: Vec::new(),
+            edits: Vec::new(),
+            blocks: Vec::new(),
+            new_evidence: String::new(),
+        };
+        assert_eq!(edit_preview(&decision), None);
+        decision.edits.push(tod_store::decisions::OptionEdit {
+            option: 2,
+            obligation_id: Uuid::new_v4(),
+            body: "uses the in-memory comparison".into(),
+            was: Some("uses last_synced_at".into()),
+        });
+        let text = edit_preview(&decision).unwrap();
+        assert!(text.contains("Option 2"), "{text}");
+        assert!(text.contains("from: uses last_synced_at"), "{text}");
+        assert!(text.contains("to: uses the in-memory comparison"), "{text}");
     }
 
     #[test]

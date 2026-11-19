@@ -15,7 +15,7 @@ use crate::args::Args;
 use tod_core::conversation::implement::{IMPLEMENT_CONVERSATION_ENV, IMPLEMENT_NODE_ENV};
 use tod_store::conversation::ConversationRepo;
 use tod_store::decisions::{
-    DECISION_REASONS, Decision, DecisionRepo, EVIDENCE_KINDS, EvidenceRef, NewDecision, OptionMove,
+    DECISION_REASONS, Decision, DecisionRepo, EVIDENCE_KINDS, EvidenceRef, NewDecision, OptionEdit, OptionMove,
 };
 use tod_store::interview::{InterviewCommand, InterviewRepo, short_id};
 use uuid::Uuid;
@@ -28,7 +28,7 @@ Inside a conversation --node defaults to the node it is about, and asks are
 filed under that conversation and its protocol.
 
 COMMANDS:
-    ask   [--node <UUID>] <QUESTION> [--option <TEXT> (repeatable)] [--evidence <KIND>:<ID> (repeatable)] [--reason <KIND>] [--moves-to <N>:<STATE> (repeatable)] [--blocks <STEP_ID> (repeatable)] [--new-evidence <TEXT>]
+    ask   [--node <UUID>] <QUESTION> [--option <TEXT> (repeatable)] [--evidence <KIND>:<ID> (repeatable)] [--reason <KIND>] [--moves-to <N>:<STATE> (repeatable)] [--edit-obligation <N>:<OBLIGATION_ID>=<NEW_TEXT> (repeatable)] [--blocks <STEP_ID> (repeatable)] [--new-evidence <TEXT>]
     list  [--node <UUID>] [--all]
     show  <ID>
 
@@ -42,6 +42,10 @@ other when omitted). --moves-to makes option N (1-based) send the node back to
 STATE when the user picks it: the app moves the node itself, as the user's own
 move, and reopens its implementation steps when STATE is active or earlier. STATE
 must be before the node's current state and before pr_review.
+--edit-obligation makes option N change an obligation of the node to
+NEW_TEXT when the user picks it (an obligation may be given as its 8-character
+prefix; repeat the flag for more than one): the app edits it itself, as the
+user's own edit, so the change set shows it and it can be reversed.
 --blocks links a plan step of the node that this question holds up (one cause,
 one request): the user answers once, the step opens again, and the question and
 its steps show as one request. A question already answered on the node in the
@@ -189,6 +193,20 @@ pub(crate) fn report_broken(inv: &Invocation, what: &str) -> anyhow::Result<bool
     Ok(true)
 }
 
+/// `--edit-obligation <N>:<OBLIGATION_ID>=<NEW_TEXT>`: option N (1-based)
+/// changes that obligation's text when picked.
+fn parse_edit(inv: &Invocation, raw: &str) -> anyhow::Result<OptionEdit> {
+    let usage = || anyhow::anyhow!("--edit-obligation must be `<option number>:<obligation id>=<new text>` (got `{raw}`)");
+    let (head, body) = raw.split_once('=').ok_or_else(usage)?;
+    let (option, id) = head.split_once(':').ok_or_else(usage)?;
+    let option: i64 = option
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("--edit-obligation `{raw}`: `{option}` is not an option number"))?;
+    let obligation_id = inv.client().read(|conn| InterviewRepo::new(conn).resolve_obligation_id(id.trim()))?;
+    Ok(OptionEdit { option, obligation_id, body: body.to_string(), was: None })
+}
+
 /// `--moves-to <N>:<STATE>`: option N (1-based) sends the node back to STATE.
 fn parse_move(raw: &str) -> anyhow::Result<OptionMove> {
     let (option, to) = raw
@@ -255,6 +273,11 @@ fn ask(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
         .iter()
         .map(|raw| parse_move(raw))
         .collect::<anyhow::Result<Vec<_>>>()?;
+    let edits = args
+        .get_all("--edit-obligation")
+        .iter()
+        .map(|raw| parse_edit(inv, raw))
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let mut blocks = Vec::new();
     for raw in args.get_all("--blocks") {
         for id in raw.split(',').map(str::trim).filter(|id| !id.is_empty()) {
@@ -285,6 +308,7 @@ fn ask(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
             evidence,
             reason,
             moves,
+            edits,
             blocks,
             guard_reask,
             new_evidence,
@@ -313,6 +337,7 @@ fn decision_json(d: &Decision) -> serde_json::Value {
         "status": d.status,
         "reason": d.reason,
         "moves": d.moves.iter().map(|m| serde_json::json!({"option": m.option, "to": m.to})).collect::<Vec<_>>(),
+        "edits": d.edits.iter().map(|e| serde_json::json!({"option": e.option, "obligation_id": e.obligation_id.to_string(), "body": e.body})).collect::<Vec<_>>(),
         "blocks": d.blocks.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
     })
 }
@@ -324,9 +349,16 @@ fn decision_line(d: &Decision) -> String {
         d.options
             .iter()
             .enumerate()
-            .map(|(i, o)| match d.move_for(i as i64 + 1) {
-                Some(to) => format!("{}. {o} (moves the node back to {to})", i + 1),
-                None => format!("{}. {o}", i + 1),
+            .map(|(i, o)| {
+                let n = i as i64 + 1;
+                let mut line = match d.move_for(n) {
+                    Some(to) => format!("{}. {o} (moves the node back to {to})", i + 1),
+                    None => format!("{}. {o}", i + 1),
+                };
+                for e in d.edits_for(n) {
+                    line.push_str(&format!(" (edits obligation {} to: {})", short_id(e.obligation_id), e.body));
+                }
+                line
             })
             .collect::<Vec<_>>()
             .join(" | ")

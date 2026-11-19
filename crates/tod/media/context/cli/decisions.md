@@ -7,7 +7,7 @@ as what a node with nothing on it is for. You only ask; answering is the
 user's.
 
 ```
-tod-cli --data-root <DATA_ROOT> decisions ask  [--node <NODE_UUID>] <QUESTION> [--option <TEXT> (repeatable)] [--evidence <KIND>:<ID> (repeatable)] [--reason <KIND>] [--moves-to <N>:<STATE> (repeatable)] [--blocks <STEP_ID> (repeatable)] [--new-evidence <TEXT>]
+tod-cli --data-root <DATA_ROOT> decisions ask  [--node <NODE_UUID>] <QUESTION> [--option <TEXT> (repeatable)] [--evidence <KIND>:<ID> (repeatable)] [--reason <KIND>] [--moves-to <N>:<STATE> (repeatable)] [--edit-obligation <N>:<OBLIGATION_ID>=<NEW_TEXT> (repeatable)] [--blocks <STEP_ID> (repeatable)] [--new-evidence <TEXT>]
 tod-cli --data-root <DATA_ROOT> decisions list [--node <NODE_UUID>] [--all]
 tod-cli --data-root <DATA_ROOT> decisions show <DECISION_ID>
 ```
@@ -41,6 +41,19 @@ in full or as the 8-character prefix listings show.
   your session cannot, so a plain option worded that way does nothing. `STATE`
   must be earlier than the node's current state and before `pr_review`; the
   ask fails otherwise.
+- `--edit-obligation <N>:<OBLIGATION_ID>=<NEW_TEXT>`: repeatable. Option N
+  (1-based) changes that obligation of the node to `NEW_TEXT` when the user
+  picks it; the id may be the 8-character prefix. Past `planning` you may not
+  edit obligations, only the user may, so whenever an option changes the
+  approach and an obligation names the approach it replaces (a check, a
+  mechanism, a name, a number), put the obligation's new text on that option.
+  The user sees the edit beside the option, and answering applies it as their
+  own edit (it shows in the change set and can be reversed), so you never ask
+  a second time to "update the obligations to match". Give the full new text
+  of the obligation, and the edit to every obligation the option makes stale;
+  an option that leaves them true carries none. The edits of the option the
+  user did not pick are never made. If an obligation changes before the user
+  answers, the answer is refused and says which; ask again then.
 - `--blocks`: repeatable plan step id (the 8-character prefix is fine) of this
   node that the question holds up. Use it whenever you hand a step back
   (`plan update --status blocked|partial`) for the same cause: ask once, with

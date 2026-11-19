@@ -88,6 +88,15 @@ pub fn record_decision_answer_as(
              implementation steps, as the user chose. Do nothing more in this session."
         )
     });
+    let edited = if answered.edited.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "\n\nThe app has already edited obligation(s) {} to what the option you were offered said, \
+             as the user's own edit. Do not edit or ask about them again; verify against the new text.",
+            answered.edited.join(", ")
+        ))
+    };
     let message = match credential {
         Some(message) => message,
         None => match before.answers.last() {
@@ -125,7 +134,7 @@ pub fn record_decision_answer_as(
                 .join(", ")
         )
     };
-    Ok(Some((conversation_id, format!("{message}{released}{}", moved.unwrap_or_default()))))
+    Ok(Some((conversation_id, format!("{message}{released}{}{}", moved.unwrap_or_default(), edited.unwrap_or_default()))))
 }
 
 /// Records the user's answer to a plan step the agent handed back (Keep,

@@ -87,6 +87,8 @@ fn send_back_with(
 pub struct Answered {
     /// The state the node was sent back to, when the picked option moves it.
     pub moved_to: Option<String>,
+    /// Short ids of the obligations the picked option edited, as the user.
+    pub edited: Vec<String>,
 }
 
 /// Record the user's answer to a decision, first carrying out the move the
@@ -155,6 +157,12 @@ fn answer_with_reopen(
         .read(|conn| DecisionRepo::new(conn).get(decision_id))?
         .with_context(|| format!("decision {decision_id} not found"))?;
     let target = option.and_then(|o| decision.move_for(o)).map(str::to_string);
+    // The obligation edits the option carries are made with the answer
+    // (`InterviewCommand::AnswerDecision`); one that no longer fits must fail
+    // before the task is moved, so nothing is half done.
+    if decision.status == DECISION_PENDING {
+        fleet.read(|conn| DecisionRepo::new(conn).pending_edits(&decision, option))?;
+    }
     let mut moved_to = None;
     if let Some(to) = target {
         if decision.status == DECISION_WITHDRAWN {
@@ -196,20 +204,28 @@ fn answer_with_reopen(
             .with_context(|| format!("could not send the task back to `{to}` as \"{label}\" asks"))?;
         moved_to = Some(to);
     }
+    let edited: Vec<String> = match (decision.status == DECISION_PENDING, option) {
+        (true, Some(o)) => decision
+            .edits_for(o)
+            .iter()
+            .map(|e| tod_store::interview::short_id(e.obligation_id))
+            .collect(),
+        _ => Vec::new(),
+    };
     record(InterviewCommand::AnswerDecision { decision_id, option, text }).map_err(|err| match &moved_to {
         Some(to) => anyhow::anyhow!(
             "the task was sent back to `{to}`, but recording the answer failed: {err:#}; answer again to finish"
         ),
         None => err,
     })?;
-    Ok(Answered { moved_to })
+    Ok(Answered { moved_to, edited })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::interview::test_support::{Fixture, fixture};
-    use tod_store::decisions::{DECISION_ANSWERED, NewDecision, OptionMove};
+    use tod_store::decisions::{DECISION_ANSWERED, NewDecision, OptionEdit, OptionMove};
     use tod_store::outline::OutlineMutation;
     use tod_store::outline::repos::plan_steps::{STATUS_PENDING, STATUS_READY, STATUS_VERIFIED};
 
@@ -257,6 +273,136 @@ mod tests {
 
     fn pending(fx: &Fixture) -> usize {
         fx.fleet.read(|conn| DecisionRepo::new(conn).list_pending_for_node(fx.node)).unwrap().len()
+    }
+
+
+    fn obligation(fx: &Fixture, body: &str) -> Uuid {
+        let id = Uuid::new_v4();
+        fx.fleet
+            .enqueue_outline(OutlineMutation::CreateObligation {
+                obligation_id: Some(id),
+                node_id: fx.node,
+                kind: "requirement".into(),
+                after_id: None,
+                before: false,
+                section: None,
+                body: body.into(),
+                phase: "requirements".into(),
+            })
+            .unwrap();
+        fx.fleet.writer().flush().unwrap();
+        id
+    }
+
+    fn body_of(fx: &Fixture, id: Uuid) -> String {
+        fx.fleet.list_obligations_for_node(fx.node).unwrap().into_iter().find(|o| o.id == id).unwrap().body
+    }
+
+    fn ask_with_edits(fx: &Fixture, edits: Vec<OptionEdit>) -> anyhow::Result<Uuid> {
+        let value = fx.fleet.interview(
+            ACTOR_USER,
+            InterviewCommand::AskDecision {
+                node_id: fx.node,
+                conversation_id: None,
+                protocol: Some("verify".into()),
+                decision: NewDecision {
+                    question: "Which check tells a refresh from an edit?\n\nBackground.".into(),
+                    options: vec!["Use last_synced_at".into(), "Use the in-memory comparison".into()],
+                    edits,
+                    ..Default::default()
+                },
+            },
+        )?;
+        Ok(Uuid::parse_str(value["id"].as_str().unwrap())?)
+    }
+
+    fn edit(option: i64, obligation_id: Uuid, body: &str) -> OptionEdit {
+        OptionEdit { option, obligation_id, body: body.into(), was: None }
+    }
+
+    /// Gap 65: a decision whose answer changes the approach carries the
+    /// obligation changes, past planning where only the user may edit them,
+    /// so the agent never has to ask a second time.
+    #[test]
+    fn answering_an_option_applies_its_obligation_edits_as_the_user_and_only_that_options() {
+        let fx = fixture();
+        let one = obligation(&fx, "Tell a refresh from an edit by last_synced_at");
+        let two = obligation(&fx, "A refresh never marks a field as edited, by last_synced_at");
+        let other = obligation(&fx, "Unrelated");
+        crate::lifecycle::set_lifecycle(&fx.fleet, fx.node, "verifying").unwrap();
+        // The agent cannot make this edit itself: the premise of the gap.
+        let agent = fx.fleet.interview(
+            "verifier-actor",
+            InterviewCommand::Outline {
+                mutation: OutlineMutation::UpdateObligationBody { obligation_id: one, body: "agent".into() },
+                target: None,
+            },
+        );
+        assert!(agent.is_err());
+        assert_eq!(body_of(&fx, one), "Tell a refresh from an edit by last_synced_at");
+
+        let id = ask_with_edits(
+            &fx,
+            vec![
+                edit(1, other, "Option 1's edit"),
+                edit(2, one, "Tell a refresh from an edit by the in-memory comparison"),
+                edit(2, two, "A refresh never marks a field as edited, by the in-memory comparison"),
+            ],
+        )
+        .unwrap();
+        let d = fx.fleet.read(|conn| DecisionRepo::new(conn).get(id)).unwrap().unwrap();
+        assert_eq!(d.edits.len(), 3);
+        assert_eq!(d.edits[1].was.as_deref(), Some("Tell a refresh from an edit by last_synced_at"));
+
+        let answered = answer_decision(&fx.fleet, id, Some(2), None).unwrap();
+
+        assert_eq!(answered.edited.len(), 2);
+        assert_eq!(body_of(&fx, one), "Tell a refresh from an edit by the in-memory comparison");
+        assert_eq!(body_of(&fx, two), "A refresh never marks a field as edited, by the in-memory comparison");
+        assert_eq!(body_of(&fx, other), "Unrelated", "the other option's edit is not made");
+        // Recorded as the user's own edit, in the change log, so it can be reversed.
+        let conn = rusqlite::Connection::open(fx.fleet.paths().db()).unwrap();
+        let recorded: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM conversation_actions WHERE actor = 'user' AND source = 'user'
+                 AND kind = 'edit' AND entity_id = ?1",
+                [tod_store::outline::uuid_blob::uuid_to_blob(one)],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(recorded, 1, "the edit is in the change log as the user's");
+        assert_eq!(pending(&fx), 0);
+    }
+
+    #[test]
+    fn an_obligation_changed_since_the_question_refuses_the_answer_and_nothing_is_made() {
+        let fx = fixture();
+        let one = obligation(&fx, "Old text");
+        crate::lifecycle::set_lifecycle(&fx.fleet, fx.node, "verifying").unwrap();
+        let id = ask_with_edits(&fx, vec![edit(2, one, "New text")]).unwrap();
+        fx.fleet
+            .enqueue_outline(OutlineMutation::UpdateObligationBody { obligation_id: one, body: "Someone else".into() })
+            .unwrap();
+        fx.fleet.writer().flush().unwrap();
+
+        let err = answer_decision(&fx.fleet, id, Some(2), None).unwrap_err();
+
+        assert!(format!("{err:#}").contains("changed since"), "{err:#}");
+        assert_eq!(body_of(&fx, one), "Someone else");
+        assert_eq!(pending(&fx), 1, "still waiting");
+        // The other option has no edits and still answers.
+        answer_decision(&fx.fleet, id, Some(1), None).unwrap();
+        assert_eq!(body_of(&fx, one), "Someone else");
+    }
+
+    #[test]
+    fn an_edit_to_nothing_or_to_no_option_is_refused_when_asked() {
+        let fx = fixture();
+        let one = obligation(&fx, "Text");
+        assert!(ask_with_edits(&fx, vec![edit(2, Uuid::new_v4(), "x")]).is_err());
+        assert!(ask_with_edits(&fx, vec![edit(3, one, "x")]).is_err());
+        assert!(ask_with_edits(&fx, vec![edit(2, one, "Text")]).is_err());
+        assert!(ask_with_edits(&fx, vec![edit(2, one, "  ")]).is_err());
     }
 
     #[test]

@@ -191,7 +191,10 @@ work around with fixtures never needs the user. When something does:
 - When the user answers one — settles a conflict, picks an option, supplies
   access — the app sets the step back to `in_progress` and tells you the
   answer. Act on it; where the answer changes what an obligation says, the
-  user changes the obligation (the app refuses yours past `planning`).
+  user changes the obligation (the app refuses yours past `planning`). Do not
+  ask for that afterwards: when you ask the question, put each option's new
+  obligation text on the option (see the decisions commands), and answering
+  makes the edit.
 
 ## Asking the user
 

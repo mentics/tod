@@ -13,7 +13,11 @@ order shown to the user in the app.
 Obligations are the user's. Once a task is past `planning`, you never add,
 change, move, or delete one yourself, even when the code or a reviewer
 disagrees with it: ask the user, quoting the change you propose and why, and
-the user makes it if they agree. The one exception is where an obligation
+the user makes it if they agree. When the question is a choice between
+approaches and an obligation names the one an option replaces, put that
+obligation's new text on the option itself (see the decisions commands):
+answering then makes the edit as the user's own, so you never have to ask
+again to "update the obligations to match". The one exception is where an obligation
 acts (see "Acts in"): a verification session that finds one only a later phase
 can deliver moves it there itself.
 

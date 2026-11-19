@@ -1079,7 +1079,31 @@ pub fn execute(
             option,
             text,
         } => {
-            let answer = crate::decisions::DecisionRepo::new(conn).answer(
+            let decisions = crate::decisions::DecisionRepo::new(conn);
+            // The obligation edits the picked option carries are the user's
+            // choice, made in the same transaction as the answer: both or
+            // neither. They are applied once, when the request is first
+            // answered, and recorded as the user's own edits (so the change
+            // set shows them and they can be reversed), also when a shepherd
+            // answers for the user.
+            if let Some(found) = decisions.get(*decision_id)? {
+                if option.is_some_and(|o| !found.edits_for(o).is_empty()) {
+                    if agent.is_some() {
+                        bail!("only the user answers a request whose option edits obligations");
+                    }
+                    if found.status != crate::decisions::DECISION_PENDING {
+                        bail!(
+                            "this request was already answered; a changed answer does not edit obligations, so \
+                             this option's edits are not made: edit them in the obligations panel if they are still wanted"
+                        );
+                    }
+                    for (obligation_id, body) in decisions.pending_edits(&found, *option)? {
+                        let mutation = OutlineMutation::UpdateObligationBody { obligation_id, body };
+                        crate::conversation::record_direct(conn, ACTOR_USER, &mutation, media_root)?;
+                    }
+                }
+            }
+            let answer = decisions.answer(
                 *decision_id,
                 *option,
                 text.as_deref(),

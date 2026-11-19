@@ -84,6 +84,28 @@ pub struct OptionMove {
     pub asked_in: Option<String>,
 }
 
+/// A change to an obligation's text that picking an option stands for. An
+/// agent past planning may not edit its node's obligations (only the user
+/// may), so when an option changes the approach the obligations it names must
+/// change with it: the option carries the new text, the user sees it with the
+/// option, and answering applies it as the user's own edit
+/// (`DecisionRepo::answer_edits`), so the agent never asks a second time.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OptionEdit {
+    /// 1-based, as options are numbered to the user.
+    pub option: i64,
+    /// The obligation of the decision's node whose text changes.
+    pub obligation_id: Uuid,
+    /// The text it gets.
+    pub body: String,
+    /// The text it had when the question was asked, recorded by
+    /// `DecisionRepo::create`. An obligation that has changed since (by
+    /// someone else) no longer matches what the user was shown, and
+    /// answering is refused.
+    #[serde(default)]
+    pub was: Option<String>,
+}
+
 /// The first lifecycle state a decision's option may not move a node into:
 /// from here on the work is out on a pull request, and only the node's own
 /// run (or the user's state chip) takes it there.
@@ -135,6 +157,8 @@ pub struct Decision {
     pub reason: String,
     /// The options that move the node when picked.
     pub moves: Vec<OptionMove>,
+    /// The obligation edits options carry, applied when the option is picked.
+    pub edits: Vec<OptionEdit>,
     /// The plan steps this decision holds up (`decisions ask --blocks`, or
     /// `plan update --decision`): one cause, one request. Answering the
     /// decision reopens the ones still handed back, and retrying one of
@@ -150,6 +174,11 @@ impl Decision {
     /// The state picking `option` (1-based) moves the node back to, if it does.
     pub fn move_for(&self, option: i64) -> Option<&str> {
         self.moves.iter().find(|m| m.option == option).map(|m| m.to.as_str())
+    }
+
+    /// The obligation edits picking `option` (1-based) makes.
+    pub fn edits_for(&self, option: i64) -> Vec<&OptionEdit> {
+        self.edits.iter().filter(|e| e.option == option).collect()
     }
 
     /// The state the node was in when picking `option` was offered, if known.
@@ -196,6 +225,10 @@ pub struct NewDecision {
     /// `pr_review`.
     #[serde(default)]
     pub moves: Vec<OptionMove>,
+    /// Obligation edits options carry (`--edit-obligation`): each `option`
+    /// names one of `options`, each `obligation_id` an obligation of the node.
+    #[serde(default)]
+    pub edits: Vec<OptionEdit>,
     /// Plan steps of the node this decision holds up (`--blocks`).
     #[serde(default)]
     pub blocks: Vec<Uuid>,
@@ -250,7 +283,7 @@ pub const CREATE_TABLE: &str = "
 ";
 
 const DECISION_COLUMNS: &str =
-    "id, node_id, conversation_id, protocol, question, options, evidence, status, created_at, reason, option_moves, blocks, new_evidence";
+    "id, node_id, conversation_id, protocol, question, options, evidence, status, created_at, reason, option_moves, blocks, new_evidence, option_edits";
 
 /// `decisions.option_moves` (an option that sends the node back); a no-op
 /// when the column is already there.
@@ -262,6 +295,20 @@ pub fn add_option_moves(conn: &Connection) -> Result<()> {
     )?;
     if !has {
         conn.execute_batch("ALTER TABLE decisions ADD COLUMN option_moves TEXT NOT NULL DEFAULT '[]';")?;
+    }
+    Ok(())
+}
+
+/// `decisions.option_edits` (obligation edits an option carries); a no-op
+/// when the column is already there.
+pub fn add_option_edits(conn: &Connection) -> Result<()> {
+    let has: bool = conn.query_row(
+        "SELECT COUNT(*) > 0 FROM pragma_table_info('decisions') WHERE name = 'option_edits'",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has {
+        conn.execute_batch("ALTER TABLE decisions ADD COLUMN option_edits TEXT NOT NULL DEFAULT '[]';")?;
     }
     Ok(())
 }
@@ -373,6 +420,48 @@ impl<'a> DecisionRepo<'a> {
             }
             moves.push(OptionMove { option: m.option, to: m.to.clone(), asked_in: Some(current) });
         }
+        let mut edits: Vec<OptionEdit> = Vec::new();
+        for e in &decision.edits {
+            if e.option < 1 || e.option > options.len() as i64 {
+                bail!(
+                    "--edit-obligation names option {}, but the decision has {} option(s)",
+                    e.option,
+                    options.len()
+                );
+            }
+            let body = e.body.trim();
+            if body.is_empty() {
+                bail!("--edit-obligation: the new text of obligation {} is empty", crate::interview::short_id(e.obligation_id));
+            }
+            if edits.iter().any(|x| x.option == e.option && x.obligation_id == e.obligation_id) {
+                bail!(
+                    "option {} edits obligation {} twice",
+                    e.option,
+                    crate::interview::short_id(e.obligation_id)
+                );
+            }
+            let Some(current) = crate::outline::repos::ObligationRepo::new(self.conn).get(e.obligation_id)? else {
+                bail!("--edit-obligation: obligation {} does not exist", crate::interview::short_id(e.obligation_id));
+            };
+            if current.node_id != node_id {
+                bail!(
+                    "--edit-obligation: obligation {} belongs to another node",
+                    crate::interview::short_id(e.obligation_id)
+                );
+            }
+            if current.body.trim() == body {
+                bail!(
+                    "--edit-obligation: obligation {} already says that; an option that changes nothing needs no edit",
+                    crate::interview::short_id(e.obligation_id)
+                );
+            }
+            edits.push(OptionEdit {
+                option: e.option,
+                obligation_id: e.obligation_id,
+                body: body.to_string(),
+                was: Some(current.body),
+            });
+        }
         let mut blocks: Vec<Uuid> = Vec::new();
         for step in &decision.blocks {
             if blocks.contains(step) {
@@ -391,8 +480,8 @@ impl<'a> DecisionRepo<'a> {
         let now = now_ms();
         self.conn.execute(
             "INSERT INTO decisions
-             (id, node_id, conversation_id, protocol, question, options, evidence, status, created_at, reason, option_moves, blocks, new_evidence)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?9, ?10, ?11, ?12)",
+             (id, node_id, conversation_id, protocol, question, options, evidence, status, created_at, reason, option_moves, blocks, new_evidence, option_edits)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 uuid_to_blob(id),
                 uuid_to_blob(node_id),
@@ -406,6 +495,7 @@ impl<'a> DecisionRepo<'a> {
                 serde_json::to_string(&moves)?,
                 serde_json::to_string(&blocks)?,
                 decision.new_evidence.trim(),
+                serde_json::to_string(&edits)?,
             ],
         )?;
         self.get(id)?.context("decision vanished after insert")
@@ -634,6 +724,39 @@ impl<'a> DecisionRepo<'a> {
                 map_answer,
             )
             .context("answer vanished after insert")
+    }
+
+    /// The obligation edits picking `option` makes, checked against the
+    /// obligations as they are now: each must still exist on the node and
+    /// still read as it did when the question was asked (or already read as
+    /// the new text). Returns the edits still to make, as mutations to run as
+    /// the user. Fails, naming the obligation, when one no longer fits.
+    pub fn pending_edits(&self, decision: &Decision, option: Option<i64>) -> Result<Vec<(Uuid, String)>> {
+        let Some(option) = option else { return Ok(Vec::new()) };
+        let mut out = Vec::new();
+        for edit in decision.edits_for(option) {
+            let short = crate::interview::short_id(edit.obligation_id);
+            let Some(current) = crate::outline::repos::ObligationRepo::new(self.conn).get(edit.obligation_id)? else {
+                bail!("obligation {short} no longer exists, so this option's edit to it cannot be made");
+            };
+            if current.node_id != decision.node_id {
+                bail!("obligation {short} is no longer on this node, so this option's edit to it cannot be made");
+            }
+            if current.body.trim() == edit.body.trim() {
+                continue;
+            }
+            if let Some(was) = &edit.was {
+                if current.body.trim() != was.trim() {
+                    bail!(
+                        "obligation {short} changed since this was asked, so the edit shown with the option no \
+                         longer applies: it now reads \"{}\"",
+                        current.body
+                    );
+                }
+            }
+            out.push((edit.obligation_id, edit.body.clone()));
+        }
+        Ok(out)
     }
 
     /// Set the still-handed-back steps `decision` holds up to `ready`.
@@ -866,6 +989,12 @@ fn map_decision(row: &rusqlite::Row<'_>) -> rusqlite::Result<Decision> {
             })?
         },
         new_evidence: row.get(12)?,
+        edits: {
+            let raw: String = row.get(13)?;
+            serde_json::from_str(&raw).map_err(|err| {
+                rusqlite::Error::FromSqlConversionFailure(13, rusqlite::types::Type::Text, Box::new(err))
+            })?
+        },
     })
 }
 

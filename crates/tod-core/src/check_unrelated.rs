@@ -255,6 +255,7 @@ mod tests {
             created_at: 0,
             reason: REASON_BROKEN.into(),
             moves: Vec::new(),
+            edits: Vec::new(),
             blocks: Vec::new(),
             new_evidence: String::new(),
         };
