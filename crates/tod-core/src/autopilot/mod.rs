@@ -1397,6 +1397,14 @@ impl Autopilot {
             };
             self.note_fallbacks(fleet, &live, phase_key)?;
             note_draft_skipped(fleet, node, &live, phase_key)?;
+            // A failing check whose failure the base branch has too is not
+            // the agent's to fix (`Assessment::checks_to_fix` already leaves it
+            // out): the user is asked once, here, so a pull request that has
+            // nothing else to do never reads as clear with a red check, and no
+            // turn is spent on it.
+            if self.ask_about_base_failures(fleet, &live, phase_key)? {
+                continue;
+            }
             let mut overall = pr_readiness::overall(&live);
             // A change the agent made and tod has not reviewed or pushed yet
             // (the run stopped in between) is finished first, whatever the
@@ -1587,12 +1595,24 @@ impl Autopilot {
                         self.state.loops.pr_unchanged = if same { self.state.loops.pr_unchanged + 1 } else { 0 };
                         self.save()?;
                         if self.state.loops.pr_unchanged >= 2 {
+                            // A failing check is the user's to decide, as a
+                            // request, not a stop that says "open the log".
+                            let seen = if pr_readiness::outstanding(&now).is_empty() { &live } else { &now };
+                            if self.ask_about_quiet_checks(fleet, seen, phase_key)? {
+                                self.state.loops.pr_unchanged = 0;
+                                // The rounds spent on the check before the
+                                // question was asked are not the user's
+                                // answer's to inherit: "fix it here" starts
+                                // a fresh budget.
+                                self.state.loops.pr_rounds = 0;
+                                self.save()?;
+                                continue;
+                            }
                             // Name what is still outstanding, on which pull
                             // request, and what the user can decide: the
                             // agent changed nothing because it had nothing
                             // it could change (a failing check that is not
                             // the change's, say).
-                            let seen = if pr_readiness::outstanding(&now).is_empty() { &live } else { &now };
                             let why = format!(
                                 "two turns in a row changed nothing on the pull request. Still outstanding: {}. {}",
                                 pr_readiness::outstanding(seen),
@@ -1954,6 +1974,130 @@ impl Autopilot {
         Ok((None, open))
     }
 
+    /// Raises the one check-unrelated request ([`crate::check_unrelated`]) for
+    /// each failing check that has a proof of failing on the base branch too
+    /// ([`tod_store::github::BaseFailure`]) and no standing yet on this head:
+    /// tod's own claim, with its proof, in place of the agent's (the agent
+    /// would otherwise be sent to fix what main fails, take two turns that
+    /// change nothing and stop the run `pr_stuck`). Returns whether any was
+    /// raised; the loop then stops on it at the top, like any pending request.
+    fn ask_about_base_failures(&self, fleet: &FleetStore, live: &[crate::pr_readiness::LivePr], phase: &str) -> Result<bool> {
+        use crate::check_unrelated as cu;
+        use tod_store::node_timeline::{KIND_NOTE, TimelineEntry};
+        let node = self.node;
+        let mut asked = false;
+        for p in live {
+            let a = &p.assessment;
+            let head = a.head_sha.clone().unwrap_or_default();
+            if a.merged || head.is_empty() {
+                continue;
+            }
+            for found in &a.base_failures {
+                if !a.failing_checks.iter().any(|c| c.eq_ignore_ascii_case(&found.check)) || a.check_standing(&found.check).is_some() {
+                    continue;
+                }
+                let label = crate::pr_readiness::pr_label(&p.pr);
+                let signature = a
+                    .failing_signatures
+                    .iter()
+                    .find(|(n, _)| n.eq_ignore_ascii_case(&found.check))
+                    .map(|(_, s)| s.clone())
+                    .unwrap_or_default();
+                let claim = cu::Claim {
+                    pr: label.clone(),
+                    pr_url: p.pr.url.clone(),
+                    check: found.check.clone(),
+                    head: head.clone(),
+                    signature,
+                    reason: found.describe(),
+                    raised: crate::check_unrelated::Raised::BaseBranch,
+                };
+                tracing::info!(%node, pr = %label, check = %found.check, "a failing check is also failing on the base: asking the user once");
+                fleet
+                    .interview(
+                        "autopilot",
+                        InterviewCommand::AskDecision {
+                            node_id: node,
+                            conversation_id: None,
+                            protocol: Some(cu::PROTOCOL.to_string()),
+                            decision: cu::new_decision(&claim),
+                        },
+                    )
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                let title = format!("\"{}\" on {label} also fails on {}: the agent is not sent for it", found.check, found.base_branch);
+                let entry = TimelineEntry::new(node, KIND_NOTE, phase, title, false, found.describe());
+                fleet.enqueue(tod_store::fleet::FleetMutation::RecordTimeline(Box::new(entry)))?;
+                fleet.writer().flush()?;
+                asked = true;
+            }
+        }
+        Ok(asked)
+    }
+
+    /// Two agent turns in a row changed nothing while checks failed and the
+    /// agent never said they are not the change's: instead of stopping the run
+    /// `pr_stuck` with "open the log", the user gets the one check-unrelated
+    /// request ([`crate::check_unrelated::Raised::QuietTurns`]) for each such
+    /// check with no standing on this head. A user who already said to fix it
+    /// here has no standing left to ask for: that stays a stop. Returns
+    /// whether any was raised.
+    fn ask_about_quiet_checks(&self, fleet: &FleetStore, live: &[crate::pr_readiness::LivePr], phase: &str) -> Result<bool> {
+        use crate::check_unrelated as cu;
+        use tod_store::node_timeline::{KIND_NOTE, TimelineEntry};
+        let node = self.node;
+        let mut asked = false;
+        for p in live {
+            let a = &p.assessment;
+            let head = a.head_sha.clone().unwrap_or_default();
+            if a.merged || head.is_empty() {
+                continue;
+            }
+            for check in a.checks_to_fix() {
+                if a.check_standing(&check).is_some() {
+                    continue;
+                }
+                let label = crate::pr_readiness::pr_label(&p.pr);
+                let signature = a
+                    .failing_signatures
+                    .iter()
+                    .find(|(n, _)| n.eq_ignore_ascii_case(&check))
+                    .map(|(_, s)| s.clone())
+                    .unwrap_or_default();
+                let reason = format!(
+                    "The check \"{check}\" on {label} ({}) is still failing; tod found no proof that the base branch fails it too.",
+                    p.pr.url
+                );
+                let claim = cu::Claim {
+                    pr: label.clone(),
+                    pr_url: p.pr.url.clone(),
+                    check: check.clone(),
+                    head: head.clone(),
+                    signature,
+                    reason: reason.clone(),
+                    raised: cu::Raised::QuietTurns,
+                };
+                tracing::info!(%node, pr = %label, %check, "two turns changed nothing on a failing check: asking the user instead of stopping");
+                fleet
+                    .interview(
+                        "autopilot",
+                        InterviewCommand::AskDecision {
+                            node_id: node,
+                            conversation_id: None,
+                            protocol: Some(cu::PROTOCOL.to_string()),
+                            decision: cu::new_decision(&claim),
+                        },
+                    )
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                let title = format!("Two turns changed nothing on \"{check}\" ({label}): the user is asked");
+                let entry = TimelineEntry::new(node, KIND_NOTE, phase, title, false, reason);
+                fleet.enqueue(tod_store::fleet::FleetMutation::RecordTimeline(Box::new(entry)))?;
+                fleet.writer().flush()?;
+                asked = true;
+            }
+        }
+        Ok(asked)
+    }
+
     /// Tends the node's pending check-unrelated questions
     /// ([`crate::check_unrelated::PROTOCOL`]): one is withdrawn, with a note
     /// on the node's activity, once its check no longer fails on its pull
@@ -2002,7 +2146,12 @@ impl Autopilot {
                     // The agent said again, on this head, that the check is
                     // not the change's, and the user once said to carry on
                     // without it on this pull request: apply that, and say so.
-                    if tod_store::settings::waived_on_earlier_head(
+                    // Only the agent's own attestation counts: a question tod
+                    // raised (a base failure, two quiet turns) is the user's
+                    // to answer again for a head whose failure is not known
+                    // to be the same.
+                    if crate::check_unrelated::raised_of(&decision) == crate::check_unrelated::Raised::Agent
+                        && tod_store::settings::waived_on_earlier_head(
                         &settings.unrelated_checks,
                         &pr,
                         &check,

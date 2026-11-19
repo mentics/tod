@@ -51,8 +51,25 @@ pub struct Claim {
     /// when not known: the answer holds for later heads while it fails the
     /// same way.
     pub signature: String,
-    /// The agent's evidence, as it gave it.
+    /// The evidence: the agent's, as it gave it, or what tod compared
+    /// ([`Raised::BaseBranch`]).
     pub reason: String,
+    /// Who raised it, which decides the wording.
+    pub raised: Raised,
+}
+
+/// Who put the question to the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Raised {
+    /// The pull request's agent (`tod-cli pr checks unrelated`).
+    Agent,
+    /// tod, because the failure is also on the base branch
+    /// (`tod_store::github::BaseFailure`): `reason` is its proof.
+    BaseBranch,
+    /// tod, because two agent turns in a row changed nothing while the check
+    /// failed and the agent never said it was not the change's: the user
+    /// decides instead of the run stopping `pr_stuck`.
+    QuietTurns,
 }
 
 /// The option that carries on without the check. It carries the key (the
@@ -62,6 +79,20 @@ pub fn carry_on_option(pr: &str, check: &str, head: &str, signature: &str) -> St
         format!("{CARRY_ON_PREFIX}{check}\" ({pr} @ {head})")
     } else {
         format!("{CARRY_ON_PREFIX}{check}\" ({pr} @ {head} ~ {signature})")
+    }
+}
+
+const BASE_SOURCE: &str = "tod found, without the agent, that the same failure is on the base branch";
+const QUIET_SOURCE: &str = "tod raised this itself: the pull request's agent took two turns in a row";
+
+/// Who raised `decision`, read back from its wording.
+pub fn raised_of(decision: &Decision) -> Raised {
+    if decision.question.contains(BASE_SOURCE) {
+        Raised::BaseBranch
+    } else if decision.question.contains(QUIET_SOURCE) {
+        Raised::QuietTurns
+    } else {
+        Raised::Agent
     }
 }
 
@@ -75,9 +106,14 @@ pub fn options(pr: &str, check: &str, head: &str, signature: &str) -> Vec<String
 pub fn question(claim: &Claim) -> String {
     format!(
         "Decide whether the failing check \"{check}\" on pull request {pr} ({url}) is fixed in that pull request or carried on without.\n\n\
-         The pull request's agent says this change did not cause it. Its evidence: {reason}\n\n\
+         {source}\n\n\
          Until you answer, tod does not send the agent back for this check. Carrying on without it leaves the check failing on GitHub, and the pull request stays blocked from merging there if the project requires it. {scope}",
-        scope = if claim.signature.is_empty() {
+        scope = if claim.signature.is_empty() && claim.raised != Raised::Agent {
+            format!(
+                "Your answer is for commit {} only: if a later push still fails the check, you are asked again.",
+                claim.head.chars().take(7).collect::<String>()
+            )
+        } else if claim.signature.is_empty() {
             format!(
                 "Your answer is for commit {} only: if a later push fails the check, the agent must say again that it is not the change's, and a carry-on you gave here is then applied without asking you again.",
                 claim.head.chars().take(7).collect::<String>()
@@ -88,7 +124,18 @@ pub fn question(claim: &Claim) -> String {
         check = claim.check,
         pr = claim.pr,
         url = claim.pr_url,
-        reason = claim.reason.trim(),
+        source = match claim.raised {
+            Raised::BaseBranch => format!(
+                "{BASE_SOURCE}, so this change did not cause it. Its evidence: {}",
+                claim.reason.trim()
+            ),
+            Raised::QuietTurns => format!(
+                "{QUIET_SOURCE} on this check and changed nothing, and did not say the check is not this change's. {} \
+                 If this change did cause it, answer \"{FIX_HERE}\" and tell the agent what to change; if it did not (open the check's log), carry on without it.",
+                claim.reason.trim()
+            ),
+            Raised::Agent => format!("The pull request's agent says this change did not cause it. Its evidence: {}", claim.reason.trim()),
+        },
     )
 }
 
@@ -224,7 +271,15 @@ mod tests {
             head: "abc1234".into(),
             signature: "sig1".into(),
             reason: "the lock file error is in modules/aws/stacks/kasm, which this change does not touch; the same check fails on vageli/retool-security-update".into(),
+            raised: Raised::Agent,
         }
+    }
+
+    #[test]
+    fn a_question_tod_raised_says_so_and_names_its_proof() {
+        let q = question(&Claim { raised: Raised::BaseBranch, reason: "main @ abc1234 fails the same".into(), ..claim() });
+        assert!(q.contains("tod found, without the agent") && q.contains("main @ abc1234"), "{q}");
+        assert!(!q.contains("agent says"), "{q}");
     }
 
     #[test]

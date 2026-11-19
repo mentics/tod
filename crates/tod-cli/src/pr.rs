@@ -787,7 +787,7 @@ fn checks_unrelated(inv: &Invocation, rest: &[String]) -> anyhow::Result<String>
         ),
         None => {}
     }
-    let claim = cu::Claim { pr: label.clone(), pr_url: pr.url.clone(), check: name.clone(), head, signature, reason };
+    let claim = cu::Claim { pr: label.clone(), pr_url: pr.url.clone(), check: name.clone(), head, signature, reason, raised: cu::Raised::Agent };
     inv.client().interview(InterviewCommand::AskDecision {
         node_id: node,
         conversation_id: None,

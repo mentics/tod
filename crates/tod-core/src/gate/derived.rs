@@ -1766,6 +1766,8 @@ mod readiness_tests {
             failing_checks: Vec::new(),
             failing_signatures: Vec::new(),
             signature_notes: Vec::new(),
+            failing_evidence: Vec::new(),
+            base_failures: Vec::new(),
             checks_running: false,
             head_sha: None,
             head_committed_at: None,

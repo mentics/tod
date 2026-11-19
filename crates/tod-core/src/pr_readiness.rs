@@ -307,6 +307,11 @@ pub struct Assessment {
     /// Why an answer about a failing check cannot carry across heads
     /// ([`PrStatus::signature_notes`]), named for the agent and the user.
     pub signature_notes: Vec<(String, String)>,
+    /// The failing checks whose failure is also on the base branch
+    /// ([`PrStatus::base_failures`]): the change did not cause them, so they
+    /// are never agent work and never a turn to lose; the user is asked once
+    /// ([`crate::check_unrelated`]) what to do about them.
+    pub base_failures: Vec<tod_store::github::BaseFailure>,
     /// A check is still running, whatever else failed.
     pub checks_running: bool,
     /// The head commit this was read at; a standing for a failing check
@@ -561,6 +566,7 @@ impl Assessment {
             failing_checks: snapshot.status.failing_checks.clone(),
             failing_signatures: snapshot.status.failing_signatures.clone(),
             signature_notes: snapshot.status.signature_notes.clone(),
+            base_failures: snapshot.status.base_failures.clone(),
             checks_running: snapshot.status.checks_running,
             head_sha: snapshot.status.head_sha.clone(),
             check_standings: Vec::new(),
@@ -627,12 +633,27 @@ impl Assessment {
     /// The failing checks that are agent work: those the agent has not said
     /// are not the change's (pending the user's answer, or carried on
     /// without).
+    ///
+    /// A check whose failure is also on the base branch is excused from the
+    /// start (the user's answer decides the rest): sending the agent to fix
+    /// what main already fails is the loop that ended in `pr_stuck`. Only the
+    /// user's "fix it in this pull request" makes it work again.
     pub fn checks_to_fix(&self) -> Vec<String> {
         self.failing_checks
             .iter()
-            .filter(|c| !matches!(self.check_standing(c), Some(UnrelatedStanding::Pending | UnrelatedStanding::Waived)))
+            .filter(|c| match self.check_standing(c) {
+                Some(UnrelatedStanding::Pending | UnrelatedStanding::Waived) => false,
+                Some(UnrelatedStanding::FixHere) => true,
+                None => self.base_failure(c).is_none(),
+            })
             .cloned()
             .collect()
+    }
+
+    /// The proof that failing check `check` is also failing on the base
+    /// branch, when there is one.
+    pub fn base_failure(&self, check: &str) -> Option<&tod_store::github::BaseFailure> {
+        self.base_failures.iter().find(|b| b.check.eq_ignore_ascii_case(check))
     }
 
     /// The checks the user said to fix in this pull request.

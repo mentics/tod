@@ -2415,6 +2415,8 @@ fn a_pr_draft_wake_leaves_running_checks_to_the_babysitter() {
         failing_checks: Vec::new(),
         failing_signatures: Vec::new(),
         signature_notes: Vec::new(),
+        failing_evidence: Vec::new(),
+        base_failures: Vec::new(),
         checks_running: false,
         head_sha: None,
         head_committed_at: None,
@@ -2460,6 +2462,8 @@ fn check_now_in_pr_draft_waits_for_the_draft_to_be_ready_and_reviewed() {
         failing_checks: Vec::new(),
         failing_signatures: Vec::new(),
         signature_notes: Vec::new(),
+        failing_evidence: Vec::new(),
+        base_failures: Vec::new(),
         checks_running: false,
         head_sha: None,
         head_committed_at: None,
@@ -2584,6 +2588,8 @@ fn check_now_in_pr_draft_sends_new_changes_requested_to_the_agent_even_on_a_draf
         failing_checks: Vec::new(),
         failing_signatures: Vec::new(),
         signature_notes: Vec::new(),
+        failing_evidence: Vec::new(),
+        base_failures: Vec::new(),
         checks_running: false,
         head_sha: None,
         head_committed_at: Some("2026-01-01T09:00:00Z".into()),
@@ -2632,6 +2638,8 @@ fn check_now_in_pr_draft_clears_a_leftover_review_wait_and_ignores_a_bot_reviewe
         failing_checks: Vec::new(),
         failing_signatures: Vec::new(),
         signature_notes: Vec::new(),
+        failing_evidence: Vec::new(),
+        base_failures: Vec::new(),
         checks_running: false,
         head_sha: None,
         head_committed_at: None,
@@ -4566,6 +4574,9 @@ struct FailingCheckFeed {
     repeats: std::sync::atomic::AtomicBool,
     /// How the check fails (`failure_signature`); empty is "not known".
     signature: std::sync::Mutex<String>,
+    /// The proof, when there is one, that the base branch fails `terraform`
+    /// the same way (what `Github::base_failures` reads).
+    base_failure: std::sync::Mutex<Option<tod_store::github::BaseFailure>>,
 }
 
 impl FailingCheckFeed {
@@ -4602,6 +4613,7 @@ impl crate::pr_readiness::PrFeed for FailingCheckFeed {
                 open: true,
                 reviewers: vec!["maria".into()],
                 base_ref: Some("main".into()),
+                base_failures: if fixed { Vec::new() } else { self.base_failure.lock().unwrap().iter().cloned().collect() },
                 ..Default::default()
             },
             threads: Vec::new(),
@@ -4633,6 +4645,7 @@ fn failing_check_node(says_unrelated: bool) -> (Fixture, Arc<FailingCheckFeed>, 
         head: std::sync::Mutex::new("abc1234".into()),
         repeats: std::sync::atomic::AtomicBool::new(false),
         signature: std::sync::Mutex::new(String::new()),
+        base_failure: std::sync::Mutex::new(None),
     });
     crate::pr_readiness::set_feed_override(Some(feed.clone()));
     linked_to_prs(&fx, "pr_review", &["https://github.com/acme/app/pull/42"]);
@@ -4653,6 +4666,7 @@ fn failing_check_node(says_unrelated: bool) -> (Fixture, Arc<FailingCheckFeed>, 
                 head: feed_seen.head.lock().unwrap().clone(),
                 signature: feed_seen.signature.lock().unwrap().clone(),
                 reason: "the lock file in infra/ fails the same way on main".into(),
+                raised: crate::check_unrelated::Raised::Agent,
             };
             fleet
                 .interview(
@@ -4752,16 +4766,124 @@ fn a_question_for_a_check_that_passes_again_is_withdrawn() {
 }
 
 #[test]
-fn two_quiet_turns_on_a_failing_check_stop_naming_the_check() {
+fn two_quiet_turns_on_a_failing_check_become_one_request_not_a_stop() {
+    // Gap 73: this used to stop the run `pr_stuck` with "open the log". The
+    // user is asked once, naming the check, and the run waits for the answer.
     let (fx, _, mut agent, _) = failing_check_node(false);
     let outcome = run_babysitter(&fx, &mut agent);
-    match &outcome {
-        Outcome::NeedsHuman { reason: NeedsHuman::PrStuck { why } } => {
-            assert!(why.contains("terraform"), "{why}");
-            assert!(why.contains("unrelated"), "{why}");
-        }
+    assert!(
+        matches!(&outcome, Outcome::NeedsHuman { reason: NeedsHuman::Decision { pending: 1 } }),
+        "{outcome:?}"
+    );
+    assert_eq!(agent.turns, 2);
+    let decisions = unrelated_decisions(&fx);
+    assert_eq!(decisions.len(), 1);
+    let q = &decisions[0].question;
+    assert!(q.contains("terraform") && q.contains("took two turns in a row on this check and changed nothing"), "{q}");
+    // Asked again and again: one request, no more turns.
+    for _ in 0..2 {
+        run_babysitter(&fx, &mut agent);
+    }
+    assert_eq!(agent.turns, 2);
+    assert_eq!(unrelated_decisions(&fx).len(), 1);
+    // "Fix it here" with the agent still unable to: nothing is left to ask,
+    // so that (the user's own instruction, not a base failure) is a stop.
+    fx.fleet
+        .interview(ACTOR_USER, InterviewCommand::AnswerDecision { decision_id: decisions[0].id, option: Some(2), text: None })
+        .unwrap();
+    match run_babysitter(&fx, &mut agent) {
+        Outcome::NeedsHuman { reason: NeedsHuman::PrStuck { why } } => assert!(why.contains("terraform"), "{why}"),
         other => panic!("{other:?}"),
     }
+}
+
+fn base_proof_for_terraform(proof: tod_store::github::BaseProof) -> tod_store::github::BaseFailure {
+    tod_store::github::BaseFailure {
+        check: "terraform".into(),
+        base_branch: "main".into(),
+        base_sha: "9e05268aaaaaaa".into(),
+        base_check: "update".into(),
+        base_url: Some("https://github.com/acme/app/actions/runs/1/job/2".into()),
+        proof,
+    }
+}
+
+/// Gap 73 (ENG-2504, ENG-2157): a check the base branch fails too, with the
+/// agent never claiming it, used to send the agent back twice for nothing and
+/// stop the run `pr_stuck`. Now tod asks the user once, with its proof, and the
+/// agent is never sent for it.
+#[test]
+fn a_check_the_base_fails_too_is_asked_once_and_never_stops_the_run_stuck() {
+    for proof in [
+        tod_store::github::BaseProof::SameCheck,
+        tod_store::github::BaseProof::SameErrors { paths: vec!["/w/inventory/ocr.py".into()] },
+    ] {
+        let (fx, feed, mut agent, _) = failing_check_node(false);
+        feed.fails_as("0123456789abcdef");
+        *feed.base_failure.lock().unwrap() = Some(base_proof_for_terraform(proof));
+        // Even with a quiet turn already counted: no turn is spent on it.
+        let mut pilot = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO);
+        pilot.state.loops.pr_unchanged = 1;
+        let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
+        assert!(
+            matches!(&outcome, Outcome::NeedsHuman { reason: NeedsHuman::Decision { pending: 1 } }),
+            "{outcome:?}"
+        );
+        assert_eq!(agent.turns, 0, "the agent was not sent for a failure the base has");
+        assert_eq!(pilot.state().loops.pr_unchanged, 1);
+        assert_eq!(pilot.state().loops.pr_rounds, 0, "not a round of fixing");
+        let decisions = unrelated_decisions(&fx);
+        assert_eq!(decisions.len(), 1);
+        let q = &decisions[0].question;
+        assert!(q.contains("acme/app#42") && q.contains("terraform") && q.contains("on the base branch"), "{q}");
+        assert!(q.contains("main @ 9e05268") || q.contains("fails on main @ 9e05268"), "{q}");
+        // Asked again and again: still one request, still no turn.
+        for _ in 0..3 {
+            let outcome = run_babysitter(&fx, &mut agent);
+            assert!(matches!(&outcome, Outcome::NeedsHuman { reason: NeedsHuman::Decision { pending: 1 } }), "{outcome:?}");
+        }
+        assert_eq!(agent.turns, 0);
+        assert_eq!(unrelated_decisions(&fx).len(), 1);
+        // Carrying on moves the node on, still with no turn.
+        fx.fleet
+            .interview(ACTOR_USER, InterviewCommand::AnswerDecision { decision_id: decisions[0].id, option: Some(1), text: None })
+            .unwrap();
+        let outcome = run_babysitter(&fx, &mut agent);
+        assert!(matches!(outcome, Outcome::Waiting { .. }), "{outcome:?}");
+        assert_eq!(agent.turns, 0);
+        assert_eq!(unrelated_decisions(&fx).len(), 1, "never asked again");
+    }
+}
+
+/// The user's "fix it in this pull request" is the one thing that sends the
+/// agent for a check the base fails too.
+#[test]
+fn a_base_failure_the_user_says_to_fix_here_is_work_again() {
+    let (fx, feed, mut agent, _) = failing_check_node(false);
+    feed.fails_as("0123456789abcdef");
+    *feed.base_failure.lock().unwrap() = Some(base_proof_for_terraform(tod_store::github::BaseProof::SameCheck));
+    run_babysitter(&fx, &mut agent);
+    let d = unrelated_decisions(&fx).remove(0);
+    fx.fleet
+        .interview(ACTOR_USER, InterviewCommand::AnswerDecision { decision_id: d.id, option: Some(2), text: None })
+        .unwrap();
+    run_babysitter(&fx, &mut agent);
+    assert!(agent.turns >= 1, "the user said to fix it here");
+}
+
+/// A deploy must not withdraw the agent's claim that a check is not the
+/// change's: the rerun it caused changed nothing twice and stopped the run.
+#[test]
+fn a_deploy_keeps_a_check_unrelated_claim() {
+    let (fx, _, mut agent, _) = failing_check_node(true);
+    run_babysitter(&fx, &mut agent);
+    assert_eq!(unrelated_decisions(&fx).len(), 1);
+    let later = chrono::Utc::now().timestamp_millis() + 60_000;
+    let withdrawn = crate::decision_recheck::sweep(&fx.fleet, later).unwrap();
+    assert!(withdrawn.is_empty(), "{withdrawn:?}");
+    let outcome = run_babysitter(&fx, &mut agent);
+    assert!(matches!(&outcome, Outcome::NeedsHuman { reason: NeedsHuman::Decision { pending: 1 } }), "{outcome:?}");
+    assert_eq!(agent.turns, 1, "no rerun after the deploy");
 }
 
 /// With one quiet turn already counted, the turn that records the check as

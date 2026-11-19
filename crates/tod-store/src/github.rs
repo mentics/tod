@@ -355,6 +355,15 @@ pub struct PrStatus {
     /// the annotations or log request, or no failure text in them). Shown
     /// wherever the check is, and logged when found.
     pub signature_notes: Vec<(String, String)>,
+    /// For each of [`Self::failing_checks`] whose failure text is known, `(name,
+    /// lines)`: the normalized lines the signature is made of
+    /// ([`normalized_failure_lines`]). What lets the same errors be recognized
+    /// on the base branch under another check's name ([`BaseFailure`]).
+    pub failing_evidence: Vec<(String, Vec<String>)>,
+    /// The failing checks whose failure also exists on the base branch, and the
+    /// proof ([`Github::base_failures`]); filled by [`Github::get_pr_snapshot`],
+    /// empty from [`Github::get_pr_status`].
+    pub base_failures: Vec<BaseFailure>,
     /// Some check is still running (a status `pending`, a run not completed),
     /// whatever else failed: `checks` says `failure` first.
     pub checks_running: bool,
@@ -388,6 +397,138 @@ impl PrStatus {
             .map(|(_, sig)| sig.clone())
             .unwrap_or_default()
     }
+}
+
+/// A failing check of a pull request whose failure is also on the base
+/// branch, so the change did not cause it. Never inferred from a name or a
+/// status alone: [`BaseProof`] says what was compared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaseFailure {
+    /// The pull request's failing check.
+    pub check: String,
+    pub base_branch: String,
+    /// The base branch's head the comparison was made at.
+    pub base_sha: String,
+    /// The failing run on the base that carries the same failure (its name
+    /// differs from `check` when the base runs the tool in another workflow).
+    pub base_check: String,
+    pub base_url: Option<String>,
+    pub proof: BaseProof,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BaseProof {
+    /// The same check name fails on the base head with the same failure
+    /// signature.
+    SameCheck,
+    /// The base has no run of that check, but a failing run of its own
+    /// reproduces every error line of the check's failure, and the files those
+    /// errors name (`paths`, at least one) are all outside the pull request's
+    /// change against the base.
+    SameErrors { paths: Vec<String> },
+}
+
+impl BaseFailure {
+    /// The proof in words, for the user and the agent.
+    pub fn describe(&self) -> String {
+        let at = self.base_sha.chars().take(7).collect::<String>();
+        let run = match &self.base_url {
+            Some(url) => format!(" ({url})"),
+            None => String::new(),
+        };
+        match &self.proof {
+            BaseProof::SameCheck => format!(
+                "\"{}\" fails on {} @ {at} with the same failure (same check, same failing step and error){run}",
+                self.check, self.base_branch
+            ),
+            BaseProof::SameErrors { paths } => format!(
+                "{} @ {at} fails in its \"{}\" check with every error line of \"{}\" ({}), and the files they name are not in this change{run}",
+                self.base_branch,
+                self.base_check,
+                self.check,
+                paths.join(", ")
+            ),
+        }
+    }
+}
+
+/// The files the errors in normalized failure `lines` name: each word that
+/// looks like a file path (a name with a short extension), once.
+pub fn error_paths(lines: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in lines {
+        for word in line.split_whitespace() {
+            let w = word.trim_matches(|c: char| matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | '"' | '\'' | '`' | ':'));
+            let Some((stem, ext)) = w.rsplit_once('.') else { continue };
+            let ext_ok = (1..=5).contains(&ext.len())
+                && ext.chars().all(|c| c.is_ascii_alphanumeric())
+                && ext.chars().any(|c| c.is_ascii_alphabetic());
+            // A directory part is required: a bare word like `e.g` is no file.
+            let stem_ok = !stem.is_empty() && w.contains('/') && !stem.ends_with('/') && !w.contains("://");
+            if ext_ok && stem_ok && !out.iter().any(|p| p == w) {
+                out.push(w.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Whether error path `path` (maybe absolute, from a runner's checkout) is
+/// one of the pull request's changed `files` (repository-relative): either is
+/// a path-suffix of the other. A bare file name is inside when any changed
+/// file has it, so a doubt counts as inside, never as outside.
+fn path_in_change(path: &str, files: &[String]) -> bool {
+    let path = path.trim_start_matches("./");
+    files.iter().any(|f| path == f || path.ends_with(&format!("/{f}")) || f.ends_with(&format!("/{path}")))
+}
+
+/// A failing run on a base head, with the failure text it gave.
+#[derive(Debug, Clone)]
+pub struct BaseRun {
+    pub name: String,
+    pub url: Option<String>,
+    pub signature: String,
+    pub lines: Vec<String>,
+}
+
+/// The proof that `check` (failing with `signature` and `lines`) also fails on
+/// the base, from the base head's failing `runs`; `None` when there is none.
+/// `changed_files` is read only when the second kind of proof needs it.
+///
+/// 1. A base run of the same name with an equal, known signature.
+/// 2. Otherwise a base run (any name) whose lines include every one of the
+///    check's lines, when those lines name at least one file and none of the
+///    files is in the pull request's change.
+///
+/// A check with no failure text (no signature, no lines) has no proof: a
+/// name or a status alone is never evidence.
+pub fn base_proof(
+    check: &str,
+    signature: &str,
+    lines: &[String],
+    runs: &[BaseRun],
+    changed_files: &mut dyn FnMut() -> Result<Vec<String>, GithubError>,
+) -> Result<Option<(BaseRun, BaseProof)>, GithubError> {
+    if !signature.is_empty()
+        && let Some(run) = runs.iter().find(|r| r.name.eq_ignore_ascii_case(check) && r.signature == signature)
+    {
+        return Ok(Some((run.clone(), BaseProof::SameCheck)));
+    }
+    if lines.is_empty() {
+        return Ok(None);
+    }
+    let Some(run) = runs.iter().find(|r| lines.iter().all(|l| r.lines.contains(l))) else {
+        return Ok(None);
+    };
+    let paths = error_paths(lines);
+    if paths.is_empty() {
+        return Ok(None);
+    }
+    let files = changed_files()?;
+    if paths.iter().any(|p| path_in_change(p, &files)) {
+        return Ok(None);
+    }
+    Ok(Some((run.clone(), BaseProof::SameErrors { paths })))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -795,9 +936,10 @@ impl Github {
         names: &[String],
         statuses: &CombinedStatusRaw,
         runs: &CheckRunsRaw,
-    ) -> Result<(Vec<(String, String)>, Vec<(String, String)>), GithubError> {
+    ) -> Result<FailingSignatures, GithubError> {
         let mut sigs: Vec<(String, String)> = Vec::new();
         let mut notes: Vec<(String, String)> = Vec::new();
+        let mut evidence: Vec<(String, Vec<String>)> = Vec::new();
         let mut record = |name: &String, result: Result<String, String>| match result {
             Ok(sig) => sigs.push((name.clone(), sig)),
             Err(why) => {
@@ -832,10 +974,13 @@ impl Github {
                 continue;
             }
             seen.push(name.clone());
-            let result = self.run_signature(owner, repo, run)?;
-            record(name, result);
+            let failure = self.run_signature(owner, repo, run)?;
+            if !failure.lines.is_empty() {
+                evidence.push((name.clone(), failure.lines));
+            }
+            record(name, failure.signature);
         }
-        Ok((sigs, notes))
+        Ok((sigs, notes, evidence))
     }
 
     /// Every annotation of a check run, all pages; more than 1,000 is an
@@ -855,7 +1000,7 @@ impl Github {
     }
 
     /// One failed check run's signature, or why it has none; cached by run.
-    fn run_signature(&self, owner: &str, repo: &str, run: &CheckRunRaw) -> Result<Result<String, String>, GithubError> {
+    fn run_signature(&self, owner: &str, repo: &str, run: &CheckRunRaw) -> Result<RunFailure, GithubError> {
         let key = format!("{}|{owner}/{repo}|{}", self.api, run.id);
         if run.id != 0 {
             if let Some(hit) = signature_cache_get(&key) {
@@ -914,7 +1059,8 @@ impl Github {
             }
         }
         let sig = failure_signature(conclusion, step.map(|s| s.name.as_str()).unwrap_or_default(), &evidence);
-        let result = if sig.is_empty() {
+        let lines = if sig.is_empty() { Vec::new() } else { normalized_failure_lines(&evidence) };
+        let signature = if sig.is_empty() {
             if reasons.is_empty() {
                 reasons.push("GitHub gave no annotation or log line saying how it failed".to_string());
             }
@@ -925,6 +1071,7 @@ impl Github {
         // A refusal is remembered for a while (so a token with no Actions
         // access does not cost three requests a minute); only a signature is
         // kept for good.
+        let result = RunFailure { signature, lines };
         if run.id != 0 {
             signature_cache_put(key, result.clone());
         }
@@ -941,6 +1088,7 @@ impl Github {
         let mut failing_checks = Vec::new();
         let mut failing_signatures = Vec::new();
         let mut signature_notes = Vec::new();
+        let mut failing_evidence = Vec::new();
         let mut checks_running = false;
         let checks = match &raw.head {
             Some(head) => {
@@ -950,7 +1098,7 @@ impl Github {
                     .get_json::<CombinedStatusRaw>(&format!("/repos/{owner}/{repo}/commits/{}/status", head.sha))?;
                 let runs = self.get_check_runs(owner, repo, &head.sha)?;
                 failing_checks = failing_check_names(Some(&statuses), Some(&runs));
-                (failing_signatures, signature_notes) =
+                (failing_signatures, signature_notes, failing_evidence) =
                     self.failing_signatures(owner, repo, &failing_checks, &statuses, &runs)?;
                 checks_running = checks_running_in(Some(&statuses), Some(&runs));
                 combine_checks(Some(&statuses), Some(&runs))
@@ -976,6 +1124,8 @@ impl Github {
             failing_checks,
             failing_signatures,
             signature_notes,
+            failing_evidence,
+            base_failures: Vec::new(),
             checks_running,
             head_sha: raw.head.as_ref().map(|h| h.sha.clone()),
             head_committed_at: None,
@@ -1517,8 +1667,82 @@ impl Github {
         )))
     }
 
+    /// The failing checks of `status` whose failure also exists on its base
+    /// branch's head, each with its proof ([`base_proof`]). Only a check whose
+    /// failure text is known can have one; the base head's failing check runs
+    /// are read once each (their failures never change, [`signature_cache`]).
+    /// A base with more than [`MAX_BASE_RUNS`] failing runs, or a change too
+    /// large to list its files, proves nothing (the check stays the change's
+    /// to explain); a failed request is an error, as everywhere.
+    pub fn base_failures(&self, owner: &str, repo: &str, status: &PrStatus) -> Result<Vec<BaseFailure>, GithubError> {
+        let (Some(base), Some(head)) = (status.base_ref.as_deref(), status.head_sha.as_deref()) else {
+            return Ok(Vec::new());
+        };
+        let candidates: Vec<&String> = status
+            .failing_checks
+            .iter()
+            .filter(|c| !status.failure_signature_of(c).is_empty())
+            .collect();
+        if status.merged || candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+        let base_sha = self.branch_sha(owner, repo, base)?;
+        let runs = self.get_check_runs(owner, repo, &base_sha)?;
+        let failing: Vec<&CheckRunRaw> = runs
+            .check_runs
+            .iter()
+            .filter(|r| r.status == "completed" && matches!(r.conclusion.as_deref(), Some("failure" | "timed_out")))
+            .collect();
+        if failing.len() > MAX_BASE_RUNS {
+            tracing::warn!(target: "tod::github", "{owner}/{repo}: {base} has {} failing check runs, too many to compare with", failing.len());
+            return Ok(Vec::new());
+        }
+        let mut base_runs: Vec<BaseRun> = Vec::new();
+        for run in failing {
+            let Some(name) = run.name.clone() else { continue };
+            let failure = self.run_signature(owner, repo, run)?;
+            if let Ok(signature) = failure.signature {
+                base_runs.push(BaseRun { name, url: run.html_url.clone(), signature, lines: failure.lines });
+            }
+        }
+        if base_runs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut diff: Option<Vec<String>> = None;
+        let mut changed = || -> Result<Vec<String>, GithubError> {
+            if diff.is_none() {
+                diff = Some(self.compare_files(owner, repo, base, head)?.into_iter().map(|f| f.filename).collect());
+            }
+            Ok(diff.clone().unwrap_or_default())
+        };
+        let mut out = Vec::new();
+        for check in candidates {
+            let lines = status
+                .failing_evidence
+                .iter()
+                .find(|(n, _)| n == check)
+                .map(|(_, l)| l.as_slice())
+                .unwrap_or_default();
+            match base_proof(check, &status.failure_signature_of(check), lines, &base_runs, &mut changed) {
+                Ok(Some((run, proof))) => out.push(BaseFailure {
+                    check: check.clone(),
+                    base_branch: base.to_string(),
+                    base_sha: base_sha.clone(),
+                    base_check: run.name,
+                    base_url: run.url,
+                    proof,
+                }),
+                Ok(None) => {}
+                Err(err) if err.is_transient() => return Err(err),
+                Err(err) => tracing::warn!(target: "tod::github", "{owner}/{repo}: \"{check}\" cannot be compared with {base}: {err}"),
+            }
+        }
+        Ok(out)
+    }
+
     pub fn get_pr_snapshot(&self, owner: &str, repo: &str, number: i64) -> Result<PrSnapshot, GithubError> {
         let mut status = self.get_pr_status(owner, repo, number)?;
+        status.base_failures = self.base_failures(owner, repo, &status)?;
         if let Some(sha) = status.head_sha.clone() {
             status.head_committed_at = self.commit_date(owner, repo, &sha).ok().flatten();
         }
@@ -2157,6 +2381,10 @@ pub enum Which {
 /// The most files GitHub lists of one compare.
 const COMPARE_FILE_LIMIT: usize = 300;
 
+/// The most failing check runs of a base head read to compare a pull
+/// request's failures with.
+const MAX_BASE_RUNS: usize = 20;
+
 /// Whether the change `head` makes is covered by `reviewed`: every file of
 /// `head` is in `reviewed` with the same renamed-from and the same added and
 /// removed lines. A file only `reviewed` has was either absorbed by the base
@@ -2365,6 +2593,8 @@ struct CheckRunRaw {
     started_at: Option<String>,
     #[serde(default)]
     output: Option<CheckOutputRaw>,
+    #[serde(default)]
+    html_url: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -2526,7 +2756,19 @@ fn failing_step_log(log: &str, step: &JobStepRaw) -> String {
     chosen.join("\n")
 }
 
-type CachedSignature = (Result<String, String>, Option<std::time::Instant>);
+/// What a finished check run's failure was read as: its signature (or why it
+/// has none) and the normalized lines it is made of.
+#[derive(Debug, Clone)]
+struct RunFailure {
+    signature: Result<String, String>,
+    lines: Vec<String>,
+}
+
+/// `(signatures, notes, evidence)` of the failing checks
+/// ([`Github::failing_signatures`]).
+type FailingSignatures = (Vec<(String, String)>, Vec<(String, String)>, Vec<(String, Vec<String>)>);
+
+type CachedSignature = (RunFailure, Option<std::time::Instant>);
 
 /// Signatures (and refusals, for ten minutes) by check run; see
 /// [`Github::run_signature`].
@@ -2538,7 +2780,7 @@ fn signature_cache() -> &'static std::sync::Mutex<std::collections::HashMap<Stri
 
 const REFUSAL_REMEMBERED: std::time::Duration = std::time::Duration::from_secs(600);
 
-fn signature_cache_get(key: &str) -> Option<Result<String, String>> {
+fn signature_cache_get(key: &str) -> Option<RunFailure> {
     let cache = signature_cache().lock().unwrap_or_else(|e| e.into_inner());
     match cache.get(key)? {
         (result, None) => Some(result.clone()),
@@ -2547,12 +2789,12 @@ fn signature_cache_get(key: &str) -> Option<Result<String, String>> {
     }
 }
 
-fn signature_cache_put(key: String, result: Result<String, String>) {
+fn signature_cache_put(key: String, result: RunFailure) {
     let mut cache = signature_cache().lock().unwrap_or_else(|e| e.into_inner());
     if cache.len() > 4000 {
         cache.clear();
     }
-    let at = result.is_err().then(std::time::Instant::now);
+    let at = result.signature.is_err().then(std::time::Instant::now);
     cache.insert(key, (result, at));
 }
 
@@ -2701,6 +2943,11 @@ fn scrub_word(word: &str) -> Option<String> {
 /// durations all stay); then the sorted, de-duplicated set of lines, so the
 /// order and repeats of lines do not matter.
 fn normalize_failure_text(text: &str) -> String {
+    normalized_failure_lines(text).join("\n")
+}
+
+/// The lines of [`normalize_failure_text`]: sorted and de-duplicated.
+pub fn normalized_failure_lines(text: &str) -> Vec<String> {
     let mut lines = std::collections::BTreeSet::new();
     for line in text.lines() {
         // ANSI escapes: `ESC [ ... letter`.
@@ -2722,7 +2969,7 @@ fn normalize_failure_text(text: &str) -> String {
             lines.insert(words.join(" "));
         }
     }
-    lines.into_iter().collect::<Vec<_>>().join("\n")
+    lines.into_iter().collect()
 }
 
 /// [`PrStatus::checks`] from the combined status and the check runs.
@@ -3794,6 +4041,135 @@ mod tests {
         assert!(!first.failure_signature_of("Kasm offline validation and tests").is_empty());
         assert_eq!(first.failing_signatures, second.failing_signatures);
         assert_eq!(handle.join().unwrap(), 8);
+    }
+
+    // ---- A failing check whose failure the base branch has too (gap 73) ----
+
+    const PYRIGHT_PATH: &str = "inventory/core/document_extractor/ocr.py";
+
+    fn pyright_annotations(path: &str, message: &str) -> &'static str {
+        leaked(format!(
+            r#"[{{"path":"{path}","annotation_level":"failure","title":"error","message":"{message}"}}]"#
+        ))
+    }
+
+    /// The pull request's failing `pyright`, failing with `annotations`.
+    fn pyright_status(annotations: &'static str) -> PrStatus {
+        let parsed: Vec<AnnotationRaw> = serde_json::from_str(annotations).unwrap();
+        let evidence = annotation_evidence(&parsed, true);
+        PrStatus {
+            failing_checks: vec!["pyright".into()],
+            failing_signatures: vec![("pyright".into(), failure_signature("failure", "Terraform validate", &evidence))],
+            failing_evidence: vec![("pyright".into(), normalized_failure_lines(&evidence))],
+            base_ref: Some("main".into()),
+            head_sha: Some("headsha1".into()),
+            ..Default::default()
+        }
+    }
+
+    fn base_runs(name: &str, id: i64) -> &'static str {
+        leaked(format!(
+            r#"{{"total_count":1,"check_runs":[{{"id":{id},"name":"{name}","status":"completed","conclusion":"failure","html_url":"https://github.com/o/r/runs/{id}","app":{{"id":15368,"slug":"github-actions"}},"output":{{"title":"t","summary":""}}}}]}}"#
+        ))
+    }
+
+    /// `base_failures` after the canned replies of the base head's read.
+    fn base_failures_after(status: &PrStatus, replies: Vec<(&'static str, &'static str)>) -> Vec<BaseFailure> {
+        let mut all = vec![("200 OK", r#"{"sha":"9e052682a4721f9d9b810dfd299ea4a876753e69"}"#)];
+        all.extend(replies);
+        let expected = all.len();
+        let (url, handle) = serve_canned(all);
+        let found = client(&url, &[]).base_failures("o", "r", status).unwrap();
+        assert_eq!(handle.join().unwrap(), expected);
+        found
+    }
+
+    #[test]
+    fn the_same_check_failing_the_same_way_on_the_base_head_is_proof() {
+        let a = pyright_annotations(PYRIGHT_PATH, "fitz is not a known attribute");
+        let found = base_failures_after(
+            &pyright_status(a),
+            vec![("200 OK", base_runs("pyright", 7001)), ("200 OK", job_json()), ("200 OK", a)],
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].proof, BaseProof::SameCheck);
+        assert_eq!(found[0].base_sha, "9e052682a4721f9d9b810dfd299ea4a876753e69");
+        assert!(found[0].describe().contains("main @ 9e05268"), "{}", found[0].describe());
+        // The same name failing differently on the base is not proof.
+        let other = pyright_annotations(PYRIGHT_PATH, "a different problem entirely");
+        let found = base_failures_after(
+            &pyright_status(a),
+            vec![("200 OK", base_runs("pyright", 7002)), ("200 OK", job_json()), ("200 OK", other)],
+        );
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn the_same_errors_in_another_workflow_are_proof_only_outside_the_change() {
+        let a = pyright_annotations(PYRIGHT_PATH, "fitz is not a known attribute");
+        // The base runs the tool as `update`, and the change touches other files.
+        let found = base_failures_after(
+            &pyright_status(a),
+            vec![
+                ("200 OK", base_runs("update", 7010)),
+                ("200 OK", job_json()),
+                ("200 OK", a),
+                ("200 OK", r#"{"files":[{"filename":"web/app.ts"}]}"#),
+            ],
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].base_check, "update");
+        assert_eq!(found[0].base_url.as_deref(), Some("https://github.com/o/r/runs/7010"));
+        assert!(matches!(&found[0].proof, BaseProof::SameErrors { paths } if paths.iter().any(|p| p.ends_with("ocr.py"))));
+        // The change touches the file the errors name: its to explain.
+        let found = base_failures_after(
+            &pyright_status(a),
+            vec![
+                ("200 OK", base_runs("update", 7011)),
+                ("200 OK", job_json()),
+                ("200 OK", a),
+                ("200 OK", leaked(format!(r#"{{"files":[{{"filename":"{PYRIGHT_PATH}"}}]}}"#))),
+            ],
+        );
+        assert!(found.is_empty(), "{found:?}");
+        // The base's errors are not all of the change's errors (it has one more).
+        let more = pyright_annotations(PYRIGHT_PATH, "something else entirely");
+        let found = base_failures_after(
+            &pyright_status(a),
+            vec![("200 OK", base_runs("update", 7012)), ("200 OK", job_json()), ("200 OK", more)],
+        );
+        assert!(found.is_empty(), "no overlap: {found:?}");
+    }
+
+    #[test]
+    fn a_check_with_no_failure_text_or_no_file_named_has_no_proof() {
+        // Errors that name no file are never proof by lines alone.
+        let a = pyright_annotations("", "something failed somewhere");
+        let status = pyright_status(a);
+        assert!(error_paths(&status.failing_evidence[0].1).is_empty(), "{:?}", status.failing_evidence);
+        let found = base_failures_after(
+            &status,
+            vec![("200 OK", base_runs("update", 7020)), ("200 OK", job_json()), ("200 OK", a)],
+        );
+        assert!(found.is_empty(), "{found:?}");
+        // A status with no failure text is not even looked up on the base.
+        let mut blind = pyright_status(a);
+        blind.failing_signatures.clear();
+        blind.failing_evidence.clear();
+        let (url, handle) = serve_canned(Vec::new());
+        assert!(client(&url, &[]).base_failures("o", "r", &blind).unwrap().is_empty());
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn error_paths_are_files_with_a_directory_and_an_extension() {
+        let lines = vec![
+            "/home/runner/work/app/app/inventory/ocr.py - error: \"x.y\" is unknown (reportAttributeAccessIssue)".to_string(),
+            "3 errors, 0 warnings e.g. 1.2.3 see https://example.com/a/b.html".to_string(),
+        ];
+        assert_eq!(error_paths(&lines), vec!["/home/runner/work/app/app/inventory/ocr.py".to_string()]);
+        assert!(path_in_change("/home/runner/work/app/app/inventory/ocr.py", &["inventory/ocr.py".to_string()]));
+        assert!(!path_in_change("/home/runner/work/app/app/inventory/ocr.py", &["inventory/other.py".to_string()]));
     }
 
     #[test]

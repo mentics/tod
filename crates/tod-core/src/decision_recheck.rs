@@ -38,6 +38,13 @@ pub fn cause_can_be_fixed_by_a_deploy(decision: &Decision) -> bool {
         Some(stop_questions::CONFIG) => true,
         Some(p) if stop_questions::is_kind(Some(p)) => false,
         Some(p) if p == crate::bot_silence::PROTOCOL || p == crate::permission::PROTOCOL => false,
+        // A claim that a failing check is not the change's (reason `broken`)
+        // is a judgment about CI, which a deploy does not change: withdrawing
+        // it sent the agent back to a failure it had already explained, and
+        // two turns that changed nothing stopped the run `pr_stuck` (gap 73).
+        // The autopilot withdraws it itself once the check stops failing the
+        // same way ([`crate::check_unrelated`]).
+        Some(p) if p == crate::check_unrelated::PROTOCOL => false,
         _ => [REASON_BROKEN, REASON_ACCESS, REASON_CAPABILITY].contains(&decision.reason.as_str()),
     }
 }
@@ -166,12 +173,16 @@ mod tests {
         let budget = ask(&fleet, node, REASON_BROKEN, stop_questions::BUDGET);
         let bot = ask(&fleet, node, REASON_BROKEN, crate::bot_silence::PROTOCOL);
         let permission = ask(&fleet, node, REASON_ACCESS, crate::permission::PROTOCOL);
+        // Gap 73: a claim that a failing check is not the change's is `broken`
+        // too, but a deploy cannot change CI: withdrawing it sent the agent
+        // back to a failure it had explained, into a no-change stop.
+        let unrelated = ask(&fleet, node, REASON_BROKEN, crate::check_unrelated::PROTOCOL);
         // A build older than every request: nothing predates it.
         assert!(sweep(&fleet, 1).unwrap().is_empty());
         let done: Vec<Uuid> = sweep(&fleet, later()).unwrap().into_iter().map(|d| d.id).collect();
         assert_eq!(done, vec![broken]);
         let left = pending(&fleet);
-        for id in [intent, risk, budget, bot, permission] {
+        for id in [intent, risk, budget, bot, permission, unrelated] {
             assert!(left.contains(&id), "{id} should still be pending");
         }
     }
