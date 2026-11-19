@@ -730,6 +730,9 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     // The node's timeline of gate checks, command runs and phase changes:
     // synced, not journaled (`crate::node_timeline`).
     conn.execute_batch(crate::node_timeline::CREATE_TABLE)?;
+    // Transient git failures that were retried: machine-local telemetry, no
+    // schema version (`crate::git_retries`).
+    conn.execute_batch(crate::git_retries::CREATE_TABLE)?;
     crate::sync::install(conn)?;
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that

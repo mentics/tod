@@ -67,6 +67,37 @@ impl Drop for FleetStore {
     }
 }
 
+/// Counts the git calls this process retries through `writer`
+/// (`crate::git_retries`). Queueing never blocks the git call. When a record
+/// cannot be queued the git call is left alone, as its outcome stands on its
+/// own; the failure is returned to `workdir` (counted and logged) and, when
+/// the retry was for a node, put on that node as a problem its views show.
+fn install_git_retry_sink(writer: &FleetWriter) {
+    let queue = writer.queue_handle();
+    crate::fleet::workdir::set_retry_sink(Arc::new(move |retry| {
+        let node = retry.node_id;
+        let what = format!("git {} in {}", retry.op, retry.workdir);
+        match queue(FleetMutation::RecordGitRetry(Box::new(retry))) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if let Some(node) = node {
+                    let message = format!("tod could not count the retries of {what}: {e}");
+                    // Best effort: the error is returned either way.
+                    let _ = queue(FleetMutation::RecordNodeProblem {
+                        problem: crate::node_problems::NodeProblem::new(
+                            node,
+                            crate::node_problems::KIND_GIT_RETRY_RECORD,
+                            message,
+                            crate::outline::uuid_blob::now_ms(),
+                        ),
+                    });
+                }
+                Err(anyhow::anyhow!("{e}"))
+            }
+        }
+    }));
+}
+
 impl FleetStore {
     pub fn open(root: impl AsRef<Path>) -> Result<Self, FleetLaunchError> {
         Self::open_with_guest_liveness(root, &NoopGuestLiveness)
@@ -131,6 +162,7 @@ impl FleetStore {
         ));
         let change_tx = projection.lock().expect("fleet projection mutex").change_sender();
         let background_shutdown = Arc::new(AtomicBool::new(false));
+        install_git_retry_sink(&writer);
         if reload {
             crate::fleet::projection::spawn_commit_reloader(
                 projection.clone(),
@@ -170,6 +202,7 @@ impl FleetStore {
         ));
         let change_tx = projection.lock().expect("fleet projection mutex").change_sender();
         let background_shutdown = Arc::new(AtomicBool::new(false));
+        install_git_retry_sink(&writer);
         crate::fleet::projection::spawn_commit_reloader(
             projection.clone(),
             commit_notify,

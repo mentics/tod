@@ -82,7 +82,7 @@ the act is left on the node's activity as that shepherd's, else as the operator'
 ";
 
 pub(crate) const STATS_SUMMARY: &str =
-    "stats                  How the lifecycle is going: cost, review, PR, requests, stops, sandbox churn (operator tier)";
+    "stats                  How the lifecycle is going: cost, review, PR, requests, stops, sandbox churn, git retries (operator tier)";
 
 pub(crate) const STATS_USAGE: &str = "\
 tod-cli stats — how the lifecycle is going, from what tod already keeps (operator tier)
@@ -96,8 +96,10 @@ Read-only. One report over the store with a section per question: `cost`
 `pr-draft` (PR agent sessions, draft review rounds, threads posted, pushes, CI
 failures), `requests` (how many, how long they waited, answered with an offered
 option or carry-on words, about tod's setup), `stops` (runs stopped now by
-reason, and who resumes them) and `sandbox` (locations made and removed,
-replacements, losses). <NODE> (a slug or UUID) narrows it to one node;
+reason, and who resumes them), `sandbox` (locations made and removed,
+replacements, losses) and `git-retries` (git calls tod retried after a ref-lock
+race or a network error, per node: calls, retries, recovered, gave up, by
+operation; a call that gave up also leaves a note on the node's activity). <NODE> (a slug or UUID) narrows it to one node;
 --section to one section; --since (30m, 2h, 7d) to what happened in that
 window. Every section ends with `not available:` lines naming what tod does
 not keep (tokens, bot reviews, stop history, setup time), so a missing figure

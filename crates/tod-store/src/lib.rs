@@ -12,6 +12,7 @@ pub mod cloudflare_access;
 pub mod credentials;
 pub mod deferrals;
 pub mod git_identity;
+pub mod git_retries;
 pub mod decisions;
 pub mod done_close;
 pub mod environment;

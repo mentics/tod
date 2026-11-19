@@ -44,6 +44,8 @@ pub fn resolve_launch_cwd_with(
     node_id: &str,
     progress: &mut dyn FnMut(&str),
 ) -> Result<(Workdir, Vec<String>)> {
+    // The git retries this makes are counted against the node.
+    let _retries = crate::fleet::workdir::scope_retries_to_node(node_id);
     // A worktree already made is used under the node's lock, which a release of
     // its lease ([`release_parked_worktree`]) also holds for all of its work: a
     // launch and a release never interleave, so the directory returned here is
@@ -371,6 +373,7 @@ pub fn make_location(
     node_id: &str,
     progress: &mut dyn FnMut(&str),
 ) -> Result<(Workdir, Vec<String>)> {
+    let _retries = crate::fleet::workdir::scope_retries_to_node(node_id);
     let lock = node_lock(node_id);
     let _held = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     // Another launch may have made it while this one waited.

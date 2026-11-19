@@ -267,7 +267,7 @@ fn a_node_filter_and_a_since_filter_narrow_every_section() {
 fn the_text_report_names_every_section_and_what_is_unavailable() {
     let f = fx();
     let text = all(&f.conn).text();
-    for head in ["COST", "REVIEW LOOP", "PR LOOP", "REQUESTS", "STOPS", "SANDBOX CHURN", "not available"] {
+    for head in ["COST", "REVIEW LOOP", "PR LOOP", "REQUESTS", "STOPS", "SANDBOX CHURN", "GIT RETRIES", "not available"] {
         assert!(text.contains(head), "missing {head}:\n{text}");
     }
 }
@@ -276,4 +276,27 @@ fn the_text_report_names_every_section_and_what_is_unavailable() {
 fn an_unknown_section_is_an_error_naming_the_choices() {
     let err = Section::parse("bogus").unwrap_err().to_string();
     assert!(err.contains("bogus") && err.contains("pr-draft"), "{err}");
+}
+
+#[test]
+fn git_retries_count_calls_retries_and_outcomes_per_node_and_workdir() {
+    use tod_store::git_retries::{CLASS_LOCK_RACE, CLASS_NETWORK, GitRetry, GitRetryRepo};
+    let f = fx();
+    let a = node(&f.conn, "alpha");
+    let b = node(&f.conn, "beta");
+    let repo = GitRetryRepo::new(&f.conn);
+    repo.record(&GitRetry::new(Some(a), "/r", "fetch", CLASS_LOCK_RACE, 2, true, "")).unwrap();
+    repo.record(&GitRetry::new(Some(a), "/r", "submodule update", CLASS_NETWORK, 3, false, "early EOF")).unwrap();
+    repo.record(&GitRetry::new(Some(b), "/r", "fetch", CLASS_NETWORK, 1, true, "")).unwrap();
+    repo.record(&GitRetry::new(None, "/elsewhere", "clone", CLASS_NETWORK, 1, true, "")).unwrap();
+    let g = compute(&f.conn, &Filter::default(), &[Section::GitRetries]).unwrap().git_retries.unwrap();
+    assert_eq!((g.calls, g.retries, g.recovered, g.gave_up), (4, 7, 3, 1));
+    let alpha = g.rows.iter().find(|r| r.subject == "alpha").unwrap();
+    assert_eq!((alpha.calls, alpha.retries, alpha.recovered, alpha.gave_up, alpha.lock_race, alpha.network), (2, 5, 1, 1, 1, 1));
+    assert_eq!(alpha.by_op["fetch"], 1);
+    assert!(g.rows.iter().any(|r| r.subject == "/elsewhere"), "a retry for no node is counted against its workdir");
+    let only = compute(&f.conn, &Filter { node: Some("beta".into()), since_ms: None }, &[Section::GitRetries]).unwrap();
+    assert_eq!(only.git_retries.unwrap().calls, 1);
+    let text = compute(&f.conn, &Filter::default(), &[Section::GitRetries]).unwrap().text();
+    assert!(text.contains("GIT RETRIES: 4 calls retried (7 retries): 3 recovered, 1 gave up") && text.contains("not available"), "{text}");
 }

@@ -8,6 +8,7 @@ use anyhow::{Result, bail};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use crate::git_retries::{CLASS_LOCK_RACE, CLASS_NETWORK, GitRetry};
 use tod_agent::devcontainer::ContainerExec;
 
 /// Put before the arguments of every git tod runs in a dev container: turns
@@ -100,11 +101,26 @@ pub fn retry_ref_lock_race(
     backoff: &[std::time::Duration],
     run: impl FnMut() -> Result<Output>,
 ) -> Result<Output> {
-    retry_network_git(args, backoff, run, || {})
+    retry_network_git("", args, backoff, run, || {})
+}
+
+/// [`retry_ref_lock_race`] for a call in `workdir`, which a retry is recorded
+/// against ([`set_retry_sink`]).
+pub fn retry_ref_lock_race_in(
+    workdir: &str,
+    args: &[&str],
+    backoff: &[std::time::Duration],
+    run: impl FnMut() -> Result<Output>,
+) -> Result<Output> {
+    retry_network_git(workdir, args, backoff, run, || {})
 }
 
 /// [`retry_ref_lock_race`], calling `before_retry` before each new attempt.
+/// The one loop every Rust git retry goes through, so the one place a retry is
+/// counted: a call that needed at least one retry is reported once
+/// ([`report_retry`]) with how it ended.
 fn retry_network_git(
+    workdir: &str,
     args: &[&str],
     backoff: &[std::time::Duration],
     mut run: impl FnMut() -> Result<Output>,
@@ -114,15 +130,85 @@ fn retry_network_git(
     if !is_network_git(args) {
         return Ok(out);
     }
+    let mut retries = 0u32;
+    let mut class = "";
     for wait in backoff {
-        if out.status.success() || !is_transient_fetch_failure(&String::from_utf8_lossy(&out.stderr)) {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if out.status.success() || !is_transient_fetch_failure(&stderr) {
             break;
         }
+        if retries == 0 {
+            class = if is_ref_lock_race(&stderr) { CLASS_LOCK_RACE } else { CLASS_NETWORK };
+        }
+        retries += 1;
         std::thread::sleep(*wait);
         before_retry();
         out = run()?;
     }
+    if retries > 0 {
+        // The call itself ended however it ended: recording it never changes that.
+        report_retry(workdir, args, class, retries, &out);
+    }
     Ok(out)
+}
+
+fn op_name(args: &[&str]) -> String {
+    if is_submodule_update(args) { "submodule update".into() } else { git_subcommand(args).unwrap_or("git").to_string() }
+}
+
+/// Where a retried git call is counted: a function given the record, installed
+/// once per store ([`set_retry_sink`]). It returns the error when it could not
+/// record it.
+pub type RetrySink = std::sync::Arc<dyn Fn(GitRetry) -> Result<()> + Send + Sync>;
+
+static RETRY_SINK: std::sync::RwLock<Option<RetrySink>> = std::sync::RwLock::new(None);
+static RETRY_RECORD_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Installs the sink retried git calls are counted through (the store that
+/// owns this process's database does it when it opens). The latest wins.
+pub fn set_retry_sink(sink: RetrySink) {
+    *RETRY_SINK.write().unwrap_or_else(|p| p.into_inner()) = Some(sink);
+}
+
+/// How many retries this process failed to record (each was also logged as an
+/// error).
+pub fn retry_record_failures() -> u64 {
+    RETRY_RECORD_FAILURES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+thread_local! {
+    static RETRY_NODE: std::cell::RefCell<Option<uuid::Uuid>> = const { std::cell::RefCell::new(None) };
+}
+
+/// While alive, git calls this thread retries are counted against a node.
+pub struct RetryNodeScope(Option<uuid::Uuid>);
+
+impl Drop for RetryNodeScope {
+    fn drop(&mut self) {
+        RETRY_NODE.with(|n| *n.borrow_mut() = self.0.take());
+    }
+}
+
+/// Counts the git retries this thread makes until the guard drops against
+/// `node_id` (a node id string; one that is not a UUID counts against none).
+pub fn scope_retries_to_node(node_id: &str) -> RetryNodeScope {
+    let node = uuid::Uuid::parse_str(node_id).ok();
+    RetryNodeScope(RETRY_NODE.with(|n| n.replace(node)))
+}
+
+fn report_retry(workdir: &str, args: &[&str], class: &str, retries: u32, last: &Output) {
+    let Some(sink) = RETRY_SINK.read().unwrap_or_else(|p| p.into_inner()).clone() else {
+        return;
+    };
+    let node = RETRY_NODE.with(|n| *n.borrow());
+    let op = op_name(args);
+    let record = GitRetry::new(node, workdir, &op, class, retries, last.status.success(), &String::from_utf8_lossy(&last.stderr));
+    if let Err(e) = sink(record) {
+        // Never fails the git call (which may have recovered); the failure is
+        // counted and logged, and the sink itself puts it on the node.
+        RETRY_RECORD_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::error!("could not record the retry of git {op} in {workdir}: {e:#}");
+    }
 }
 
 /// Removes what a `git submodule update` cut off mid-clone leaves behind, so
@@ -382,6 +468,7 @@ impl Workdir {
     /// ownership check is off (see [`CONTAINER_GIT_CONFIG`]).
     pub fn git_output(&self, args: &[&str]) -> Result<Output> {
         retry_network_git(
+            &self.to_string(),
             args,
             FETCH_RETRY_BACKOFF,
             || self.git_output_once(args),
@@ -531,6 +618,72 @@ mod retry_tests {
         Output { status: std::process::ExitStatus::from_raw(code << 8), stdout: vec![], stderr: stderr.as_bytes().to_vec() }
     }
 
+    /// Collects what `report_retry` hands the sink, the sink being process-wide.
+    fn collecting_sink() -> std::sync::Arc<std::sync::Mutex<Vec<GitRetry>>> {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        set_retry_sink(std::sync::Arc::new(move |r| {
+            sink.lock().unwrap().push(r);
+            Ok(())
+        }));
+        seen
+    }
+
+    #[test]
+    fn a_retried_call_is_counted_with_node_workdir_operation_class_and_outcome() {
+        let seen = collecting_sink();
+        let node = uuid::Uuid::new_v4();
+        {
+            let _scope = scope_retries_to_node(&node.to_string());
+            let mut calls = 0;
+            retry_ref_lock_race_in("/r/counted-recovers", &["fetch", "origin"], &[Duration::ZERO; 3], || {
+                calls += 1;
+                Ok(if calls < 3 { out(128, "error: cannot lock ref 'refs/remotes/origin/main'") } else { out(0, "") })
+            })
+            .unwrap();
+            let r = retry_ref_lock_race_in("/r/counted-gives-up", &["submodule", "update", "--init"], &[Duration::ZERO; 3], || {
+                Ok(out(128, "fatal: early EOF"))
+            })
+            .unwrap();
+            assert!(!r.status.success(), "the failure is still returned as it was");
+        }
+        // A call that needs no retry, and a failure that is not transient, leave nothing.
+        retry_ref_lock_race_in("/r/counted-none", &["fetch"], &[Duration::ZERO; 3], || Ok(out(0, ""))).unwrap();
+        retry_ref_lock_race_in("/r/counted-none", &["fetch"], &[Duration::ZERO; 3], || Ok(out(128, "fatal: Authentication failed"))).unwrap();
+        // Outside the scope the retry is for no node.
+        retry_ref_lock_race_in("/r/counted-unscoped", &["pull"], &[Duration::ZERO; 3], || Ok(out(128, "Could not resolve host"))).unwrap();
+        let seen = seen.lock().unwrap();
+        let mine = |w: &str| seen.iter().filter(|r| r.workdir == w).cloned().collect::<Vec<_>>();
+        let [ok] = mine("/r/counted-recovers").try_into().unwrap();
+        assert_eq!(
+            (ok.node_id, ok.op.as_str(), ok.class.as_str(), ok.retries, ok.outcome.as_str()),
+            (Some(node), "fetch", "lock_race", 2, "recovered")
+        );
+        let [bad] = mine("/r/counted-gives-up").try_into().unwrap();
+        assert_eq!(
+            (bad.op.as_str(), bad.class.as_str(), bad.retries, bad.outcome.as_str()),
+            ("submodule update", "network", 3, "gave_up")
+        );
+        assert!(bad.error.contains("early EOF"));
+        assert!(mine("/r/counted-none").is_empty(), "{seen:?}");
+        let [un] = mine("/r/counted-unscoped").try_into().unwrap();
+        assert_eq!((un.node_id, un.op.as_str()), (None, "pull"));
+    }
+
+    #[test]
+    fn a_sink_that_cannot_record_never_changes_the_git_result() {
+        set_retry_sink(std::sync::Arc::new(|_| anyhow::bail!("writer closed")));
+        let before = retry_record_failures();
+        let mut calls = 0;
+        let r = retry_ref_lock_race_in("/r/unrecordable", &["fetch"], &[Duration::ZERO; 3], || {
+            calls += 1;
+            Ok(if calls == 2 { out(0, "") } else { out(128, "fatal: early EOF") })
+        })
+        .unwrap();
+        assert!(r.status.success(), "a recovered fetch stays recovered");
+        assert!(retry_record_failures() > before, "the failure is counted and logged, not dropped");
+    }
+
     #[test]
     fn classifies_lock_races() {
         assert!(is_ref_lock_race("error: cannot lock ref 'refs/remotes/origin/main': is at X but expected Y"));
@@ -574,6 +727,7 @@ mod retry_tests {
             let mut calls = 0;
             let mut cleaned = 0;
             let r = retry_network_git(
+                "",
                 args,
                 &[Duration::ZERO; 3],
                 || {

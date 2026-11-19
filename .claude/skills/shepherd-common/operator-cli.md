@@ -148,13 +148,15 @@ tod-cli stats [<NODE>] [--section <NAME>] [--since <DURATION>]
 ```
 
 Read-only. One report from what tod already keeps, with a section per question
-(`--section cost|review|pr-draft|requests|stops|sandbox`): per node and phase
+(`--section cost|review|pr-draft|requests|stops|sandbox|git-retries`): per node and phase
 sessions, agent turns, tool calls and wall time; the review loop (rounds,
 findings, clean rounds, reopened findings, rejected/declined ratio); the PR
 loop (PR agent sessions, draft review rounds, threads posted, pushes, CI
 failures); requests (count, wait, answered with an offered option or carry-on
 words, about tod's setup); runs stopped now by reason; sandbox locations made,
-removed, replaced and lost. `<NODE>` narrows it to one node, `--since 7d` to a
+removed, replaced and lost; git calls tod retried after a ref-lock race or a
+network error (per node: calls, retries, recovered, gave up; a call that gave up
+is also a note on the node's activity, "Git gave up retrying"). `<NODE>` narrows it to one node, `--since 7d` to a
 window, `--json` gives JSON. Each section ends with `not available:` lines for
 what tod does not keep (tokens, a review bot's findings, stop history, setup
 time): read them before concluding anything from a zero. Use it to see where

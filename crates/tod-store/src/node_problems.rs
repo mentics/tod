@@ -30,6 +30,8 @@ pub const KIND_ADOPT: &str = "adopt";
 /// A cloud record that disagrees with the node's Files location
 /// (`tod_core::cloud_sync::lost::located_rows`).
 pub const KIND_CLOUD_RECORD: &str = "cloud_record";
+/// A git retry tod could not count (`crate::git_retries`).
+pub const KIND_GIT_RETRY_RECORD: &str = "git_retry_record";
 
 pub const CREATE_TABLE: &str = "
     CREATE TABLE IF NOT EXISTS node_problems (

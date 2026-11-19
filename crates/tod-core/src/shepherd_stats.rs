@@ -1,7 +1,7 @@
 //! Statistics about how the lifecycle is going, computed from what tod already
 //! keeps (`doc/history/improvement-log.md`, "Statistics worth collecting").
 //!
-//! One read-only pass over the store ([`compute`]) answers six questions, each
+//! One read-only pass over the store ([`compute`]) answers seven questions, each
 //! a section of [`Stats`]. Nothing here records anything new: a figure that has
 //! no source in the data is named in its section's `unavailable` list, with
 //! why, so a reader never takes a missing number for a zero.
@@ -18,6 +18,10 @@
 //! - [`ChurnRow`]: per node, sandbox locations made and removed
 //!   (`journey_changes` on `node_files_locations`) and sandbox losses
 //!   (`cloud_nodes.lost_at`).
+//! - [`GitRetryRow`]: per node (or workdir, when the retry was not for a
+//!   node), the git calls tod retried and whether each recovered
+//!   (`tod_store::git_retries`, the only section whose figures are recorded
+//!   for the purpose rather than derived).
 //!
 //! `journey_changes` is the app's change journal; it holds only what was
 //! written since it was introduced and may be trimmed, so every figure that
@@ -46,11 +50,19 @@ pub enum Section {
     Requests,
     Stops,
     Sandbox,
+    GitRetries,
 }
 
 impl Section {
-    pub const ALL: [Section; 6] =
-        [Section::Cost, Section::Review, Section::PrDraft, Section::Requests, Section::Stops, Section::Sandbox];
+    pub const ALL: [Section; 7] = [
+        Section::Cost,
+        Section::Review,
+        Section::PrDraft,
+        Section::Requests,
+        Section::Stops,
+        Section::Sandbox,
+        Section::GitRetries,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -60,6 +72,7 @@ impl Section {
             Section::Requests => "requests",
             Section::Stops => "stops",
             Section::Sandbox => "sandbox",
+            Section::GitRetries => "git-retries",
         }
     }
 
@@ -83,6 +96,7 @@ pub struct Stats {
     pub requests: Option<RequestStats>,
     pub stops: Option<StopStats>,
     pub sandbox: Option<Sandbox>,
+    pub git_retries: Option<GitRetries>,
 }
 
 // ---- cost ----
@@ -232,6 +246,33 @@ pub struct Sandbox {
     pub unavailable: Vec<String>,
 }
 
+// ---- git retries ----
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+pub struct GitRetryRow {
+    /// The node's slug, or the workdir for a retry made for no node.
+    pub subject: String,
+    /// Git calls that needed at least one retry.
+    pub calls: u64,
+    pub retries: u64,
+    pub recovered: u64,
+    pub gave_up: u64,
+    pub lock_race: u64,
+    pub network: u64,
+    /// Calls by operation (`fetch`, `submodule update`, ...).
+    pub by_op: BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct GitRetries {
+    pub rows: Vec<GitRetryRow>,
+    pub calls: u64,
+    pub retries: u64,
+    pub recovered: u64,
+    pub gave_up: u64,
+    pub unavailable: Vec<String>,
+}
+
 // ---- computing ----
 
 /// Computes the requested sections.
@@ -245,6 +286,7 @@ pub fn compute(conn: &Connection, filter: &Filter, sections: &[Section]) -> Resu
             Section::Requests => stats.requests = Some(requests(conn, filter)?),
             Section::Stops => stats.stops = Some(stops(conn, filter)?),
             Section::Sandbox => stats.sandbox = Some(sandbox(conn, filter)?),
+            Section::GitRetries => stats.git_retries = Some(git_retries(conn, filter)?),
         }
     }
     Ok(stats)
@@ -663,6 +705,48 @@ fn sandbox(conn: &Connection, f: &Filter) -> Result<Sandbox> {
     Ok(out)
 }
 
+fn git_retries(conn: &Connection, f: &Filter) -> Result<GitRetries> {
+    let mut rows: BTreeMap<String, GitRetryRow> = BTreeMap::new();
+    let sql = format!(
+        "SELECT COALESCE(n.slug, g.workdir), g.op, g.class, g.retries, g.outcome
+         FROM git_retries g LEFT JOIN nodes n ON n.id = g.node_id
+         WHERE (?1 IS NULL OR n.slug = ?1) AND (?2 IS NULL OR g.at >= ?2)"
+    );
+    let mut out = GitRetries::default();
+    for r in conn.prepare(&sql)?.query_map(params![f.node, f.since_ms], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, u64>(3)?, r.get::<_, String>(4)?))
+    })? {
+        let (subject, op, class, retries, outcome) = r?;
+        let row = rows.entry(subject.clone()).or_insert_with(|| GitRetryRow { subject, ..Default::default() });
+        row.calls += 1;
+        row.retries += retries;
+        *row.by_op.entry(op).or_default() += 1;
+        if class == tod_store::git_retries::CLASS_LOCK_RACE {
+            row.lock_race += 1;
+        } else {
+            row.network += 1;
+        }
+        if outcome == tod_store::git_retries::OUTCOME_GAVE_UP {
+            row.gave_up += 1;
+        } else {
+            row.recovered += 1;
+        }
+    }
+    out.rows = rows.into_values().collect();
+    for r in &out.rows {
+        out.calls += r.calls;
+        out.retries += r.retries;
+        out.recovered += r.recovered;
+        out.gave_up += r.gave_up;
+    }
+    out.unavailable = vec![
+        "git calls that succeeded at once are not counted, so there is no retry rate, only the calls that needed one".into(),
+        "retries of the shell scripts (quick branch script, sandbox checkout, golden refresh) and of a supervisor in a sandbox: the records are this machine's".into(),
+        "a retry made outside any node's launch is counted against its workdir, not a node".into(),
+    ];
+    Ok(out)
+}
+
 // ---- text ----
 
 fn dur(ms: i64) -> String {
@@ -769,6 +853,23 @@ impl Stats {
                 ));
             }
             notes(&mut o, &s.unavailable);
+        }
+        if let Some(g) = &self.git_retries {
+            if !o.is_empty() {
+                o.push('\n');
+            }
+            o.push_str(&format!(
+                "GIT RETRIES: {} calls retried ({} retries): {} recovered, {} gave up\n",
+                g.calls, g.retries, g.recovered, g.gave_up
+            ));
+            for x in &g.rows {
+                let ops = x.by_op.iter().map(|(k, v)| format!("{k} {v}")).collect::<Vec<_>>().join(", ");
+                o.push_str(&format!(
+                    "    {:<48} calls {:>3} retries {:>3} recovered {:>3} gave up {:>3} lock {:>3} network {:>3} ({ops})\n",
+                    x.subject, x.calls, x.retries, x.recovered, x.gave_up, x.lock_race, x.network
+                ));
+            }
+            notes(&mut o, &g.unavailable);
         }
         o.trim_end().to_string()
     }

@@ -239,6 +239,8 @@ pub enum FleetMutation {
     RecordTimeline(Box<crate::node_timeline::TimelineEntry>),
     /// A gate check's result, left out when it reads as the last one did.
     RecordGateTimeline(Box<crate::node_timeline::TimelineEntry>),
+    /// A git call that was retried (`crate::git_retries`).
+    RecordGitRetry(Box<crate::git_retries::GitRetry>),
     /// The processing is still alive.
     ActivityBeat {
         id: uuid::Uuid,
@@ -613,6 +615,9 @@ impl FleetMutation {
             FleetMutation::RecordGateTimeline(entry) => {
                 crate::node_timeline::TimelineRepo::new(conn).record_gate_if_changed(entry)?;
             }
+            FleetMutation::RecordGitRetry(retry) => {
+                crate::git_retries::GitRetryRepo::new(conn).record(retry)?;
+            }
             FleetMutation::ActivityBeat { id, at } => {
                 // A lease cleared under its owner is the owner's to notice
                 // (`ActivityGuard`), not an error of the writer.
@@ -943,6 +948,23 @@ impl FleetWriter {
             .block_on(rx)
             .map_err(|_| FleetWriterError::Closed)??;
         Ok(())
+    }
+
+    /// A cheap handle that queues one mutation without blocking and without
+    /// borrowing this writer, for code with no store at hand (the git retry
+    /// recorder, `crate::fleet::workdir::set_retry_sink`). It fails once the
+    /// writer has shut down.
+    pub fn queue_handle(&self) -> Arc<dyn Fn(FleetMutation) -> Result<(), FleetWriterError> + Send + Sync> {
+        match &self.backend {
+            Backend::Local(local) => {
+                let tx = local.tx.clone();
+                Arc::new(move |m| tx.send(WriterCommand::Mutation(m)).map_err(|_| FleetWriterError::Closed))
+            }
+            Backend::Remote(remote) => {
+                let remote = remote.clone();
+                Arc::new(move |m| Ok(remote.enqueue(ACTOR_USER, m)?))
+            }
+        }
     }
 
     pub fn shutdown(self) -> Result<()> {
