@@ -67,6 +67,36 @@ pub fn resolve_launch_cwd_with(
     resolve_launch_cwd_unlocked(fleet, node_id, progress)
 }
 
+/// Reads `node_id`'s made worktree with `f`, without stamping a use: for what
+/// only looks (a check's staleness) and must not keep a parked node's lease
+/// from being given back ([`release_parked_worktree`]). The node's lock is held
+/// while `f` runs, so the worktree is not returned under it. `None` when no
+/// worktree is made (never or given back) or when the files are not a
+/// worktree; then nothing is made. `f` must not take long.
+pub fn read_made_files<T>(
+    fleet: &FleetStore,
+    node_id: &str,
+    f: impl FnOnce(&Workdir) -> Result<T>,
+) -> Result<Option<T>> {
+    let made = |fleet: &FleetStore| -> Result<Option<Workdir>> {
+        let files = resolve_files(fleet, node_id)?;
+        Ok(match files.directory() {
+            FilesDirectory::Ready(dir) if files.per_node() && dir.sandbox_name().is_none() => Some(dir),
+            _ => None,
+        })
+    };
+    if made(fleet)?.is_none() {
+        return Ok(None);
+    }
+    let lock = node_lock(node_id);
+    let _held = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Looked at again under the lock: a release may have come first.
+    match made(fleet)? {
+        Some(dir) => f(&dir).map(Some),
+        None => Ok(None),
+    }
+}
+
 /// Records that something used `node_id`'s files location just now.
 fn mark_used(fleet: &FleetStore, node_id: &str) -> Result<()> {
     fleet.enqueue(FleetMutation::MarkFilesUsed { node_id: node_id.to_string(), at: crate::outline::uuid_blob::now_ms() })?;
@@ -561,6 +591,18 @@ pub fn release_parked_worktree(
             return Ok(Release::Kept(format!("{} uncommitted change(s)", lines.len())));
         }
         LocationState::Gone => return Ok(Release::Kept("its directory is gone".into())),
+    }
+    // The tree must be exactly the commit the branch tip records: a submodule
+    // sitting elsewhere (a pointer change `location_state` ignores) is not, and
+    // a worktree given back in that state could not be told from the branch by
+    // the checks' head key (`tod_core::checks::tree_key`), so every wake would
+    // lease it again.
+    let drift = dir.git(&["status", "--porcelain"])?;
+    if !drift.trim().is_empty() {
+        return Ok(Release::Kept(format!(
+            "a submodule is not at the commit the branch records: {}",
+            drift.lines().take(3).collect::<Vec<_>>().join("; ")
+        )));
     }
     let unpushed = unpushed_commits(&dir)?;
     if !unpushed.is_empty() {

@@ -48,6 +48,18 @@ pub fn ensure_used_at(conn: &Connection) -> Result<()> {
         conn.execute_batch("ALTER TABLE node_files_locations ADD COLUMN used_at INTEGER NOT NULL DEFAULT 0;")?;
         conn.execute("UPDATE node_files_locations SET used_at = ?1", params![now_ms()])?;
     }
+    // The journey trigger ignores an update that changes only `used_at`.
+    let trigger: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'trg_journey_node_files_locations_update'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if trigger.is_some_and(|sql| !sql.contains(" WHEN ")) {
+        conn.execute_batch("DROP TRIGGER trg_journey_node_files_locations_update;")?;
+        conn.execute_batch(&crate::journey_changes::files_locations_triggers_sql())?;
+    }
     Ok(())
 }
 

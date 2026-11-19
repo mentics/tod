@@ -857,6 +857,49 @@ fn current_without_files(fleet: &FleetStore, node: Uuid, key: &str, checks: &[Ch
     Ok(Some(Round { fingerprint: format!("head {head}"), runs }))
 }
 
+/// The stored run that still answers for `check` on files assessed as
+/// `assessment`, when `clean_head` is the head if they are exactly a commit:
+/// the same files (fingerprint), or the same commit and check ([`tree_key`]; a
+/// worktree made again elsewhere has other paths, so another fingerprint).
+fn current_run(latest: Option<CheckRun>, check: &Check, assessment: &Assessment, clean_head: Option<&str>) -> Option<CheckRun> {
+    let run = latest?;
+    let key_now = clean_head.map(|head| tree_key(head, check));
+    let same = run.fingerprint == assessment.fingerprint || key_now.as_deref().is_some_and(|k| run.tree_key == k);
+    (run.label == check.label && reusable(&run) && same).then_some(run)
+}
+
+/// The round for a node whose worktree is made, answered by looking at the
+/// files without using them: nothing is stamped as used, so a node parked on a
+/// review, woken every few minutes to find nothing changed, does not keep its
+/// lease from being given back (`worktree_release`). `None` when any check has
+/// to run: the caller then resolves the files as a use.
+fn current_in_made_files(fleet: &FleetStore, node: Uuid, key: &str, checks: &[Check]) -> Result<Option<Round>> {
+    let looked = tod_store::fleet::provision::read_made_files(fleet, &node.to_string(), |cwd| {
+        let tree = Tree::new(cwd)?;
+        let clean_head = tree.clean_head()?;
+        let mut runs = Vec::new();
+        for check in checks {
+            let dir = clean_dir(&check.dir);
+            let assessment = assess(&tree, check)?;
+            let latest = fleet.read(|conn| CheckRunRepo::new(conn).latest(node, key, &dir, &check.command))?;
+            let Some(run) = current_run(latest, check, &assessment, clean_head.as_deref()) else { return Ok(None) };
+            let run = match clean_head.as_deref().map(|head| tree_key(head, check)) {
+                // Remember which commit it answers for, so a later look needs no files.
+                Some(k) if run.tree_key != k => {
+                    let run = CheckRun { tree_key: k, ..run };
+                    fleet.enqueue(tod_store::fleet::FleetMutation::RecordCheckRun(Box::new(run.clone())))?;
+                    fleet.writer().flush()?;
+                    run
+                }
+                _ => run,
+            };
+            runs.push(run);
+        }
+        Ok(Some(Round { fingerprint: tree.fingerprint_all()?, runs }))
+    })?;
+    Ok(looked.flatten())
+}
+
 /// Run the checks configured for `state` whose latest run was against other
 /// files than these (or never happened), and return every check's latest run.
 /// Does nothing, and returns an empty round, when none is configured. Git,
@@ -871,6 +914,10 @@ pub fn run_stale(fleet: &FleetStore, node: Uuid, state: &str) -> Result<Round> {
     if let Some(round) = current_without_files(fleet, node, key, &checks)? {
         return Ok(round);
     }
+    if let Some(round) = current_in_made_files(fleet, node, key, &checks)? {
+        return Ok(round);
+    }
+    // A check has to run: the files are used now.
     let cwd = tod_store::fleet::provision::resolve_launch_cwd(fleet, &node.to_string())
         .with_context(|| format!("find the files to run the {state} checks in"))?;
     let tree = Tree::new(&cwd)?;

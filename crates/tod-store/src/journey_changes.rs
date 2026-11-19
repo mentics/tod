@@ -359,8 +359,23 @@ pub fn groups_triggers_sql() -> String {
 }
 
 /// Triggers for `node_files_locations` (one row per node).
+///
+/// An update that changes only `used_at` (stamped by every launch, shell,
+/// editor and run: [`crate::fleet::provision::resolve_launch_cwd`]) is not
+/// journaled: it is bookkeeping, and would be a row per launch.
 pub fn files_locations_triggers_sql() -> String {
-    node_keyed_triggers("node_files_locations")
+    let changed = [
+        "source_node_id", "recipe", "repo", "container", "worktree_path", "worktree_lease_id",
+        "worktree_lease_holder", "sandbox", "created_at", "updated_at", "creds_synced_at",
+    ]
+    .iter()
+    .map(|c| format!("OLD.{c} IS NOT NEW.{c}"))
+    .collect::<Vec<_>>()
+    .join(" OR ");
+    node_keyed_triggers("node_files_locations").replace(
+        "AFTER UPDATE ON node_files_locations BEGIN",
+        &format!("AFTER UPDATE ON node_files_locations WHEN {changed} BEGIN"),
+    )
 }
 
 /// Triggers for `request_feedback` (simple `(id, node_id)` shape, can be
@@ -507,6 +522,41 @@ mod tests {
             .into_iter()
             .filter(|c| c.node_id == node && c.table == table)
             .collect()
+    }
+
+    /// `used_at` is bookkeeping stamped by every launch: updating only it adds
+    /// no change row, while a real change to the location still does.
+    #[test]
+    fn a_used_at_only_update_of_a_files_location_is_not_journaled() {
+        use crate::fleet::{FleetMutation, repos::files_location::FilesLocation};
+        let (root, fleet, node) = fixture();
+        let id = node.to_string();
+        let mut location = FilesLocation {
+            node_id: id.clone(),
+            source_node_id: id.clone(),
+            recipe: "r".into(),
+            repo: Some("/repo".into()),
+            container: None,
+            worktree_path: Some("/wt/a".into()),
+            worktree_lease_id: None,
+            worktree_lease_holder: None,
+            sandbox: None,
+            created_at: 0,
+        };
+        fleet.enqueue(FleetMutation::RecordFilesLocation { location: location.clone() }).unwrap();
+        fleet.writer().flush().unwrap();
+        let ops = |fleet: &FleetStore| -> Vec<String> {
+            changes_for(fleet, node, "node_files_locations").into_iter().map(|r| r.op).collect()
+        };
+        assert_eq!(ops(&fleet), ["insert"]);
+        fleet.enqueue(FleetMutation::MarkFilesUsed { node_id: id.clone(), at: i64::MAX / 2 }).unwrap();
+        fleet.writer().flush().unwrap();
+        assert_eq!(ops(&fleet), ["insert"], "a use is not a change");
+        location.worktree_path = Some("/wt/b".into());
+        fleet.enqueue(FleetMutation::RecordFilesLocation { location }).unwrap();
+        fleet.writer().flush().unwrap();
+        assert_eq!(ops(&fleet), ["insert", "update"]);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

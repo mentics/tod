@@ -289,6 +289,72 @@ mod tests {
         assert!(round.runs[0].ran_at > first_ran.ran_at, "the check ran again for the new head");
     }
 
+    fn used_at(p: &Parked) -> i64 {
+        p.fx.fleet.reload_if_stale().unwrap();
+        p.fx.fleet.read(|c| tod_store::fleet::repos::files_location::FilesLocationRepo::new(c).used_at(&p.node)).unwrap().unwrap()
+    }
+
+    /// Shepherd gap 68 second review: wake-ups that find every check current
+    /// (every few minutes while a pull request waits) only look at the made
+    /// worktree; they do not count as using it, so the idle period still
+    /// elapses and the lease is given back.
+    #[test]
+    fn wake_ups_that_find_checks_current_do_not_keep_a_made_worktree_from_release() {
+        let p = parked("pr_draft");
+        assert!(p.made());
+        let stamped = used_at(&p);
+        for wake in 0..5 {
+            let round = crate::checks::run_stale(&p.fx.fleet, p.fx.node, "pr_draft").unwrap();
+            assert!(round.clear() && round.runs.len() == 1, "wake {wake}: {round:?}");
+            assert_eq!(used_at(&p), stamped, "wake {wake} stamped a use");
+        }
+        assert!(due(&p.fx.fleet).unwrap().len() == 1, "still idle after the wake-ups");
+        let report = release_due(&p.fx.fleet).unwrap();
+        assert_eq!(report.released.len(), 1, "{report:?}");
+        assert!(!p.made());
+    }
+
+    /// A submodule that is not at the commit the branch records is not
+    /// "exactly a commit": the release keeps the worktree (the checks' head key
+    /// could not stand for it), and gives it back once it is.
+    #[test]
+    fn a_submodule_off_its_recorded_commit_keeps_the_worktree() {
+        let p = parked("pr_draft");
+        let dir = provision::node_location(&p.fx.fleet, &p.node).unwrap().unwrap().directory().unwrap();
+        let dir = dir.host_path().unwrap().to_path_buf();
+        let sub = p.fx.root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        git(&sub, &["init", "-q", "-b", "main"]);
+        git(&sub, &["commit", "-q", "--allow-empty", "-m", "sub init"]);
+        git(&dir, &["-c", "protocol.file.allow=always", "submodule", "add", "-q", sub.to_str().unwrap(), "vendor"]);
+        git(&dir, &["commit", "-qm", "add submodule"]);
+        git(&dir, &["push", "-q", "origin", &p.branch]);
+        assert_eq!(release_due(&p.fx.fleet).unwrap().kept.len(), 0, "a submodule at its recorded commit is clean");
+        // Make another lease for the next half of the test.
+        drop(p);
+        let p = parked("pr_draft");
+        let dir = provision::node_location(&p.fx.fleet, &p.node).unwrap().unwrap().directory().unwrap();
+        let dir = dir.host_path().unwrap().to_path_buf();
+        let sub = p.fx.root.join("sub2");
+        std::fs::create_dir_all(&sub).unwrap();
+        git(&sub, &["init", "-q", "-b", "main"]);
+        git(&sub, &["commit", "-q", "--allow-empty", "-m", "sub init"]);
+        git(&dir, &["-c", "protocol.file.allow=always", "submodule", "add", "-q", sub.to_str().unwrap(), "vendor"]);
+        git(&dir, &["commit", "-qm", "add submodule"]);
+        git(&dir, &["push", "-q", "origin", &p.branch]);
+        // The submodule moves to a newer commit its remote has.
+        git(&sub, &["commit", "-q", "--allow-empty", "-m", "drift"]);
+        git(&dir.join("vendor"), &["fetch", "-q", "origin"]);
+        git(&dir.join("vendor"), &["checkout", "-q", "origin/main"]);
+        let report = release_due(&p.fx.fleet).unwrap();
+        assert!(report.released.is_empty() && report.kept.len() == 1, "{report:?}");
+        assert!(report.kept[0].1.contains("not at the commit the branch records"), "{report:?}");
+        assert!(p.made());
+        git(&dir, &["-c", "protocol.file.allow=always", "submodule", "update", "--force"]);
+        let report = release_due(&p.fx.fleet).unwrap();
+        assert_eq!(report.released.len(), 1, "{report:?}");
+    }
+
     /// `due` and `release_due`: Working nodes, a node before `pr_draft` and a
     /// node used lately are skipped; a parked idle clean pushed one is released.
     #[test]
