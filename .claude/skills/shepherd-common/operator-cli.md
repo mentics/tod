@@ -156,7 +156,9 @@ failures); requests (count, wait, answered with an offered option or carry-on
 words, about tod's setup); runs stopped now by reason; sandbox locations made,
 removed, replaced and lost; git calls tod retried after a ref-lock race or a
 network error (per node: calls, retries, recovered, gave up; a call that gave up
-is also a note on the node's activity, "Git gave up retrying"). `<NODE>` narrows it to one node, `--since 7d` to a
+is also a note on the node's activity, "Git gave up retrying"); runs stopped or failed
+whose node's standing shows something else, such as a request that does not show
+the stop, and for how long (`stop-mismatch`; a state, so `--since` does not apply). `<NODE>` narrows it to one node, `--since 7d` to a
 window, `--json` gives JSON. Each section ends with `not available:` lines for
 what tod does not keep (tokens, a review bot's findings, stop history, setup
 time): read them before concluding anything from a zero. Use it to see where

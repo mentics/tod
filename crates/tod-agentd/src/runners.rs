@@ -90,6 +90,8 @@ struct Inner {
     /// When the stale waits were last swept (ms; 0 = never), so the
     /// reconciler writes at most once per [`WAIT_SWEEP_EVERY_MS`].
     last_wait_sweep: std::sync::atomic::AtomicI64,
+    /// The nodes of the last logged stop mismatch, and when it was logged.
+    last_stop_mismatch_log: Mutex<(Vec<Uuid>, i64)>,
     /// When this build was made (ms; 0 = not known): requests filed before it
     /// whose cause a deploy can remove are re-examined once
     /// (`tod_core::decision_recheck`).
@@ -221,6 +223,7 @@ impl Runners {
                 subscribers: Mutex::new(Vec::new()),
                 actors: Mutex::new(ActorTracker::default()),
                 last_wait_sweep: std::sync::atomic::AtomicI64::new(0),
+                last_stop_mismatch_log: Mutex::new((Vec::new(), 0)),
                 build_time_ms: std::sync::atomic::AtomicI64::new(0),
                 rechecked: std::sync::atomic::AtomicBool::new(false),
             }),
@@ -346,6 +349,26 @@ impl Runners {
     /// Start a run that is due: one that ended to wait and whose time has
     /// come, or one that stopped for a request that has been answered. Then
     /// reconcile what is desired with what is happening.
+    /// Logs the stop-mismatch statistic (`tod_core::stop_mismatch`): how many
+    /// nodes, and how long the longest has lasted.
+    fn log_stop_mismatch(&self, found: &[tod_core::stop_mismatch::Mismatch], now: i64) {
+        const REPEAT_MS: i64 = 5 * 60_000;
+        let mut nodes: Vec<Uuid> = found.iter().map(|m| m.node_id).collect();
+        nodes.sort();
+        let mut last = self.inner.last_stop_mismatch_log.lock().expect("stop mismatch log");
+        if last.0 == nodes && (nodes.is_empty() || now - last.1 < REPEAT_MS) {
+            return;
+        }
+        if found.is_empty() {
+            tracing::info!("every stopped or failed run is shown as such: no mismatch");
+        } else {
+            let longest = found.iter().map(|m| m.lasted_ms).max().unwrap_or(0);
+            let list = found.iter().map(|m| format!("{} (shows {}, {}s)", m.node_id, m.shown, m.lasted_ms / 1000)).collect::<Vec<_>>().join("; ");
+            tracing::warn!(count = found.len(), longest_ms = longest, "runs stopped or failed while the node shows something else: {list}");
+        }
+        *last = (nodes, now);
+    }
+
     fn tick(&self) {
         self.start_due();
         self.resume_stale_request_waits();
@@ -512,6 +535,13 @@ impl Runners {
         }
         let standings = next_actor::compute(store, &root).context("work out who is next")?;
         let mut errors: Vec<String> = Vec::new();
+        // The statistic of gap 52: runs stopped or failed whose node shows
+        // something else. Logged when the set changes, and every few minutes
+        // while any stands; a failed check is an error of the tick.
+        match store.read(|conn| tod_core::stop_mismatch::find_with(conn, &standings, now)) {
+            Ok(found) => self.log_stop_mismatch(&found, now),
+            Err(err) => errors.push(format!("check for stopped runs shown as something else: {err:#}")),
+        }
 
         let rows = store.read(|conn| DeferralRepo::new(conn).list_all()).context("read the deferrals")?;
         for node in next_actor::spent_deferrals(&rows, &standings, now) {

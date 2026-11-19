@@ -60,7 +60,9 @@ fn finding(conn: &Connection, node: Uuid, conv: Uuid, seq: i64, summary: &str, s
 }
 
 fn all(conn: &Connection) -> Stats {
-    compute(conn, &Filter::default(), &Section::ALL).unwrap()
+    let root = tod_test_util::scratch_dir(format!("tod-shepherd-stats-root-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    compute_with_root(conn, &Filter::default(), &Section::ALL, Some(&root)).unwrap()
 }
 
 #[test]
@@ -299,4 +301,39 @@ fn git_retries_count_calls_retries_and_outcomes_per_node_and_workdir() {
     assert_eq!(only.git_retries.unwrap().calls, 1);
     let text = compute(&f.conn, &Filter::default(), &[Section::GitRetries]).unwrap().text();
     assert!(text.contains("GIT RETRIES: 4 calls retried (7 retries): 3 recovered, 1 gave up") && text.contains("not available"), "{text}");
+}
+
+#[test]
+fn stop_mismatch_counts_a_stopped_run_shown_as_working_and_not_a_consistent_one() {
+    use tod_store::run_state::{Draft, Phase};
+    let f = fx();
+    let hidden = node(&f.conn, "hidden");
+    let plain = node(&f.conn, "plain");
+    let now = tod_store::outline::uuid_blob::now_ms();
+    for n in [hidden, plain] {
+        NodeRepo::new(&f.conn).set_lifecycle(n, "active").unwrap();
+        let draft = Draft {
+            phase: Phase::Stopped,
+            reason_kind: crate::run_state::kind::BUDGET.into(),
+            reason_text: "spent its budget".into(),
+            resumable_by: tod_store::run_state::RESUMABLE_BY_YOU.into(),
+        };
+        tod_store::run_state::set(&f.conn, n, &draft, "test", now - 90_000).unwrap();
+    }
+    // Something is processing `hidden`, so its standing says working.
+    tod_store::activity::ActivityRepo::new(&f.conn)
+        .start(Uuid::new_v4(), hidden, tod_store::activity::KIND_RUN, "test", now)
+        .unwrap();
+    let root = tod_test_util::scratch_dir(format!("tod-stop-mismatch-root-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let m = compute_with_root(&f.conn, &Filter::default(), &[Section::StopMismatch], Some(&root))
+        .unwrap()
+        .stop_mismatch
+        .unwrap();
+    assert_eq!(m.count, 1, "{m:?}");
+    assert_eq!(m.rows[0].node, "hidden");
+    assert!(m.rows[0].lasted_secs >= 90, "{m:?}");
+    assert_eq!(m.rows[0].shown, "working");
+    let err = compute(&f.conn, &Filter::default(), &[Section::StopMismatch]).unwrap_err().to_string();
+    assert!(err.contains("data root"), "{err}");
 }

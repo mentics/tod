@@ -93,6 +93,7 @@ pub mod runner_menu;
 pub mod direct_store;
 pub mod runner_operator;
 pub mod shepherd_stats;
+pub mod stop_mismatch;
 pub mod runner_place;
 pub mod sandbox_retire;
 pub mod worktree_release;

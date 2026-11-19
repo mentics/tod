@@ -22,6 +22,9 @@
 //!   node), the git calls tod retried and whether each recovered
 //!   (`tod_store::git_retries`, the only section whose figures are recorded
 //!   for the purpose rather than derived).
+//! - [`StopMismatchStats`]: runs stopped or failed (`run_state`) whose node's
+//!   standing shows something else, and for how long
+//!   (`crate::stop_mismatch`; needs the data root for the saved runs).
 //!
 //! `journey_changes` is the app's change journal; it holds only what was
 //! written since it was introduced and may be trimmed, so every figure that
@@ -51,10 +54,11 @@ pub enum Section {
     Stops,
     Sandbox,
     GitRetries,
+    StopMismatch,
 }
 
 impl Section {
-    pub const ALL: [Section; 7] = [
+    pub const ALL: [Section; 8] = [
         Section::Cost,
         Section::Review,
         Section::PrDraft,
@@ -62,6 +66,7 @@ impl Section {
         Section::Stops,
         Section::Sandbox,
         Section::GitRetries,
+        Section::StopMismatch,
     ];
 
     pub fn name(self) -> &'static str {
@@ -73,6 +78,7 @@ impl Section {
             Section::Stops => "stops",
             Section::Sandbox => "sandbox",
             Section::GitRetries => "git-retries",
+            Section::StopMismatch => "stop-mismatch",
         }
     }
 
@@ -97,6 +103,7 @@ pub struct Stats {
     pub stops: Option<StopStats>,
     pub sandbox: Option<Sandbox>,
     pub git_retries: Option<GitRetries>,
+    pub stop_mismatch: Option<StopMismatchStats>,
 }
 
 // ---- cost ----
@@ -273,10 +280,46 @@ pub struct GitRetries {
     pub unavailable: Vec<String>,
 }
 
+// ---- stop mismatch ----
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+pub struct StopMismatchRow {
+    pub node: String,
+    /// The run's stop: reason kind and text.
+    pub run: String,
+    /// What the node's standing shows instead.
+    pub shown: String,
+    /// How long the run has been stopped (seconds).
+    pub lasted_secs: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct StopMismatchStats {
+    /// Longest-lasting first.
+    pub rows: Vec<StopMismatchRow>,
+    pub count: u64,
+    pub longest_secs: Option<i64>,
+    pub unavailable: Vec<String>,
+}
+
 // ---- computing ----
 
 /// Computes the requested sections.
+///
+/// [`Section::StopMismatch`] needs the data root (the saved runs behind each
+/// node's standing), so asking for it here is an error: use
+/// [`compute_with_root`].
 pub fn compute(conn: &Connection, filter: &Filter, sections: &[Section]) -> Result<Stats> {
+    compute_with_root(conn, filter, sections, None)
+}
+
+/// [`compute`], with the data root the standings are worked out from.
+pub fn compute_with_root(
+    conn: &Connection,
+    filter: &Filter,
+    sections: &[Section],
+    data_root: Option<&std::path::Path>,
+) -> Result<Stats> {
     let mut stats = Stats::default();
     for section in sections {
         match section {
@@ -287,6 +330,11 @@ pub fn compute(conn: &Connection, filter: &Filter, sections: &[Section]) -> Resu
             Section::Stops => stats.stops = Some(stops(conn, filter)?),
             Section::Sandbox => stats.sandbox = Some(sandbox(conn, filter)?),
             Section::GitRetries => stats.git_retries = Some(git_retries(conn, filter)?),
+            Section::StopMismatch => {
+                let root = data_root
+                    .ok_or_else(|| anyhow::anyhow!("the stop-mismatch section needs the data root to work out each node's standing"))?;
+                stats.stop_mismatch = Some(stop_mismatch(conn, filter, root)?);
+            }
         }
     }
     Ok(stats)
@@ -747,6 +795,28 @@ fn git_retries(conn: &Connection, f: &Filter) -> Result<GitRetries> {
     Ok(out)
 }
 
+fn stop_mismatch(conn: &Connection, f: &Filter, root: &std::path::Path) -> Result<StopMismatchStats> {
+    let mut out = StopMismatchStats::default();
+    for m in crate::stop_mismatch::find(conn, root)? {
+        let slug = tod_store::outline::repos::NodeRepo::new(conn)
+            .get(m.node_id)?
+            .map(|n| n.slug)
+            .unwrap_or_else(|| m.node_id.to_string());
+        if f.node.as_ref().is_some_and(|only| *only != slug) {
+            continue;
+        }
+        out.rows.push(StopMismatchRow { node: slug, run: m.run, shown: m.shown, lasted_secs: m.lasted_ms / 1000 });
+    }
+    out.count = out.rows.len() as u64;
+    out.longest_secs = out.rows.first().map(|r| r.lasted_secs);
+    out.unavailable = vec![
+        "a run that stopped and was shown as something else earlier but no longer is: only what stands now is checked, there is no history".into(),
+        "--since does not apply: a mismatch is a state, and its age is how long the run has been stopped".into(),
+        "a node whose runner wrote no run_state row (a supervisor built before the table) is not checked".into(),
+    ];
+    Ok(out)
+}
+
 // ---- text ----
 
 fn dur(ms: i64) -> String {
@@ -870,6 +940,20 @@ impl Stats {
                 ));
             }
             notes(&mut o, &g.unavailable);
+        }
+        if let Some(m) = &self.stop_mismatch {
+            if !o.is_empty() {
+                o.push('\n');
+            }
+            o.push_str(&format!(
+                "STOP MISMATCH: {} runs stopped or failed while the node shows something else, longest {}\n",
+                m.count,
+                m.longest_secs.map(|s| dur(s * 1000)).unwrap_or_else(|| "n/a".into())
+            ));
+            for x in &m.rows {
+                o.push_str(&format!("    {:<48} {:>9} run {} | shows {}\n", x.node, dur(x.lasted_secs * 1000), x.run, x.shown));
+            }
+            notes(&mut o, &m.unavailable);
         }
         o.trim_end().to_string()
     }

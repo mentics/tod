@@ -30,7 +30,8 @@ pub fn run(inv: Invocation, env: Env) -> anyhow::Result<String> {
         None => None,
     };
     let filter = Filter { node, since_ms };
-    let stats = inv.client().read(move |conn| shepherd_stats::compute(conn, &filter, &sections))?;
+    let root = inv.data_root.clone();
+    let stats = inv.client().read(move |conn| shepherd_stats::compute_with_root(conn, &filter, &sections, Some(&root)))?;
     if inv.json { Ok(serde_json::to_string(&stats)?) } else { Ok(stats.text()) }
 }
 

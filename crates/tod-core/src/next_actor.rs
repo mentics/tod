@@ -459,9 +459,15 @@ pub fn for_nodes(
 /// A saved run that cannot be read is not skipped: the node shows it as a
 /// failure, with the reason.
 pub fn compute(fleet: &tod_store::fleet::FleetStore, data_root: &std::path::Path) -> Result<HashMap<Uuid, NodeStanding>> {
+    fleet.read(|conn| compute_in(conn, data_root))
+}
+
+/// [`compute`] over a connection the caller already holds (the operator
+/// statistics read through the client's, never a fleet store).
+pub fn compute_in(conn: &Connection, data_root: &std::path::Path) -> Result<HashMap<Uuid, NodeStanding>> {
     use crate::autopilot::{AutopilotState, state_path};
     let now_ms = tod_store::outline::uuid_blob::now_ms();
-    fleet.read(|conn| {
+    {
         let ids: Vec<Uuid> = NodeRepo::new(conn).list_all()?.into_iter().map(|n| n.id).collect();
         let with_lifecycle = NodeRepo::new(conn).get_lifecycle_for_nodes(&ids)?;
         let mut inputs = Inputs { now_ms, ..Default::default() };
@@ -498,7 +504,7 @@ pub fn compute(fleet: &tod_store::fleet::FleetStore, data_root: &std::path::Path
             }
         }
         for_nodes(conn, &ids, &inputs)
-    })
+    }
 }
 
 /// The nodes whose stored deferral is spent and should be cleared: it
