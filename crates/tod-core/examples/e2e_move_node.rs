@@ -105,6 +105,11 @@ fn main() -> anyhow::Result<()> {
                 }
                 break;
             }
+            if let Some(ConversationEvent::FilesBusy { message }) =
+                events.iter().find(|e| matches!(e, ConversationEvent::FilesBusy { .. }))
+            {
+                anyhow::bail!("files busy: {message}");
+            }
             anyhow::ensure!(start.elapsed() < Duration::from_secs(420), "turn timed out");
             std::thread::sleep(Duration::from_millis(400));
         }

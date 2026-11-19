@@ -162,7 +162,7 @@ impl AgentRuns {
                     })
                     .await;
                 let Ok(()) = this.update(cx, |this, cx| {
-                    for (id, driver, events) in ticked {
+                    for (id, mut driver, events) in ticked {
                         // Every run collected here can block on a permission,
                         // not only one a view shows.
                         if let Some(request) = driver.status().permission {
@@ -172,8 +172,20 @@ impl AgentRuns {
                             );
                         }
                         for event in events {
-                            if let tod_core::conversation::ConversationEvent::Notice(notice) = event {
-                                tracing::warn!("conversation notice: {notice:?}");
+                            match event {
+                                tod_core::conversation::ConversationEvent::Notice(notice) => {
+                                    tracing::warn!("conversation notice: {notice:?}");
+                                }
+                                // A person's turn that could not start (another
+                                // node holds the files lock): nothing here
+                                // waits and retries, so it is shown as failed,
+                                // with the holder named, for the drawer's Retry.
+                                tod_core::conversation::ConversationEvent::FilesBusy { message } => {
+                                    if let Err(err) = driver.record_files_busy(&this.fleet, &message) {
+                                        tracing::error!("could not record the busy files lock: {err:#}");
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                         if this.take_cancel(id) {

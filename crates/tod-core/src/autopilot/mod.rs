@@ -2710,9 +2710,9 @@ impl Autopilot {
                     }
                     ConversationEvent::FilesBusy { message } => {
                         // A rotation or cold resume could not make the node's
-                        // files: wait for the holder, never a failed run.
-                        self.state.current = None;
-                        self.save()?;
+                        // files: wait for the holder, never a failed run. The
+                        // conversation stays current, so the retry reopens it
+                        // rather than starting one beside its unanswered turn.
                         let what = format!("another node is still making its files: {message}");
                         return Ok(Some(self.wait_for_files(fleet, what)?));
                     }

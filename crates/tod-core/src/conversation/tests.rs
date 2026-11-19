@@ -2204,4 +2204,14 @@ fn a_rotation_that_finds_the_files_lock_busy_is_a_wait_not_an_error() {
     assert!(!errors[0].1.contains("tod-x"), "{all:?}");
     // And only the rotation marker joined what was there.
     assert_eq!(all.len(), before + 1, "{all:?}");
+
+    // The chat drawer has no loop to wait in: its consumer records the busy
+    // lock as a failed turn naming the holder, so the message does not vanish
+    // and the drawer's Retry resends it.
+    driver.record_files_busy(&fx.fleet, "tod-x on branch task/x").unwrap();
+    let all = turns(&fx, id);
+    let (role, body) = all.last().unwrap();
+    assert_eq!(*role, TurnRole::Error, "{all:?}");
+    assert!(body.contains("tod-x on branch task/x") && body.contains("Send it again"), "{body}");
+    assert!(driver.status().last_error.is_some());
 }

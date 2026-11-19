@@ -622,6 +622,24 @@ impl ConversationDriver {
         started.map(|()| user_seq)
     }
 
+    /// A consumer that has no loop of its own to wait and retry in (the chat
+    /// drawer: a person sent the message) answers a
+    /// [`ConversationEvent::FilesBusy`] with this: the turn ended unanswered,
+    /// so say so in the transcript, naming who holds the lock. The drawer then
+    /// offers its Retry on the failed message. One row per busy event, never
+    /// per retry: only a person's own send can come back here.
+    pub fn record_files_busy(&mut self, fleet: &FleetStore, holder: &str) -> Result<()> {
+        let id = self
+            .conversation_id
+            .context("a busy lock for a conversation that was never started")?;
+        let message = format!(
+            "Another node is still making its files ({holder}), so this message did not reach the agent. Send it again once that is done."
+        );
+        self.append(fleet, id, TurnRole::Error, &message)?;
+        self.last_error = Some(message);
+        Ok(())
+    }
+
     /// Collect a finished turn. Call on every poll.
     pub fn tick<A: AgentAccess + ?Sized>(
         &mut self,
