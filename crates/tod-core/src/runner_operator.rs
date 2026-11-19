@@ -640,8 +640,21 @@ fn migrate(ctx: &Ctx, node: Uuid, g: &Gathered, opts: &Options, progress: &mut d
     }
     let wanted = opts.location.as_deref().context("migrate needs --to <LOCATION> (by name or id)")?;
     let place = find_place(&g.facts.locations, wanted)?;
-    g.facts.check_migration_target(place)?;
     let id = node.to_string();
+    if let Some(stale) = provision::stale_location_of(ctx.fleet, &id)?
+        && Some(place.id.as_str()) == g.facts.current_location.as_deref()
+    {
+        // Moving to the place it is in would pin an override to no purpose;
+        // what is wrong is the stale files, and Reset removes exactly them.
+        bail!(
+            "the node is already in location `{}`, but its {} was made from Files settings that have since \
+             changed. Run `runner reset-environment`: it removes it (the branch is pushed first, uncommitted work \
+             is committed on it) and the next launch makes a fresh one, with no override pinned",
+            place.name,
+            stale.describe()
+        );
+    }
+    g.facts.check_migration_target(place)?;
     let paths = tod_store::TodPaths::at(ctx.root);
     let settings = tod_store::TodSettings::load(&paths).context("read the settings")?;
     let affected = places::migrate_impact(ctx.fleet, &id, &place.id).context("Could not migrate")?;
@@ -687,7 +700,12 @@ fn migrate(ctx: &Ctx, node: Uuid, g: &Gathered, opts: &Options, progress: &mut d
     if left_sandbox {
         cloud_sync::lost::announce_left_cloud(ctx.fleet, &id)?;
     }
-    Ok(Done::ok(format!("Migrated to {}. Nothing was started.", place.name)))
+    Ok(Done::ok(format!(
+        "Migrated to {}. Nothing was started. The node now has a Files override of its own (location {}), which \
+         every node below it inherits; `tod-cli capabilities disable {id} files` hands it back to the nearest \
+         ancestor's, and `runner reset-environment` then removes the worktree made for the override.",
+        place.name, place.name
+    )))
 }
 
 /// What answering a request did, for `decisions answer`.

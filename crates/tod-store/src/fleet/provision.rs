@@ -238,7 +238,9 @@ pub fn launch_cwd_if_made(fleet: &FleetStore, node_id: &str) -> Result<Option<Wo
 fn stale_message(files: &ResolvedFiles, stale: &FilesLocation) -> String {
     format!(
         "This node's {} was made from Files settings that have since changed \
-         (now {}'s). Remove it first; its branch is pushed before it goes.",
+         (now {}'s). Reset environment removes it (the runner menu, or `tod-cli runner reset-environment <node>`): \
+         its branch is pushed before it goes, and uncommitted work is committed on it first. The next launch makes a \
+         fresh one.",
         stale.describe(),
         files.source_title
     )
@@ -2152,7 +2154,15 @@ pub struct AffectedLocation {
 pub fn locations_affected_by(fleet: &FleetStore, node_id: &str) -> Result<Vec<AffectedLocation>> {
     let node = uuid::Uuid::parse_str(node_id)?;
     locations_where(fleet, |location, chain| {
-        location.source_node_id == node_id || {
+        location.source_node_id == node_id
+            // The node's own location whose source is no longer anywhere
+            // above it (the source node was deleted, moved, or lost Files):
+            // no ancestor will match it again, so it is stale for good, and
+            // every path that leaves the node's settings (Migrate) must
+            // remove it or it stays behind (shepherd gap 46).
+            || (chain.last() == Some(&node)
+                && uuid::Uuid::parse_str(&location.source_node_id).map_or(true, |s| !chain.contains(&s)))
+            || {
             let at = chain.iter().position(|id| *id == node);
             let source = uuid::Uuid::parse_str(&location.source_node_id).ok();
             let from = source.and_then(|s| chain.iter().position(|id| *id == s));
@@ -2192,6 +2202,63 @@ fn locations_where(
         }
         Ok(out)
     })
+}
+
+/// What [`remove_stale_location`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleRemoved {
+    /// What was removed ("worktree /x", "sandbox y").
+    pub described: String,
+    /// Uncommitted changes (`git status` lines) committed on the branch first.
+    pub committed: Vec<String>,
+    /// The location was a cloud sandbox: the caller tells the orchestrator.
+    pub was_sandbox: bool,
+}
+
+/// `node_id`'s location when it was made from Files settings that have since
+/// changed (or that no longer resolve to it): never used, only removed.
+pub fn stale_location_of(fleet: &FleetStore, node_id: &str) -> Result<Option<FilesLocation>> {
+    fleet.reload_if_stale().ok();
+    Ok(fleet.resolve_files_for_node(node_id)?.and_then(|f| f.stale_location))
+}
+
+/// Removes `node_id`'s stale location, for Reset environment
+/// (`tod_core::environment_reset`), the operator's explicit confirmation of
+/// what the Files-impact dialog asks for. Uncommitted changes are never
+/// discarded: they are committed on the node's branch first (the dialog's
+/// Commit, never its Discard), then [`remove_location`] pushes the branch and
+/// removes the worktree or sandbox and the row, so the next launch makes a
+/// fresh one. Something running in it refuses, naming what. `None` when the
+/// node has no stale location. Slow: never on the UI thread.
+pub fn remove_stale_location(
+    fleet: &FleetStore,
+    paths: &TodPaths,
+    settings: &TodSettings,
+    node_id: &str,
+    progress: &mut dyn FnMut(&str),
+) -> Result<Option<StaleRemoved>> {
+    let Some(stale) = stale_location_of(fleet, node_id)? else {
+        return Ok(None);
+    };
+    let described = stale.describe();
+    let mut committed = Vec::new();
+    match location_state(fleet, paths, node_id)? {
+        LocationState::Busy(reason) => bail!("{described} is in use: {reason}"),
+        LocationState::Dirty(lines) => {
+            progress(&format!(
+                "{described} has {} uncommitted change(s); committing them on its branch first…",
+                lines.len()
+            ));
+            commit_location_changes(fleet, node_id).with_context(|| {
+                format!("commit the uncommitted changes in {described} ({}); it was kept", lines.join("; "))
+            })?;
+            committed = lines;
+        }
+        LocationState::Clean | LocationState::Gone => {}
+    }
+    remove_location(fleet, paths, settings, node_id, progress)
+        .with_context(|| format!("remove the stale {described}"))?;
+    Ok(Some(StaleRemoved { described, committed, was_sandbox: stale.sandbox().is_some() }))
 }
 
 /// Every node's location that is stale: made from settings that changed,

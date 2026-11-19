@@ -66,7 +66,7 @@ the node's runner runs:
 | `check-now` | Check now | Checks the phase's gate with no agent; moves the node on when it is clear; starts the phase agent when only its work is left. A failing gate or an unreadable GitHub is the result, printed as the check's finding (`failed` in JSON), not an error. |
 | `rerun-phase` | Rerun this phase | A new stay in the current state, then the run starts in a new session. |
 | `migrate` | Migrate to... | Moves the node's files to the location `--to` names (a name or an id; `menu` lists them, without the one the node is already in, which is refused as "already in <location>"). Its sessions are kept, its current files are removed with each branch pushed first, nothing is started. |
-| `reset-environment` | Reset environment | Sets the node's environment up again, deleting nothing. |
+| `reset-environment` | Reset environment | Sets the node's environment up again. A **stale** worktree or sandbox (made from Files settings that have since changed: the error "was made from Files settings that have since changed … Remove it first") is removed first: its branch is pushed, uncommitted work is committed on the branch (never discarded), then the files and record go and the next launch makes a fresh one. Nothing else is deleted. |
 | `update-workspace` | Update workspace to latest main | Brings the node's checkout up to the latest main, or says why it left it alone. |
 | `delete-sandbox` | Delete sandbox | Deletes the node's cloud sandbox after a checkpoint of its uncommitted work. |
 | `delete-sandbox-anyway` | Delete sandbox without a checkpoint | The same without the checkpoint: uncommitted work in the sandbox is lost. |
@@ -90,6 +90,13 @@ supervisor there (the same verbs become requests to it).
   uncommitted changes, unless `--commit` commits them on the branch first or
   `--discard` throws them away (the dialog's Commit and Discard; give at most one).
   Files that something is using are refused too.
+- **A node stopped on "made from Files settings that have since changed"**: `runner
+  reset-environment <NODE>` removes the stale worktree (it never needs `migrate`, and
+  `migrate` to the place the node is already in is refused pointing at it). `migrate`
+  pins a node-level Files override; clear one with `tod-cli capabilities disable <NODE>
+  files` (the node then inherits the nearest ancestor's location again), then run
+  `runner reset-environment <NODE>` to remove the worktree the override had made. Check
+  with `capabilities list <NODE>` first: only disable `files` on a node you pinned.
 - **`delete-sandbox` and `delete-sandbox-anyway`** refuse while the run is active
   unless `--stop` stops it first (the panel's "Stop and delete").
 - **Not in an agent session**, as above.

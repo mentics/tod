@@ -9,6 +9,14 @@
 //!   waiting on someone.
 //! - **A worktree or directory on this machine:** an error; there is nothing
 //!   to set up again.
+//! - **A stale location** (the node's worktree or sandbox was made from Files
+//!   settings that have since changed, so every launch refuses it): removed
+//!   first, in any of the cases above. This is what the Files-impact dialog
+//!   asks the user to confirm, and Reset is the operator's explicit
+//!   confirmation: uncommitted work is committed on the node's branch (never
+//!   discarded), the branch is pushed, then the worktree or sandbox and its
+//!   record go; the next launch makes a fresh one. On a host-only node this
+//!   is all Reset does, and it succeeds.
 //!
 //! It refuses while the runner is active. Blocks on Docker, git or the
 //! network: never call it on the UI thread.
@@ -81,11 +89,33 @@ pub fn reset_with(
     progress: &mut dyn FnMut(&str),
     actions: &mut dyn Actions,
 ) -> Result<()> {
-    let target = target(fleet, node)?;
-    if let Some(why) = cloud_sync::lost::runner_blocker(fleet, &node.to_string())? {
+    let id = node.to_string();
+    // A stale location (made from Files settings that have since changed)
+    // would stop every launch, and nothing else removes it from here: the
+    // Files-impact dialog is the only other path. Checked before the target,
+    // because a stale host worktree is something to reset too.
+    let stale = tod_store::fleet::provision::stale_location_of(fleet, &id)?;
+    let target = match (target(fleet, node), &stale) {
+        (Ok(target), _) => Some(target),
+        (Err(_), Some(_)) => None,
+        (Err(err), None) => return Err(err),
+    };
+    if let Some(why) = cloud_sync::lost::runner_blocker(fleet, &id)? {
         bail!("cannot reset the environment while the node is running: {why}. Stop it first");
     }
-    let id = node.to_string();
+    if stale.is_some() {
+        let removed = remove_stale(fleet, &id, progress)?;
+        if removed.is_some_and(|r| r.was_sandbox) {
+            cloud_sync::lost::announce_left_cloud(fleet, &id)
+                .context("the stale sandbox was removed, but the orchestrator could not be told")?;
+        }
+    }
+    let Some(target) = target else {
+        // A worktree on this machine has nothing else to set up: the next
+        // launch makes a fresh one.
+        progress("The next launch makes a fresh worktree.");
+        return Ok(());
+    };
     match target {
         Target::DevContainer => actions.dev_container(fleet, &id, progress),
         Target::Sandbox => {
@@ -93,6 +123,28 @@ pub fn reset_with(
             actions.sandbox(fleet, &id, wake, progress)
         }
     }
+}
+
+/// Removes the node's stale location ([`tod_store::fleet::provision::remove_stale_location`]):
+/// uncommitted work is committed on its branch (never discarded), the branch
+/// is pushed, then the files and the record go.
+fn remove_stale(
+    fleet: &FleetStore,
+    node: &str,
+    progress: &mut dyn FnMut(&str),
+) -> Result<Option<tod_store::fleet::provision::StaleRemoved>> {
+    let paths = tod_store::TodPaths::at(fleet.paths().root());
+    let settings = tod_store::TodSettings::load(&paths).context("read the settings")?;
+    let removed = tod_store::fleet::provision::remove_stale_location(fleet, &paths, &settings, node, progress)?;
+    if let Some(removed) = &removed {
+        let saved = if removed.committed.is_empty() {
+            String::new()
+        } else {
+            format!(" ({} uncommitted change(s) committed on its branch first)", removed.committed.len())
+        };
+        progress(&format!("Removed the stale {}{saved}; the next launch makes a fresh one.", removed.described));
+    }
+    Ok(removed)
 }
 
 struct Real;
@@ -215,6 +267,145 @@ mod tests {
         assert!(format!("{:#}", result.unwrap_err()).contains("no Files"));
         assert!(calls.is_empty());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    // ---- a stale location (shepherd gap 46), with real git ----
+
+    fn git(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).to_string()
+    }
+
+    /// A repository with a bare `origin`, a Files location for `node` that
+    /// makes a git worktree of it, and that node's made worktree. Returns
+    /// (paths, settings, origin dir, worktree dir).
+    fn made_worktree(
+        fleet: &FleetStore,
+        root: &std::path::Path,
+        node: Uuid,
+    ) -> (tod_store::TodPaths, tod_store::TodSettings, std::path::PathBuf, std::path::PathBuf) {
+        let base = tod_test_util::scratch_dir("tod-stale-loc-");
+        let repo = base.join("repo");
+        let origin = base.join("origin.git");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("a.txt"), "a").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "init"]);
+        git(&base, &["clone", "-q", "--bare", repo.to_str().unwrap(), origin.to_str().unwrap()]);
+        git(&repo, &["remote", "add", "origin", origin.to_str().unwrap()]);
+        git(&repo, &["fetch", "-q", "origin"]);
+        git(&repo, &["branch", "-q", "--set-upstream-to=origin/main", "main"]);
+        git(&repo, &["remote", "set-head", "origin", "main"]);
+        fleet
+            .enqueue_outline(OutlineMutation::EnableCapabilities {
+                node_id: node,
+                capabilities: vec![tod_store::outline::Capability::Files],
+            })
+            .unwrap();
+        let place = tod_store::fleet::FilesPlace {
+            id: Uuid::new_v4().to_string(),
+            name: "wt".into(),
+            repo: Some(repo.to_str().unwrap().into()),
+            use_worktree: true,
+            ..Default::default()
+        };
+        let id = place.id.clone();
+        fleet.enqueue(tod_store::fleet::FleetMutation::SaveFilesPlace { place }).unwrap();
+        fleet
+            .enqueue(tod_store::fleet::FleetMutation::SetNodeFilesPlace { node_id: node.to_string(), place_id: Some(id) })
+            .unwrap();
+        fleet.writer().flush().unwrap();
+        fleet.reload_if_stale().unwrap();
+        let paths = tod_store::TodPaths::at(root);
+        let mut settings = tod_store::TodSettings::default();
+        settings.worktree_backend = tod_store::WorktreeBackend::GitOnly;
+        let (dir, _) =
+            tod_store::fleet::provision::make_location(fleet, &paths, &settings, &node.to_string(), &mut |_| {}).unwrap();
+        let dir = std::path::PathBuf::from(dir.storage());
+        (paths, settings, origin, dir)
+    }
+
+    /// The node's location, now claiming to have been made from some other
+    /// node's settings (one that was deleted or moved away): exactly the live
+    /// rows of gap 46, which no ancestor will ever match again.
+    fn make_stale(fleet: &FleetStore, node: Uuid) {
+        let mut location = tod_store::fleet::provision::node_location(fleet, &node.to_string()).unwrap().unwrap();
+        location.source_node_id = Uuid::new_v4().to_string();
+        fleet.enqueue(tod_store::fleet::FleetMutation::RecordFilesLocation { location }).unwrap();
+        fleet.writer().flush().unwrap();
+        fleet.reload_if_stale().unwrap();
+        let stale = tod_store::fleet::provision::launch_cwd_if_made(fleet, &node.to_string()).unwrap_err();
+        let stale = format!("{stale:#}");
+        assert!(stale.contains("since changed") && stale.contains("Reset environment"), "{stale}");
+    }
+
+    #[test]
+    fn reset_removes_a_stale_location_after_pushing_and_the_next_launch_makes_a_fresh_one() {
+        let (fleet, root, node) = setup();
+        let (paths, settings, origin, dir) = made_worktree(&fleet, &root, node);
+        let id = node.to_string();
+        // Work committed in the worktree and never pushed.
+        std::fs::write(dir.join("done.txt"), "committed work").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "work"]);
+        let branch = git(&dir, &["rev-parse", "--abbrev-ref", "HEAD"]).trim().to_string();
+        make_stale(&fleet, node);
+
+        // `locations_affected_by` names it too, so Migrate no longer leaves it behind.
+        let affected = tod_store::fleet::provision::locations_affected_by(&fleet, &id).unwrap();
+        assert_eq!(affected.len(), 1, "an orphaned own location is affected by a change to the node's settings");
+        let place = fleet.resolve_files_for_node(&id).unwrap().unwrap().place_id.unwrap();
+        let migrating = tod_store::fleet::places::migrate_impact(&fleet, &id, &place).unwrap();
+        assert_eq!(migrating.len(), 1, "migrating (main and back) removes it instead of leaving it");
+
+        let (result, calls) = run(&fleet, node);
+        result.unwrap();
+        assert!(calls.is_empty(), "a host worktree has nothing else to set up: {calls:?}");
+        assert_eq!(tod_store::fleet::provision::node_location(&fleet, &id).unwrap(), None, "the row is gone");
+        assert!(!dir.exists(), "the worktree is gone");
+        let pushed = git(&origin, &["show", &format!("{branch}:done.txt")]);
+        assert_eq!(pushed, "committed work", "the branch was pushed before the worktree went");
+
+        let (fresh, _) =
+            tod_store::fleet::provision::make_location(&fleet, &paths, &settings, &id, &mut |_| {}).unwrap();
+        assert!(fresh.is_dir(), "the next launch makes a fresh worktree");
+        assert!(tod_store::fleet::provision::stale_location_of(&fleet, &id).unwrap().is_none());
+    }
+
+    #[test]
+    fn reset_never_discards_uncommitted_work_in_a_stale_location() {
+        let (fleet, root, node) = setup();
+        let (_, _, origin, dir) = made_worktree(&fleet, &root, node);
+        std::fs::write(dir.join("wip.txt"), "unsaved work").unwrap();
+        std::fs::write(dir.join("a.txt"), "edited").unwrap();
+        let branch = git(&dir, &["rev-parse", "--abbrev-ref", "HEAD"]).trim().to_string();
+        make_stale(&fleet, node);
+
+        let mut said = Vec::new();
+        let mut fake = Fake::default();
+        reset_with(&fleet, node, &mut |m| said.push(m.to_string()), &mut fake).unwrap();
+        assert!(said.iter().any(|m| m.contains("2 uncommitted change(s)")), "it says what it saved: {said:?}");
+        assert!(!dir.exists());
+        assert_eq!(git(&origin, &["show", &format!("{branch}:wip.txt")]), "unsaved work");
+        assert_eq!(git(&origin, &["show", &format!("{branch}:a.txt")]), "edited");
+    }
+
+    #[test]
+    fn a_current_location_is_not_touched_by_the_stale_path() {
+        let (fleet, root, node) = setup();
+        let (_, _, _, dir) = made_worktree(&fleet, &root, node);
+        // A current location on a host worktree: Reset still does not apply.
+        let (result, _) = run(&fleet, node);
+        assert!(format!("{:#}", result.unwrap_err()).contains("does not apply"));
+        assert!(dir.is_dir(), "a current location is left alone");
     }
 
     #[test]
