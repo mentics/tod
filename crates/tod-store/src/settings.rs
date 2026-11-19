@@ -504,6 +504,9 @@ pub struct UnrelatedCheck {
     /// standing without a signature, holds for its head only.
     pub signature: String,
     pub standing: UnrelatedStanding,
+    /// When it was given (milliseconds; a pending question is `i64::MAX`, as
+    /// the newest thing there is): the latest answer about one failure wins.
+    pub at: i64,
 }
 
 /// The standing a list of [`UnrelatedCheck`] holds for `check` of `pr` on the
@@ -527,14 +530,14 @@ pub fn unrelated_standing(
     }
     let same_failure: Vec<&UnrelatedCheck> =
         list.iter().filter(same_check).filter(|u| u.signature == signature).collect();
-    if same_failure.iter().any(|u| u.standing == UnrelatedStanding::FixHere) {
-        None
-    } else if same_failure.iter().any(|u| u.standing == UnrelatedStanding::Waived) {
-        Some(UnrelatedStanding::Waived)
-    } else if same_failure.iter().any(|u| u.standing == UnrelatedStanding::Pending) {
-        Some(UnrelatedStanding::Pending)
-    } else {
-        None
+    // The latest answer about this failure decides (a fix-here on an earlier
+    // head does not shadow a carry-on given since, nor the reverse); a
+    // question still pending counts only when nothing was answered.
+    match same_failure.iter().filter(|u| u.standing != UnrelatedStanding::Pending).max_by_key(|u| u.at) {
+        Some(u) if u.standing == UnrelatedStanding::Waived => Some(UnrelatedStanding::Waived),
+        Some(_) => None,
+        None if same_failure.iter().any(|u| u.standing == UnrelatedStanding::Pending) => Some(UnrelatedStanding::Pending),
+        None => None,
     }
 }
 
@@ -1471,6 +1474,31 @@ mod tests {
         assert!(!journeys.can_submit());
         journeys.relay_code = None;
         assert!(!journeys.can_submit());
+    }
+
+    #[test]
+    fn the_latest_answer_about_a_failure_wins_whatever_the_head() {
+        let given = |head: &str, standing, at| UnrelatedCheck {
+            pr: "o/r#1".into(),
+            check: "c".into(),
+            head: head.into(),
+            signature: "sig".into(),
+            standing,
+            at,
+        };
+        let on = |list: &[UnrelatedCheck]| unrelated_standing(list, "o/r#1", "c", "h3", "sig");
+        // A fix-here on an earlier head does not shadow a later carry-on, and the reverse.
+        let fix_then_carry = [given("h1", UnrelatedStanding::FixHere, 10), given("h2", UnrelatedStanding::Waived, 20)];
+        assert_eq!(on(&fix_then_carry), Some(UnrelatedStanding::Waived));
+        let carry_then_fix = [given("h1", UnrelatedStanding::Waived, 10), given("h2", UnrelatedStanding::FixHere, 20)];
+        assert_eq!(on(&carry_then_fix), None);
+        // A question still pending counts only when nothing was answered.
+        let pending = given("h2", UnrelatedStanding::Pending, i64::MAX);
+        assert_eq!(on(&[pending.clone()]), Some(UnrelatedStanding::Pending));
+        assert_eq!(on(&[pending, given("h1", UnrelatedStanding::Waived, 10)]), Some(UnrelatedStanding::Waived));
+        // A different or unknown failure is never carried over.
+        assert_eq!(unrelated_standing(&fix_then_carry, "o/r#1", "c", "h3", "other"), None);
+        assert_eq!(unrelated_standing(&fix_then_carry, "o/r#1", "c", "h3", ""), None);
     }
 
     #[test]

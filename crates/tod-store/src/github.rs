@@ -350,6 +350,11 @@ pub struct PrStatus {
     /// signature)` ([`failure_signature`]): the same failure on a later head
     /// has the same signature. A check with none is not listed.
     pub failing_signatures: Vec<(String, String)>,
+    /// For each of [`Self::failing_checks`] with no signature, `(name, why)`:
+    /// why an answer about it cannot carry across heads (GitHub's refusal of
+    /// the annotations or log request, or no failure text in them). Shown
+    /// wherever the check is, and logged when found.
+    pub signature_notes: Vec<(String, String)>,
     /// Some check is still running (a status `pending`, a run not completed),
     /// whatever else failed: `checks` says `failure` first.
     pub checks_running: bool,
@@ -523,6 +528,45 @@ impl Github {
             Err(GithubError::NotFound) => Err(self.explain_pull_not_found(path)),
             other => other,
         }
+    }
+
+    /// `GET <api><path>` as text (a job's log; GitHub redirects to the file),
+    /// at most `limit` bytes: a longer reply is an error, never a truncation.
+    fn get_text(&self, path: &str, limit: u64) -> Result<String, GithubError> {
+        if self.proxy_missing {
+            return Err(GithubError::ProxyMissing);
+        }
+        self.check_quota_gate("GET", path, None)?;
+        let response = self.authorize(self.agent.get(&format!("{}{path}", self.api)), path, None).call();
+        let request = format!("GET {path}");
+        let class = endpoint_class("GET", path);
+        if let Ok(r) = &response {
+            note_response(&class, r.headers());
+        } else {
+            with_usage(|u| *u.calls.entry(class.clone()).or_insert(0) += 1);
+        }
+        let mut response = response.map_err(|err| GithubError::Http(err.to_string()))?;
+        let status = response.status().as_u16();
+        if status >= 400 {
+            let err = api_error(&request, status, &mut response);
+            if let GithubError::RateLimited { reset_epoch_secs, .. } = &err {
+                let key = self.quota_key(path, None);
+                with_usage(|u| {
+                    u.blocked_until.insert(key, *reset_epoch_secs);
+                });
+            }
+            return Err(err);
+        }
+        response
+            .body_mut()
+            .with_config()
+            .limit(limit)
+            .lossy_utf8(true)
+            .read_to_string()
+            .map_err(|err| match err {
+                ureq::Error::BodyExceedsLimit(_) => GithubError::Api(format!("{request}: the reply is longer than {limit} bytes")),
+                err => GithubError::Http(format!("{request}: could not read the body (HTTP {status}): {err}")),
+            })
     }
 
     /// A 404 on `/repos/<o>/<r>/pulls/<n>...`, told apart by asking GitHub
@@ -733,10 +777,17 @@ impl Github {
         Err(GithubError::Api(format!("{owner}/{repo}@{sha}: more than 5000 check runs")))
     }
 
-    /// `(name, signature)` for each failing check that has one
-    /// ([`failure_signature`]): a GitHub Actions run names its failing step
-    /// (one more request per failing run), any run its output title and
-    /// summary, a commit status its description.
+    /// The signatures of the failing checks, and why the others have none
+    /// ([`failure_signature`]). A commit status's own description is its
+    /// failure text. A check run's is its annotations; a GitHub Actions run
+    /// with none of its own is the error lines of its failing step's log. A
+    /// check whose failure text cannot be had has no signature (an answer
+    /// about it stays with its head) and a note saying why: a refused or
+    /// missing annotations or log request is that check's note, never an
+    /// error of the whole look. A transient failure is an error, as every
+    /// other request's is. A finished run's failure never changes, so each
+    /// run is read once ([`signature_cache`]).
+    #[allow(clippy::type_complexity)]
     fn failing_signatures(
         &self,
         owner: &str,
@@ -744,17 +795,32 @@ impl Github {
         names: &[String],
         statuses: &CombinedStatusRaw,
         runs: &CheckRunsRaw,
-    ) -> Result<Vec<(String, String)>, GithubError> {
-        let mut out: Vec<(String, String)> = Vec::new();
+    ) -> Result<(Vec<(String, String)>, Vec<(String, String)>), GithubError> {
+        let mut sigs: Vec<(String, String)> = Vec::new();
+        let mut notes: Vec<(String, String)> = Vec::new();
+        let mut record = |name: &String, result: Result<String, String>| match result {
+            Ok(sig) => sigs.push((name.clone(), sig)),
+            Err(why) => {
+                tracing::warn!(target: "tod::github", "{owner}/{repo}: check \"{name}\" has no failure signature: {why}");
+                notes.push((name.clone(), why));
+            }
+        };
+        let mut seen: Vec<String> = Vec::new();
         for s in &statuses.statuses {
             let Some(name) = s.context.as_ref().filter(|n| names.contains(n)) else { continue };
-            if matches!(s.state.as_str(), "success" | "pending") || out.iter().any(|(n, _)| n == name) {
+            if matches!(s.state.as_str(), "success" | "pending") || seen.contains(name) {
                 continue;
             }
-            let sig = failure_signature(&s.state, "", "", s.description.as_deref().unwrap_or_default());
-            if !sig.is_empty() {
-                out.push((name.clone(), sig));
-            }
+            seen.push(name.clone());
+            let sig = failure_signature(&s.state, "", s.description.as_deref().unwrap_or_default());
+            record(
+                name,
+                if sig.is_empty() {
+                    Err("an answer about it holds for one head only: the commit status gave no description of the failure".to_string())
+                } else {
+                    Ok(sig)
+                },
+            );
         }
         for run in &runs.check_runs {
             let Some(name) = run.name.as_ref().filter(|n| names.contains(n)) else { continue };
@@ -762,31 +828,96 @@ impl Github {
             if run.status != "completed" || matches!(conclusion, "success" | "neutral" | "skipped") {
                 continue;
             }
-            if out.iter().any(|(n, _)| n == name) {
+            if seen.contains(name) {
                 continue;
             }
-            let mut step = String::new();
-            if run.app.as_ref().and_then(|a| a.slug.as_deref()) == Some("github-actions") && run.id != 0 {
-                let job: JobRaw = self.get_json(&format!("/repos/{owner}/{repo}/actions/jobs/{}", run.id))?;
-                step = job
-                    .steps
-                    .iter()
-                    .find(|s| s.conclusion.as_deref() == Some("failure"))
-                    .map(|s| s.name.clone())
-                    .unwrap_or_default();
-            }
-            let output = run.output.as_ref();
-            let sig = failure_signature(
-                conclusion,
-                &step,
-                output.and_then(|o| o.title.as_deref()).unwrap_or_default(),
-                output.and_then(|o| o.summary.as_deref()).unwrap_or_default(),
-            );
-            if !sig.is_empty() {
-                out.push((name.clone(), sig));
+            seen.push(name.clone());
+            let result = self.run_signature(owner, repo, run)?;
+            record(name, result);
+        }
+        Ok((sigs, notes))
+    }
+
+    /// One failed check run's signature, or why it has none; cached by run.
+    fn run_signature(&self, owner: &str, repo: &str, run: &CheckRunRaw) -> Result<Result<String, String>, GithubError> {
+        let key = format!("{}|{owner}/{repo}|{}", self.api, run.id);
+        if run.id != 0 {
+            if let Some(hit) = signature_cache_get(&key) {
+                return Ok(hit);
             }
         }
-        Ok(out)
+        let conclusion = run.conclusion.as_deref().unwrap_or_default();
+        let actions = run.app.as_ref().and_then(|a| a.slug.as_deref()) == Some("github-actions") && run.id != 0;
+        let mut reasons: Vec<String> = Vec::new();
+        // A refusal (not a transient failure) of one request is that check's
+        // note; the next source is still tried.
+        fn soft<T>(what: &str, got: Result<T, GithubError>, reasons: &mut Vec<String>) -> Result<Option<T>, GithubError> {
+            match got {
+                Ok(v) => Ok(Some(v)),
+                Err(e) if e.is_transient() => Err(e),
+                Err(e) => {
+                    reasons.push(format!("{what}: {e}"));
+                    Ok(None)
+                }
+            }
+        }
+        let mut job: Option<JobRaw> = None;
+        if actions {
+            job = soft(
+                "the job",
+                self.get_json::<JobRaw>(&format!("/repos/{owner}/{repo}/actions/jobs/{}", run.id)),
+                &mut reasons,
+            )?;
+        }
+        let step = job.as_ref().and_then(|j| j.steps.iter().find(|s| step_failed(s)));
+        let mut evidence = String::new();
+        if run.id != 0 {
+            let annotations = soft(
+                "the annotations",
+                self.get_json::<Vec<AnnotationRaw>>(&format!(
+                    "/repos/{owner}/{repo}/check-runs/{}/annotations?per_page=50",
+                    run.id
+                )),
+                &mut reasons,
+            )?;
+            evidence = annotations.map(|a| annotation_evidence(&a, actions)).unwrap_or_default();
+        }
+        if evidence.is_empty() && actions {
+            if let Some(step) = step {
+                let log = soft(
+                    "the log",
+                    self.get_text(&format!("/repos/{owner}/{repo}/actions/jobs/{}/logs", run.id), LOG_LIMIT_BYTES),
+                    &mut reasons,
+                )?;
+                evidence = log.map(|l| failing_step_log(&l, step)).unwrap_or_default();
+            } else if job.is_some() {
+                reasons.push("the job names no failed step".to_string());
+            }
+        }
+        if evidence.is_empty() && !actions {
+            let output = run.output.as_ref();
+            evidence = format!(
+                "{} {}",
+                output.and_then(|o| o.title.as_deref()).unwrap_or_default(),
+                output.and_then(|o| o.summary.as_deref()).unwrap_or_default()
+            );
+        }
+        let sig = failure_signature(conclusion, step.map(|s| s.name.as_str()).unwrap_or_default(), &evidence);
+        let result = if sig.is_empty() {
+            if reasons.is_empty() {
+                reasons.push("GitHub gave no annotation or log line saying how it failed".to_string());
+            }
+            Err(format!("an answer about it holds for one head only: {}", reasons.join("; ")))
+        } else {
+            Ok(sig)
+        };
+        // A refusal is remembered for a while (so a token with no Actions
+        // access does not cost three requests a minute); only a signature is
+        // kept for good.
+        if run.id != 0 {
+            signature_cache_put(key, result.clone());
+        }
+        Ok(result)
     }
 
     /// Fetch a pull request's live status: mergeable flag, mergeable state,
@@ -798,6 +929,7 @@ impl Github {
         // Actions and apps), which the combined status leaves out.
         let mut failing_checks = Vec::new();
         let mut failing_signatures = Vec::new();
+        let mut signature_notes = Vec::new();
         let mut checks_running = false;
         let checks = match &raw.head {
             Some(head) => {
@@ -807,7 +939,8 @@ impl Github {
                     .get_json::<CombinedStatusRaw>(&format!("/repos/{owner}/{repo}/commits/{}/status", head.sha))?;
                 let runs = self.get_check_runs(owner, repo, &head.sha)?;
                 failing_checks = failing_check_names(Some(&statuses), Some(&runs));
-                failing_signatures = self.failing_signatures(owner, repo, &failing_checks, &statuses, &runs)?;
+                (failing_signatures, signature_notes) =
+                    self.failing_signatures(owner, repo, &failing_checks, &statuses, &runs)?;
                 checks_running = checks_running_in(Some(&statuses), Some(&runs));
                 combine_checks(Some(&statuses), Some(&runs))
             }
@@ -831,6 +964,7 @@ impl Github {
             checks,
             failing_checks,
             failing_signatures,
+            signature_notes,
             checks_running,
             head_sha: raw.head.as_ref().map(|h| h.sha.clone()),
             head_committed_at: None,
@@ -2248,36 +2382,225 @@ struct JobStepRaw {
     name: String,
     #[serde(default)]
     conclusion: Option<String>,
+    #[serde(default)]
+    started_at: Option<String>,
+    #[serde(default)]
+    completed_at: Option<String>,
+}
+
+/// One annotation of a check run (`/check-runs/{id}/annotations`).
+#[derive(Debug, Deserialize)]
+struct AnnotationRaw {
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    annotation_level: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+/// The most of a job's log read; a longer one has no signature.
+const LOG_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
+
+fn step_failed(step: &JobStepRaw) -> bool {
+    matches!(step.conclusion.as_deref(), Some("failure" | "timed_out" | "cancelled"))
+}
+
+/// What GitHub Actions adds to every failed job whatever failed.
+fn generic_failure_text(text: &str) -> bool {
+    let t = text.trim().to_ascii_lowercase();
+    t.starts_with("process completed with exit code") || t.starts_with("the operation was canceled")
+}
+
+/// The failure text in a check run's annotations: each one's level, path and
+/// message (never its line, which moves between commits), without the generic
+/// exit-code one. A GitHub Actions run counts only failure-level ones (its
+/// warnings are about the workflow, not the failure). Empty when there is none.
+fn annotation_evidence(annotations: &[AnnotationRaw], actions: bool) -> String {
+    annotations
+        .iter()
+        .filter(|a| {
+            let level = a.annotation_level.as_deref().unwrap_or_default();
+            if actions { level == "failure" } else { level != "notice" }
+        })
+        .filter(|a| !generic_failure_text(a.message.as_deref().unwrap_or_default()))
+        .take(20)
+        .map(|a| {
+            format!(
+                "{} {} {} {}",
+                a.annotation_level.as_deref().unwrap_or_default(),
+                a.path.as_deref().unwrap_or_default(),
+                a.title.as_deref().unwrap_or_default(),
+                a.message.as_deref().unwrap_or_default()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The lines of a job's log that say how `step` failed: the step's own
+/// section (lines stamped between its start and end; when the step's times
+/// are not known, only the log's `##[error]` lines), the lines of it that
+/// name an error (up to 20), else its last 10 lines. Empty when the section
+/// holds nothing but the generic exit-code line.
+fn failing_step_log(log: &str, step: &JobStepRaw) -> String {
+    let parse = |t: &Option<String>| t.as_deref().and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok());
+    let window = match (parse(&step.started_at), parse(&step.completed_at)) {
+        (Some(a), Some(b)) => Some((a - chrono::Duration::seconds(1), b + chrono::Duration::seconds(1))),
+        _ => None,
+    };
+    let mut current: Option<chrono::DateTime<chrono::FixedOffset>> = None;
+    let mut section: Vec<&str> = Vec::new();
+    for line in log.lines() {
+        let line = line.trim_start_matches('\u{feff}');
+        let (stamp, rest) = line.split_once(' ').unwrap_or((line, ""));
+        let text = match chrono::DateTime::parse_from_rfc3339(stamp) {
+            Ok(t) => {
+                current = Some(t);
+                rest
+            }
+            Err(_) => line,
+        };
+        let inside = match (window, current) {
+            (Some((a, b)), Some(t)) => t >= a && t <= b,
+            (Some(_), None) => false,
+            (None, _) => true,
+        };
+        if inside {
+            section.push(text);
+        }
+    }
+    const KEYWORDS: [&str; 14] = [
+        "error", "fail", "panic", "exception", "fatal", "denied", "mismatch", "invalid", "cannot", "unable", "not found",
+        "unexpected", "syntax", "refused",
+    ];
+    let content = |l: &str| -> Option<String> {
+        let l = l.trim();
+        if l.starts_with("##[") && !l.starts_with("##[error]") && !l.starts_with("##[warning]") {
+            return None;
+        }
+        let l = l.trim_start_matches("##[error]").trim_start_matches("##[warning]").trim();
+        (!l.is_empty() && !generic_failure_text(l)).then(|| l.to_string())
+    };
+    let flagged: Vec<String> = if window.is_none() {
+        section.iter().filter(|l| l.trim().starts_with("##[error]")).filter_map(|l| content(l)).collect()
+    } else {
+        section
+            .iter()
+            .filter_map(|l| content(l))
+            .filter(|l| {
+                let low = l.to_ascii_lowercase();
+                KEYWORDS.iter().any(|k| low.contains(k))
+            })
+            .collect()
+    };
+    let chosen: Vec<String> = if !flagged.is_empty() {
+        flagged.into_iter().take(20).collect()
+    } else if window.is_some() {
+        let all: Vec<String> = section.iter().filter_map(|l| content(l)).collect();
+        all[all.len().saturating_sub(10)..].to_vec()
+    } else {
+        Vec::new()
+    };
+    chosen.into_iter().map(|l| l.chars().take(300).collect::<String>()).collect::<Vec<_>>().join("\n")
+}
+
+type CachedSignature = (Result<String, String>, Option<std::time::Instant>);
+
+/// Signatures (and refusals, for ten minutes) by check run; see
+/// [`Github::run_signature`].
+fn signature_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, CachedSignature>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, CachedSignature>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+const REFUSAL_REMEMBERED: std::time::Duration = std::time::Duration::from_secs(600);
+
+fn signature_cache_get(key: &str) -> Option<Result<String, String>> {
+    let cache = signature_cache().lock().unwrap_or_else(|e| e.into_inner());
+    match cache.get(key)? {
+        (result, None) => Some(result.clone()),
+        (result, Some(at)) if at.elapsed() < REFUSAL_REMEMBERED => Some(result.clone()),
+        _ => None,
+    }
+}
+
+fn signature_cache_put(key: String, result: Result<String, String>) {
+    let mut cache = signature_cache().lock().unwrap_or_else(|e| e.into_inner());
+    if cache.len() > 4000 {
+        cache.clear();
+    }
+    let at = result.is_err().then(std::time::Instant::now);
+    cache.insert(key, (result, at));
 }
 
 /// A short, stable fingerprint of why a check fails, so that an answer about
 /// the failure can hold for later commits while it is the same failure: the
-/// conclusion, the failing step, and the check's own title and summary with
-/// what changes between runs (anything with a digit in it: commit ids,
-/// counts, durations, times; case; spacing) taken out. Empty when nothing
-/// but the name is known.
-pub fn failure_signature(conclusion: &str, step: &str, title: &str, summary: &str) -> String {
-    fn normal(text: &str) -> String {
-        text.chars()
-            .take(4000)
-            .map(|c| if c.is_alphanumeric() || matches!(c, '_' | '-' | '/' | '.') { c.to_ascii_lowercase() } else { ' ' })
-            .collect::<String>()
-            .split_whitespace()
-            .filter(|w| !w.chars().any(|c| c.is_ascii_digit()))
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
-    let (step, title, summary) = (normal(step), normal(title), normal(summary));
-    if step.is_empty() && title.is_empty() && summary.is_empty() {
+/// conclusion, the failing step, and the failure text itself (`evidence`:
+/// annotations, the error lines of the failing step's log, or a commit
+/// status's description), with what changes between runs taken out: ANSI
+/// colors, timestamps, ids, hashes, counts, durations and versions (any word
+/// with a digit in it), long hex or encoded strings, temporary paths, case and
+/// spacing. Empty when `evidence` says nothing: the step's name alone never
+/// makes one, since a new failure in the same step would then read as the old.
+pub fn failure_signature(conclusion: &str, step: &str, evidence: &str) -> String {
+    let evidence = normalize_failure_text(evidence);
+    if evidence.is_empty() {
         return String::new();
     }
-    let joined = format!("{}\u{1f}{step}\u{1f}{title}\u{1f}{summary}", conclusion.to_ascii_lowercase());
+    let joined = format!("{}\u{1f}{}\u{1f}{evidence}", conclusion.to_ascii_lowercase(), normalize_failure_text(step));
     let mut hash: u64 = 0xcbf29ce484222325;
     for b in joined.bytes() {
         hash ^= u64::from(b);
         hash = hash.wrapping_mul(0x100000001b3);
     }
     format!("{hash:016x}")
+}
+
+/// [`failure_signature`]'s normal form of a failure text, line by line.
+fn normalize_failure_text(text: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for line in text.chars().take(8000).collect::<String>().lines() {
+        // ANSI escapes: `ESC [ ... letter`.
+        let mut plain = String::new();
+        let mut chars = line.chars();
+        while let Some(c) = chars.next() {
+            if c == '\u{1b}' {
+                for n in chars.by_ref() {
+                    if n.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            } else {
+                plain.push(c);
+            }
+        }
+        let words: Vec<String> = plain
+            .split_whitespace()
+            .filter(|w| {
+                let temp = w.contains("/tmp/") || w.starts_with("/tmp") || w.contains("_temp") || w.contains("/var/folders");
+                let hex = w.len() >= 7 && w.chars().all(|c| c.is_ascii_hexdigit());
+                !temp && !hex && w.len() < 60
+            })
+            .flat_map(|w| {
+                w.chars()
+                    .map(|c| if c.is_alphanumeric() || matches!(c, '_' | '-' | '/' | '.') { c.to_ascii_lowercase() } else { ' ' })
+                    .collect::<String>()
+                    .split_whitespace()
+                    .filter(|p| !p.chars().any(|c| c.is_ascii_digit()))
+                    .map(|p| p.trim_matches(|c| matches!(c, '.' | '-' | '/')).to_string())
+                    .filter(|p| !p.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        if !words.is_empty() {
+            out.push(words.join(" "));
+        }
+    }
+    out.join("\n")
 }
 
 /// [`PrStatus::checks`] from the combined status and the check runs.
@@ -3077,6 +3400,179 @@ mod tests {
         // Nameless.
         let n = runs(r#"{"check_runs":[{"status":"completed","conclusion":"failure"}]}"#);
         assert_eq!(failing_check_names(None, Some(&n)), vec!["(unnamed check)".to_string()]);
+    }
+
+    const CLOUDFLARE_ERR_A: &str = "\u{1b}[31;1mError:\u{1b}[0m Failed to install provider cloudflare/cloudflare 4.52.0: the current package for registry.terraform.io/cloudflare/cloudflare doesn't match any of the checksums previously recorded in the dependency lock file (h1:Zc8dQ5m7vK2PjRtq0ZxYw1oN3aBcDeFgHiJk=) in /home/runner/work/_temp/9f3a1c7e/.terraform.lock.hcl after 12.4s";
+    const CLOUDFLARE_ERR_B: &str = "Error: Failed to install provider cloudflare/cloudflare 4.53.1: the current package for registry.terraform.io/cloudflare/cloudflare doesn't match any of the checksums previously recorded in the dependency lock file (h1:QqQqQqQqQqQqQqQqQq77Zz=) in /home/runner/work/_temp/0b2e55d1/.terraform.lock.hcl after 3.1s";
+
+    #[test]
+    fn a_signature_ignores_what_changes_between_runs_and_keeps_the_error() {
+        let sig = |text: &str| failure_signature("failure", "Terraform validate", text);
+        // The same checksum error across heads, with other timestamps, ids,
+        // hashes, temp paths, versions and durations.
+        let a = format!("2026-11-18T20:14:45.1234567Z {CLOUDFLARE_ERR_A}");
+        let b = format!("2026-11-19T03:02:11.7654321Z {CLOUDFLARE_ERR_B}");
+        assert!(!sig(&a).is_empty());
+        assert_eq!(sig(&a), sig(&b));
+        assert_eq!(sig(&a), sig(&a.to_ascii_uppercase()), "case does not matter");
+        // A different error in the same step is a different failure.
+        let syntax = "2026-11-19T03:02:11Z Error: Argument or block definition required: syntax error in modules/aws/main.tf";
+        assert_ne!(sig(&a), sig(syntax));
+        // The step name alone never makes a signature.
+        assert_eq!(failure_signature("failure", "Terraform validate", ""), "");
+        assert_eq!(failure_signature("failure", "Terraform validate", "  12:30:01  2026-11-19T03:02:11Z  4821 \n"), "");
+        // Another conclusion or step is another failure.
+        assert_ne!(sig(&a), failure_signature("timed_out", "Terraform validate", &a));
+        assert_ne!(sig(&a), failure_signature("failure", "Terraform plan", &a));
+    }
+
+    #[test]
+    fn a_failing_steps_log_section_is_cut_out_and_its_error_lines_chosen() {
+        let step = JobStepRaw {
+            name: "Terraform validate".into(),
+            conclusion: Some("failure".into()),
+            started_at: Some("2026-11-18T20:14:40Z".into()),
+            completed_at: Some("2026-11-18T20:14:50Z".into()),
+        };
+        let log = format!(
+            "2026-11-18T20:10:00.0000000Z ##[group]Run actions/checkout@v4\n\
+             2026-11-18T20:10:01.0000000Z Error: this earlier step's error is not ours\n\
+             2026-11-18T20:14:41.1000000Z ##[group]Run terraform validate\n\
+             2026-11-18T20:14:42.2000000Z fetching providers\n\
+             2026-11-18T20:14:45.3000000Z {CLOUDFLARE_ERR_A}\n\
+             continuation without a stamp: invalid checksum\n\
+             2026-11-18T20:14:46.4000000Z ##[error]Process completed with exit code 1.\n\
+             2026-11-18T20:20:00.0000000Z Error: a later step's error is not ours either\n"
+        );
+        let got = failing_step_log(&log, &step);
+        assert!(got.contains("Failed to install provider") && got.contains("invalid checksum"), "{got}");
+        assert!(!got.contains("earlier step") && !got.contains("later step") && !got.contains("exit code"), "{got}");
+        // With no error word the last lines stand in; only the generic line is nothing.
+        let quiet = "2026-11-18T20:14:42Z compiling\n2026-11-18T20:14:43Z ##[error]Process completed with exit code 1.\n";
+        assert_eq!(failing_step_log(quiet, &step), "compiling");
+        let generic = "2026-11-18T20:14:43Z ##[error]Process completed with exit code 1.\n";
+        assert_eq!(failing_step_log(generic, &step), "");
+        // Without the step's times only the log's error lines are used.
+        let untimed = JobStepRaw { started_at: None, completed_at: None, ..step };
+        assert!(failing_step_log(&log, &untimed).is_empty(), "the log's only ##[error] line is the generic one");
+    }
+
+    fn actions_run_json(id: i64) -> String {
+        format!(
+            r#"{{"total_count":1,"check_runs":[{{"id":{id},"name":"Kasm offline validation and tests","status":"completed","conclusion":"failure","app":{{"id":15368,"slug":"github-actions"}},"output":{{"title":"Kasm offline validation and tests","summary":""}}}}]}}"#
+        )
+    }
+
+    fn job_json() -> &'static str {
+        r#"{"steps":[{"name":"Checkout","conclusion":"success","started_at":"2026-11-18T20:10:00Z","completed_at":"2026-11-18T20:10:05Z"},{"name":"Terraform validate","conclusion":"failure","started_at":"2026-11-18T20:14:40Z","completed_at":"2026-11-18T20:14:50Z"}]}"#
+    }
+
+    fn leaked(s: String) -> &'static str {
+        Box::leak(s.into_boxed_str())
+    }
+
+    /// The signature of the one failing check after `replies` past the status.
+    fn status_with(replies: Vec<(&'static str, &'static str)>) -> (PrStatus, usize) {
+        let mut all = vec![("200 OK", PR_JSON), ("200 OK", STATUS_JSON)];
+        all.extend(replies);
+        let (url, handle) = serve_canned(all);
+        let status = client(&url, &[]).get_pr_status("o", "r", 1).unwrap();
+        (status, handle.join().unwrap())
+    }
+
+    #[test]
+    fn a_failing_actions_checks_signature_comes_from_its_annotations_or_its_log() {
+        let generic = r#"[{"path":".github","annotation_level":"failure","message":"Process completed with exit code 1."}]"#;
+        let log_a = leaked(format!("2026-11-18T20:14:45.1Z {CLOUDFLARE_ERR_A}\n2026-11-18T20:14:46Z ##[error]Process completed with exit code 1.\n"));
+        let log_b = leaked(format!("2026-11-18T20:14:47.9Z {CLOUDFLARE_ERR_B}\n2026-11-18T20:14:48Z ##[error]Process completed with exit code 1.\n"));
+        let log_syntax = "2026-11-18T20:14:45Z Error: syntax error in modules/aws/main.tf\n2026-11-18T20:14:46Z ##[error]Process completed with exit code 1.\n";
+        let sig = |run_id: i64, log: &'static str| {
+            let (status, requests) = status_with(vec![
+                ("200 OK", leaked(actions_run_json(run_id))),
+                ("200 OK", job_json()),
+                ("200 OK", generic),
+                ("200 OK", log),
+            ]);
+            assert_eq!(requests, 6);
+            assert!(status.signature_notes.is_empty(), "{:?}", status.signature_notes);
+            status.failure_signature_of("Kasm offline validation and tests")
+        };
+        // The generic annotation is no failure text: the log is read.
+        let a = sig(9001, log_a);
+        assert!(!a.is_empty());
+        // The same error on another head (another run, other times and ids): same signature.
+        assert_eq!(a, sig(9002, log_b));
+        // A different error in the same step: a different one.
+        assert_ne!(a, sig(9003, log_syntax));
+        // A real annotation is the failure text, and the log is not read.
+        let annotated = r#"[{"path":"modules/aws/main.tf","start_line":12,"annotation_level":"failure","message":"syntax error: unexpected token"}]"#;
+        let (status, requests) = status_with(vec![
+            ("200 OK", leaked(actions_run_json(9004))),
+            ("200 OK", job_json()),
+            ("200 OK", annotated),
+        ]);
+        assert_eq!(requests, 5);
+        assert!(!status.failure_signature_of("Kasm offline validation and tests").is_empty());
+    }
+
+    #[test]
+    fn a_runs_signature_is_read_once() {
+        let run = leaked(actions_run_json(9100));
+        let annotated = r#"[{"path":"a.tf","annotation_level":"failure","message":"checksum mismatch"}]"#;
+        let (url, handle) = serve_canned(vec![
+            ("200 OK", PR_JSON),
+            ("200 OK", STATUS_JSON),
+            ("200 OK", run),
+            ("200 OK", job_json()),
+            ("200 OK", annotated),
+            // The second look: no job, annotations or log request.
+            ("200 OK", PR_JSON),
+            ("200 OK", STATUS_JSON),
+            ("200 OK", run),
+        ]);
+        let gh = client(&url, &[]);
+        let first = gh.get_pr_status("o", "r", 1).unwrap();
+        let second = gh.get_pr_status("o", "r", 1).unwrap();
+        assert!(!first.failure_signature_of("Kasm offline validation and tests").is_empty());
+        assert_eq!(first.failing_signatures, second.failing_signatures);
+        assert_eq!(handle.join().unwrap(), 8);
+    }
+
+    #[test]
+    fn a_refused_annotations_or_log_request_gives_that_check_no_signature_and_a_note() {
+        // Annotations and the log are refused: the look still succeeds.
+        let (status, requests) = status_with(vec![
+            ("200 OK", leaked(actions_run_json(9200))),
+            ("200 OK", job_json()),
+            ("403 Forbidden", r#"{"message":"Resource not accessible by integration"}"#),
+            ("404 Not Found", r#"{"message":"Not Found"}"#),
+        ]);
+        assert_eq!(requests, 6);
+        assert_eq!(status.checks.as_deref(), Some("failure"));
+        assert_eq!(status.failing_checks, vec!["Kasm offline validation and tests".to_string()]);
+        assert!(status.failing_signatures.is_empty());
+        let note = &status.signature_notes[0];
+        assert_eq!(note.0, "Kasm offline validation and tests");
+        assert!(note.1.contains("one head only") && note.1.contains("the annotations") && note.1.contains("the log"), "{}", note.1);
+        // A job with only the generic annotation and a log with nothing: a note, no signature.
+        let generic = r#"[{"path":".github","annotation_level":"failure","message":"Process completed with exit code 1."}]"#;
+        let (status, _) = status_with(vec![
+            ("200 OK", leaked(actions_run_json(9201))),
+            ("200 OK", job_json()),
+            ("200 OK", generic),
+            ("200 OK", "2026-11-18T20:14:46Z ##[error]Process completed with exit code 1.\n"),
+        ]);
+        assert!(status.failing_signatures.is_empty() && status.signature_notes.len() == 1);
+        // A transient failure is still an error of the look.
+        let (url, handle) = serve_canned(vec![
+            ("200 OK", PR_JSON),
+            ("200 OK", STATUS_JSON),
+            ("200 OK", leaked(actions_run_json(9202))),
+            ("503 Service Unavailable", r#"{"message":"down"}"#),
+        ]);
+        let err = client(&url, &[]).get_pr_status("o", "r", 1).unwrap_err();
+        assert!(err.is_transient(), "{err}");
+        handle.join().unwrap();
     }
 
     #[test]

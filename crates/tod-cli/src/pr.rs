@@ -710,8 +710,13 @@ fn checks(inv: &Invocation, rest: &[String]) -> anyhow::Result<String> {
                 Some(UnrelatedStanding::FixHere) => "failing; the user said to fix it in this pull request",
             };
             lines.push(format!("  \"{check}\": {words}"));
+            let note = status.signature_notes.iter().find(|(n, _)| n.eq_ignore_ascii_case(check)).map(|(_, w)| w.clone());
+            if let Some(why) = &note {
+                lines.push(format!("    note: tod could not tell how it fails, so an answer about it cannot carry across pushes: {why}"));
+            }
             failing.push(serde_json::json!({
                 "check": check,
+                "signature_note": note,
                 "standing": standing.map(|s| match s {
                     UnrelatedStanding::Pending => "pending",
                     UnrelatedStanding::Waived => "waived",

@@ -304,6 +304,9 @@ pub struct Assessment {
     /// How each of them fails, where known ([`PrStatus::failing_signatures`]):
     /// what lets an answer about a check hold for the next head.
     pub failing_signatures: Vec<(String, String)>,
+    /// Why an answer about a failing check cannot carry across heads
+    /// ([`PrStatus::signature_notes`]), named for the agent and the user.
+    pub signature_notes: Vec<(String, String)>,
     /// A check is still running, whatever else failed.
     pub checks_running: bool,
     /// The head commit this was read at; a standing for a failing check
@@ -557,6 +560,7 @@ impl Assessment {
             checks: snapshot.status.checks.clone(),
             failing_checks: snapshot.status.failing_checks.clone(),
             failing_signatures: snapshot.status.failing_signatures.clone(),
+            signature_notes: snapshot.status.signature_notes.clone(),
             checks_running: snapshot.status.checks_running,
             head_sha: snapshot.status.head_sha.clone(),
             check_standings: Vec::new(),
@@ -1199,6 +1203,13 @@ fn failing_checks_line(assessment: &Assessment, names: &[String]) -> String {
             if rest.len() == 1 { "a check is" } else { "checks are" },
             rest.iter().map(|n| format!("\"{n}\"")).collect::<Vec<_>>().join(", "),
         ));
+    }
+    for (check, why) in &assessment.signature_notes {
+        if names.iter().any(|n| n == check) {
+            out.push_str(&format!(
+                "- note on \"{check}\": tod could not tell how it fails, so the user's answer about it cannot carry across pushes: {why}\n"
+            ));
+        }
     }
     if !here.is_empty() {
         out.push_str(&format!(
@@ -2484,7 +2495,7 @@ Not safe.
     }
 
     fn standing_of(check: &str, standing: UnrelatedStanding) -> Vec<UnrelatedCheck> {
-        vec![UnrelatedCheck { pr: "acme/app#42".into(), check: check.into(), head: "abcdef1234567".into(), signature: String::new(), standing }]
+        vec![UnrelatedCheck { pr: "acme/app#42".into(), check: check.into(), head: "abcdef1234567".into(), signature: String::new(), standing, at: 0 }]
     }
 
     #[test]

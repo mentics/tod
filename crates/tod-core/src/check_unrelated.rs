@@ -169,9 +169,9 @@ pub fn standings(conn: &rusqlite::Connection, node: Uuid) -> anyhow::Result<Vec<
                 u.pr.eq_ignore_ascii_case(&pr) && u.check.eq_ignore_ascii_case(&check) && u.head.eq_ignore_ascii_case(&head)
             })
         {
-            Some(entry) if entry.1 <= at => *entry = (UnrelatedCheck { pr, check, head, signature, standing }, at),
+            Some(entry) if entry.1 <= at => *entry = (UnrelatedCheck { pr, check, head, signature, standing, at }, at),
             Some(_) => {}
-            None => found.push((UnrelatedCheck { pr, check, head, signature, standing }, at)),
+            None => found.push((UnrelatedCheck { pr, check, head, signature, standing, at }, at)),
         }
     }
     Ok(found.into_iter().map(|(u, _)| u).collect())
@@ -273,8 +273,8 @@ mod tests {
     fn only_waived_checks_are_waived_and_an_unnamed_failure_never_is() {
         let settings = PrReadinessSettings {
             unrelated_checks: vec![
-                UnrelatedCheck { pr: "o/r#1".into(), check: "a".into(), head: "h1".into(), signature: String::new(), standing: UnrelatedStanding::Waived },
-                UnrelatedCheck { pr: "o/r#1".into(), check: "b".into(), head: "h1".into(), signature: String::new(), standing: UnrelatedStanding::Pending },
+                UnrelatedCheck { pr: "o/r#1".into(), check: "a".into(), head: "h1".into(), signature: String::new(), standing: UnrelatedStanding::Waived, at: 0 },
+                UnrelatedCheck { pr: "o/r#1".into(), check: "b".into(), head: "h1".into(), signature: String::new(), standing: UnrelatedStanding::Pending, at: 0 },
             ],
             ..Default::default()
         };

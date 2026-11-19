@@ -586,8 +586,17 @@ request*.
   (`Autopilot::tend_unrelated_check_questions`).
 - A standing is keyed by check, pull request and **failure signature**
   (`github::failure_signature`: the conclusion, the failing Actions step, and
-  the check's output title and summary with commit ids and numbers taken out;
-  carried in the carry-on option as `(<pr> @ <head> ~ <signature>)`). A
+  the failure text itself, normalized: the check run's annotations, else the
+  error lines of the failing step's log, else (a non-Actions check) its output
+  text; timestamps, ids, hashes, temp paths, counts and durations are taken out,
+  so the same error on a later head matches and a different one in the same
+  step does not. A step name alone never makes one. Each run is read once and
+  cached. A check whose failure text cannot be had, including a refused
+  annotations or log request, has no signature and a note saying why (logged;
+  shown on `tod-cli pr checks` and to the agent): its answer stays with its
+  head, and the look as a whole still succeeds. Carried in the carry-on option
+  as `(<pr> @ <head> ~ <signature>)`. The latest answer about one failure wins
+  across heads). A
   carry-on, or a question not yet answered, holds for every later head while
   the check fails the same way (`settings::unrelated_standing`), so a push
   neither re-asks nor withdraws it (seen ENG-2504, gap 48: the same lock-file
