@@ -23,6 +23,82 @@ pub const CONTAINER_GIT_CONFIG: [&str; 2] = ["-c", "safe.directory=*"];
 /// any `GIT_CONFIG_COUNT` entries the container already sets.
 pub const CONTAINER_GIT_CONFIG_ENV: &str = r#"n=${GIT_CONFIG_COUNT:-0}; export "GIT_CONFIG_KEY_$n=safe.directory" "GIT_CONFIG_VALUE_$n=*" "GIT_CONFIG_COUNT=$((n + 1))"; exec "$@""#;
 
+/// Waits between the attempts of a `git fetch` that lost a race for a ref
+/// lock (so up to `len + 1` attempts).
+pub const FETCH_RETRY_BACKOFF: &[std::time::Duration] = &[
+    std::time::Duration::from_millis(250),
+    std::time::Duration::from_millis(750),
+    std::time::Duration::from_millis(2000),
+];
+
+/// Whether git's stderr says a fetch lost a race with another git process on
+/// the same repository: a ref or file lock held ("Unable to create
+/// '...lock': File exists", "cannot lock ref"), or a ref that moved under it
+/// ("is at X but expected Y"). Nothing was changed; trying again succeeds.
+pub fn is_ref_lock_race(stderr: &str) -> bool {
+    stderr.contains("cannot lock ref")
+        || (stderr.contains("is at ") && stderr.contains("but expected"))
+        || (stderr.contains("Unable to create") && stderr.contains(".lock"))
+}
+
+/// Whether git's stderr says a fetch hit a transient network failure: a TLS
+/// receive error (GnuTLS "recv error (-110)", OpenSSL "SSL_read"), a DNS
+/// miss, a timeout or reset connection, a premature end of the pack, a
+/// failed RPC (curl 56), or an HTTP 5xx. Trying again normally succeeds.
+pub fn is_transient_network_error(stderr: &str) -> bool {
+    const MARKERS: [&str; 14] = [
+        "GnuTLS recv error",
+        "GnuTLS send error",
+        "SSL_read",
+        "SSL_connect",
+        "Could not resolve host",
+        "Connection timed out",
+        "Connection reset",
+        "Operation timed out",
+        "early EOF",
+        "RPC failed",
+        "curl 56",
+        "curl 28",
+        "unexpected disconnect",
+        "The remote end hung up unexpectedly",
+    ];
+    MARKERS.iter().any(|m| stderr.contains(m))
+        || ["500", "502", "503", "504"].iter().any(|c| stderr.contains(&format!("error: {c}")) || stderr.contains(&format!("returned error: {c}")))
+}
+
+/// A failure of a fetch worth trying again: [`is_ref_lock_race`] or
+/// [`is_transient_network_error`].
+pub fn is_transient_fetch_failure(stderr: &str) -> bool {
+    is_ref_lock_race(stderr) || is_transient_network_error(stderr)
+}
+
+/// Run `run` (one git call with `args`); when `args` is a `git fetch` that
+/// fails transiently ([`is_transient_fetch_failure`]: a lock race or a network error), run it again after each wait
+/// in `backoff`. The last attempt's output is returned as it is, so a race
+/// that outlasts the retries is still an error naming git's own message.
+/// Concurrent fetches of one repository come from this app, the daemon, and
+/// the supervisor's boundary push, in separate processes, so a lock in
+/// process would not cover them.
+pub fn retry_ref_lock_race(
+    args: &[&str],
+    backoff: &[std::time::Duration],
+    mut run: impl FnMut() -> Result<Output>,
+) -> Result<Output> {
+    let is_fetch = args.iter().find(|a| !a.starts_with('-') && **a != "safe.directory=*") == Some(&"fetch");
+    let mut out = run()?;
+    if !is_fetch {
+        return Ok(out);
+    }
+    for wait in backoff {
+        if out.status.success() || !is_transient_fetch_failure(&String::from_utf8_lossy(&out.stderr)) {
+            break;
+        }
+        std::thread::sleep(*wait);
+        out = run()?;
+    }
+    Ok(out)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Workdir {
     /// A directory on this machine.
@@ -270,6 +346,10 @@ impl Workdir {
     /// `git args…` in this directory. In a container or sandbox, git's
     /// ownership check is off (see [`CONTAINER_GIT_CONFIG`]).
     pub fn git_output(&self, args: &[&str]) -> Result<Output> {
+        retry_ref_lock_race(args, FETCH_RETRY_BACKOFF, || self.git_output_once(args))
+    }
+
+    fn git_output_once(&self, args: &[&str]) -> Result<Output> {
         match self {
             Self::Host(path) => {
                 let path = strip_verbatim(path);
@@ -382,5 +462,78 @@ mod tests {
         assert_eq!(repo.container_name(), None);
         assert!(!repo.same_location(&Workdir::container("dev", "/root/app")));
         assert_eq!(repo.to_string(), "/root/app (in sandbox dev)");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod retry_tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+    use std::time::Duration;
+
+    fn out(code: i32, stderr: &str) -> Output {
+        Output { status: std::process::ExitStatus::from_raw(code << 8), stdout: vec![], stderr: stderr.as_bytes().to_vec() }
+    }
+
+    #[test]
+    fn classifies_lock_races() {
+        assert!(is_ref_lock_race("error: cannot lock ref 'refs/remotes/origin/main': is at X but expected Y"));
+        assert!(is_ref_lock_race("fatal: Unable to create '/r/.git/refs/remotes/origin/main.lock': File exists."));
+        assert!(!is_ref_lock_race("fatal: couldn't find remote ref main"));
+    }
+
+    #[test]
+    fn classifies_network_errors() {
+        assert!(is_transient_network_error("error: RPC failed; curl 56 GnuTLS recv error (-110): The TLS connection was non-properly terminated."));
+        assert!(is_transient_network_error("fatal: unable to access 'https://x/': Could not resolve host: github.com"));
+        assert!(is_transient_network_error("fatal: early EOF"));
+        assert!(is_transient_network_error("fatal: unable to access 'u': The requested URL returned error: 503"));
+        assert!(!is_transient_network_error("fatal: Authentication failed for 'https://x/'"));
+        assert!(!is_transient_network_error("fatal: couldn't find remote ref main"));
+    }
+
+    #[test]
+    fn fetch_retries_a_network_error_then_returns_it_named() {
+        let mut calls = 0;
+        let r = retry_ref_lock_race(&["fetch", "origin"], &[Duration::ZERO; 3], || {
+            calls += 1;
+            Ok(out(128, "error: GnuTLS recv error (-110): The TLS connection was non-properly terminated."))
+        })
+        .unwrap();
+        assert!(!r.status.success());
+        assert_eq!(calls, 4);
+        assert!(String::from_utf8_lossy(&r.stderr).contains("GnuTLS recv error"));
+    }
+
+    #[test]
+    fn fetch_retries_a_lock_race_then_succeeds() {
+        let mut calls = 0;
+        let r = retry_ref_lock_race(&["fetch", "origin"], &[Duration::ZERO; 3], || {
+            calls += 1;
+            Ok(if calls < 3 { out(1, "error: cannot lock ref 'refs/remotes/origin/main': is at a but expected b") } else { out(0, "") })
+        })
+        .unwrap();
+        assert!(r.status.success());
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn persistent_race_is_returned_not_swallowed() {
+        let mut calls = 0;
+        let r = retry_ref_lock_race(&["-c", "safe.directory=*", "fetch"], &[Duration::ZERO; 3], || {
+            calls += 1;
+            Ok(out(1, "cannot lock ref"))
+        })
+        .unwrap();
+        assert!(!r.status.success());
+        assert_eq!(calls, 4);
+    }
+
+    #[test]
+    fn other_failures_and_commands_are_not_retried() {
+        let mut calls = 0;
+        retry_ref_lock_race(&["fetch"], &[Duration::ZERO; 3], || { calls += 1; Ok(out(1, "couldn't find remote ref")) }).unwrap();
+        retry_ref_lock_race(&["push"], &[Duration::ZERO; 3], || { calls += 1; Ok(out(1, "cannot lock ref")) }).unwrap();
+        assert_eq!(calls, 2);
     }
 }

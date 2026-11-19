@@ -9,12 +9,12 @@ use std::path::Path;
 use std::process::Command;
 
 fn git(workspace: &Path, args: &[&str]) -> Result<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(workspace)
-        .args(args)
-        .output()
-        .with_context(|| format!("run git {}", args.join(" ")))?;
+    // A fetch that loses a race with another fetch of the same repository
+    // (a ref lock) is retried; see `retry_ref_lock_race`.
+    let out = tod_store::fleet::workdir::retry_ref_lock_race(args, tod_store::fleet::workdir::FETCH_RETRY_BACKOFF, || {
+        Ok(Command::new("git").arg("-C").arg(workspace).args(args).output()?)
+    })
+    .with_context(|| format!("run git {}", args.join(" ")))?;
     if !out.status.success() {
         bail!("git {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
     }
