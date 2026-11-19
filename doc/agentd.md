@@ -118,6 +118,7 @@ starts `tod`; waits that came due meanwhile fire then.
 
 **`quit`** is a protocol command, as with the agent control socket: drain
 (below), then exit. Anything launched for a test must be stopped this way.
+A drain is a **handover**, never the user's Pause or Stop: each run stops at its next boundary (a turn past 20 s is cancelled) with `Request::Handover`, records no `desired`, saves no outcome (like a cut-off run, so the next daemon's `resume_saved` continues it) and leaves the node `starting`, not `stopped_now`. A pause or stop the user already asked for is kept and still holds.
 Never `quit` the daemon of a root an app has open (the user's live root
 above all) to open the store directly: the app's change feed starts it again
 at once (below), and while the other process holds `tod.lock` it cannot, so

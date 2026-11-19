@@ -32,6 +32,10 @@ const WRITER: &str = "local";
 pub const PAUSED: &str = "paused";
 /// The reason a run the user stopped mid-turn stopped with.
 pub const STOPPED: &str = "stopped";
+/// The reason a run stopped with when its daemon was replaced by a newer one.
+/// Never saved as the run's outcome: the next daemon continues it, as it does
+/// a run cut off (see [`Request::Handover`]).
+pub const HANDOVER: &str = "handover";
 /// The start of the reason a run stopped with when the app itself failed
 /// (the store, the process docs), not the node's work.
 pub const FAILED_PREFIX: &str = "failed: ";
@@ -49,6 +53,13 @@ pub enum Request {
     Pause = 1,
     /// Cancel the turn in flight and stop.
     StopNow = 2,
+    /// The daemon hosting the run is being replaced: stop at the next
+    /// boundary and leave the run unfinished (no outcome saved) for the next
+    /// daemon to continue. Never the user's stop: it is only asked of a run
+    /// nobody has paused or stopped ([`LocalRun::hand_over`]).
+    Handover = 3,
+    /// [`Request::Handover`], cancelling the turn in flight.
+    HandoverNow = 4,
 }
 
 impl Request {
@@ -56,6 +67,8 @@ impl Request {
         match value {
             1 => Self::Pause,
             2 => Self::StopNow,
+            3 => Self::Handover,
+            4 => Self::HandoverNow,
             _ => Self::Run,
         }
     }
@@ -185,6 +198,21 @@ impl LocalRun {
                     // How it ended, as the node's run state: the one place
                     // `next_actor` reads why a run stopped.
                     let outcome = outcome?;
+                    if matches!(&outcome, Outcome::Stopped { reason } if reason == HANDOVER) {
+                        // Not an ending: the saved run has no outcome, like a
+                        // cut-off one, so the next daemon continues it, and the
+                        // node says so rather than "you stopped it".
+                        let mut state = AutopilotState::load(&data_root, node)?;
+                        state.outcome = None;
+                        state.save(&data_root, node)?;
+                        crate::run_state::record(
+                            &fleet,
+                            node,
+                            crate::run_state::sending_now("handing over to the next tod-agentd; it continues by itself"),
+                            WRITER,
+                        )?;
+                        return Ok(outcome);
+                    }
                     crate::run_state::record(
                         &fleet,
                         node,
@@ -227,12 +255,41 @@ impl LocalRun {
 
     /// Stop once the agent's turn ends.
     pub fn pause(&self) {
+        // A user's pause also takes over a handover that has not ended the run.
+        for from in [Request::Run, Request::Handover] {
+            if self
+                .request
+                .compare_exchange(from as u8, Request::Pause as u8, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
+    /// The daemon is being replaced: stop at the next boundary without
+    /// finishing, so the next daemon continues the run. A pause or stop the
+    /// user already asked for is kept (it ends the run as the user's).
+    pub fn hand_over(&self) {
         let _ = self.request.compare_exchange(
             Request::Run as u8,
-            Request::Pause as u8,
+            Request::Handover as u8,
             Ordering::SeqCst,
             Ordering::SeqCst,
         );
+    }
+
+    /// [`Self::hand_over`], cancelling the turn in flight.
+    pub fn hand_over_now(&self) {
+        for from in [Request::Run, Request::Handover] {
+            if self
+                .request
+                .compare_exchange(from as u8, Request::HandoverNow as u8, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return;
+            }
+        }
     }
 
     /// Read GitHub now instead of waiting for the next scheduled poll. Does
@@ -384,6 +441,7 @@ impl<F: FnMut(LocalEvent)> StepHook for Hook<'_, F> {
             Request::Run => None,
             Request::Pause => Some(PAUSED.to_string()),
             Request::StopNow => Some(STOPPED.to_string()),
+            Request::Handover | Request::HandoverNow => Some(HANDOVER.to_string()),
         })
     }
 
@@ -422,8 +480,10 @@ impl<F: FnMut(LocalEvent)> StepHook for Hook<'_, F> {
     }
 
     fn watch(&mut self, turn: Turn<'_>) -> Option<String> {
-        if self.requested() == Request::StopNow {
-            return Some(STOPPED.to_string());
+        match self.requested() {
+            Request::StopNow => return Some(STOPPED.to_string()),
+            Request::HandoverNow => return Some(HANDOVER.to_string()),
+            _ => {}
         }
         let status = turn.status.clone();
         self.report(Live {

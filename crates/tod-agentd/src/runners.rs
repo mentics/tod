@@ -789,10 +789,11 @@ impl Runners {
         rx
     }
 
-    /// Stop every run at its next boundary, and wait for them: a turn in
-    /// flight gets [`DRAIN_PATIENCE`] to end before it is cancelled. Runs
-    /// that have not ended keep no outcome, so the next daemon starts them
-    /// again.
+    /// Hand every run over: each stops at its next boundary, and waits for
+    /// them: a turn in flight gets [`DRAIN_PATIENCE`] to end before it is
+    /// cancelled. This is never the user's Pause or Stop: nothing is recorded
+    /// as desired, a run the user already paused or stopped keeps that, and a
+    /// handed-over run keeps no outcome, so the next daemon continues it.
     pub fn drain(&self) {
         let nodes: Vec<Uuid> = {
             let slots = self.inner.slots.lock().expect("runner slots");
@@ -801,16 +802,26 @@ impl Runners {
         if nodes.is_empty() {
             return;
         }
-        for node in &nodes {
-            self.pause(*node);
-        }
+        self.hand_over_all(&nodes, false);
         if self.wait_idle(DRAIN_PATIENCE) {
             return;
         }
-        for node in &nodes {
-            self.stop_now(*node);
-        }
+        self.hand_over_all(&nodes, true);
         self.wait_idle(DRAIN_CANCELLED);
+    }
+
+    /// Ask each node's run to hand over; `desired` is not touched.
+    fn hand_over_all(&self, nodes: &[Uuid], cancel_turn: bool) {
+        let slots = self.inner.slots.lock().expect("runner slots");
+        for node in nodes {
+            if let Some(run) = slots.get(node).and_then(|s| s.run.as_ref()) {
+                if cancel_turn {
+                    run.hand_over_now();
+                } else {
+                    run.hand_over();
+                }
+            }
+        }
     }
 
     fn wait_idle(&self, patience: Duration) -> bool {
@@ -1432,6 +1443,59 @@ mod tests {
         drop(slots);
         // Reported once: the outcome now explains the node.
         fx.runners.reconcile().unwrap();
+    }
+
+    /// Gap 61: the old daemon's drain on a handover paused, then stopped,
+    /// every live run as the user would: the nodes read "you stopped it".
+    #[test]
+    fn a_drain_for_a_handover_is_not_a_user_pause_or_stop_and_the_next_daemon_continues_the_run() {
+        let fx = fixture_with_media(true);
+        fx.runners.start(fx.node, false).unwrap();
+        fx.runners.drain();
+        {
+            let slots = fx.runners.inner.slots.lock().unwrap();
+            assert_eq!(slots[&fx.node].desired, Desired::Run, "a drain records no pause or stop");
+            assert!(slots[&fx.node].run.as_ref().is_none_or(|r| r.is_finished()));
+        }
+        let saved = AutopilotState::load(&fx.root, fx.node).unwrap();
+        assert!(
+            !saved.outcome.as_ref().is_some_and(tod_core::autopilot::local::stopped_by_user),
+            "never saved as the user's stop: {:?}",
+            saved.outcome
+        );
+        fx.runners.inner.store.writer().flush().unwrap();
+        fx.runners.inner.store.reload_if_stale().unwrap();
+        let row = fx.runners.inner.store.read(|c| tod_store::run_state::get(c, fx.node)).unwrap().unwrap();
+        assert!(!matches!(row.reason_kind.as_str(), "stopped_now" | "paused"), "{row:?}");
+        // A handed-over run has no outcome, which the next daemon resumes;
+        // one that ended on its own in the meantime keeps its own.
+        if saved.outcome.is_none() {
+            let agent: SharedAgent = Arc::new(Mutex::new(Box::new(MockAgentProvider::new())));
+            let next = Runners::new(fx.runners.inner.store.clone(), agent);
+            next.resume_saved();
+            let slots = next.inner.slots.lock().unwrap();
+            assert!(slots.contains_key(&fx.node), "the next daemon holds the run");
+            assert_eq!(slots[&fx.node].desired, Desired::Run);
+        }
+    }
+
+    /// A real user pause is saved as the run's outcome and holds across a
+    /// handover: the next daemon does not start the node.
+    #[test]
+    fn a_user_pause_holds_across_a_handover() {
+        let fx = fixture_with_media(true);
+        AutopilotState {
+            outcome: Some(Outcome::Stopped { reason: tod_core::autopilot::local::PAUSED.into() }),
+            ..AutopilotState::fresh()
+        }
+        .save(&fx.root, fx.node)
+        .unwrap();
+        fx.runners.resume_saved();
+        fx.runners.reconcile().unwrap();
+        let slots = fx.runners.inner.slots.lock().unwrap();
+        let slot = &slots[&fx.node];
+        assert!(slot.run.is_none() && !slot.starting);
+        assert!(matches!(&slot.outcome, Some(Outcome::Stopped { reason }) if reason == tod_core::autopilot::local::PAUSED));
     }
 
     #[test]

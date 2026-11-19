@@ -1035,6 +1035,77 @@ fn a_local_run_asked_to_pause_stops_at_the_first_boundary() {
     assert_ne!(lifecycle::current_state(&fx.fleet, fx.node).unwrap(), "done");
 }
 
+/// Runs `request` against a fresh local run, asked before its first event, and
+/// returns how it finished.
+fn local_run_asked(request: impl FnOnce(&super::local::LocalRun)) -> (Fixture, Vec<super::local::LocalEvent>) {
+    use super::local::{LocalEvent, LocalRun};
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    let agent: tod_agent::SharedAgent =
+        Arc::new(std::sync::Mutex::new(Box::new(FakeAgent::new(&fx.fleet))));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    let mut first = Some(go_rx);
+    let run = LocalRun::start_with(
+        fx.fleet.clone(),
+        agent,
+        config(&fx),
+        fx.node,
+        Budget::default(),
+        false,
+        false,
+        Some(Duration::ZERO),
+        move |event: LocalEvent| {
+            if let Some(go) = first.take() {
+                let _ = go.recv();
+            }
+            let _ = tx.send(event);
+        },
+    )
+    .unwrap();
+    request(&run);
+    go_tx.send(()).unwrap();
+    let events: Vec<LocalEvent> = rx.iter().collect();
+    run.join();
+    (fx, events)
+}
+
+/// Gap 61: a daemon handover stopped three live runs as if the user had, and
+/// each said "you stopped it".
+#[test]
+fn a_run_handed_over_to_the_next_daemon_is_not_a_user_stop_and_keeps_no_outcome() {
+    use super::local::{HANDOVER, LocalEvent, stopped_by_user};
+    for now in [false, true] {
+        let (fx, events) = local_run_asked(|run| if now { run.hand_over_now() } else { run.hand_over() });
+        let outcome = Outcome::Stopped { reason: HANDOVER.into() };
+        assert!(!stopped_by_user(&outcome));
+        assert_eq!(events.last(), Some(&LocalEvent::Finished(Ok(outcome))));
+        let saved = AutopilotState::load(&fx.root, fx.node).unwrap();
+        assert_eq!(saved.outcome, None, "the next daemon continues it, as a cut-off run");
+        let row = fx.fleet.read(|conn| tod_store::run_state::get(conn, fx.node)).unwrap().unwrap();
+        assert_ne!(row.reason_kind, crate::run_state::kind::STOPPED_NOW, "{row:?}");
+        assert_ne!(row.reason_kind, crate::run_state::kind::PAUSED, "{row:?}");
+        assert!(crate::run_state::you_reason(&row).is_none(), "{row:?}");
+    }
+}
+
+/// A real user pause or stop already asked for holds across a handover.
+#[test]
+fn a_user_pause_or_stop_survives_a_handover_request() {
+    use super::local::{PAUSED, STOPPED};
+    for (stop, reason) in [(false, PAUSED), (true, STOPPED)] {
+        let (fx, events) = local_run_asked(|run| {
+            if stop { run.stop_now() } else { run.pause() }
+            run.hand_over();
+            run.hand_over_now();
+        });
+        let outcome = Outcome::Stopped { reason: reason.into() };
+        assert_eq!(events.last(), Some(&super::local::LocalEvent::Finished(Ok(outcome.clone()))));
+        let saved = AutopilotState::load(&fx.root, fx.node).unwrap();
+        assert_eq!(saved.outcome, Some(outcome));
+    }
+}
+
 /// A node with nothing on it that says what it is for: the `proposed` agent
 /// asks the user, in free text, and carries on from the answer.
 #[test]
