@@ -223,6 +223,60 @@ pub fn you_reason(state: &RunState) -> Option<YouReason> {
     })
 }
 
+/// How long a local `working` row may stand with no live lease before it is
+/// a ghost: the runner writes the row, then its lease, a moment apart.
+pub const GHOST_GRACE_MS: i64 = 60_000;
+
+/// A local run the row calls `working` that nothing holds: no live lifecycle
+/// lease (the owner that held it is gone, or it never took one).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ghost {
+    /// The owner of the stale lease, when one is left.
+    pub owner: Option<String>,
+    /// Since when nothing has proved it works (the lease's last beat, else
+    /// the row's last write).
+    pub silent_since: i64,
+}
+
+impl Ghost {
+    /// Said to the user and in the logs.
+    pub fn describe(&self, row: &RunState, now_ms: i64) -> String {
+        let silent = crate::runner_status::format_elapsed(now_ms - self.silent_since);
+        match &self.owner {
+            Some(owner) => format!(
+                "the run was cut off: its row says \"{}\" but {owner}, which held it, stopped responding {silent} ago",
+                row.reason_text
+            ),
+            None => format!(
+                "the run was cut off: its row says \"{}\" but nothing has held the node for {silent}",
+                row.reason_text
+            ),
+        }
+    }
+}
+
+/// The one rule for a run row that claims work: `working`, written by the
+/// local runner, older than [`GHOST_GRACE_MS`], with no live lifecycle lease.
+/// A cloud supervisor's rows are proved by its heartbeat instead, so they are
+/// never a ghost here. Used by the daemon (adopts it), `next_actor` (never
+/// shows it as working) and `stop_mismatch` (counts it).
+pub fn ghost_working(row: &RunState, leases: &[tod_store::activity::Lease], now_ms: i64) -> Option<Ghost> {
+    if row.phase != Phase::Working || row.writer != LOCAL_WRITER || now_ms - row.updated_at <= GHOST_GRACE_MS {
+        return None;
+    }
+    if leases.iter().any(|l| l.is_lifecycle() && l.is_live(now_ms)) {
+        return None;
+    }
+    let stale = leases.iter().filter(|l| l.is_lifecycle()).max_by_key(|l| l.heartbeat_at);
+    Some(Ghost {
+        owner: stale.map(|l| l.owner.clone()),
+        silent_since: stale.map_or(row.updated_at, |l| l.heartbeat_at),
+    })
+}
+
+/// The `writer` of the local runner's rows.
+pub const LOCAL_WRITER: &str = "local";
+
 /// The actor that records a run state from the app or the local runner.
 pub const ACTOR: &str = "run-state";
 

@@ -701,6 +701,15 @@ fn run_end(facts: &Facts<'_>) -> Option<(YouReason, i64)> {
         );
         return Some((YouReason::Failed { error }, lease.heartbeat_at));
     }
+    // The runner's row says `working` and no live lease backs it (its owner
+    // is gone, or it never took one): the run was cut off, and is never
+    // shown as working. The stale-lease case above words its own error; this
+    // is the row with no lease left at all.
+    if let Some(row) = run_state
+        && let Some(ghost) = crate::run_state::ghost_working(row, facts.leases, facts.now_ms)
+    {
+        return Some((YouReason::Failed { error: ghost.describe(row, facts.now_ms) }, ghost.silent_since));
+    }
     // The same for a supervisor in the cloud that stopped beating without
     // ending its run: its sandbox or process died mid-run.
     if let Some(beat) = facts.cloud.filter(|b| !b.is_idle() && !b.is_live(facts.now_ms)) {
@@ -1228,6 +1237,41 @@ mod tests {
         assert_eq!(Work::from_kind(KIND_INCOMING_CHECK), Work::IncomingCheck);
         assert_eq!(Work::from_kind("something-new"), Work::Other);
         assert_eq!(Work::from_kind("protocol:nonsense"), Work::Other);
+    }
+
+    /// The local runner's `working` row, written long ago.
+    fn old_working_row() -> RunState {
+        row(Phase::Working, "working", "running on this machine", NOW - 7 * 3_600_000, NOW - 7 * 3_600_000)
+    }
+
+    #[test]
+    fn a_working_row_with_a_dead_owners_stale_lease_is_never_working() {
+        // The live fault: the row said working for hours; its lease's owner
+        // was a daemon of an older build that no longer exists.
+        let mut c = case("active");
+        c.run_state = Some(RunState { writer: "local".into(), ..old_working_row() });
+        c.leases = vec![lease(tod_store::activity::KIND_RUN, NOW - 7 * 3_600_000, 6 * 3_600_000)];
+        let s = standing(&c);
+        assert!(!matches!(s.actor, NextActor::Working { .. }), "{:?}", s.actor);
+        let NextActor::You { why: YouReason::Failed { error }, .. } = s.actor else { panic!("{:?}", s.actor) };
+        assert!(error.contains("daemon-1"), "{error}");
+    }
+
+    #[test]
+    fn a_local_working_row_with_no_lease_at_all_is_a_failure_after_the_grace() {
+        let mut c = case("active");
+        c.run_state = Some(RunState { writer: "local".into(), ..old_working_row() });
+        let NextActor::You { why: YouReason::Failed { error }, .. } = standing(&c).actor else {
+            panic!("a run nothing holds must be the user's")
+        };
+        assert!(error.contains("nothing has held the node"), "{error}");
+        // Just written: the lease follows the row by a moment.
+        c.run_state = Some(RunState { writer: "local".into(), updated_at: NOW - 1_000, since: NOW - 1_000, ..old_working_row() });
+        assert!(matches!(standing(&c).actor, NextActor::You { why: YouReason::NotStarted, .. }));
+        // A live lease holds it.
+        c.run_state = Some(RunState { writer: "local".into(), ..old_working_row() });
+        c.leases = vec![live_lease(tod_store::activity::KIND_RUN, NOW - 5_000)];
+        assert!(matches!(standing(&c).actor, NextActor::Working { .. }));
     }
 
     #[test]

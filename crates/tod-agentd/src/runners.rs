@@ -372,12 +372,99 @@ impl Runners {
     fn tick(&self) {
         self.start_due();
         self.resume_stale_request_waits();
+        self.adopt_cut_off_runs();
         if let Err(err) = self.reconcile() {
             tracing::error!("reconciling the runs failed: {err:#}");
         }
         // After `start_due` has seen each node waiting, so the next tick sees
         // its request gone and continues the run.
         self.recheck_requests();
+    }
+
+    /// A local run row that says `working` while no live lease backs it was
+    /// cut off: a daemon replaced by a newer one, killed, or crashed gave it
+    /// up without recording an end, and no slot here holds it (a node the
+    /// saved-run scan did not resume, or one whose saved state ended). Resume
+    /// it, as `resume_saved` does for a run the daemon was stopped on: the
+    /// autopilot continues from its saved state. The stale lease is cleared
+    /// and the restart is journaled, naming the dead owner. Where it cannot be
+    /// resumed (the node runs in a sandbox now, or the user paused it) the
+    /// run is recorded as failed with that reason, never left `working`.
+    fn adopt_cut_off_runs(&self) {
+        let now = now_ms();
+        let found = self.inner.store.read(|conn| {
+            let rows = tod_store::run_state::list_working(conn)?;
+            let ids: Vec<Uuid> = rows.iter().map(|r| r.node_id).collect();
+            let mut leases: HashMap<Uuid, Vec<Lease>> = HashMap::new();
+            for lease in ActivityRepo::new(conn).list_for_nodes(&ids)? {
+                leases.entry(lease.node_id).or_default().push(lease);
+            }
+            Ok((rows, leases))
+        });
+        let (rows, leases) = match found {
+            Ok(found) => found,
+            Err(err) => {
+                tracing::error!("could not look for runs cut off while working: {err:#}");
+                return;
+            }
+        };
+        for row in rows {
+            let node = row.node_id;
+            let Some(ghost) = tod_core::run_state::ghost_working(&row, leases.get(&node).map(Vec::as_slice).unwrap_or(&[]), now)
+            else {
+                continue;
+            };
+            {
+                let slots = self.inner.slots.lock().expect("runner slots");
+                if let Some(slot) = slots.get(&node)
+                    && (slot.starting
+                        || slot.run.as_ref().is_some_and(|r| !r.is_finished())
+                        || matches!(slot.desired, Desired::Pause | Desired::Stop)
+                        || matches!(&slot.outcome, Some(Outcome::Stopped { reason }) if reason.starts_with(FAILED_PREFIX)))
+                {
+                    continue;
+                }
+            }
+            let why = ghost.describe(&row, now);
+            match RunnerPlace::of(&self.inner.store, node) {
+                Ok(RunnerPlace::Local) => {}
+                Ok(RunnerPlace::Supervisor) => {
+                    let err = anyhow!("{why}; {SUPERVISED}");
+                    tracing::error!(%node, "{err:#}");
+                    self.record_start_failure(node, &err);
+                    continue;
+                }
+                Err(err) => {
+                    tracing::error!(%node, "could not tell where a cut-off run belongs, so it is not resumed: {err:#}");
+                    continue;
+                }
+            }
+            tracing::warn!(%node, "resuming a run cut off while working: {why}");
+            let lost = Some(format!(
+                "{} held by {} stopped beating {}ms ago",
+                tod_store::activity::KIND_RUN,
+                ghost.owner.as_deref().unwrap_or("nothing"),
+                now - ghost.silent_since,
+            ));
+            // A failure to start is recorded on the node by `start`.
+            if let Err(err) = self.act(node, Action::Start { lost }) {
+                tracing::error!(%node, "could not resume the cut-off run: {err:#}");
+                continue;
+            }
+            // Started in name only (the user's pause is saved and holds):
+            // the row must not go on saying `working`.
+            let running = self
+                .inner
+                .slots
+                .lock()
+                .expect("runner slots")
+                .get(&node)
+                .is_some_and(|s| s.run.is_some() || s.starting);
+            if !running {
+                let err = anyhow!("{why}; it was not resumed, because the user paused or stopped it");
+                self.record_start_failure(node, &err);
+            }
+        }
     }
 
     /// A run row that says "waiting on a request" while none is pending
@@ -1447,6 +1534,80 @@ mod tests {
         fx.runners.reconcile().unwrap();
         let slots = fx.runners.inner.slots.lock().unwrap();
         assert!(matches!(slots[&fx.node].outcome, Some(Outcome::Done)));
+    }
+
+    #[test]
+    fn a_working_row_whose_lease_owner_is_dead_is_adopted_on_the_next_tick_with_no_slot() {
+        let fx = fixture();
+        let store = &fx.runners.inner.store;
+        let long_ago = now_ms() - 7 * 3_600_000;
+        // What the live data showed: the row says working since hours ago,
+        // written by the local runner; its lease belongs to a dead daemon;
+        // and this daemon holds no slot for the node.
+        store
+            .interview(
+                tod_core::run_state::ACTOR,
+                tod_store::interview::InterviewCommand::SetRunState {
+                    node_id: fx.node,
+                    draft: tod_core::run_state::working("running on this machine"),
+                    writer: "local".into(),
+                    at: long_ago,
+                },
+            )
+            .unwrap();
+        store
+            .enqueue(FleetMutation::ActivityStart {
+                id: Uuid::new_v4(),
+                node: fx.node,
+                kind: tod_store::activity::KIND_RUN.into(),
+                owner: "tod-agentd-768aa82677b906a7:19909".into(),
+                at: long_ago,
+            })
+            .unwrap();
+        store.writer().flush().unwrap();
+        store.reload_if_stale().unwrap();
+        assert!(fx.runners.inner.slots.lock().unwrap().get(&fx.node).is_none());
+        let row = store.read(|c| tod_store::run_state::get(c, fx.node)).unwrap().unwrap();
+        assert_eq!(row.phase, tod_store::run_state::Phase::Working);
+
+        fx.runners.tick();
+        store.reload_if_stale().unwrap();
+
+        // Adopted: a start was made (it fails here for want of media, and the
+        // node says so). Never left `working`, and never shown as working.
+        let row = store.read(|c| tod_store::run_state::get(c, fx.node)).unwrap().unwrap();
+        assert_ne!(row.phase, tod_store::run_state::Phase::Working, "{row:?}");
+        let NextActor::You { why: YouReason::Failed { error }, .. } = standing_of(&fx).actor else {
+            panic!("the node should be failed, not working")
+        };
+        assert!(error.contains("Media bundle"), "{error}");
+        let leases = store.read(|c| ActivityRepo::new(c).list_for_nodes(&[fx.node])).unwrap();
+        assert!(leases.iter().all(|l| l.owner != "tod-agentd-768aa82677b906a7:19909"), "the dead owner's lease is cleared");
+    }
+
+    #[test]
+    fn a_cut_off_working_row_the_user_paused_is_recorded_not_resumed() {
+        let fx = fixture();
+        let store = &fx.runners.inner.store;
+        store
+            .interview(
+                tod_core::run_state::ACTOR,
+                tod_store::interview::InterviewCommand::SetRunState {
+                    node_id: fx.node,
+                    draft: tod_core::run_state::working("running on this machine"),
+                    writer: "local".into(),
+                    at: now_ms() - 3_600_000,
+                },
+            )
+            .unwrap();
+        {
+            let mut slots = fx.runners.inner.slots.lock().unwrap();
+            slots.entry(fx.node).or_default().desired = Desired::Pause;
+        }
+        fx.runners.adopt_cut_off_runs();
+        let slots = fx.runners.inner.slots.lock().unwrap();
+        // The user's pause holds: nothing is started.
+        assert!(slots[&fx.node].run.is_none() && !slots[&fx.node].starting);
     }
 
     #[test]

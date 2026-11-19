@@ -196,6 +196,16 @@ pub fn list_starting(conn: &Connection) -> Result<Vec<RunState>> {
     rows.into_iter().map(finish).collect()
 }
 
+/// Every row whose phase is `working`.
+pub fn list_working(conn: &Connection) -> Result<Vec<RunState>> {
+    if !has_table(conn)? {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(&format!("SELECT {COLUMNS} FROM run_state WHERE phase = 'working'"))?;
+    let rows = stmt.query_map([], read)?.collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter().map(finish).collect()
+}
+
 /// Every row whose phase is `waiting`.
 pub fn list_waiting(conn: &Connection) -> Result<Vec<RunState>> {
     if !has_table(conn)? {

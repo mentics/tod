@@ -9,6 +9,12 @@
 //! that the run's end sits behind counts). Any other standing is a mismatch,
 //! and `lasted_ms` says since when the run has been stopped. Read by the
 //! daemon's tick (a logged line) and `tod-cli stats --section stop-mismatch`.
+//!
+//! The same check covers the run that is *claimed* rather than stopped: a
+//! local row that says `working` while no live lease backs it
+//! ([`crate::run_state::ghost_working`], a daemon replaced or killed mid-step).
+//! Shown as anything but a failure, it is a mismatch too, and `lasted_ms` says
+//! since when nothing has held it.
 
 use crate::next_actor::{NextActor, NodeStanding, YouReason};
 use crate::run_state::kind;
@@ -16,6 +22,7 @@ use anyhow::Result;
 use rusqlite::Connection;
 use serde::Serialize;
 use std::collections::HashMap;
+use tod_store::activity::{ActivityRepo, Lease};
 use tod_store::run_state::{Phase, RunState};
 use uuid::Uuid;
 
@@ -74,11 +81,50 @@ pub fn detect(rows: &[RunState], standings: &HashMap<Uuid, NodeStanding>, now_ms
     out
 }
 
-/// [`detect`] over the store, given the standings the caller already has.
+/// The pure rule for claimed work: `working` rows with no live lease whose
+/// node's standing is not a failure (an actor of `Working` is the bug itself).
+/// Longest-lasting first.
+pub fn detect_ghosts(
+    rows: &[RunState],
+    leases: &HashMap<Uuid, Vec<Lease>>,
+    standings: &HashMap<Uuid, NodeStanding>,
+    now_ms: i64,
+) -> Vec<Mismatch> {
+    let mut out: Vec<Mismatch> = rows
+        .iter()
+        .filter_map(|r| {
+            let standing = standings.get(&r.node_id)?;
+            let mine = leases.get(&r.node_id).map(Vec::as_slice).unwrap_or(&[]);
+            let ghost = crate::run_state::ghost_working(r, mine, now_ms)?;
+            let ok = match &standing.actor {
+                NextActor::You { why, .. } => why.is_failure(),
+                _ => false,
+            };
+            (!ok).then(|| Mismatch {
+                node_id: r.node_id,
+                run: format!("{} (working, no live lease): {}", r.reason_kind, ghost.describe(r, now_ms)),
+                shown: shown(&standing.actor),
+                lasted_ms: (now_ms - ghost.silent_since).max(0),
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| b.lasted_ms.cmp(&a.lasted_ms).then(a.node_id.cmp(&b.node_id)));
+    out
+}
+
+/// [`detect`] and [`detect_ghosts`] over the store, given the standings the
+/// caller already has.
 pub fn find_with(conn: &Connection, standings: &HashMap<Uuid, NodeStanding>, now_ms: i64) -> Result<Vec<Mismatch>> {
     let ids: Vec<Uuid> = standings.keys().copied().collect();
     let rows = tod_store::run_state::list_for_nodes(conn, &ids)?;
-    Ok(detect(&rows, standings, now_ms))
+    let mut leases: HashMap<Uuid, Vec<Lease>> = HashMap::new();
+    for lease in ActivityRepo::new(conn).list_for_nodes(&ids)? {
+        leases.entry(lease.node_id).or_default().push(lease);
+    }
+    let mut out = detect(&rows, standings, now_ms);
+    out.extend(detect_ghosts(&rows, &leases, standings, now_ms));
+    out.sort_by(|a, b| b.lasted_ms.cmp(&a.lasted_ms).then(a.node_id.cmp(&b.node_id)));
+    Ok(out)
 }
 
 /// Every mismatch now, working the standings out from `data_root`.
@@ -125,6 +171,49 @@ mod tests {
                 retry: None,
             },
         }
+    }
+
+    fn lease_of(node: Uuid, owner: &str, beat: i64) -> Lease {
+        Lease {
+            id: Uuid::new_v4(),
+            node_id: node,
+            kind: tod_store::activity::KIND_RUN.into(),
+            owner: owner.into(),
+            started_at: 0,
+            heartbeat_at: beat,
+        }
+    }
+
+    #[test]
+    fn a_working_row_whose_lease_owner_is_gone_is_counted_unless_shown_failed() {
+        let now = 10_000_000;
+        let (a, b, c, d) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let working = |n| RunState { writer: "local".into(), ..row(n, Phase::Working, kind::WORKING, 1_000) };
+        let rows = [working(a), working(b), working(c), working(d)];
+        let dead = tod_store::activity::STALE_AFTER_MS + 1;
+        let leases: HashMap<Uuid, Vec<Lease>> = [
+            (a, vec![lease_of(a, "tod-agentd-old:19909", now - dead)]),
+            (b, vec![lease_of(b, "tod-agentd-old:19909", now - dead)]),
+            // A live lease holds the run: not a ghost.
+            (c, vec![lease_of(c, "tod-agentd-new:1", now - 1)]),
+            // No lease at all.
+            (d, vec![]),
+        ]
+        .into();
+        let standings: HashMap<_, _> = [
+            standing(a, NextActor::Working { what: crate::next_actor::Work::Runner, since: 0 }),
+            standing(b, you(YouReason::Failed { error: "processing was lost".into() })),
+            standing(c, NextActor::Working { what: crate::next_actor::Work::Runner, since: 0 }),
+            standing(d, others()),
+        ]
+        .into();
+        let found = detect_ghosts(&rows, &leases, &standings, now);
+        let nodes: Vec<Uuid> = found.iter().map(|m| m.node_id).collect();
+        assert!(nodes.contains(&a) && nodes.contains(&d) && nodes.len() == 2, "{found:?}");
+        let ghost = found.iter().find(|m| m.node_id == a).unwrap();
+        assert_eq!(ghost.shown, "working");
+        assert_eq!(ghost.lasted_ms, dead);
+        assert!(ghost.run.contains("tod-agentd-old:19909"), "{}", ghost.run);
     }
 
     #[test]
