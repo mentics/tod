@@ -5260,3 +5260,87 @@ fn a_pull_request_only_behind_its_base_is_not_worked_on() {
     let outcome = pilot.run_with(&fx.fleet, &mut agent, &mut StopAfter(40)).unwrap();
     assert_eq!(agent.turns, 0, "{outcome:?}");
 }
+
+/// ENG-3129: the agent pushed a prerequisite branch beside the pull request
+/// and opened no pull request for it, so the main pull request's checks
+/// failed on what only the prerequisite held and the user was asked about
+/// them. A branch the node pushed with no pull request is the agent's work,
+/// named in its turn, until the pull request exists.
+#[test]
+fn a_pushed_branch_without_a_pull_request_is_sent_to_the_agent_by_name() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    fx.fleet
+        .enqueue(tod_store::fleet::FleetMutation::UpdateTaskTicket {
+            id: fx.node.to_string(),
+            ticket: Some("ENG-9".into()),
+        })
+        .unwrap();
+    fx.fleet
+        .enqueue(tod_store::fleet::FleetMutation::UpdateTaskBranch {
+            id: fx.node.to_string(),
+            branch: Some("task/ENG-9-main-change".into()),
+        })
+        .unwrap();
+    fx.fleet.writer().flush().unwrap();
+    fx.fleet.reload_if_stale().ok();
+
+    struct Bare {
+        open: Arc<std::sync::atomic::AtomicBool>,
+        prefixes: std::sync::Mutex<Vec<String>>,
+    }
+    impl crate::pr_readiness::PrFeed for Bare {
+        fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
+            use tod_store::github::{PrSnapshot, PrStatus};
+            Ok(PrSnapshot {
+                status: PrStatus {
+                    mergeable: Some(true),
+                    mergeable_state: Some("blocked".into()),
+                    behind_by: Some(0),
+                    checks: Some("success".into()),
+                    head_sha: Some("abcdef1".into()),
+                    head_committed_at: Some("2020-01-01T00:00:00Z".into()),
+                    draft: true,
+                    open: true,
+                    ..Default::default()
+                },
+                threads: vec![],
+                comments: vec![],
+                reviews: vec![],
+            })
+        }
+        fn branches_without_pr(&self, _: &tod_store::github::NodePr, prefix: &str) -> Result<Vec<String>, String> {
+            self.prefixes.lock().unwrap().push(prefix.to_string());
+            Ok(if self.open.load(std::sync::atomic::Ordering::SeqCst) {
+                vec!["task/ENG-9-mirror-images".to_string()]
+            } else {
+                Vec::new()
+            })
+        }
+    }
+    let open = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let feed = Arc::new(Bare { open: open.clone(), prefixes: Default::default() });
+    crate::pr_readiness::set_feed_override(Some(feed.clone()));
+    linked_to_prs(&fx, "pr_draft", &["https://github.com/acme/app/pull/42"]);
+    let mut agent = FakeAgent::new(&fx.fleet);
+    // The agent opens the pull request when told which branch has none.
+    agent.pr_hook = Some(Arc::new(move |sent: &str| {
+        if sent.contains("task/ENG-9-mirror-images") {
+            open.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }));
+    let log = agent.log.clone();
+    let mut pilot = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO);
+    let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
+    let told: Vec<String> = log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, sent)| sent.contains("acme/app:task/ENG-9-mirror-images") && sent.contains("no pull request"))
+        .map(|(_, s)| s.clone())
+        .collect();
+    assert!(!told.is_empty(), "the agent was never told the branch has no pull request: {outcome:?}");
+    // The siblings are found by the node's branch up to its ticket.
+    assert!(feed.prefixes.lock().unwrap().iter().all(|p| p == "task/ENG-9"), "{:?}", feed.prefixes.lock().unwrap());
+    assert!(!matches!(outcome, Outcome::NeedsHuman { reason: NeedsHuman::PrBlocked { .. } }), "{outcome:?}");
+}

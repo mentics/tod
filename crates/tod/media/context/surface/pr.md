@@ -66,7 +66,10 @@ repository may exist on this machine — never change into them or build them.
    first if you are not sure. `pr open` always opens a **draft** PR; leave it
    a draft, do not mark it ready for review or request reviewers: a person
    does. A PR that already exists but is not linked is linked, not opened
-   again: `pr open` finds it from its branch.
+   again: `pr open` finds it from its branch. Every branch you pushed gets
+   its own linked PR, including one that another change of yours depends on
+   (a prerequisite): the app fails the gate, and the babysitter sends you back,
+   for a pushed branch with no PR.
 2. In `pr`, once the draft is open and describes the change, certify the
    phase (`phase certify`); you certify it yourself, since no separate
    session evaluates this state.

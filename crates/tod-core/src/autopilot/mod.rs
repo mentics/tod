@@ -1389,7 +1389,7 @@ impl Autopilot {
             };
             let settings = pr_readiness::settings_for_node(fleet, self.node, &self.config.data_root)?;
             let answered_at = pr_readiness::agent_answered_at(fleet, self.node)?;
-            let live = match pr_readiness::live_answered(feed.as_ref(), &links.prs, &settings, answered_at) {
+            let mut live = match pr_readiness::live_answered(feed.as_ref(), &links.prs, &settings, answered_at) {
                 Ok(live) => {
                     github_wait::clear_read_failures(fleet, self.node)?;
                     live
@@ -1399,6 +1399,19 @@ impl Autopilot {
                     return Ok(Some(github_wait::github_look_failed(fleet, self.node, false, &err)?));
                 }
             };
+            // A branch the node pushed that has no pull request is work the
+            // agent owes (open and link it), never something to carry on
+            // without: a pull request may depend on it.
+            let node_id = self.node;
+            if let Some(prefix) = fleet.read(|conn| pr_readiness::node_branch_prefix(conn, node_id))? {
+                match pr_readiness::unlinked_branches(feed.as_ref(), &links.prs, &prefix) {
+                    Ok(unlinked) => pr_readiness::attach_unlinked_branches(&mut live, &unlinked),
+                    Err(err) => {
+                        hook.waiting(None, None);
+                        return Ok(Some(github_wait::github_look_failed(fleet, self.node, false, &err)?));
+                    }
+                }
+            }
             self.note_fallbacks(fleet, &live, phase_key)?;
             note_draft_skipped(fleet, node, &live, phase_key)?;
             // A failing check whose failure the base branch has too is not

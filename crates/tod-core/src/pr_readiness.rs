@@ -346,6 +346,11 @@ pub struct Assessment {
     /// have been seen and answered. `None` until set
     /// ([`Self::answered_through`]).
     pub answered_at: Option<DateTime<Utc>>,
+    /// Branches the node pushed to this repository that have no pull request
+    /// of any state ([`attach_unlinked_branches`]): changes the node made
+    /// that nothing reviews, merges, or waits on. Set on one pull request per
+    /// repository, so each is named once.
+    pub unlinked_branches: Vec<String>,
 }
 
 /// Something the babysitter has to do.
@@ -377,6 +382,9 @@ pub enum Work {
     /// People left reviews with text but no verdict since the last push and
     /// the agent has not yet had a turn on them.
     ReviewComments(usize),
+    /// Branches the node pushed that have no pull request: open and link one
+    /// for each (a prerequisite change the pull request depends on, for one).
+    BranchesWithoutPr(Vec<String>),
 }
 
 impl Work {
@@ -391,6 +399,7 @@ impl Work {
             | Work::LowScore { .. }
             | Work::ChangesRequested
             | Work::ReviewComments(_) => true,
+            Work::BranchesWithoutPr(_) => false,
             Work::BotReviewMissing { low_last_score, .. } => low_last_score.is_some(),
             Work::Behind | Work::Conflict => false,
         }
@@ -595,6 +604,7 @@ impl Assessment {
             ),
             read_at: now,
             answered_at: None,
+            unlinked_branches: Vec::new(),
         })
     }
 
@@ -704,6 +714,9 @@ impl Assessment {
             return Vec::new();
         }
         let mut work = Vec::new();
+        if !self.unlinked_branches.is_empty() {
+            work.push(Work::BranchesWithoutPr(self.unlinked_branches.clone()));
+        }
         if self.conflicted() {
             work.push(Work::Conflict);
         }
@@ -1179,6 +1192,7 @@ pub fn render_work(url: &str, assessment: &Assessment) -> String {
         out.push_str(&match work {
             Work::Conflict => "- it conflicts with its base branch: merge the base in and resolve\n".to_string(),
             Work::Behind => "- it is behind its base branch: merge the base in\n".to_string(),
+            Work::BranchesWithoutPr(branches) => branches_without_pr_line(&branches),
             Work::Threads(n) => format!("- {n} review thread(s) are open: `tod-cli pr threads`\n"),
             Work::FailingChecks(names) => failing_checks_line(assessment, &names),
             Work::ChangesRequested => "- a reviewer asked for changes in a review: read it with `tod-cli pr status`\n".to_string(),
@@ -1205,6 +1219,17 @@ pub fn render_work(url: &str, assessment: &Assessment) -> String {
         });
     }
     out
+}
+
+/// What the agent is told about branches it pushed that have no pull request.
+pub fn branches_without_pr_line(branches: &[String]) -> String {
+    format!(
+        "- you pushed {} with no pull request: {}. Open each as a draft pull request and link it to this node (`tod-cli pr open`); \
+         a change this pull request depends on has to be reviewed and merged too, and tod waits for it only once it is a linked pull request. \
+         If a branch is not meant to ship, delete it from the remote instead.\n",
+        if branches.len() == 1 { "a branch" } else { "branches" },
+        branches.join(", "),
+    )
 }
 
 /// What the agent is told about the failing checks `names`: read the log
@@ -1274,6 +1299,7 @@ pub fn outstanding(live: &[LivePr]) -> String {
                 Work::BotReviewMissing { bot, .. } => format!("no {bot} review of the current head"),
                 Work::ChangesRequested => "a reviewer asked for changes".to_string(),
                 Work::ReviewComments(n) => format!("{n} review{} with comments to answer", if n == 1 { "" } else { "s" }),
+                Work::BranchesWithoutPr(b) => format!("pushed without a pull request: {}", b.join(", ")),
             });
         }
         if !parts.is_empty() {
@@ -2756,6 +2782,12 @@ pub trait PrFeed: Send + Sync {
     ) -> Result<Vec<tod_store::github::RecentPr>, String> {
         Ok(Vec::new())
     }
+    /// The branches of the pull request's repository that start with
+    /// `prefix` and have no pull request in any state. A feed with no such
+    /// listing says none.
+    fn branches_without_pr(&self, _pr: &tod_store::github::NodePr, _prefix: &str) -> Result<Vec<String>, String> {
+        Ok(Vec::new())
+    }
     /// Post a top-level comment on the pull request (the ask for a bot's
     /// review, `PrReviewBotSettings::ask`).
     fn post_comment(&self, _pr: &tod_store::github::NodePr, _body: &str) -> Result<(), String> {
@@ -2882,6 +2914,25 @@ impl PrFeed for GithubFeed {
             all.extend(prs);
         }
         Ok(all)
+    }
+
+    fn branches_without_pr(&self, pr: &tod_store::github::NodePr, prefix: &str) -> Result<Vec<String>, String> {
+        let repo = tod_store::github::GithubRepo { owner: pr.owner.clone(), repo: pr.repo.clone() };
+        let branches = self
+            .0
+            .list_branches_with_prefix(&repo, prefix)
+            .map_err(|err| format!("listing {}/{}'s branches starting with {prefix}: {err}", pr.owner, pr.repo))?;
+        let mut bare = Vec::new();
+        for branch in branches {
+            let prs = self
+                .0
+                .list_branch_prs(&repo, &branch)
+                .map_err(|err| format!("looking for pull requests from {}/{}'s branch {branch}: {err}", pr.owner, pr.repo))?;
+            if prs.is_empty() {
+                bare.push(branch);
+            }
+        }
+        Ok(bare)
     }
 
     fn post_comment(&self, pr: &tod_store::github::NodePr, body: &str) -> Result<(), String> {
@@ -3243,6 +3294,72 @@ pub fn live_answered(
         .collect()
 }
 
+/// The start every branch the node pushed shares: its own branch up to and
+/// including its ticket (`task/TOD-142` of `task/TOD-142-fix-login`, which a
+/// prerequisite branch `task/TOD-142-mirror-images` shares), else the whole
+/// branch. `None` when the node has no branch yet.
+pub fn pushed_branch_prefix(branch: &str, ticket: Option<&str>) -> Option<String> {
+    let branch = branch.trim();
+    if branch.is_empty() {
+        return None;
+    }
+    if let Some(ticket) = ticket.map(str::trim).filter(|t| !t.is_empty())
+        && let Some(at) = branch.to_ascii_lowercase().find(&ticket.to_ascii_lowercase())
+    {
+        return Some(branch[..at + ticket.len()].to_string());
+    }
+    Some(branch.to_string())
+}
+
+/// The node's [`pushed_branch_prefix`], from its resolved Files branch and ticket.
+pub fn node_branch_prefix(conn: &rusqlite::Connection, node_id: uuid::Uuid) -> anyhow::Result<Option<String>> {
+    let Some(files) = tod_store::fleet::node_actions::resolve_files_for_node(conn, &node_id.to_string())? else {
+        return Ok(None);
+    };
+    let Some(branch) = files.branch() else {
+        return Ok(None);
+    };
+    let ticket: Option<String> = rusqlite::OptionalExtension::optional(conn.query_row(
+        "SELECT ticket FROM node_fields WHERE node_id = ?1",
+        rusqlite::params![node_id.as_bytes().to_vec()],
+        |row| row.get::<_, Option<String>>(0),
+    ))?
+    .flatten();
+    Ok(pushed_branch_prefix(branch, ticket.as_deref()))
+}
+
+/// Every branch the node pushed (in the repository of each of `prs`, those
+/// starting with `prefix`) that has no pull request, as `(repository, branch)`.
+pub fn unlinked_branches(
+    feed: &dyn PrFeed,
+    prs: &[tod_store::github::NodePr],
+    prefix: &str,
+) -> Result<Vec<(String, String)>, String> {
+    let mut seen: Vec<(String, String)> = Vec::new();
+    let mut out = Vec::new();
+    for pr in prs {
+        let key = (pr.owner.to_ascii_lowercase(), pr.repo.to_ascii_lowercase());
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        for branch in feed.branches_without_pr(pr, prefix)? {
+            out.push((format!("{}/{}", pr.owner, pr.repo), branch));
+        }
+    }
+    Ok(out)
+}
+
+/// Names the branches of `unlinked` on `live`: each repository's go on the
+/// first pull request in it, so the agent is told once.
+pub fn attach_unlinked_branches(live: &mut [LivePr], unlinked: &[(String, String)]) {
+    for (repo, branch) in unlinked {
+        if let Some(p) = live.iter_mut().find(|p| format!("{}/{}", p.pr.owner, p.pr.repo).eq_ignore_ascii_case(repo)) {
+            p.assessment.unlinked_branches.push(format!("{repo}:{branch}"));
+        }
+    }
+}
+
 /// What the babysitter does next across `prs`: the first work, else the
 /// waits together, else clear; merged only when every one is.
 pub fn overall(prs: &[LivePr]) -> Next {
@@ -3264,5 +3381,64 @@ pub fn overall(prs: &[LivePr]) -> Next {
         Next::Wait(waits)
     } else {
         Next::Clear
+    }
+}
+
+#[cfg(test)]
+mod pushed_branch_tests {
+    use super::*;
+
+    #[test]
+    fn siblings_share_the_branch_up_to_its_ticket() {
+        // ENG-3129: `task/ENG-3129ci-tests-...` and the prerequisite
+        // `task/ENG-3129-mirror-postgres-to-ecr` share `task/ENG-3129`.
+        assert_eq!(
+            pushed_branch_prefix("task/ENG-3129ci-tests-run", Some("ENG-3129")).as_deref(),
+            Some("task/ENG-3129")
+        );
+        assert_eq!(pushed_branch_prefix("task/eng-3129-x", Some("ENG-3129")).as_deref(), Some("task/eng-3129"));
+        // No ticket in the branch (or no ticket): the whole branch.
+        assert_eq!(pushed_branch_prefix("task/fix-login", None).as_deref(), Some("task/fix-login"));
+        assert_eq!(pushed_branch_prefix("task/fix-login", Some("TOD-1")).as_deref(), Some("task/fix-login"));
+        assert_eq!(pushed_branch_prefix("  ", Some("TOD-1")), None);
+    }
+
+    struct Branches;
+    impl PrFeed for Branches {
+        fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<PrSnapshot, String> {
+            Err("unused".into())
+        }
+        fn branches_without_pr(&self, pr: &tod_store::github::NodePr, _: &str) -> Result<Vec<String>, String> {
+            Ok(vec![format!("task/T-1-in-{}", pr.repo)])
+        }
+    }
+
+    #[test]
+    fn each_repository_is_asked_once_and_the_branch_named_for_the_agent() {
+        let prs = [
+            tod_store::github::NodePr::new("acme", "app", 1),
+            tod_store::github::NodePr::new("acme", "app", 2),
+            tod_store::github::NodePr::new("acme", "docs", 3),
+        ];
+        let found = unlinked_branches(&Branches, &prs, "task/T-1").unwrap();
+        assert_eq!(
+            found,
+            vec![
+                ("acme/app".to_string(), "task/T-1-in-app".to_string()),
+                ("acme/docs".to_string(), "task/T-1-in-docs".to_string())
+            ]
+        );
+        let mut assessment = Assessment::of(
+            &PrSnapshot { status: Default::default(), threads: vec![], comments: vec![], reviews: vec![] },
+            &PrReadinessSettings::default(),
+            Utc::now(),
+        );
+        assert!(assessment.work().iter().all(|w| !matches!(w, Work::BranchesWithoutPr(_))));
+        assessment.unlinked_branches = vec!["acme/app:task/T-1-in-app".into()];
+        let work = assessment.work();
+        assert_eq!(work[0], Work::BranchesWithoutPr(vec!["acme/app:task/T-1-in-app".into()]));
+        assert!(!work[0].is_feedback() && work[0].agent_can_fix());
+        let text = render_work("acme/app#1", &assessment);
+        assert!(text.contains("acme/app:task/T-1-in-app") && text.contains("no pull request"), "{text}");
     }
 }

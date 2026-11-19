@@ -53,13 +53,13 @@ submodule in it (all on the same branch), plus every one linked; with
 --all-open, every open pull request in those repositories instead,
 whichever branch it is from.
 `open` creates a draft pull request via the GitHub API (or finds the one already
-open from --head) and links it to the node, enabling Ticket if it is off; it
-refuses when the node already links a pull request in that repository — call
-`status` first if you are not sure one already exists.
+open from --head) and links it to the node, enabling Ticket if it is off. A
+node may link several pull requests in one repository (one per branch it pushed,
+a prerequisite change beside the main one); opening for a --head that already
+has an open pull request only links that one.
 `link` attaches an existing pull request (a URL or <OWNER>/<REPO>#<NUMBER>) to the
 node, after any it already links, enabling Ticket if it is off; `unlink` removes
-one and leaves the others. Neither touches GitHub, and `link` does not check the
-one-per-repository rule `open` applies.
+one and leaves the others. Neither touches GitHub.
 `status` fetches each linked PR's live mergeable flag, combined check status,
 and merged flag.
 `comment reply` posts a reply to a review comment thread by its numeric id
@@ -334,15 +334,6 @@ fn open(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
     let base = args.require("--base")?.to_string();
     let title = args.require("--title")?.to_string();
     let body = args.get("--body").unwrap_or_default().to_string();
-    let links = inv.client().read(|conn| NodePrRepo::new(conn).read(node))?;
-    if let Some(pr) = links.prs.iter().find(|pr| {
-        pr.owner.eq_ignore_ascii_case(&owner) && pr.repo.eq_ignore_ascii_case(&repo)
-    }) {
-        anyhow::bail!(
-            "node {node} already links {} in {owner}/{repo} — run `pr status`",
-            pr.url
-        );
-    }
     let github = github(inv)?;
     // GitHub itself is the source of truth for whether one already exists —
     // not just the node's links checked above — so a retry after the local

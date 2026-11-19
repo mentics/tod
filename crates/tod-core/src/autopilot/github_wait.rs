@@ -591,6 +591,7 @@ fn work_description(work: &[crate::pr_readiness::Work]) -> String {
             Work::BotReviewMissing { bot, .. } => format!("no {bot} review of the current head"),
             Work::ChangesRequested => "changes requested".to_string(),
             Work::ReviewComments(n) => format!("{n} review{} with comments to answer", if *n == 1 { "" } else { "s" }),
+            Work::BranchesWithoutPr(b) => format!("pushed without a pull request: {}", b.join(", ")),
         })
         .collect::<Vec<_>>()
         .join(", ")

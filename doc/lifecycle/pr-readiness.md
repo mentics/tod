@@ -363,6 +363,30 @@ it is outward-facing, so it is bounded:
   work it cannot fix (`Work::agent_can_fix` is false: a bot that has not
   reviewed and has no findings) never does.
 
+## A branch the node pushed with no pull request
+
+A node can push more than its main branch: a prerequisite change its pull
+request depends on (a workflow that has to land first) goes on a branch of its
+own. A branch with no pull request is invisible to everything here: its
+failures read as the main pull request's, and the user is asked to "carry on"
+about what is really "the other change has to land first" (ENG-3129).
+
+The node's pushed branches are those of each repository it has a linked pull
+request in that start with the node's branch up to and including its ticket
+(`task/ENG-3129` of `task/ENG-3129-...`; the whole branch when it has no
+ticket): `pr_readiness::pushed_branch_prefix`, listed through
+`PrFeed::branches_without_pr`. One with no pull request in any state is
+
+- a failure of `pr -> pr_draft` (`pr-open`) and `pr_draft -> pr_review`
+  (`pr-ready`), naming `owner/repo:branch`, and
+- agent work in the babysitter (`Work::BranchesWithoutPr`, on the first pull
+  request of its repository, never feedback): the agent opens each as a draft
+  and links it (`pr open` links several per repository), or deletes the branch.
+
+Once linked, the prerequisite is an ordinary pull request of the node: its
+merge is waited on like the others'. A failed listing is a failed look at
+GitHub, never "no branches".
+
 ## A bot that stays silent
 
 Seen 2026-11-11/12: a review bot stopped answering on every pull request (an

@@ -11,6 +11,7 @@ The PR is worked as the task's `pr` conversation. Read lifecycle state, obligati
 Get the **draft** pull request in place and describing the change as it is now:
 
 - If none exists yet, open it and link it to the task (`tod-cli pr open` does both; it always opens a draft). Push the branch first. Write the title and description from the task's obligations and what was built, so a reviewer who has not followed the work can follow the change.
+- Every branch you pushed for this task, in any repository, gets a linked pull request too, a prerequisite change the main one depends on included (it must land first, and tod waits on it only once it is linked). A pushed branch with no pull request fails the gate.
 - If one exists, push what is not pushed yet, and bring its title and description up to date with what is built now.
 - Apply this phase's configured skills to the PR, as its context lists them.
 - Keep it a draft. Do not mark it ready for review, and do not request reviewers.

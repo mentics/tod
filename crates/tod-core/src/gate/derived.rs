@@ -604,6 +604,32 @@ fn own_review_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutcome
     })
 }
 
+/// Fails when the node pushed a branch to a repository it has a pull request
+/// in that has no pull request of its own ([`crate::pr_readiness::unlinked_branches`]),
+/// naming each so the `pr` agent opens and links it.
+fn unlinked_branches_failure(conn: &Connection, node_id: Uuid, prs: &[NodePr]) -> Result<Option<DerivedOutcome>> {
+    let Some(prefix) = crate::pr_readiness::node_branch_prefix(conn, node_id)? else {
+        return Ok(None);
+    };
+    let feed: std::sync::Arc<dyn crate::pr_readiness::PrFeed> = match crate::pr_readiness::feed_override() {
+        Some(feed) => feed,
+        None => match github_client(conn) {
+            Some(github) => std::sync::Arc::new(crate::pr_readiness::GithubFeed(github)),
+            None => return Ok(None),
+        },
+    };
+    Ok(match crate::pr_readiness::unlinked_branches(feed.as_ref(), prs, &prefix) {
+        Ok(found) if found.is_empty() => None,
+        Ok(found) => {
+            let names: Vec<String> = found.iter().map(|(repo, branch)| format!("{repo}:{branch}")).collect();
+            Some(fail(
+                crate::pr_readiness::branches_without_pr_line(&names).trim_start_matches("- ").trim_end().to_string(),
+            ))
+        }
+        Err(err) => Some(fail(format!("Could not look for pushed branches without a pull request: {err}"))),
+    })
+}
+
 /// Every linked PR is open (a draft is what `pr` opens) or already merged:
 /// the `pr → pr_draft` check that the agent's pull request exists.
 fn pr_open_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutcome> {
@@ -621,6 +647,9 @@ fn pr_open_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutcome> {
             Ok(line) => passed.push(line),
             Err(why) => return Ok(fail(why)),
         }
+    }
+    if let Some(outcome) = unlinked_branches_failure(conn, node_id, &prs)? {
+        return Ok(outcome);
     }
     Ok(DerivedOutcome {
         outcome: OUTCOME_PASS,
@@ -701,6 +730,9 @@ fn pr_ready_for_review_outcome(conn: &Connection, node_id: Uuid) -> Result<Deriv
             Ok(line) => passed.push(line),
             Err(why) => return Ok(fail(why)),
         }
+    }
+    if let Some(outcome) = unlinked_branches_failure(conn, node_id, &prs)? {
+        return Ok(outcome);
     }
     Ok(DerivedOutcome {
         outcome: OUTCOME_PASS,

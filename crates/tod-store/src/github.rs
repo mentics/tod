@@ -875,6 +875,22 @@ impl Github {
         Ok(raw.into_iter().map(PullListRaw::into_summary).collect())
     }
 
+    /// The names of `repo`'s branches that start with `prefix` (at most 100).
+    pub fn list_branches_with_prefix(&self, repo: &GithubRepo, prefix: &str) -> Result<Vec<String>, GithubError> {
+        #[derive(Deserialize)]
+        struct RefRaw {
+            #[serde(rename = "ref")]
+            name: String,
+        }
+        let raw: Vec<RefRaw> = self.get_json(&format!(
+            "/repos/{}/{}/git/matching-refs/heads/{}?per_page=100",
+            repo.owner,
+            repo.repo,
+            query_encode(prefix),
+        ))?;
+        Ok(raw.into_iter().filter_map(|r| r.name.strip_prefix("refs/heads/").map(str::to_string)).collect())
+    }
+
     /// Every open pull request in `repo`, whichever branch it is from, most
     /// recently updated first (the first 100).
     pub fn list_open_prs(&self, repo: &GithubRepo) -> Result<Vec<PullSummary>, GithubError> {

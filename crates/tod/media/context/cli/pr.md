@@ -20,7 +20,7 @@ tod-cli --data-root <DATA_ROOT> pr merged                            [--note <TE
 tod-cli --data-root <DATA_ROOT> pr blocked                           --why <TEXT>
 ```
 
-- `open` always opens a draft PR, and refuses when a PR is already linked in that repository; run `status` first.
+- `open` always opens a draft PR for `--head`, or links the open one that branch already has. A node may link several PRs in one repository: open one for every branch you pushed.
 - `link` attaches an existing PR to the node (a URL or `<OWNER>/<REPO>#<NUMBER>`);
   `unlink` removes one and keeps the others. To swap a PR, link the new one and
   unlink the old.
