@@ -190,3 +190,67 @@ fn a_quiet_resume_whose_wait_was_satisfied_and_state_advanced_leaves_no_row_nami
     assert_eq!(row.reason_kind, crate::run_state::kind::WORKING, "{row:?}");
     assert!(!row.reason_text.contains("marked ready"), "{row:?}");
 }
+
+/// Gap 81: a step boundary on a node whose branch the remote already has says
+/// nothing about saving it and leaves a waiting row waiting; the same boundary
+/// with a commit to push says so, as work.
+#[test]
+fn a_step_boundary_with_nothing_to_push_leaves_the_wait_row_and_says_nothing_about_saving() {
+    use crate::autopilot::StepHook;
+    let fx = setup();
+    let workspace = super::lost_work::workspace_is_a_clone(&fx);
+    super::push_failure::node_works_in(&fx, &workspace);
+    // Push once so the remote has the node's branch.
+    assert!(crate::autopilot::local::push_branch(&fx.fleet, fx.node).unwrap().is_none());
+    wait_on(&fx, "greptile review");
+    let before = wait_row(&fx);
+    let mut sink = |_: LocalEvent| {};
+    let mut hook = hook(&fx, &mut sink);
+    hook.resume(&fx.fleet).unwrap();
+    hook.at(&fx.fleet, Boundary::Step).unwrap();
+    let after = wait_row(&fx);
+    assert_eq!(after.since, before.since, "{after:?}");
+    assert_eq!(after.reason_kind, crate::run_state::kind::WAITING_OUTSIDE, "{after:?}");
+    assert!(!after.reason_text.contains("saving the branch"), "{after:?}");
+    assert!(!live_run_lease(&fx));
+    // Real work later must not inherit a stale "saving" status.
+    hook.working_on("running the Review checks");
+    assert!(!wait_row(&fx).reason_text.contains("saving"), "{:?}", wait_row(&fx));
+}
+
+#[test]
+fn a_step_boundary_with_a_commit_to_push_says_saving_the_branch() {
+    use crate::autopilot::StepHook;
+    let fx = setup();
+    let workspace = super::lost_work::workspace_is_a_clone(&fx);
+    super::push_failure::node_works_in(&fx, &workspace);
+    super::lost_work::git_in(&workspace, &["commit", "-q", "--allow-empty", "-m", "the fix"]);
+    wait_on(&fx, "greptile review");
+    let mut sink = |_: LocalEvent| {};
+    let mut hook = hook(&fx, &mut sink);
+    hook.resume(&fx.fleet).unwrap();
+    hook.at(&fx.fleet, Boundary::Step).unwrap();
+    let row = wait_row(&fx);
+    assert_eq!(row.reason_kind, crate::run_state::kind::WORKING, "{row:?}");
+}
+
+/// Gap 81, the in-process wait loop: a run that is not quiet but is waiting
+/// (it said so itself) crosses a step boundary with nothing to push and its
+/// row must keep saying it waits, not flip to "saving the branch".
+#[test]
+fn a_waiting_run_crossing_a_step_boundary_with_nothing_to_push_keeps_its_waiting_row() {
+    use crate::autopilot::StepHook;
+    let fx = setup();
+    let workspace = super::lost_work::workspace_is_a_clone(&fx);
+    super::push_failure::node_works_in(&fx, &workspace);
+    assert!(crate::autopilot::local::push_branch(&fx.fleet, fx.node).unwrap().is_none());
+    let mut sink = |_: LocalEvent| {};
+    let mut hook = hook(&fx, &mut sink);
+    hook.waiting(Some("greptile review"), None);
+    let before = wait_row(&fx);
+    assert_eq!(before.reason_kind, crate::run_state::kind::WAITING_OUTSIDE, "{before:?}");
+    hook.at(&fx.fleet, Boundary::Step).unwrap();
+    let after = wait_row(&fx);
+    assert_eq!(after.since, before.since, "{after:?}");
+    assert_eq!(after.reason_kind, crate::run_state::kind::WAITING_OUTSIDE, "{after:?}");
+}

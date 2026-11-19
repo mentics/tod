@@ -1,6 +1,7 @@
 //! What the activity panel lists for a node, and how the list is grouped:
-//! agent sessions, gate checks and rounds of the phase's commands, in time
-//! order, in one group per stay in a phase.
+//! agent sessions, gate checks and rounds of the phase's commands, in
+//! order of last activity, in one group per stay in a phase. A session cut by
+//! other activity is several rows ([`Piece`]).
 //!
 //! A stay begins at a phase change recorded in the node's timeline
 //! (`tod_store::node_timeline`). The stay before the first recorded change is
@@ -39,6 +40,9 @@ pub struct Item {
     /// The phase it worked in, when it says (a session records the state it
     /// was started for). Only used where no phase change was recorded.
     pub phase: Option<String>,
+    /// Set when the row shows only part of a session: the turns between two
+    /// cuts (see [`cut_pieces`]).
+    pub piece: Option<Piece>,
 }
 
 impl Item {
@@ -48,6 +52,118 @@ impl Item {
             ItemKind::Session => None,
         }
     }
+}
+
+/// Part of a session that is a row of its own: a long-lived conversation (the
+/// PR agent keeps one for a whole stay) is listed where its work happened, so
+/// it is cut wherever something else in the activity happened between two of
+/// its turns, and each piece is placed at its own time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Piece {
+    pub conversation: Uuid,
+    /// The turns shown, by `seq`, inclusive.
+    pub from_seq: i64,
+    pub to_seq: i64,
+    /// Which piece of how many, counting from 1.
+    pub number: usize,
+    pub of: usize,
+    /// The session's last piece, where a streaming reply belongs.
+    pub last: bool,
+}
+
+/// The row id of the piece of `conversation` that starts at `from_seq`:
+/// stable across loads, and never the conversation's own id.
+pub fn piece_id(conversation: Uuid, from_seq: i64) -> Uuid {
+    let mut bytes = *conversation.as_bytes();
+    for (b, s) in bytes[8..].iter_mut().zip((from_seq as u64).wrapping_add(0x9e37_79b9_7f4a_7c15).to_be_bytes()) {
+        *b ^= s;
+    }
+    Uuid::from_bytes(bytes)
+}
+
+impl Item {
+    /// The conversation a session row shows (the whole of it, or a piece).
+    pub fn conversation(&self) -> Option<Uuid> {
+        match (&self.kind, &self.piece) {
+            (_, Some(p)) => Some(p.conversation),
+            (ItemKind::Session, None) => Some(self.id),
+            _ => None,
+        }
+    }
+}
+
+/// One run of a conversation's turns between cuts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Span {
+    pub from_seq: i64,
+    pub to_seq: i64,
+    pub first_at: i64,
+    pub last_at: i64,
+}
+
+/// Cut a conversation's turns (`(seq, created_at)`, in order) into pieces:
+/// a cut falls between two consecutive turns when some time in `others` (the
+/// time of anything else in the activity: another session's turn, a gate
+/// check, a round of commands, a phase change) lies strictly between them.
+/// With nothing in between, the whole conversation is one span.
+pub fn cut_pieces(turns: &[(i64, i64)], others: &[i64]) -> Vec<Span> {
+    let mut spans: Vec<Span> = Vec::new();
+    for &(seq, at) in turns {
+        let cut = spans.last().is_none_or(|s| others.iter().any(|&x| x > s.last_at && x < at));
+        if cut {
+            spans.push(Span { from_seq: seq, to_seq: seq, first_at: at, last_at: at });
+        } else if let Some(s) = spans.last_mut() {
+            s.to_seq = seq;
+            s.last_at = at;
+        }
+    }
+    spans
+}
+
+/// The rows for one session: a single row when it is not cut, else one per
+/// piece, each labelled `label · part N`. `updated_at` is when the session
+/// was last active (it keeps a running session's last piece the latest).
+pub fn session_items(
+    id: Uuid,
+    label: &str,
+    phase: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+    turns: &[(i64, i64)],
+    others: &[i64],
+) -> Vec<Item> {
+    let spans = cut_pieces(turns, others);
+    let whole = |piece| Item {
+        id,
+        kind: ItemKind::Session,
+        label: label.to_string(),
+        at: updated_at,
+        started: created_at,
+        failed: false,
+        phase: phase.clone(),
+        piece,
+    };
+    if spans.len() < 2 {
+        return vec![whole(None)];
+    }
+    let of = spans.len();
+    spans
+        .iter()
+        .enumerate()
+        .map(|(ix, s)| {
+            let last = ix + 1 == of;
+            Item {
+                id: piece_id(id, s.from_seq),
+                kind: ItemKind::Session,
+                label: format!("{label} \u{b7} part {}", ix + 1),
+                at: if last { s.last_at.max(updated_at) } else { s.last_at },
+                started: s.first_at,
+                failed: false,
+                phase: phase.clone(),
+                piece: Some(Piece { conversation: id, from_seq: s.from_seq, to_seq: s.to_seq, number: ix + 1, of, last }),
+            }
+        })
+        .collect()
 }
 
 /// A stay in a phase and what happened in it.
@@ -97,6 +213,7 @@ pub fn entry_items(timeline: &[TimelineEntry]) -> Vec<Item> {
                 started: e.at,
                 failed: e.failed,
                 phase: Some(e.phase.clone()),
+                piece: None,
             })
         })
         .collect()
@@ -111,12 +228,11 @@ pub fn entry_items(timeline: &[TimelineEntry]) -> Vec<Item> {
 /// phase ([`Item::phase`]); one that does not say belongs with its
 /// neighbours.
 pub fn build_groups(mut items: Vec<Item>, timeline: &[TimelineEntry], current: &str) -> Vec<Group> {
-    items.sort_by_key(|i| (i.started, i.at));
+    items.sort_by_key(|i| (i.at, i.started));
     let changes = changes(timeline);
     let first_change = changes.first().map(|c| c.at);
-    let split = items.iter().position(|i| first_change.is_some_and(|at| i.started >= at)).unwrap_or(items.len());
-    let recorded = items.split_off(split);
-    let legacy = items;
+    let (recorded, legacy): (Vec<Item>, Vec<Item>) =
+        items.into_iter().partition(|i| first_change.is_some_and(|at| i.started >= at));
 
     let mut groups: Vec<Group> = Vec::new();
     // The phase before the first recorded change, when nothing says otherwise.
@@ -161,7 +277,7 @@ mod tests {
     use super::*;
 
     fn session(at: i64) -> Item {
-        Item { id: Uuid::new_v4(), kind: ItemKind::Session, label: "s".into(), at, started: at, failed: false, phase: None }
+        Item { id: Uuid::new_v4(), kind: ItemKind::Session, label: "s".into(), at, started: at, failed: false, phase: None, piece: None }
     }
 
     fn change(node: Uuid, at: i64, from: &str, to: &str, by_user: bool) -> TimelineEntry {
@@ -227,6 +343,56 @@ mod tests {
         let groups = build_groups(vec![in_phase(1, "proposed"), in_phase(2, "design"), session(12)], &timeline, "planning");
         let titles: Vec<_> = groups.iter().map(Group::title).collect();
         assert_eq!(titles, vec!["Proposed", "Design", "Planning"]);
+    }
+
+    #[test]
+    fn a_conversation_is_cut_where_something_else_happened_between_its_turns() {
+        let turns = [(1, 10), (2, 11), (3, 50), (4, 51), (5, 90)];
+        // Nothing between: one span.
+        assert_eq!(cut_pieces(&turns, &[]).len(), 1);
+        // Something at 30 (between 11 and 50) and 70 (between 51 and 90).
+        let spans = cut_pieces(&turns, &[30, 70, 200]);
+        assert_eq!(
+            spans,
+            vec![
+                Span { from_seq: 1, to_seq: 2, first_at: 10, last_at: 11 },
+                Span { from_seq: 3, to_seq: 4, first_at: 50, last_at: 51 },
+                Span { from_seq: 5, to_seq: 5, first_at: 90, last_at: 90 },
+            ]
+        );
+        // A tie with a turn's own time is not between.
+        assert_eq!(cut_pieces(&turns, &[11, 50]).len(), 1);
+        assert!(cut_pieces(&[], &[1]).is_empty());
+    }
+
+    #[test]
+    fn pieces_are_rows_placed_at_their_own_time_among_the_other_items() {
+        let id = Uuid::new_v4();
+        let turns = [(1, 10), (2, 11), (3, 50), (4, 51)];
+        let mut items = session_items(id, "Pull request", None, 10, 60, &turns, &[30]);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].label, "Pull request \u{b7} part 1");
+        assert_ne!(items[0].id, id);
+        assert_ne!(items[0].id, items[1].id);
+        assert_eq!((items[0].at, items[1].at), (11, 60));
+        assert!(items[1].piece.as_ref().unwrap().last);
+        assert_eq!(items[0].conversation(), Some(id));
+        // Ordered by last update, with the other session in between.
+        items.push(Item { at: 40, started: 30, ..session(40) });
+        let groups = build_groups(items, &[], "pr_draft");
+        let ats: Vec<_> = groups[0].items.iter().map(|i| i.at).collect();
+        assert_eq!(ats, vec![11, 40, 60]);
+    }
+
+    #[test]
+    fn an_uncut_session_stays_one_row_with_its_own_id() {
+        let id = Uuid::new_v4();
+        let items = session_items(id, "Implement", None, 1, 20, &[(1, 5), (2, 6)], &[]);
+        assert_eq!(items.len(), 1);
+        assert_eq!((items[0].id, items[0].at, items[0].started), (id, 20, 1));
+        assert!(items[0].piece.is_none());
+        // No turns loaded: still one row, ordered by last update.
+        assert_eq!(session_items(id, "x", None, 1, 20, &[], &[5]).len(), 1);
     }
 
     #[test]

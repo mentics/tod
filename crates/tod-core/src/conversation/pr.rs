@@ -311,7 +311,7 @@ fn render_work(live: &[crate::pr_readiness::LivePr], guidance: &str) -> String {
 /// How to go about the work when tod reviews the change before it is pushed
 /// (`pr_draft` with its review steps on): change and commit, nothing more.
 const CHANGE_GUIDANCE: &str = "
-Do it now, in order: bring the branch up to date with its base, fix what the feedback needs, run the tests, and commit. Then stop: do not push, and do not answer any thread yet. tod reviews your commits first, and once that review is clean you will be told to push and answer. Apply this phase's skills, given at the start of this session, throughout.
+Do it now, in order: pull the branch (tod merges a base that only moved in on GitHub itself; merge the base in yourself only to resolve a conflict), fix what the feedback needs, run the tests, and commit. Then stop: do not push, and do not answer any thread yet. tod reviews your commits first, and once that review is clean you will be told to push and answer. Apply this phase's skills, given at the start of this session, throughout.
 
 Stay within what this node set out to do. Fix a problem this change introduces. A problem that was already there, or one whose fix would enlarge the scope, you leave alone now and reject, giving the reason, when you are told to answer. A thread you cannot decide goes to the user with `tod-cli decisions ask`.
 

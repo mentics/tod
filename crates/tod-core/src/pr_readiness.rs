@@ -1191,7 +1191,10 @@ pub fn render_work(url: &str, assessment: &Assessment) -> String {
     for work in assessment.work() {
         out.push_str(&match work {
             Work::Conflict => "- it conflicts with its base branch: merge the base in and resolve\n".to_string(),
-            Work::Behind => "- it is behind its base branch: merge the base in\n".to_string(),
+            // Merged in by the conflict's own resolution; a branch only
+            // behind is tod's to update (`Autopilot::update_branches`).
+            Work::Behind if assessment.conflicted() => String::new(),
+            Work::Behind => "- it is behind its base branch: tod merges the base in on GitHub; pull the branch before you start\n".to_string(),
             Work::BranchesWithoutPr(branches) => branches_without_pr_line(&branches),
             Work::Threads(n) => format!("- {n} review thread(s) are open: `tod-cli pr threads`\n"),
             Work::FailingChecks(names) => failing_checks_line(assessment, &names),
@@ -2797,6 +2800,12 @@ pub trait PrFeed: Send + Sync {
     fn post_review(&self, _pr: &tod_store::github::NodePr, _post: &ReviewPost) -> Result<(), String> {
         Err("this feed does not post reviews".to_string())
     }
+    /// Merge the base branch into the pull request's branch on GitHub, as its
+    /// "Update branch" button does: how tod brings a branch that is only
+    /// behind up to date, with no agent (`Autopilot::update_branches`).
+    fn update_branch(&self, _pr: &tod_store::github::NodePr) -> Result<(), String> {
+        Err("this feed does not update branches".to_string())
+    }
 }
 
 /// What tod's own review of a pull request posts: one review with `body` as
@@ -2833,6 +2842,10 @@ impl PrFeed for GithubFeed {
 
     fn threads(&self, pr: &tod_store::github::NodePr) -> Result<Vec<tod_store::github::ReviewThread>, String> {
         self.0.list_review_threads(&pr.owner, &pr.repo, pr.pr_number).map_err(|err| err.to_string())
+    }
+
+    fn update_branch(&self, pr: &tod_store::github::NodePr) -> Result<(), String> {
+        self.0.update_pr_branch(&pr.owner, &pr.repo, pr.pr_number).map_err(|err| err.to_string())
     }
 
     fn changed_files(&self, pr: &tod_store::github::NodePr) -> Result<Vec<tod_store::github::PrFile>, String> {

@@ -461,6 +461,21 @@ pub const PR_HOUSEKEEPING_GAP: Duration = Duration::from_secs(30 * 60);
 /// live: two or three agent sessions per merge, all night.
 const PR_HOUSEKEEPING_LIMIT: u32 = 8;
 
+/// How long tod waits for GitHub to show a branch it updated
+/// (`Autopilot::update_branches`), and how often it looks meanwhile.
+const BRANCH_UPDATE_WAIT: Duration = Duration::from_secs(120);
+const BRANCH_UPDATE_POLL: Duration = Duration::from_secs(5);
+
+/// What `Autopilot::update_branches` did.
+enum BranchUpdate {
+    /// Nothing was due.
+    None,
+    /// A branch was updated on GitHub: look at the pull requests again.
+    Updated,
+    /// The run stops (GitHub failed, or the user stopped it).
+    Stop(Outcome),
+}
+
 /// Who a request is consumed by when a runner on this machine takes it.
 pub const LOCAL_CONSUMER: &str = "autopilot:local";
 
@@ -1434,6 +1449,14 @@ impl Autopilot {
             if self.ask_about_base_failures(fleet, &live, phase_key)? {
                 continue;
             }
+            match self.update_branches(fleet, hook, feed.as_ref(), &live, before_review)? {
+                BranchUpdate::None => {}
+                BranchUpdate::Updated => continue,
+                BranchUpdate::Stop(outcome) => {
+                    hook.waiting(None, None);
+                    return Ok(Some(outcome));
+                }
+            }
             let mut overall = pr_readiness::overall(&live);
             // A change the agent made and tod has not reviewed or pushed yet
             // (the run stopped in between) is finished first, whatever the
@@ -2388,6 +2411,118 @@ impl Autopilot {
         Ok(None)
     }
 
+    /// Brings each linked pull request that is behind its base, and does not
+    /// conflict with it, up to date on GitHub, as its "Update branch" button
+    /// does: no agent, and nothing owed after it. A merge of the base alone is
+    /// not a change of the pull request's own, so tod's review carries over to
+    /// the new head (`pr_draft_review::owed`, by `PrFeed::same_change`) and the
+    /// checks, which run on the node's checkout, are not touched. A conflict
+    /// is not this: the agent resolves it, and the resolution is reviewed.
+    ///
+    /// When: before any other work goes to the agent, so the agent never
+    /// merges a base that only moved; otherwise at most every housekeeping gap,
+    /// in `pr_draft`, or in `pr_review` once a person approved (merging needs
+    /// it up to date, and the person's review is not disturbed before that).
+    /// Not while a change the agent made is waiting for tod's review or its
+    /// push (`AutopilotState::pr_change`). Each update is noted on the node's
+    /// Activity. A failed update, or one GitHub does not show within two
+    /// minutes, is a failed look at GitHub (retried, then the user's).
+    fn update_branches<H: StepHook + ?Sized>(
+        &mut self,
+        fleet: &FleetStore,
+        hook: &mut H,
+        feed: &dyn crate::pr_readiness::PrFeed,
+        live: &[crate::pr_readiness::LivePr],
+        before_review: bool,
+    ) -> Result<BranchUpdate> {
+        use crate::pr_readiness::{self, HumanReview, Work};
+        if self.state.pr_change.is_some() {
+            return Ok(BranchUpdate::None);
+        }
+        let behind: Vec<&pr_readiness::LivePr> = live
+            .iter()
+            .filter(|p| !p.assessment.merged && p.assessment.behind() && !p.assessment.conflicted())
+            .collect();
+        if behind.is_empty() {
+            return Ok(BranchUpdate::None);
+        }
+        let other_work = live.iter().any(|p| p.assessment.work().iter().any(|w| !matches!(w, Work::Behind)));
+        let now = state::now_ms();
+        let gap_due = now >= self.state.loops.pr_base_updated_at_ms + self.housekeeping_gap.as_millis() as i64;
+        let wanted = |p: &&pr_readiness::LivePr| {
+            other_work || (gap_due && (before_review || p.assessment.human_review == HumanReview::Approved))
+        };
+        let behind: Vec<&pr_readiness::LivePr> = behind.into_iter().filter(wanted).collect();
+        if behind.is_empty() {
+            return Ok(BranchUpdate::None);
+        }
+        let phase = if before_review { "pr_draft" } else { "pr_review" };
+        hook.working_on("merging the moved base branch in on GitHub, as its Update branch button does");
+        let mut heads = Vec::new();
+        for p in &behind {
+            if let Err(err) = feed.update_branch(&p.pr) {
+                return Ok(BranchUpdate::Stop(github_wait::github_look_failed(
+                    fleet,
+                    self.node,
+                    false,
+                    &format!("updating {} with its base branch on GitHub: {err}", p.pr.url),
+                )?));
+            }
+            pr_readiness::forget_snapshot(&p.pr);
+            heads.push((p.pr.clone(), p.head_sha.clone()));
+        }
+        self.state.loops.pr_base_updated_at_ms = now;
+        self.save()?;
+        // GitHub makes the merge commit after it answers: wait until the head
+        // moved, so the next look (and the agent) sees the updated branch.
+        for (pr, was) in &heads {
+            let mut waited = Duration::ZERO;
+            loop {
+                pr_readiness::forget_snapshot(pr);
+                let head = match feed.snapshot(pr) {
+                    Ok(snap) => snap.status.head_sha,
+                    Err(err) => {
+                        return Ok(BranchUpdate::Stop(github_wait::github_look_failed(fleet, self.node, false, &err)?));
+                    }
+                };
+                if head.is_some() && head != *was {
+                    break;
+                }
+                if waited >= BRANCH_UPDATE_WAIT {
+                    return Ok(BranchUpdate::Stop(github_wait::github_look_failed(
+                        fleet,
+                        self.node,
+                        false,
+                        &format!(
+                            "GitHub accepted updating {} with its base branch, but its head was still {} after {} seconds",
+                            pr.url,
+                            was.as_deref().unwrap_or("unknown"),
+                            BRANCH_UPDATE_WAIT.as_secs()
+                        ),
+                    )?));
+                }
+                if let Some(reason) = self.sleep_watching(fleet, hook, BRANCH_UPDATE_POLL)? {
+                    return Ok(BranchUpdate::Stop(Outcome::Stopped { reason }));
+                }
+                waited += BRANCH_UPDATE_POLL;
+            }
+            let entry = tod_store::node_timeline::TimelineEntry::new(
+                self.node,
+                tod_store::node_timeline::KIND_NOTE,
+                phase,
+                format!("Updated {} with its base branch", pr_readiness::pr_label(pr)),
+                false,
+                format!(
+                    "{} was behind its base branch, with no conflict. tod merged the base in on GitHub (its Update branch button); a merge of the base alone owes no review, no checks and no agent turn.",
+                    pr.url
+                ),
+            );
+            fleet.enqueue(tod_store::fleet::FleetMutation::RecordTimeline(Box::new(entry)))?;
+        }
+        fleet.writer().flush()?;
+        Ok(BranchUpdate::Updated)
+    }
+
     /// One round of work on the pull request's feedback in `pr_draft` with the
     /// review steps on ([`crate::pr_draft_review`]), reviewed before it
     /// reaches the pull request, in the stay's pull request conversation:
@@ -2397,8 +2532,9 @@ impl Autopilot {
     ///    answering anything ([`crate::conversation::pr::change_message`]),
     ///    then the later groups of the phase's skills run.
     /// 2. If the branch's change against its base differs from before
-    ///    ([`crate::pr_draft_review::branch_change`]; merging the base in
-    ///    alone does not count), tod's Review → Fix → Review loop runs on the
+    ///    ([`crate::pr_draft_review::pr_change`], in each pull request's own
+    ///    repository; merging the base in alone does not count, resolving a
+    ///    conflict with it always does), tod's Review → Fix → Review loop runs on the
     ///    local head until a review records nothing that stands
     ///    ([`Self::review_change`]), and that review records the head as the
     ///    one it cleared. A merge alone carries a clean review of the head
@@ -2429,16 +2565,10 @@ impl Autopilot {
         }
         let cwd = tod_store::fleet::provision::resolve_launch_cwd(fleet, &node.to_string())
             .context("finding the node's checkout, to review the pull request's change before it is pushed")?;
-        let base = live.iter().find_map(|p| p.base_ref.clone()).with_context(|| {
-            format!(
-                "GitHub did not say which branch {} merges into, so its change cannot be told from a merge of its base",
-                live.iter().map(|p| p.pr.url.as_str()).collect::<Vec<_>>().join(", ")
-            )
-        })?;
-        let change_of = |cwd: &tod_store::fleet::Workdir| {
-            pr_draft_review::branch_change(cwd, &base)
-                .with_context(|| format!("reading the branch's change against origin/{base} in {cwd}"))
-        };
+        // Each pull request's change, in its own repository's checkout: a
+        // pull request on a submodule is invisible to the superproject except
+        // as a moved pointer, which a merge of the base moves too.
+        let change_of = |cwd: &tod_store::fleet::Workdir| pr_draft_review::pr_change(cwd, live);
         let change = match self.state.pr_change.clone() {
             Some(change) => change,
             None => {
@@ -2447,6 +2577,7 @@ impl Autopilot {
                     before: change_of(&cwd)?,
                     made_at_ms: None,
                     changed: false,
+                    conflict: live.iter().any(|p| p.assessment.conflicted()),
                 };
                 self.state.pr_change = Some(change.clone());
                 self.save()?;
@@ -2491,7 +2622,10 @@ impl Autopilot {
                     return Ok(Some(Outcome::NeedsHuman { reason: NeedsHuman::Decision { pending } }));
                 }
                 let at = state::now_ms();
-                let changed = change_of(&cwd)? != change.before;
+                // Resolving a conflict with the base is reviewed whatever it
+                // left: a resolution can be wrong and still leave the lines
+                // as they were.
+                let changed = change.conflict || change_of(&cwd)? != change.before;
                 self.state.pr_change = Some(PrChange { made_at_ms: Some(at), changed, ..change });
                 self.save()?;
                 (at, changed)

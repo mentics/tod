@@ -91,6 +91,11 @@ pub struct PrChange {
     /// Whether the turn changed the branch's own change: when it did not (a
     /// merge of the base alone), no review of it is owed.
     pub changed: bool,
+    /// Whether the pull request conflicted with its base when the round
+    /// began: the agent's turn resolves it, and a resolution is always
+    /// reviewed.
+    #[serde(default)]
+    pub conflict: bool,
 }
 
 /// The later skill groups (`lifecycle_config::groups`, 1 and up) a finished
@@ -140,6 +145,10 @@ pub struct LoopCounters {
     /// When the last such round started (ms since the epoch).
     #[serde(default)]
     pub pr_housekeeping_at_ms: i64,
+    /// When tod last merged a moved base in on GitHub itself
+    /// (`Autopilot::update_branches`; ms since the epoch).
+    #[serde(default)]
+    pub pr_base_updated_at_ms: i64,
     /// Evaluator rejections in the current stay in the state being judged.
     #[serde(default)]
     pub evaluator_rejections: u32,

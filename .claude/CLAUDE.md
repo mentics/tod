@@ -197,8 +197,9 @@ same prompt. The project's bots and round limits are
 steps** on for `pr_draft` (`lifecycle_config::resolve_pr_draft_review`), feedback
 is reviewed before it is pushed (`Autopilot::pr_change_reviewed`): the PR agent
 fixes and commits without pushing or answering, then, if the branch's change
-against its base differs (`pr_draft_review::branch_change`; a merge of the base
-alone does not count), tod's Review → Fix → Review loop runs on the local head
+against its base differs (`pr_draft_review::pr_change`, in each pull request's
+own repository, a submodule's included; a merge of the base alone does not
+count, resolving a conflict with it always does), tod's Review → Fix → Review loop runs on the local head
 until clean (same round limit as `review`), and only then does the agent push
 and answer the threads; the clean review records that head (`pr_heads`). A head
 that reaches the PR without that loop is reviewed once nothing but a person is
@@ -206,7 +207,12 @@ left (`tod_core::pr_draft_review`), its findings posted on the PR as threads
 (`review_findings.pr_thread`); the `pr-pr_review.own-review` criterion gates on
 it. The same assessment answers the `pr →
 approved` criteria (`pr-approved.up-to-date`, `.threads-resolved`,
-`.review-current`, `.review-score`). Tests replace GitHub with
+`.review-current`, `.review-score`). A branch that is only behind its base (no conflict) is never agent work:
+tod merges the base in on GitHub itself, as its Update branch button does
+(`Autopilot::update_branches`, noted on the node's Activity), before any
+other work goes to the agent, else at most every housekeeping gap in
+`pr_draft` (in `pr_review` only once approved); no review, checks or turn
+follow. Tests replace GitHub with
 `pr_readiness::set_feed_override`.
 
 **Permissions while unattended** (`tod_core::permission`). A permission an agent asks for that

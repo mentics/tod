@@ -7,6 +7,11 @@
 //! the phase's configured commands (`activity_timeline`), and beside it
 //! what the chosen one shows: a session's transcript, a gate check's
 //! criteria, or one collapsible chunk per command that ran.
+//!
+//! A long-lived session is listed as pieces (`activity_timeline::cut_pieces`),
+//! one row per run of its turns with nothing else in between, each at its own
+//! time; rows are ordered by last activity. Choosing a piece shows only its
+//! turns (`shown_piece`); "Whole session" shows them all.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -86,6 +91,9 @@ pub struct TranscriptPanel {
     /// The gate check or command round shown instead of a transcript
     /// (`Watching::items`), when the node's activity is on one.
     shown_activity: Option<Uuid>,
+    /// The piece of `conversation_id` shown (a row of `Watching::items`),
+    /// when the activity is on part of a session; `None` shows it whole.
+    shown_piece: Option<Uuid>,
     /// The stored turns, as entries. Shared so a load can compare against
     /// them off the UI thread.
     stored: Arc<Vec<Entry>>,
@@ -166,6 +174,12 @@ fn run_label_base(c: &Conversation) -> String {
     .to_string()
 }
 
+/// Whether the row shows the running conversation's reply in flight (the
+/// last piece of a cut session).
+fn is_live(live_id: Option<Uuid>, item: &Item) -> bool {
+    live_id.is_some() && item.conversation() == live_id && item.piece.as_ref().is_none_or(|p| p.last)
+}
+
 /// A timestamp as the list shows it: the time today, else the date and time.
 fn format_time(ms: i64) -> String {
     use chrono::{Local, TimeZone};
@@ -183,7 +197,8 @@ fn format_time(ms: i64) -> String {
 /// of commands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Target {
-    Session(Uuid),
+    /// A conversation, and the piece of it shown (`None`: the whole).
+    Session(Uuid, Option<Uuid>),
     Entry(Uuid),
 }
 
@@ -237,6 +252,7 @@ impl TranscriptPanel {
             watching: None,
             cloud: None,
             shown_activity: None,
+            shown_piece: None,
             stored: Arc::new(Vec::new()),
             stored_dirty: false,
             loaded: false,
@@ -359,18 +375,22 @@ impl TranscriptPanel {
         let live_usage = running.as_ref().and_then(|(_, _, usage)| usage.clone());
         let chosen = match self.shown_activity {
             Some(entry) => Target::Entry(entry),
-            None => Target::Session(self.conversation_id),
+            None => Target::Session(self.conversation_id, self.shown_piece),
         };
         let (target, live) = match running {
             // The one the user chose stays; its reply streams in only while
             // it is the one running.
             Some((conversation, parts, _)) if pinned => (
                 Some(chosen),
-                if chosen == Target::Session(conversation) { parts } else { Vec::new() },
+                if matches!(chosen, Target::Session(c, p) if c == conversation && (p.is_none() || p == self.last_piece_of(conversation))) {
+                    parts
+                } else {
+                    Vec::new()
+                },
             ),
             // Mid-turn, here or in the node's cloud sandbox (whose reply
             // in flight arrives through the store): show it as it streams.
-            Some((conversation, parts, _)) => (Some(Target::Session(conversation)), parts),
+            Some((conversation, parts, _)) => (Some(Target::Session(conversation, self.last_piece_of(conversation))), parts),
             None if pinned => (Some(chosen), Vec::new()),
             // Nothing running (a cloud node's work arrives through the
             // store): follow the latest thing that happened, a session, a
@@ -383,9 +403,10 @@ impl TranscriptPanel {
             watching.live_usage = live_usage;
         }
         match target {
-            Some(Target::Session(id)) => {
+            Some(Target::Session(id, piece)) => {
                 self.shown_activity = None;
-                if id != self.conversation_id {
+                if id != self.conversation_id || piece != self.shown_piece {
+                    self.shown_piece = piece;
                     self.retarget(id, cx)
                 } else {
                     self.show(cx)
@@ -399,12 +420,18 @@ impl TranscriptPanel {
         }
     }
 
+    /// The id of the last piece of the watched node's session `conversation`,
+    /// `None` when it is not cut.
+    fn last_piece_of(&self, conversation: Uuid) -> Option<Uuid> {
+        self.watching.as_ref()?.items.iter().find(|i| i.piece.as_ref().is_some_and(|p| p.last && p.conversation == conversation)).map(|i| i.id)
+    }
+
     /// The most recent of the watched node's sessions, gate checks and command
     /// rounds.
     fn latest_target(&self) -> Option<Target> {
         let watching = self.watching.as_ref()?;
         let latest = watching.items.iter().max_by_key(|i| i.at)?;
-        Some(if latest.entry().is_some() { Target::Entry(latest.id) } else { Target::Session(latest.id) })
+        Some(if latest.entry().is_some() { Target::Entry(latest.id) } else { Target::Session(latest.conversation()?, latest.piece.as_ref().map(|_| latest.id)) })
     }
 
     /// Read what the watched node has done (its sessions, gate checks and
@@ -422,29 +449,45 @@ impl TranscriptPanel {
             let found = cx
                 .background_executor()
                 .spawn(async move {
-                    let (mut conversations, entries) = fleet.read(|conn| {
+                    let (conversations, entries, turn_times) = fleet.read(|conn| {
+                        let repo = ConversationRepo::new(conn);
+                        let mut conversations = repo.conversations_for_focus(Focus::Node(node))?;
+                        conversations.retain(|c| !matches!(c.protocol, ProtocolKind::Outline | ProtocolKind::Chat));
+                        let mut turn_times = Vec::with_capacity(conversations.len());
+                        for c in &conversations {
+                            turn_times.push(repo.turn_times(c.id)?);
+                        }
                         anyhow::Ok((
-                            ConversationRepo::new(conn).conversations_for_focus(Focus::Node(node))?,
+                            conversations,
                             tod_store::node_timeline::TimelineRepo::new(conn).list(node)?,
+                            turn_times,
                         ))
                     })?;
-                    conversations.retain(|c| !matches!(c.protocol, ProtocolKind::Outline | ProtocolKind::Chat));
-                    conversations.sort_by_key(|c| (c.created_at, c.updated_at));
                     let current = tod_core::lifecycle::current_state(&fleet, node).unwrap_or_default();
-                    let mut items: Vec<Item> = conversations
-                        .iter()
-                        .map(|c| Item {
-                            id: c.id,
-                            kind: ItemKind::Session,
-                            label: run_label(c),
-                            at: c.updated_at,
-                            started: c.created_at,
-                            failed: false,
-                            phase: session_phase(c),
-                        })
-                        .collect();
+                    // Anything else that happened, to cut a session at: every entry
+                    // (gate checks, command rounds, notes, phase changes) and every
+                    // other session's turns.
+                    let entry_times: Vec<i64> = entries.iter().map(|e| e.at).collect();
+                    let mut items: Vec<Item> = Vec::new();
+                    for (ix, c) in conversations.iter().enumerate() {
+                        let mut others = entry_times.clone();
+                        for (jx, times) in turn_times.iter().enumerate() {
+                            if jx != ix {
+                                others.extend(times.iter().map(|&(_, at)| at));
+                            }
+                        }
+                        items.extend(timeline::session_items(
+                            c.id,
+                            &run_label(c),
+                            session_phase(c),
+                            c.created_at,
+                            c.updated_at,
+                            &turn_times[ix],
+                            &others,
+                        ));
+                    }
                     items.extend(timeline::entry_items(&entries));
-                    items.sort_by_key(|i| (i.started, i.at));
+                    items.sort_by_key(|i| (i.at, i.started));
                     let groups = timeline::build_groups(items.clone(), &entries, &current);
                     anyhow::Ok((items, groups))
                 })
@@ -461,6 +504,10 @@ impl TranscriptPanel {
                             cx.notify();
                             // What is latest may have changed.
                             this.sync_watch(cx);
+                            // A piece shown may have grown.
+                            if this.shown_piece.is_some() {
+                                this.reload(cx);
+                            }
                         }
                     }
                     Err(err) => tracing::warn!("reading the node's activity: {err:#}"),
@@ -482,8 +529,14 @@ impl TranscriptPanel {
                 self.shown_activity = Some(id);
             } else {
                 self.shown_activity = None;
-                if id != self.conversation_id {
-                    self.retarget(id, cx);
+                // A row is a whole session or one piece of it.
+                let (conversation, piece) = match watching.items.iter().find(|i| i.id == id) {
+                    Some(item) => (item.conversation().unwrap_or(id), item.piece.as_ref().map(|_| id)),
+                    None => (id, None),
+                };
+                if conversation != self.conversation_id || piece != self.shown_piece {
+                    self.shown_piece = piece;
+                    self.retarget(conversation, cx);
                 }
             }
         }
@@ -535,10 +588,22 @@ impl TranscriptPanel {
                     )
                     .child("Follow latest"),
             );
+        if watching.pinned && self.shown_piece.is_some() && self.shown_activity.is_none() {
+            rows = rows.child(
+                style::menu_item(div().id("transcript-run-whole"), false)
+                    .flex_none()
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseDownEvent, _, cx| this.show_whole_session(cx)),
+                    )
+                    .child("Whole session"),
+            );
+        }
         for group in &watching.groups {
             let key = group.key;
             let open = watching.expanded_groups.contains(&key);
-            let live = group.items.iter().any(|i| watching.live_id == Some(i.id));
+            let live = group.items.iter().any(|i| is_live(watching.live_id, i));
             rows = rows.child(
                 style::menu_item(div().id(SharedString::from(format!("transcript-group-{key}"))), false)
                     .flex_none()
@@ -583,9 +648,13 @@ impl TranscriptPanel {
                 let current = watching.pinned
                     && match item.entry() {
                         Some(_) => self.shown_activity == Some(id),
-                        None => self.shown_activity.is_none() && self.conversation_id == id,
+                        None => {
+                            self.shown_activity.is_none()
+                                && item.conversation() == Some(self.conversation_id)
+                                && self.shown_piece == item.piece.as_ref().map(|_| id)
+                        }
                     };
-                let live = watching.live_id == Some(id);
+                let live = is_live(watching.live_id, item);
                 let mut label = div().flex_1().min_w_0().overflow_hidden().text_ellipsis();
                 if item.failed {
                     label = label.text_color(style::color::danger());
@@ -756,6 +825,20 @@ impl TranscriptPanel {
         self.conversation_id
     }
 
+    /// The turns (`seq`, inclusive) of the piece shown, when it is one.
+    fn shown_range(&self) -> Option<(i64, i64)> {
+        let id = self.shown_piece?;
+        let piece = self.watching.as_ref()?.items.iter().find(|i| i.id == id)?.piece.as_ref()?;
+        Some((piece.from_seq, piece.to_seq))
+    }
+
+    /// Show the whole of the session a piece is part of.
+    fn show_whole_session(&mut self, cx: &mut Context<Self>) {
+        if self.shown_piece.take().is_some() {
+            self.reload(cx);
+        }
+    }
+
     /// Point this column at a different conversation, in place.
     pub fn retarget(&mut self, conversation_id: Uuid, cx: &mut Context<Self>) {
         self.conversation_id = conversation_id;
@@ -780,6 +863,8 @@ impl TranscriptPanel {
         self.loading = true;
         let fleet = self.fleet.clone();
         let known = self.stored.clone();
+        // The turns of the piece shown, else all of them.
+        let range = self.shown_range();
         self._load = cx.spawn(async move |this, cx| {
             let (entries, session_name, meta) = cx
                 .background_executor()
@@ -787,7 +872,10 @@ impl TranscriptPanel {
                     let (turns, session_name, meta) = fleet
                         .read(|conn| {
                             let repo = ConversationRepo::new(conn);
-                            let turns = repo.turns(id)?;
+                            let turns = match range {
+                                Some((from, to)) => repo.turns_range(id, from, to)?,
+                                None => repo.turns(id)?,
+                            };
                             let row = repo.get(id)?;
                             let meta = row.as_ref().map(|c| (c.focus, c.protocol));
                             let session_name = row.and_then(|c| {
@@ -1365,6 +1453,73 @@ mod tests {
         view.update(cx, |view, cx| view.choose(None, cx));
         settle(cx);
         view.read_with(cx, |view, _| assert_eq!(view.shown_activity, Some(commands.id)));
+    }
+
+    /// A session something else happened in the middle of is listed as two
+    /// pieces around it, each showing only its own turns; the whole session
+    /// stays reachable.
+    #[gpui::test]
+    fn a_session_is_cut_around_what_happened_between_its_turns(cx: &mut TestAppContext) {
+        use crate::interview::agent::SharedAgent;
+        use std::sync::{Arc, Mutex};
+        use tod_store::node_timeline::{KIND_GATE, TimelineEntry};
+
+        let fixture = Fixture::new();
+        let session = add_conversation_under(&fixture, ProtocolKind::Pr);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let gate = TimelineEntry::new(fixture.node_id, KIND_GATE, "pr_draft", "Gate check", false, "[]".to_string());
+        fixture.store.enqueue(tod_store::fleet::FleetMutation::RecordGateTimeline(Box::new(gate.clone()))).unwrap();
+        fixture.store.writer().flush().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        for role in [TurnRole::User, TurnRole::Agent] {
+            fixture
+                .store
+                .interview(
+                    ACTOR_USER,
+                    InterviewCommand::AppendConversationTurn {
+                        conversation_id: session,
+                        role,
+                        body: "later".into(),
+                        parts: Vec::new(),
+                        sent_context: None,
+                        attachments: Vec::new(),
+                    },
+                )
+                .unwrap();
+        }
+
+        cx.update(gpui_component::init);
+        let agent: SharedAgent = Arc::new(Mutex::new(Box::new(crate::interview::agent::MockAgentProvider::new())));
+        let runs = cx.new(|_| AgentRuns::new(fixture.store.clone(), agent));
+        let (store, node, runs_in) = (fixture.store.clone(), fixture.node_id, runs.clone());
+        let slot = std::rc::Rc::new(RefCell::new(None));
+        let slot_in = slot.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let view = cx.new(|cx| TranscriptPanel::watching(node, store, runs_in, window, cx));
+            *slot_in.borrow_mut() = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let view = slot.borrow_mut().take().unwrap();
+        settle(cx);
+        let (first, second) = view.read_with(cx, |view, _| {
+            let items = &view.watching.as_ref().unwrap().items;
+            assert_eq!(items.len(), 3);
+            assert!(items[0].piece.is_some() && items[1].id == gate.id && items[2].piece.is_some());
+            assert_eq!((items[0].label.as_str(), items[2].label.as_str()), ("Pull request \u{b7} part 1", "Pull request \u{b7} part 2"));
+            (items[0].id, items[2].id)
+        });
+        view.update(cx, |view, cx| view.choose(Some(second), cx));
+        settle(cx);
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.conversation_id(), session);
+            assert_eq!(view.panel.read(cx).entries().len(), 2);
+        });
+        view.update(cx, |view, cx| view.choose(Some(first), cx));
+        settle(cx);
+        view.read_with(cx, |view, cx| assert_eq!(view.panel.read(cx).entries().len(), 2));
+        view.update(cx, |view, cx| view.show_whole_session(cx));
+        settle(cx);
+        view.read_with(cx, |view, cx| assert_eq!(view.panel.read(cx).entries().len(), 4));
     }
 
     #[gpui::test]
