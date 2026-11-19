@@ -23,6 +23,7 @@ use tod_store::settings::InterviewContextSettings;
 
 mod lost_work;
 mod push_failure;
+mod quiet_resume;
 
 /// Plays every protocol's mock agent; each run finishes at once.
 struct FakeAgent {

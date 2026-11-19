@@ -606,6 +606,10 @@ impl<F: FnMut(LocalEvent)> StepHook for Hook<'_, F> {
         self.say(what);
     }
 
+    fn wait_over(&mut self) {
+        self.begin_work(Some("running on this machine"));
+    }
+
     fn at(&mut self, fleet: &FleetStore, boundary: Boundary) -> Result<Option<String>> {
         let mut blocked: Option<String> = None;
         if boundary == Boundary::Step {

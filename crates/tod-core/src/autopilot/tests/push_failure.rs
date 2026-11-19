@@ -9,7 +9,7 @@ use crate::autopilot::local::{Hook, LocalEvent, PAUSED, PUSH_RETRY, Request, pus
 use std::sync::atomic::{AtomicBool, AtomicU8};
 
 /// The node's worktree is the clone, so `push_node_branch` has a branch to push.
-fn node_works_in(fx: &Fixture, workspace: &std::path::Path) {
+pub(super) fn node_works_in(fx: &Fixture, workspace: &std::path::Path) {
     fx.fleet
         .enqueue(tod_store::fleet::FleetMutation::RecordFilesLocation {
             location: tod_store::fleet::FilesLocation {

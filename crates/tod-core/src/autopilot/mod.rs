@@ -43,7 +43,7 @@ use crate::conversation::protocol::protocol_for;
 use crate::lifecycle;
 use state::{PendingGroups, PrChange};
 use crate::lifecycle_next::{NextStep, Standing, next_step};
-use crate::phase::{PhaseStanding, settle_gate};
+use crate::phase::PhaseStanding;
 use tod_store::phase::PhaseRepo;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -137,6 +137,12 @@ pub trait StepHook {
     /// The run is working on `what` that is not one agent turn it already
     /// shows (the next group of the phase's skills): for showing where it is.
     fn working_on(&mut self, _what: &str) {}
+
+    /// The wait this run was resumed from no longer holds (the gate cleared,
+    /// the node moved on, GitHub shows nothing to wait for): a run that
+    /// re-checked it quietly says what it does now instead of leaving the old
+    /// wait on the node's row (gap 80).
+    fn wait_over(&mut self) {}
 
     /// The run is waiting on something outside (a bot's review, CI) and no
     /// agent is working: `Some(what)` while it waits, `None` when it stops.
@@ -783,6 +789,9 @@ impl Autopilot {
                 hook.waiting(None, None);
                 return self.finish(outcome);
             }
+            if lifecycle != "pr_draft" {
+                hook.wait_over();
+            }
             let standing = fleet.read(|conn| Standing::load(conn, self.node, &lifecycle))?;
             let Some(step) = next_step(&standing) else {
                 let reason = if standing.steps_need_user > 0 {
@@ -963,7 +972,7 @@ impl Autopilot {
         lifecycle: &str,
     ) -> Result<ChecksStep> {
         let node = self.node;
-        let round = crate::checks::run_stale(fleet, node, lifecycle)?;
+        let round = crate::checks::run_stale_notifying(fleet, node, lifecycle, &mut |what| hook.working_on(what))?;
         if round.runs.is_empty() {
             return Ok(ChecksStep::Proceed);
         }
@@ -1074,7 +1083,7 @@ impl Autopilot {
             return Ok(Some(outcome));
         }
         let branch_template = tod_store::TodSettings::load(&tod_store::TodPaths::at(&self.config.data_root))?.branch_template;
-        let gate = settle_gate(fleet, self.node, &branch_template)?;
+        let gate = crate::phase::settle_gate_notifying(fleet, self.node, &branch_template, &mut |what| hook.working_on(what))?;
         // Only configured checks failing (they ran just now, on files changed
         // since the loop's own look): back to the loop, which sends them to the
         // fix agent.
@@ -1110,6 +1119,8 @@ impl Autopilot {
         if lifecycle::advance(fleet, self.node)?.is_none() {
             return Ok(Some(Outcome::Done));
         }
+        // The wait this run was resumed from, if any, is over.
+        hook.wait_over();
         self.record(fleet, "advance", from, None)?;
         Ok(None)
     }

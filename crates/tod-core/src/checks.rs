@@ -901,6 +901,15 @@ fn current_in_made_files(fleet: &FleetStore, node: Uuid, key: &str, checks: &[Ch
 /// Does nothing, and returns an empty round, when none is configured. Git,
 /// Docker, or a sandbox may be involved: never call it on the UI thread.
 pub fn run_stale(fleet: &FleetStore, node: Uuid, state: &str) -> Result<Round> {
+    run_stale_notifying(fleet, node, state, &mut |_| {})
+}
+
+/// [`run_stale`], telling `on_work` (once, with what it is doing) just before
+/// it does real work: making the node's files or running a command. A look
+/// that finds every check current never calls it, so a caller that stays
+/// "waiting" through a cheap re-check can say "working" exactly when the
+/// minutes begin (gap 80).
+pub fn run_stale_notifying(fleet: &FleetStore, node: Uuid, state: &str, on_work: &mut dyn FnMut(&str)) -> Result<Round> {
     let Some(key) = phase_key(state) else { return Ok(Round::default()) };
     let checks = fleet.read(|conn| configured(conn, node, state))?;
     if checks.is_empty() {
@@ -914,6 +923,7 @@ pub fn run_stale(fleet: &FleetStore, node: Uuid, state: &str) -> Result<Round> {
         return Ok(round);
     }
     // A check has to run: the files are used now.
+    on_work(&format!("running the {} checks", tod_store::settings::lifecycle_display_name(state)));
     let cwd = tod_store::fleet::provision::resolve_launch_cwd(fleet, &node.to_string())
         .with_context(|| format!("find the files to run the {state} checks in"))?;
     let tree = Tree::new(&cwd)?;

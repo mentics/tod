@@ -146,6 +146,17 @@ pub fn check_gate(conn: &Connection, node: Uuid, from: &str) -> Result<GateCheck
 /// `ready` → `active` gate it gives the node's Files a branch when it has
 /// none, which that gate requires.
 pub fn settle_gate(fleet: &FleetStore, node: Uuid, branch_template: &str) -> Result<GateCheck> {
+    settle_gate_notifying(fleet, node, branch_template, &mut |_| {})
+}
+
+/// [`settle_gate`], telling `on_work` before it does more than read (the
+/// phase's configured checks running, see `checks::run_stale_notifying`).
+pub fn settle_gate_notifying(
+    fleet: &FleetStore,
+    node: Uuid,
+    branch_template: &str,
+    on_work: &mut dyn FnMut(&str),
+) -> Result<GateCheck> {
     // The check may call GitHub: while it runs the node is being worked on,
     // and says so (`tod_core::next_actor`).
     let gate = tod_store::activity::with_lease(
@@ -153,7 +164,7 @@ pub fn settle_gate(fleet: &FleetStore, node: Uuid, branch_template: &str) -> Res
         node,
         tod_store::activity::KIND_GATE_CHECK,
         &crate::next_actor::this_process(),
-        || settle_gate_unleased(fleet, node, branch_template),
+        || settle_gate_unleased(fleet, node, branch_template, on_work),
     )??;
     record_gate_timeline(fleet, node, &gate)?;
     Ok(gate)
@@ -189,14 +200,14 @@ fn record_gate_timeline(fleet: &FleetStore, node: Uuid, gate: &GateCheck) -> Res
     Ok(())
 }
 
-fn settle_gate_unleased(fleet: &FleetStore, node: Uuid, branch_template: &str) -> Result<GateCheck> {
+fn settle_gate_unleased(fleet: &FleetStore, node: Uuid, branch_template: &str, on_work: &mut dyn FnMut(&str)) -> Result<GateCheck> {
     let from = crate::lifecycle::current_state(fleet, node)?;
     if from == "ready" {
         crate::gate::derived::generate_missing_branch(fleet, node, branch_template)?;
     }
     // The phase's configured checks run first, those whose files changed since
     // their last run; a command that cannot run is an error, not a failure.
-    let round = crate::checks::run_stale(fleet, node, &from)?;
+    let round = crate::checks::run_stale_notifying(fleet, node, &from, on_work)?;
     if let Some(run) = round.broken().next() {
         anyhow::bail!("the check `{}` could not run: {}", crate::checks::run_name(run), crate::checks::broken_why(run));
     }
