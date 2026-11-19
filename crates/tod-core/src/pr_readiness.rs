@@ -312,6 +312,9 @@ pub struct Assessment {
     /// are never agent work and never a turn to lose; the user is asked once
     /// ([`crate::check_unrelated`]) what to do about them.
     pub base_failures: Vec<tod_store::github::BaseFailure>,
+    /// A failing check that could not be compared with the base branch, and why
+    /// ([`PrStatus::base_notes`]): no proof either way, shown rather than hidden.
+    pub base_notes: Vec<(String, String)>,
     /// A check is still running, whatever else failed.
     pub checks_running: bool,
     /// The head commit this was read at; a standing for a failing check
@@ -567,6 +570,7 @@ impl Assessment {
             failing_signatures: snapshot.status.failing_signatures.clone(),
             signature_notes: snapshot.status.signature_notes.clone(),
             base_failures: snapshot.status.base_failures.clone(),
+            base_notes: snapshot.status.base_notes.clone(),
             checks_running: snapshot.status.checks_running,
             head_sha: snapshot.status.head_sha.clone(),
             check_standings: Vec::new(),
@@ -1230,6 +1234,11 @@ fn failing_checks_line(assessment: &Assessment, names: &[String]) -> String {
             out.push_str(&format!(
                 "- note on \"{check}\": tod could not tell how it fails, so the user's answer about it cannot carry across pushes: {why}\n"
             ));
+        }
+    }
+    for (check, why) in &assessment.base_notes {
+        if names.iter().any(|n| n == check) {
+            out.push_str(&format!("- note on \"{check}\": {why}\n"));
         }
     }
     if !here.is_empty() {

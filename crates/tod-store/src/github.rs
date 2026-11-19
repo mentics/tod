@@ -364,6 +364,9 @@ pub struct PrStatus {
     /// proof ([`Github::base_failures`]); filled by [`Github::get_pr_snapshot`],
     /// empty from [`Github::get_pr_status`].
     pub base_failures: Vec<BaseFailure>,
+    /// For a failing check that could not be compared with the base branch
+    /// (a change too large to diff), `(name, why)`: no proof, and the reason.
+    pub base_notes: Vec<(String, String)>,
     /// Some check is still running (a status `pending`, a run not completed),
     /// whatever else failed: `checks` says `failure` first.
     pub checks_running: bool,
@@ -480,6 +483,13 @@ pub fn error_paths(lines: &[String]) -> Vec<String> {
 fn path_in_change(path: &str, files: &[String]) -> bool {
     let path = path.trim_start_matches("./");
     files.iter().any(|f| path == f || path.ends_with(&format!("/{f}")) || f.ends_with(&format!("/{path}")))
+}
+
+/// What [`Github::base_failures`] found: the proofs, and the checks it could not compare.
+#[derive(Debug, Clone, Default)]
+pub struct BaseLook {
+    pub failures: Vec<BaseFailure>,
+    pub notes: Vec<(String, String)>,
 }
 
 /// A failing run on a base head, with the failure text it gave.
@@ -1126,6 +1136,7 @@ impl Github {
             signature_notes,
             failing_evidence,
             base_failures: Vec::new(),
+            base_notes: Vec::new(),
             checks_running,
             head_sha: raw.head.as_ref().map(|h| h.sha.clone()),
             head_committed_at: None,
@@ -1667,16 +1678,67 @@ impl Github {
         )))
     }
 
+    /// The base branch's head and its failing runs with their failure texts,
+    /// shared by every pull request on it for [`BASE_HEAD_REMEMBERED`]. Only a
+    /// successful read is kept: a failed one is retried by the next look.
+    fn base_head(&self, owner: &str, repo: &str, base: &str) -> Result<BaseHead, GithubError> {
+        let key = format!("{}|{owner}/{repo}|{base}", self.api);
+        if let Some(hit) = base_head_get(&key) {
+            return Ok(hit);
+        }
+        let sha = self.branch_sha(owner, repo, base)?;
+        let runs = self.get_check_runs(owner, repo, &sha)?;
+        let failing: Vec<&CheckRunRaw> = runs
+            .check_runs
+            .iter()
+            .filter(|r| r.status == "completed" && matches!(r.conclusion.as_deref(), Some("failure" | "timed_out")))
+            .collect();
+        let head = if failing.len() > MAX_BASE_RUNS {
+            tracing::warn!(target: "tod::github", "{owner}/{repo}: {base} has {} failing check runs, too many to compare with", failing.len());
+            BaseHead { sha, runs: None }
+        } else {
+            let mut base_runs: Vec<BaseRun> = Vec::new();
+            for run in failing {
+                let Some(name) = run.name.clone() else { continue };
+                let failure = self.run_signature(owner, repo, run)?;
+                if let Ok(signature) = failure.signature {
+                    base_runs.push(BaseRun { name, url: run.html_url.clone(), signature, lines: failure.lines });
+                }
+            }
+            BaseHead { sha, runs: Some(base_runs) }
+        };
+        base_head_put(key, head.clone());
+        Ok(head)
+    }
+
+    /// The files of `base_sha...head_sha`; see [`CompareOutcome`].
+    fn changed_files(&self, owner: &str, repo: &str, base_sha: &str, head_sha: &str) -> Result<CompareOutcome, GithubError> {
+        let key = format!("{}|{owner}/{repo}|{base_sha}|{head_sha}", self.api);
+        if let Some(hit) = compare_cache_get(&key) {
+            return Ok(hit);
+        }
+        let outcome = match self.compare_files(owner, repo, base_sha, head_sha) {
+            Ok(files) => Ok(files.into_iter().map(|f| f.filename).collect()),
+            Err(err) if err.is_transient() => return Err(err),
+            Err(err) => Err(err.to_string()),
+        };
+        compare_cache_put(key, outcome.clone());
+        Ok(outcome)
+    }
+
     /// The failing checks of `status` whose failure also exists on its base
-    /// branch's head, each with its proof ([`base_proof`]). Only a check whose
-    /// failure text is known can have one; the base head's failing check runs
-    /// are read once each (their failures never change, [`signature_cache`]).
-    /// A base with more than [`MAX_BASE_RUNS`] failing runs, or a change too
-    /// large to list its files, proves nothing (the check stays the change's
-    /// to explain); a failed request is an error, as everywhere.
-    pub fn base_failures(&self, owner: &str, repo: &str, status: &PrStatus) -> Result<Vec<BaseFailure>, GithubError> {
+    /// branch's head, each with its proof ([`base_proof`]), and a note for each
+    /// check that could not be compared. Only a check whose failure text is
+    /// known can have a proof. The base head and its failing runs are read once
+    /// for every pull request on that base ([`Self::base_head`]) and a diff
+    /// once per pair of commits. A base with more than [`MAX_BASE_RUNS`]
+    /// failing runs proves nothing (the check stays the change's to explain);
+    /// a change too large to list its files proves nothing and says so in a
+    /// note; a transient failure is an error, as everywhere.
+    pub fn base_failures(&self, owner: &str, repo: &str, status: &PrStatus) -> Result<BaseLook, GithubError> {
+        let mut look = BaseLook::default();
         let (Some(base), Some(head)) = (status.base_ref.as_deref(), status.head_sha.as_deref()) else {
-            return Ok(Vec::new());
+            return Ok(look);
         };
         let candidates: Vec<&String> = status
             .failing_checks
@@ -1684,38 +1746,24 @@ impl Github {
             .filter(|c| !status.failure_signature_of(c).is_empty())
             .collect();
         if status.merged || candidates.is_empty() {
-            return Ok(Vec::new());
+            return Ok(look);
         }
-        let base_sha = self.branch_sha(owner, repo, base)?;
-        let runs = self.get_check_runs(owner, repo, &base_sha)?;
-        let failing: Vec<&CheckRunRaw> = runs
-            .check_runs
-            .iter()
-            .filter(|r| r.status == "completed" && matches!(r.conclusion.as_deref(), Some("failure" | "timed_out")))
-            .collect();
-        if failing.len() > MAX_BASE_RUNS {
-            tracing::warn!(target: "tod::github", "{owner}/{repo}: {base} has {} failing check runs, too many to compare with", failing.len());
-            return Ok(Vec::new());
-        }
-        let mut base_runs: Vec<BaseRun> = Vec::new();
-        for run in failing {
-            let Some(name) = run.name.clone() else { continue };
-            let failure = self.run_signature(owner, repo, run)?;
-            if let Ok(signature) = failure.signature {
-                base_runs.push(BaseRun { name, url: run.html_url.clone(), signature, lines: failure.lines });
-            }
-        }
-        if base_runs.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut diff: Option<Vec<String>> = None;
+        let base_head = self.base_head(owner, repo, base)?;
+        let Some(base_runs) = base_head.runs.as_deref().filter(|r| !r.is_empty()) else {
+            return Ok(look);
+        };
+        let base_sha = base_head.sha.as_str();
+        let mut diff: Option<CompareOutcome> = None;
         let mut changed = || -> Result<Vec<String>, GithubError> {
             if diff.is_none() {
-                diff = Some(self.compare_files(owner, repo, base, head)?.into_iter().map(|f| f.filename).collect());
+                diff = Some(self.changed_files(owner, repo, base_sha, head)?);
             }
-            Ok(diff.clone().unwrap_or_default())
+            match diff.as_ref() {
+                Some(Ok(files)) => Ok(files.clone()),
+                Some(Err(why)) => Err(GithubError::Api(why.clone())),
+                None => Err(GithubError::Api("the change was not compared".into())),
+            }
         };
-        let mut out = Vec::new();
         for check in candidates {
             let lines = status
                 .failing_evidence
@@ -1723,26 +1771,35 @@ impl Github {
                 .find(|(n, _)| n == check)
                 .map(|(_, l)| l.as_slice())
                 .unwrap_or_default();
-            match base_proof(check, &status.failure_signature_of(check), lines, &base_runs, &mut changed) {
-                Ok(Some((run, proof))) => out.push(BaseFailure {
+            match base_proof(check, &status.failure_signature_of(check), lines, base_runs, &mut changed) {
+                Ok(Some((run, proof))) => look.failures.push(BaseFailure {
                     check: check.clone(),
                     base_branch: base.to_string(),
-                    base_sha: base_sha.clone(),
+                    base_sha: base_sha.to_string(),
                     base_check: run.name,
                     base_url: run.url,
                     proof,
                 }),
                 Ok(None) => {}
                 Err(err) if err.is_transient() => return Err(err),
-                Err(err) => tracing::warn!(target: "tod::github", "{owner}/{repo}: \"{check}\" cannot be compared with {base}: {err}"),
+                Err(err) => {
+                    // No proof (the conservative answer), but never silently.
+                    tracing::warn!(target: "tod::github", "{owner}/{repo}: \"{check}\" cannot be compared with {base}: {err}");
+                    look.notes.push((
+                        check.clone(),
+                        format!("it fails on {base} too, but the change could not be compared with {base} to tell whether that is the same failure: {err}"),
+                    ));
+                }
             }
         }
-        Ok(out)
+        Ok(look)
     }
 
     pub fn get_pr_snapshot(&self, owner: &str, repo: &str, number: i64) -> Result<PrSnapshot, GithubError> {
         let mut status = self.get_pr_status(owner, repo, number)?;
-        status.base_failures = self.base_failures(owner, repo, &status)?;
+        let look = self.base_failures(owner, repo, &status)?;
+        status.base_failures = look.failures;
+        status.base_notes = look.notes;
         if let Some(sha) = status.head_sha.clone() {
             status.head_committed_at = self.commit_date(owner, repo, &sha).ok().flatten();
         }
@@ -2796,6 +2853,66 @@ fn signature_cache_put(key: String, result: RunFailure) {
     }
     let at = result.signature.is_err().then(std::time::Instant::now);
     cache.insert(key, (result, at));
+}
+
+/// How long a base branch's head and its failing runs are remembered. The
+/// base moves when something merges (minutes apart at the busiest) and a
+/// stale view only delays a proof or its withdrawal by this long, while every
+/// pull request on the repository shares one read: 3 minutes is at most 20
+/// reads an hour per base for the whole process (it was 60 per blocked pull
+/// request). No webhook is consulted: a push to the base reaches no code here,
+/// so the TTL is the whole invalidation, and a new head is seen within it.
+const BASE_HEAD_REMEMBERED: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// The base branch's head and what its failing check runs failed with.
+#[derive(Debug, Clone)]
+struct BaseHead {
+    sha: String,
+    /// `None`: more than [`MAX_BASE_RUNS`] runs fail, so nothing is compared.
+    runs: Option<Vec<BaseRun>>,
+}
+
+type BaseHeadCache = std::collections::HashMap<String, (BaseHead, std::time::Instant)>;
+
+/// Base heads by API, repository and branch, with when each was read; see
+/// [`Github::base_head`].
+fn base_head_cache() -> &'static std::sync::Mutex<BaseHeadCache> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<BaseHeadCache>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+fn base_head_get(key: &str) -> Option<BaseHead> {
+    let cache = base_head_cache().lock().unwrap_or_else(|e| e.into_inner());
+    cache.get(key).filter(|(_, at)| at.elapsed() < BASE_HEAD_REMEMBERED).map(|(h, _)| h.clone())
+}
+
+fn base_head_put(key: String, head: BaseHead) {
+    let mut cache = base_head_cache().lock().unwrap_or_else(|e| e.into_inner());
+    cache.retain(|_, (_, at)| at.elapsed() < BASE_HEAD_REMEMBERED);
+    cache.insert(key, (head, std::time::Instant::now()));
+}
+
+/// The files `base_sha...head_sha` changes, or why they cannot be listed. Both
+/// ends are commits, so the answer never changes and is kept (a failure that
+/// is not transient too: a diff that is too large stays too large).
+type CompareOutcome = Result<Vec<String>, String>;
+
+fn compare_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, CompareOutcome>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, CompareOutcome>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+fn compare_cache_get(key: &str) -> Option<CompareOutcome> {
+    compare_cache().lock().unwrap_or_else(|e| e.into_inner()).get(key).cloned()
+}
+
+fn compare_cache_put(key: String, outcome: CompareOutcome) {
+    let mut cache = compare_cache().lock().unwrap_or_else(|e| e.into_inner());
+    if cache.len() > 2000 {
+        cache.clear();
+    }
+    cache.insert(key, outcome);
 }
 
 /// A short, stable fingerprint of why a check fails, so that an answer about
@@ -4079,9 +4196,98 @@ mod tests {
         all.extend(replies);
         let expected = all.len();
         let (url, handle) = serve_canned(all);
-        let found = client(&url, &[]).base_failures("o", "r", status).unwrap();
+        // A repository of its own: the base head is remembered per repository.
+        let found = client(&url, &[]).base_failures("o", &unique_repo(), status).unwrap().failures;
         assert_eq!(handle.join().unwrap(), expected);
         found
+    }
+
+    fn unique_repo() -> String {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        format!("r{}", N.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// `pyright_status` on another head.
+    fn pyright_status_at(annotations: &'static str, head: &str) -> PrStatus {
+        PrStatus { head_sha: Some(head.into()), ..pyright_status(annotations) }
+    }
+
+    #[test]
+    fn the_base_head_is_read_once_for_every_pull_request_polled_within_its_ttl() {
+        let a = pyright_annotations(PYRIGHT_PATH, "fitz is not a known attribute");
+        // The base runs the tool as `update`: each head's diff is read once;
+        // the base's sha, runs and failure text are read once in all.
+        let (url, handle) = serve_canned(vec![
+            ("200 OK", r#"{"sha":"9e052682a4721f9d9b810dfd299ea4a876753e69"}"#),
+            ("200 OK", base_runs("update", 7100)),
+            ("200 OK", job_json()),
+            ("200 OK", a),
+            ("200 OK", r#"{"files":[{"filename":"web/app.ts"}]}"#),
+            ("200 OK", r#"{"files":[{"filename":"web/other.ts"}]}"#),
+        ]);
+        let gh = client(&url, &[]);
+        let repo = unique_repo();
+        for _ in 0..4 {
+            for head in ["headsha1", "headsha2"] {
+                let look = gh.base_failures("o", &repo, &pyright_status_at(a, head)).unwrap();
+                assert_eq!(look.failures.len(), 1, "{look:?}");
+                assert!(look.notes.is_empty());
+            }
+        }
+        // Six requests were answered; an eighth poll's extra would have been refused.
+        assert_eq!(handle.join().unwrap(), 6);
+    }
+
+    #[test]
+    fn a_base_that_moved_is_read_again_once_its_ttl_has_passed() {
+        let a = pyright_annotations(PYRIGHT_PATH, "fitz is not a known attribute");
+        let (url, handle) = serve_canned(vec![
+            ("200 OK", r#"{"sha":"1111111111111111111111111111111111111111"}"#),
+            ("200 OK", base_runs("pyright", 7110)),
+            ("200 OK", job_json()),
+            ("200 OK", a),
+            ("200 OK", r#"{"sha":"2222222222222222222222222222222222222222"}"#),
+            ("200 OK", base_runs("pyright", 7111)),
+            ("200 OK", job_json()),
+            ("200 OK", a),
+        ]);
+        let gh = client(&url, &[]);
+        let repo = unique_repo();
+        let status = pyright_status(a);
+        let first = gh.base_failures("o", &repo, &status).unwrap();
+        assert!(first.failures[0].base_sha.starts_with("1111"));
+        // Age the entry past its TTL.
+        {
+            let mut cache = base_head_cache().lock().unwrap();
+            for (_, (_, at)) in cache.iter_mut().filter(|(k, _)| k.contains(&format!("o/{repo}|"))) {
+                *at = std::time::Instant::now() - BASE_HEAD_REMEMBERED - std::time::Duration::from_secs(1);
+            }
+        }
+        let second = gh.base_failures("o", &repo, &status).unwrap();
+        assert!(second.failures[0].base_sha.starts_with("2222"), "{second:?}");
+        assert_eq!(handle.join().unwrap(), 8);
+    }
+
+    #[test]
+    fn a_diff_that_cannot_be_listed_gives_no_proof_and_a_note_and_is_asked_once() {
+        let a = pyright_annotations(PYRIGHT_PATH, "fitz is not a known attribute");
+        let (url, handle) = serve_canned(vec![
+            ("200 OK", r#"{"sha":"9e052682a4721f9d9b810dfd299ea4a876753e69"}"#),
+            ("200 OK", base_runs("update", 7120)),
+            ("200 OK", job_json()),
+            ("200 OK", a),
+            ("422 Unprocessable Entity", r#"{"message":"diff too large"}"#),
+        ]);
+        let gh = client(&url, &[]);
+        let repo = unique_repo();
+        for _ in 0..3 {
+            let look = gh.base_failures("o", &repo, &pyright_status(a)).unwrap();
+            assert!(look.failures.is_empty(), "{look:?}");
+            assert_eq!(look.notes.len(), 1, "{look:?}");
+            assert_eq!(look.notes[0].0, "pyright");
+            assert!(look.notes[0].1.contains("could not be compared with main"), "{}", look.notes[0].1);
+        }
+        assert_eq!(handle.join().unwrap(), 5);
     }
 
     #[test]
@@ -4157,7 +4363,7 @@ mod tests {
         blind.failing_signatures.clear();
         blind.failing_evidence.clear();
         let (url, handle) = serve_canned(Vec::new());
-        assert!(client(&url, &[]).base_failures("o", "r", &blind).unwrap().is_empty());
+        assert!(client(&url, &[]).base_failures("o", &unique_repo(), &blind).unwrap().failures.is_empty());
         handle.join().unwrap();
     }
 
