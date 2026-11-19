@@ -905,8 +905,8 @@ pub fn run_stale(fleet: &FleetStore, node: Uuid, state: &str) -> Result<Round> {
 }
 
 /// [`run_stale`], telling `on_work` (once, with what it is doing) just before
-/// it does real work: making the node's files or running a command. A look
-/// that finds every check current never calls it, so a caller that stays
+/// the first command (or its setup) runs. A look that finds every check
+/// current, or skipped, never calls it, so a caller that stays
 /// "waiting" through a cheap re-check can say "working" exactly when the
 /// minutes begin (gap 80).
 pub fn run_stale_notifying(fleet: &FleetStore, node: Uuid, state: &str, on_work: &mut dyn FnMut(&str)) -> Result<Round> {
@@ -922,8 +922,10 @@ pub fn run_stale_notifying(fleet: &FleetStore, node: Uuid, state: &str, on_work:
     if let Some(round) = current_in_made_files(fleet, node, key, &checks)? {
         return Ok(round);
     }
-    // A check has to run: the files are used now.
-    on_work(&format!("running the {} checks", tod_store::settings::lifecycle_display_name(state)));
+    // The cheap looks could not answer. Resolving the files and fingerprinting
+    // them are looks (git, docker exec: seconds), not work: only a command
+    // about to run is, so `on_work` waits for that (gap 80).
+    let mut announced = false;
     let cwd = tod_store::fleet::provision::resolve_launch_cwd(fleet, &node.to_string())
         .with_context(|| format!("find the files to run the {state} checks in"))?;
     let tree = Tree::new(&cwd)?;
@@ -958,6 +960,10 @@ pub fn run_stale_notifying(fleet: &FleetStore, node: Uuid, state: &str, on_work:
             }
             _ => {
                 let (verdict, output) = if assessment.applicable {
+                    if !announced {
+                        announced = true;
+                        on_work(&format!("running the {} checks", tod_store::settings::lifecycle_display_name(state)));
+                    }
                     let at = cwd.join(&dir);
                     match ensure_setup(fleet, node, key, &dir, &at, check)? {
                         Some(setup) if setup.verdict != Verdict::Passed => {

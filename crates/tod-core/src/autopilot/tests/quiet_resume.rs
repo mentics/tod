@@ -90,21 +90,80 @@ fn a_quiet_resume_of_a_phase_with_no_checks_still_writes_nothing() {
 fn a_quiet_resume_whose_gate_settling_runs_checks_writes_working() {
     let fx = setup();
     retire_outside_criteria(&fx);
+    fx.fleet.enqueue_outline(OutlineMutation::SetLifecycle { node_id: fx.node, state: "review".into() }).unwrap();
+    fx.fleet.writer().flush().unwrap();
     with_check(&fx, "review", "probe", "exit 0");
+    assert_eq!(crate::lifecycle::current_state(&fx.fleet, fx.node).unwrap(), "review");
     wait_on(&fx, "a release");
     let mut sink = |_: LocalEvent| {};
     let mut hook = hook(&fx, &mut sink);
     hook.resume(&fx.fleet).unwrap();
     use crate::autopilot::StepHook;
-    crate::phase::settle_gate_notifying(&fx.fleet, fx.node, "task/{slug}", &mut |what| hook.working_on(what)).ok();
-    let _ = &mut hook;
-    let state = crate::lifecycle::current_state(&fx.fleet, fx.node).unwrap();
-    // The node is in the state the check is configured for only when it is
-    // `review`; otherwise the gate had no commands to run and stayed quiet.
+    let mut said = Vec::new();
+    crate::phase::settle_gate_notifying(&fx.fleet, fx.node, "task/{slug}", &mut |what| {
+        said.push(what.to_string());
+        hook.working_on(what)
+    })
+    .unwrap();
+    assert_eq!(said, vec!["running the Review checks".to_string()]);
     let row = wait_row(&fx);
-    if state == "review" {
-        assert_eq!(row.reason_kind, crate::run_state::kind::WORKING, "{row:?}");
-    }
+    assert_eq!(row.reason_kind, crate::run_state::kind::WORKING, "{row:?}");
+}
+
+/// Gate settling whose checks are all current stays quiet.
+#[test]
+fn a_quiet_resume_whose_gate_settling_finds_checks_current_writes_nothing() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    fx.fleet.enqueue_outline(OutlineMutation::SetLifecycle { node_id: fx.node, state: "review".into() }).unwrap();
+    fx.fleet.writer().flush().unwrap();
+    with_check(&fx, "review", "probe", "exit 0");
+    assert!(crate::checks::run_stale(&fx.fleet, fx.node, "review").unwrap().clear());
+    wait_on(&fx, "a release");
+    let before = wait_row(&fx);
+    let mut sink = |_: LocalEvent| {};
+    let mut hook = hook(&fx, &mut sink);
+    hook.resume(&fx.fleet).unwrap();
+    use crate::autopilot::StepHook;
+    crate::phase::settle_gate_notifying(&fx.fleet, fx.node, "task/{slug}", &mut |what| hook.working_on(what)).unwrap();
+    assert_eq!(wait_row(&fx).since, before.since, "{:?}", wait_row(&fx));
+}
+
+fn quiet_check_round_writes_nothing(fx: &Fixture) {
+    wait_on(fx, "a release");
+    let before = wait_row(fx);
+    let mut sink = |_: LocalEvent| {};
+    let mut hook = hook(fx, &mut sink);
+    hook.resume(&fx.fleet).unwrap();
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut pilot = autopilot(fx, Budget::default());
+    let round = pilot.checks_round(&fx.fleet, &mut agent, &mut hook, "review").unwrap();
+    assert!(matches!(round, ChecksStep::Proceed));
+    assert_eq!(wait_row(fx).since, before.since, "{:?}", wait_row(fx));
+    assert!(!live_run_lease(fx));
+}
+
+/// Gap 79 with checks configured, (a): the node shares the workspace directory
+/// (no worktree of its own), so only the fingerprint can say a run is current.
+#[test]
+fn a_quiet_resume_with_current_checks_in_a_shared_workspace_writes_nothing() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    with_check(&fx, "review", "probe", "exit 0");
+    assert!(crate::checks::run_stale(&fx.fleet, fx.node, "review").unwrap().clear());
+    quiet_check_round_writes_nothing(&fx);
+}
+
+/// ... and with a made worktree of its own.
+#[test]
+fn a_quiet_resume_with_current_checks_in_a_made_worktree_writes_nothing() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    let workspace = super::lost_work::workspace_is_a_clone(&fx);
+    super::push_failure::node_works_in(&fx, &workspace);
+    with_check(&fx, "review", "probe", "exit 0");
+    assert!(crate::checks::run_stale(&fx.fleet, fx.node, "review").unwrap().clear());
+    quiet_check_round_writes_nothing(&fx);
 }
 
 /// The wait the run resumed from is over and the node moved on: the row must
