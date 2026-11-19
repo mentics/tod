@@ -34,6 +34,8 @@ pub struct ResolvedFiles {
     /// Node that owns the Files capability (the node itself unless inherited).
     pub source_node_id: String,
     pub source_title: String,
+    /// The owner's slug, for commands that name it.
+    pub source_slug: String,
     pub inherited: bool,
     /// The location the source node picked (`files_places.id`), whether or
     /// not it exists on this machine.
@@ -198,15 +200,34 @@ impl ResolvedFiles {
         self.worktree_path().map(|path| self.workdir(path))
     }
 
+    /// The stop for a picked location this machine does not have (locations
+    /// are machine-local and not synced, so a pick can come from another
+    /// machine). Names the id, the node that holds the pick, and the fixes.
+    fn missing_place_reason(&self, id: &str) -> String {
+        let owner = format!("\"{}\" ({})", self.source_title, self.source_slug);
+        let whose = if self.inherited {
+            format!("its ancestor {owner}")
+        } else {
+            owner.clone()
+        };
+        format!(
+            "The Files location {id}, picked on {whose}, does not exist on this machine \
+             (locations are not synced; it was probably made on another machine). Pick one on \
+             {owner}: Settings \u{2192} Files on that node, or `tod-cli capabilities set {} files --location <name>`{}.",
+            self.source_slug,
+            if self.inherited {
+                ", or give just this node its own with Migrate to\u{2026} in the runner menu"
+            } else {
+                ""
+            },
+        )
+    }
+
     /// Why no location can be made from these settings yet (user-facing).
     pub fn incomplete(&self) -> Option<String> {
         match (&self.place_id, &self.place_name) {
             (None, _) => return Some("Choose a location".into()),
-            (Some(_), None) => {
-                return Some(
-                    "The location this node uses is not set up on this machine: choose one".into(),
-                );
-            }
+            (Some(id), None) => return Some(self.missing_place_reason(id)),
             _ => {}
         }
         if let Some(dev) = &self.dev_container {
@@ -337,6 +358,7 @@ pub fn resolve_files_for_node(conn: &Connection, node_id: &str) -> Result<Option
     else {
         return Ok(None);
     };
+    let source_slug = NodeRepo::new(conn).get(source)?.map(|n| n.slug).unwrap_or_default();
     let source_node_id = source.to_string();
     let branch_of = |id: Uuid| -> Result<Option<String>> {
         Ok(conn
@@ -359,6 +381,7 @@ pub fn resolve_files_for_node(conn: &Connection, node_id: &str) -> Result<Option
     let mut resolved = ResolvedFiles {
         node_id: node_id.to_string(),
         source_title,
+        source_slug,
         inherited,
         place_id,
         place_name: place.as_ref().map(|p| p.name.clone()),
@@ -762,6 +785,7 @@ mod tests {
             node_id: Uuid::new_v4().to_string(),
             source_node_id: Uuid::new_v4().to_string(),
             source_title: "N".into(),
+            source_slug: String::new(),
             inherited: false,
             repo: Some(repo.into()),
             branch: None,

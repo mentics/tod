@@ -149,6 +149,7 @@ mod tests {
             node_id: "n".into(),
             source_node_id: "n".into(),
             source_title: "n".into(),
+            source_slug: String::new(),
             inherited: false,
             repo: Some(dir.to_string_lossy().into_owned()),
             branch: None,

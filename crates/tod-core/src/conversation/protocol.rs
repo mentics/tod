@@ -524,10 +524,13 @@ pub(super) fn focus_cwd_or_scratch(env: &ProtocolEnv<'_>, name: &str) -> Result<
         // Only a node with no files set up works in the scratch directory. A
         // node that has them but cannot get to them is an error the user
         // sees, never a quiet change of where the agent works.
+        // A picked location this machine lacks (`place_id` set, no place) is
+        // "has files": the launch refuses it with the location's id, never a
+        // quiet turn in the scratch directory while another protocol stops.
         let has_files = env
             .fleet
             .resolve_files_for_node(&node)?
-            .is_some_and(|files| files.repo().is_some());
+            .is_some_and(|files| files.repo().is_some() || files.place_id.is_some());
         if has_files {
             return tod_store::fleet::provision::resolve_launch_cwd(env.fleet, &node)
                 .map_err(|err| err.context("this node's files are not available"));
@@ -568,6 +571,64 @@ mod tests {
         ] {
             assert_eq!(protocol_for(kind).kind(), kind, "{kind:?}");
         }
+    }
+
+    /// Shepherd gaps 44 and 47: a node whose Files pick is a location this
+    /// machine lacks must not run a chat or phase turn in the scratch
+    /// directory while implementation stops on it; every protocol refuses, and
+    /// the reason names the missing location.
+    #[test]
+    fn a_missing_picked_location_is_an_error_not_the_scratch_directory() {
+        use crate::interview::test_support::fixture;
+        use tod_store::fleet::FleetMutation;
+        use tod_store::outline::{Capability, CreatePosition, OutlineMutation};
+        let fx = fixture();
+        let list_id = fx.fleet.list_outline_lists().unwrap()[0].id;
+        let node = Uuid::new_v4();
+        fx.fleet
+            .enqueue_outline(OutlineMutation::CreateNode {
+                node_id: Some(node),
+                list_id,
+                parent_id: None,
+                anchor_id: None,
+                position: CreatePosition::Below,
+                title: "Task".into(),
+            })
+            .unwrap();
+        fx.fleet
+            .enqueue_outline(OutlineMutation::EnableCapabilities { node_id: node, capabilities: vec![Capability::Files] })
+            .unwrap();
+        fx.fleet.writer().flush().unwrap();
+        let place = tod_store::fleet::FilesPlace {
+            id: Uuid::new_v4().to_string(),
+            name: "gone".into(),
+            repo: Some("/src/app".into()),
+            ..Default::default()
+        };
+        let ghost = place.id.clone();
+        fx.fleet.enqueue(FleetMutation::SaveFilesPlace { place }).unwrap();
+        fx.fleet
+            .enqueue(FleetMutation::SetNodeFilesPlace { node_id: node.to_string(), place_id: Some(ghost.clone()) })
+            .unwrap();
+        fx.fleet.writer().flush().unwrap();
+        // The place was made on another machine: here it is gone.
+        rusqlite::Connection::open(fx.fleet.writer().db_path())
+            .unwrap()
+            .execute("DELETE FROM files_places WHERE id = ?1", [&ghost])
+            .unwrap();
+        fx.fleet.reload_if_stale().unwrap();
+
+        let media = crate::media::MediaPaths::discover().expect("media paths");
+        let env = ProtocolEnv {
+            fleet: &fx.fleet,
+            media: &media,
+            data_root: &fx.root,
+            conversation_id: Uuid::new_v4(),
+            focus: Focus::Node(node),
+        };
+        let err = format!("{:#}", focus_cwd_or_scratch(&env, "chat").unwrap_err());
+        assert!(err.contains(&ghost), "{err}");
+        assert!(err.contains("capabilities set"), "{err}");
     }
 
     /// A chat's outline writes are recorded, so its agent gets the

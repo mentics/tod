@@ -460,6 +460,36 @@ mod tests {
         cleanup_fleet_root(&root);
     }
 
+    /// Shepherd gaps 44 and 47: a pick of a location this machine lacks (it
+    /// came from another machine) stops every launch, and the reason names the
+    /// id, the node holding the pick and the commands that fix it.
+    #[test]
+    fn a_picked_location_this_machine_lacks_stops_a_launch_naming_it() {
+        let root = temp_fleet_root();
+        let store = FleetStore::open(&root).unwrap();
+        let parent = node(&store, "Workspace tasks");
+        // The pick arrives from another machine (sync), so the place is not here:
+        // the row is written as a sync would, not through `set_place`.
+        let ghost = "f1e366a9-63b6-47a7-9caf-255988d54c0e";
+        rusqlite::Connection::open(store.writer().db_path())
+            .unwrap()
+            .execute("UPDATE node_files SET place_id = ?2 WHERE node_id = ?1", rusqlite::params![parent.as_bytes().to_vec(), ghost])
+            .unwrap();
+        store.reload_if_stale().unwrap();
+        let leaf = child_of(&store, parent);
+        for id in [parent, leaf] {
+            let err = crate::fleet::provision::launch_cwd_if_made(&store, &id.to_string()).unwrap_err().to_string();
+            assert!(err.contains(ghost), "{err}");
+            assert!(err.contains("Workspace tasks"), "{err}");
+            assert!(err.contains("tod-cli capabilities set workspace-tasks files --location"), "{err}");
+            assert!(err.contains("Settings"), "{err}");
+        }
+        let err = crate::fleet::provision::launch_cwd_if_made(&store, &leaf.to_string()).unwrap_err().to_string();
+        assert!(err.contains("Migrate to"), "{err}");
+        drop(store);
+        cleanup_fleet_root(&root);
+    }
+
     #[test]
     fn a_node_with_children_cannot_migrate() {
         let root = temp_fleet_root();

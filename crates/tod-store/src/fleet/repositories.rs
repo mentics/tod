@@ -178,6 +178,7 @@ mod tests {
             node_id: String::new(),
             source_node_id: String::new(),
             source_title: String::new(),
+            source_slug: String::new(),
             inherited: false,
             repo: Some(repo.to_string_lossy().into_owned()),
             branch: branch.map(str::to_string),
