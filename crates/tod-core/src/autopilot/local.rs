@@ -613,15 +613,15 @@ impl<F: FnMut(LocalEvent)> StepHook for Hook<'_, F> {
     fn at(&mut self, fleet: &FleetStore, boundary: Boundary) -> Result<Option<String>> {
         let mut blocked: Option<String> = None;
         if boundary == Boundary::Step {
-            // Pushing can take seconds in a checkout with submodules: say so
-            // rather than leave "deciding the next step" on screen.
-            self.say("saving the branch to GitHub");
+            // Pushing can take seconds in a checkout with submodules, so a push
+            // that really runs says so, and begins work for a quiet run. A step
+            // boundary where the remote already has the branch says nothing
+            // (gap 81): only the push's own callback makes the claim.
             let node = self.node;
-            let mut start_work = false;
-            let pushed = push_branch_notifying(fleet, node, PushRetrier::Run, || start_work = true)?;
-            if start_work {
+            let pushed = push_branch_notifying(fleet, node, PushRetrier::Run, || {
                 self.begin_work(Some("saving the branch to GitHub"));
-            }
+                self.say("saving the branch to GitHub");
+            })?;
             self.push_failed |= pushed.is_some();
             match pushed {
                 None => {}
