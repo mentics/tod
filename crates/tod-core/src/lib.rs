@@ -95,6 +95,7 @@ pub mod runner_operator;
 pub mod shepherd_stats;
 pub mod runner_place;
 pub mod sandbox_retire;
+pub mod worktree_release;
 pub mod runner_status;
 pub mod scheduler;
 pub mod wait_cadence;

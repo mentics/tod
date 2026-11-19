@@ -300,6 +300,15 @@ fn retire_pass(store: &tod_store::fleet::FleetStore) {
             );
         }
     }
+    if let Err(err) = tod_core::worktree_release::release_due(store) {
+        let message = format!("Giving back the Treehouse worktrees of parked nodes failed: {err:#}");
+        tracing::warn!("tod-agentd: {message}");
+        tod_core::logging::buffer::record(
+            tod_core::logging::buffer::Level3::Error,
+            tod_core::logging::buffer::LogSource::App,
+            message,
+        );
+    }
     if let Err(err) = tod_core::sandbox_retire::retire_due(store) {
         let message = format!("Checking which done nodes' sandboxes to delete failed: {err:#}");
         tracing::warn!("tod-agentd: {message}");

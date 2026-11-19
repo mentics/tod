@@ -395,7 +395,8 @@ fn make_worktree(
         &repo_path,
         branch,
         &lease_holder,
-    )?;
+    )
+    .map_err(|err| name_pool_holders(fleet, &files.node_id, err))?;
     location.worktree_path = Some(handle.path.storage());
     location.worktree_lease_id = handle.lease.as_ref().map(|l| l.lease_id.clone());
     location.worktree_lease_holder = handle.lease.as_ref().map(|l| l.lease_holder.clone());
@@ -404,6 +405,108 @@ fn make_worktree(
         bail!("the worktree made for this node is missing at {}", handle.path);
     }
     Ok((location, handle.warnings))
+}
+
+/// Treehouse's refusal when every worktree of its pool is leased or dirty.
+const POOL_FULL: &str = "in use or dirty";
+
+/// A full Treehouse pool, said with who holds it: the error names the nodes
+/// whose Files locations hold a lease (ticket or slug, and state), so the user
+/// can act (shepherd gap 68: "all 16 worktrees are in use or dirty" named
+/// nobody, and twelve of the sixteen were nodes waiting on a human review).
+/// Any other error is returned as it came.
+fn name_pool_holders(fleet: &FleetStore, node_id: &str, err: anyhow::Error) -> anyhow::Error {
+    if !format!("{err:#}").contains(POOL_FULL) {
+        return err;
+    }
+    match pool_holders(fleet, node_id) {
+        Ok(holders) if holders.is_empty() => {
+            err.context("no node of this app holds a lease: the worktrees are dirty or leased by something else")
+        }
+        Ok(holders) => err.context(format!(
+            "the pool is held by {} node(s): {}. Nodes waiting on the user or an outside review give theirs back by \
+             themselves when clean and pushed; or reset a node's environment (the runner menu)",
+            holders.len(),
+            holders.join(", ")
+        )),
+        Err(read) => err.context(format!("who holds the pool could not be read: {read:#}")),
+    }
+}
+
+/// `"<ticket or slug> (<state>)"` for every node other than `except` whose
+/// Files location holds a Treehouse lease.
+fn pool_holders(fleet: &FleetStore, except: &str) -> Result<Vec<String>> {
+    let leased: Vec<FilesLocation> = fleet
+        .read(|c| FilesLocationRepo::new(c).list_all())?
+        .into_iter()
+        .filter(|l| l.lease_id().is_some() && l.node_id != except)
+        .collect();
+    let mut out = Vec::new();
+    for location in leased {
+        match fleet.get_node(&location.node_id)? {
+            Some(node) => out.push(format!("{} ({})", node.ticket.as_deref().unwrap_or(&node.slug), node.lifecycle)),
+            None => out.push(format!("a deleted node {}", location.node_id)),
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// What [`release_parked_worktree`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Release {
+    /// The lease went back to the pool and the location was forgotten: the
+    /// node is "not made yet", and its next launch, check or cwd leases again
+    /// ([`make_location`], which checks the pushed branch out from origin).
+    Released,
+    /// Left as it was, for this reason.
+    Kept(String),
+}
+
+/// Give a parked node's Treehouse lease back (shepherd gap 68): a node that
+/// waits for days on a person or an outside process (a review, a merge, a
+/// release) must not hold one of the pool's few worktrees. Only for a node
+/// whose Files location holds a lease, nothing running in it, and a checkout
+/// that is clean and fully pushed (the checkout and every submodule: no
+/// uncommitted or untracked file, and [`unpushed_commits`] empty). Anything
+/// else is [`Release::Kept`]; a git failure while looking is an error, never
+/// a release. Nothing is pushed here: the branch is already on the remote, or
+/// the worktree stays. The location row goes with the lease, so the worktree
+/// is simply not made yet, and never stale. Slow: not on the UI thread.
+pub fn release_parked_worktree(
+    fleet: &FleetStore,
+    paths: &TodPaths,
+    settings: &TodSettings,
+    node_id: &str,
+) -> Result<Release> {
+    let lock = node_lock(node_id);
+    let _held = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(location) = node_location(fleet, node_id)? else {
+        return Ok(Release::Kept("no files of its own".into()));
+    };
+    let Some(lease_id) = location.lease_id().map(str::to_string) else {
+        return Ok(Release::Kept("no Treehouse lease".into()));
+    };
+    if location.sandbox().is_some() {
+        return Ok(Release::Kept("its files are a sandbox".into()));
+    }
+    let dir = location_dir(&location)?;
+    match location_state(fleet, paths, node_id)? {
+        LocationState::Clean => {}
+        LocationState::Busy(reason) => return Ok(Release::Kept(reason)),
+        LocationState::Dirty(lines) => {
+            return Ok(Release::Kept(format!("{} uncommitted change(s)", lines.len())));
+        }
+        LocationState::Gone => return Ok(Release::Kept("its directory is gone".into())),
+    }
+    let unpushed = unpushed_commits(&dir)?;
+    if !unpushed.is_empty() {
+        return Ok(Release::Kept(unpushed.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ")));
+    }
+    worktree::treehouse_return(&dir, &lease_id, settings, paths)
+        .with_context(|| format!("give back the lease of {}", location.describe()))?;
+    forget_removed_location(fleet, node_id, &location)?;
+    Ok(Release::Released)
 }
 
 /// The longest a sandbox name made here may be (the name also goes into the
@@ -3543,6 +3646,74 @@ mod tests {
         assert!(node_location(&store, &child).unwrap().is_none());
         let pushed = git(&origin, &["log", "--format=%s", &branch]);
         assert!(pushed.starts_with("tod: save work"), "{pushed}");
+
+        drop(store);
+        crate::paths::clear_data_root_override();
+        cleanup_fleet_root(&root);
+    }
+
+    /// Shepherd gap 68: a parked node's clean, pushed worktree gives its
+    /// Treehouse lease back (and is "not made yet", not stale); a dirty or
+    /// unpushed one keeps it; and a full pool names who holds it.
+    #[test]
+    fn a_parked_clean_pushed_worktree_gives_up_its_lease_and_a_full_pool_names_holders() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_fleet_root();
+        let (repo, _origin) = repo_with_origin(&root);
+        crate::paths::set_data_root(root.join("data"));
+        let paths = TodPaths::discover().unwrap();
+        // A fake Treehouse: every call is logged.
+        let log = root.join("treehouse.log");
+        let fake = root.join("treehouse");
+        std::fs::write(&fake, format!("#!/bin/sh\necho \"$@\" >> {}\nexit 0\n", log.display())).unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let settings = TodSettings {
+            worktree_backend: WorktreeBackend::GitOnly,
+            fleet_storage_root: Some(root.join("data")),
+            treehouse_executable: Some(fake.clone()),
+            ..TodSettings::default()
+        };
+        let store = FleetStore::open(root.join("fleet")).unwrap();
+        let (_parent, child) = tree(&store, &repo);
+        let (dir, _) = make_location(&store, &paths, &settings, &child, &mut |_| {}).unwrap();
+        let dir_path = dir.host_path().unwrap().to_path_buf();
+        git(&dir_path, &["config", "user.email", "t@example.com"]);
+        git(&dir_path, &["config", "user.name", "t"]);
+        // Say the worktree came from the pool.
+        let mut location = node_location(&store, &child).unwrap().unwrap();
+        location.worktree_lease_id = Some("lease-1".into());
+        location.worktree_lease_holder = Some("tod-x".into());
+        record(&store, &location).unwrap();
+
+        // Dirty: kept.
+        std::fs::write(dir_path.join("work.txt"), "wip").unwrap();
+        let kept = release_parked_worktree(&store, &paths, &settings, &child).unwrap();
+        assert!(matches!(&kept, Release::Kept(why) if why.contains("uncommitted")), "{kept:?}");
+        // Committed but not pushed: kept.
+        git(&dir_path, &["add", "-A"]);
+        git(&dir_path, &["commit", "-q", "-m", "work"]);
+        let kept = release_parked_worktree(&store, &paths, &settings, &child).unwrap();
+        assert!(matches!(&kept, Release::Kept(why) if why.contains("no remote has")), "{kept:?}");
+        assert!(node_location(&store, &child).unwrap().is_some());
+        assert!(!log.exists(), "nothing was returned");
+
+        // The pool is full: the error names the holder.
+        let err = name_pool_holders(
+            &store,
+            "someone-else",
+            anyhow!("treehouse get --lease failed: all 2 worktrees are in use or dirty (max_trees = 2)"),
+        );
+        let slug = store.get_node(&child).unwrap().unwrap().slug;
+        let err = format!("{err:#}");
+        assert!(err.contains(&slug) && err.contains("proposed") && err.contains("in use or dirty"), "{err}");
+
+        // Pushed and clean: released, and not made yet (not stale, not an error).
+        git(&dir_path, &["push", "-q", "origin", &format!("task/{slug}")]);
+        assert_eq!(release_parked_worktree(&store, &paths, &settings, &child).unwrap(), Release::Released);
+        assert!(std::fs::read_to_string(&log).unwrap().contains("return"));
+        assert!(node_location(&store, &child).unwrap().is_none());
+        assert_eq!(launch_cwd_if_made(&store, &child).unwrap(), None);
+        assert!(stale_location_of(&store, &child).unwrap().is_none());
 
         drop(store);
         crate::paths::clear_data_root_override();
