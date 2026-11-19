@@ -2446,7 +2446,22 @@ impl Autopilot {
                 }
                 // A question for the user comes before the review: the answer
                 // may change what the agent does (the turn is asked for again).
-                let pending = fleet.read(|conn| Ok(DecisionRepo::new(conn).list_pending_for_node(node)?))?.len();
+                // A question about one check, or about a silent bot, does not
+                // stop the review: the same rule as the run loop and the
+                // babysitter.
+                let open_silence = match self.tend_silence_questions(fleet)? {
+                    (Some(outcome), _) => return Ok(Some(outcome)),
+                    (None, open) => open,
+                };
+                let open_unrelated = match self.tend_unrelated_check_questions(fleet)? {
+                    (Some(outcome), _) => return Ok(Some(outcome)),
+                    (None, open) => open,
+                };
+                let pending = fleet
+                    .read(|conn| Ok(DecisionRepo::new(conn).list_pending_for_node(node)?))?
+                    .len()
+                    .saturating_sub(open_silence)
+                    .saturating_sub(open_unrelated);
                 if pending > 0 {
                     return Ok(Some(Outcome::NeedsHuman { reason: NeedsHuman::Decision { pending } }));
                 }

@@ -3342,6 +3342,8 @@ struct BranchFeed {
     threads: std::sync::Mutex<Vec<tod_store::github::ReviewThread>>,
     posts: std::sync::atomic::AtomicUsize,
     cached: bool,
+    /// Checks failing on the pull request (with the same head, whatever it is).
+    failing: std::sync::Mutex<Vec<String>>,
 }
 
 impl BranchFeed {
@@ -3351,6 +3353,7 @@ impl BranchFeed {
             threads: std::sync::Mutex::new(threads),
             posts: Default::default(),
             cached,
+            failing: Default::default(),
         })
     }
 
@@ -3369,7 +3372,8 @@ impl BranchFeed {
                 mergeable: Some(true),
                 mergeable_state: Some("blocked".into()),
                 behind_by: Some(0),
-                checks: Some("success".into()),
+                checks: Some(if self.failing.lock().unwrap().is_empty() { "success" } else { "failure" }.into()),
+                failing_checks: self.failing.lock().unwrap().clone(),
                 head_sha: Some(self.pushed.lock().unwrap().clone()),
                 head_committed_at: Some("2020-01-01T00:00:00Z".into()),
                 draft: true,
@@ -3522,6 +3526,52 @@ fn pr_draft_feedback_is_reviewed_and_fixed_before_it_is_pushed() {
     assert_eq!(owed, crate::pr_draft_review::Owed::Clear);
     assert!(fx.fleet.read(|conn| Ok(tod_store::review::ReviewRepo::new(conn).list_for_node(fx.node)?)).unwrap().iter().all(|f| !f.is_open()));
     assert!(Autopilot::new(config(&fx), fx.node, Budget::default()).unwrap().state().pr_change.is_none());
+}
+
+/// A pending question about one check (gap 76) must not stop a draft whose
+/// agent just made a change for the feedback: tod's own review follows it.
+#[test]
+fn a_pending_question_about_one_check_does_not_stop_the_review_after_the_agents_change() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    let dir = git_workspace(&fx);
+    with_pr_draft_review(&fx);
+    let feed = BranchFeed::new(&dir, vec![review_thread("PRRT_1", "src/lib.rs", 2, "Rename b.")], false);
+    *feed.failing.lock().unwrap() = vec!["pyright".to_string()];
+    crate::pr_readiness::set_feed_override(Some(feed.clone()));
+    linked_to_prs(&fx, "pr_draft", &["https://github.com/acme/app/pull/42"]);
+    let head = git_in(&dir, &["rev-parse", "HEAD"]);
+    let claim = crate::check_unrelated::Claim {
+        pr: "acme/app#42".into(),
+        pr_url: "https://github.com/acme/app/pull/42".into(),
+        check: "pyright".into(),
+        head,
+        signature: String::new(),
+        reason: "main fails pyright the same way".into(),
+        raised: crate::check_unrelated::Raised::Agent,
+    };
+    fx.fleet
+        .interview(
+            ACTOR_USER,
+            InterviewCommand::AskDecision {
+                node_id: fx.node,
+                conversation_id: None,
+                protocol: Some(crate::check_unrelated::PROTOCOL.to_string()),
+                decision: crate::check_unrelated::new_decision(&claim),
+            },
+        )
+        .unwrap();
+    fn change_once(dir: &std::path::Path) {
+        if git_in(dir, &["log", "--format=%s"]).contains("answer the feedback") {
+            return;
+        }
+        edit_and_commit(dir);
+    }
+    let mut agent = branch_agent(&fx, &dir, &feed, change_once);
+    let outcome = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO).run(&fx.fleet, &mut agent).unwrap();
+    let steps = steps_of(&turn_labels(&agent));
+    assert!(steps.starts_with(&["pr".to_string(), "pr:change".to_string(), "review".to_string()]), "{steps:?} / {outcome:?}");
+    assert_eq!(unrelated_decisions(&fx).iter().filter(|d| d.status == "pending").count(), 1, "the question stands");
 }
 
 #[test]
