@@ -4,7 +4,7 @@
 
 ## First
 
-The PR is driven as the task's `pr` conversation (the protocol is named for the pull request; this state is its review). The lifecycle runner sends you into it when there is something to do, and tells you what: the open threads, the failing check, the branch behind its base.
+The PR is driven as the task's `pr` conversation (the protocol is named for the pull request; this state is its review). The lifecycle runner sends you into it when there is something to do, and tells you what: the open threads, the failing check, a conflict with its base.
 
 1. Read lifecycle state, obligations, plan, and the review's findings and their answers.
 2. Check the pull request's status before doing anything else (`tod-cli pr status`): the `pr` state opened it as a draft, `pr_draft` cleared the automated feedback on it, and a person has since marked it ready and asked for a review.
@@ -39,7 +39,7 @@ A thread you have answered three times that is still open, or four rounds of fix
 
 Do not rely on what the runner sent you or on GitHub's merge state alone: the merge state reads `blocked` while a review is missing, and that hides a branch that is behind its base. Check each of these yourself, and fix what fails:
 
-- **The branch is current.** Compare it with its base (`git fetch`, then see whether the base has commits the branch lacks); if it does, merge the base in.
+- **The branch does not conflict with its base.** A branch that is only behind its base is not yours: tod merges the base in on GitHub itself (its Update branch button), and no review or checks are owed for that. Start each turn by pulling the branch, so your work sits on what tod merged; merge the base in yourself only to resolve a conflict.
 - **Every review bot the project names** (there may be several, or none) **has reviewed the current head, and its latest score for the head meets its threshold.** A score, or a review, left on an earlier commit does not count: you never ask a bot yourself, and the project's skills must not either (a bot's credits are spent once per pull request, on the final head): tod asks it, only after its own review of that head is clean, waits for it, and sends you what it finds, which you fix where this change introduced it. A bot that does not come is tod's to decide and to raise with the user (once, with what was tried); never raise a request about it, and never about a transient GitHub error.
 - **Every open review thread, from a person or a bot, is answered.**
 - **This phase's configured skills have been applied**, as the context lists them.

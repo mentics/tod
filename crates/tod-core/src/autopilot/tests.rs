@@ -5345,3 +5345,82 @@ fn a_pushed_branch_without_a_pull_request_is_sent_to_the_agent_by_name() {
     assert!(feed.prefixes.lock().unwrap().iter().all(|p| p == "task/ENG-9"), "{:?}", feed.prefixes.lock().unwrap());
     assert!(!matches!(outcome, Outcome::NeedsHuman { reason: NeedsHuman::PrBlocked { .. } }), "{outcome:?}");
 }
+
+/// A pull request behind its base, with a thread to answer: tod merges the
+/// base in on GitHub itself (its Update branch button) before the agent's
+/// turn, notes it on the node's Activity, and the agent is not told to merge
+/// the base. A branch that conflicts is not updated: that is the agent's.
+#[test]
+fn a_branch_only_behind_is_updated_on_github_without_the_agent() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Behind {
+        behind: std::sync::Mutex<bool>,
+        conflict: bool,
+        updates: AtomicUsize,
+        turns: Arc<AtomicUsize>,
+    }
+    impl crate::pr_readiness::PrFeed for Behind {
+        fn snapshot(&self, pr: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
+            let mut snap = AwaitingReview.snapshot(pr)?;
+            let behind = *self.behind.lock().unwrap();
+            snap.status.behind_by = Some(if behind { 3 } else { 0 });
+            if self.conflict {
+                snap.status.mergeable = Some(false);
+                snap.status.mergeable_state = Some("dirty".into());
+            }
+            snap.status.head_sha = Some(format!("head{}", self.updates.load(Ordering::SeqCst)));
+            snap.status.base_ref = Some("main".into());
+            if self.turns.load(Ordering::SeqCst) == 0 {
+                snap.threads = vec![tod_store::github::ReviewThread {
+                    id: "PRRT_1".into(),
+                    resolved: false,
+                    outdated: false,
+                    path: Some("src/a.rs".into()),
+                    line: Some(1),
+                    comments: vec![],
+                }];
+            }
+            Ok(snap)
+        }
+        fn update_branch(&self, _: &tod_store::github::NodePr) -> Result<(), String> {
+            assert!(!self.conflict, "a conflicting branch is the agent's to merge");
+            assert_eq!(self.turns.load(Ordering::SeqCst), 0, "updated before the agent's turn");
+            self.updates.fetch_add(1, Ordering::SeqCst);
+            *self.behind.lock().unwrap() = false;
+            Ok(())
+        }
+    }
+    for conflict in [false, true] {
+        let fx = bare();
+        retire_outside_criteria(&fx);
+        let turns = Arc::new(AtomicUsize::new(0));
+        let feed = Arc::new(Behind {
+            behind: std::sync::Mutex::new(true),
+            conflict,
+            updates: AtomicUsize::new(0),
+            turns: turns.clone(),
+        });
+        crate::pr_readiness::set_feed_override(Some(feed.clone()));
+        linked_to_prs(&fx, "pr_review", &["https://github.com/acme/app/pull/42"]);
+        let mut agent = FakeAgent::new(&fx.fleet);
+        agent.shared_turns = Some(turns);
+        let _ = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO).run(&fx.fleet, &mut agent);
+        let notes: Vec<String> = fx
+            .fleet
+            .read(|conn| Ok(tod_store::node_timeline::TimelineRepo::new(conn).list(fx.node)?))
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.title.contains("with its base branch"))
+            .map(|e| e.title)
+            .collect();
+        if conflict {
+            assert_eq!(feed.updates.load(Ordering::SeqCst), 0);
+            assert!(agent.turns > 0, "the conflict goes to the agent");
+            assert!(notes.is_empty(), "{notes:?}");
+        } else {
+            assert_eq!(feed.updates.load(Ordering::SeqCst), 1, "updated once, before the agent's turn");
+            assert!(agent.turns > 0, "the thread still goes to the agent");
+            assert_eq!(notes, ["Updated acme/app#42 with its base branch"]);
+        }
+    }
+}

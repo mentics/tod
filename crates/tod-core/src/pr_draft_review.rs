@@ -322,6 +322,78 @@ pub fn branch_change(cwd: &Workdir, base: &str) -> Result<String> {
     Ok(format!("{:x}", hash.finalize()))
 }
 
+/// Whether `url` (a remote's URL: `git@host:owner/repo.git`,
+/// `https://host/owner/repo`, ...) names `owner/repo`.
+fn remote_is(url: &str, owner: &str, repo: &str) -> bool {
+    let url = url.trim().trim_end_matches('/');
+    let url = url.strip_suffix(".git").unwrap_or(url);
+    let want = format!("{owner}/{repo}").to_ascii_lowercase();
+    let url = url.to_ascii_lowercase();
+    url.strip_suffix(&want).is_some_and(|rest| rest.ends_with('/') || rest.ends_with(':'))
+}
+
+/// The checkout of `owner/repo` in `cwd`: `cwd` itself when its `origin` is
+/// that repository, else the submodule (at any depth) whose `origin` is. A
+/// pull request on a submodule's repository is that submodule's change; the
+/// superproject sees it only as a moved `Subproject commit` line, which any
+/// commit at all moves, a merge of the base included. A checkout with no
+/// submodules is the one repository there is. `Err` when, among submodules,
+/// none is.
+pub fn repo_dir(cwd: &Workdir, owner: &str, repo: &str) -> Result<Workdir> {
+    let origin = cwd.git(&["remote", "get-url", "origin"]).unwrap_or_default();
+    if remote_is(&origin, owner, repo) {
+        return Ok(cwd.clone());
+    }
+    let paths = cwd.git(&["submodule", "foreach", "--quiet", "--recursive", "echo \"$displaypath\""])?;
+    if paths.trim().is_empty() {
+        // One repository and no other: the pull request's, whatever its
+        // `origin` is called (a local mirror, a proxy's URL).
+        return Ok(cwd.clone());
+    }
+    let mut seen = Vec::new();
+    for path in paths.lines().map(str::trim).filter(|p| !p.is_empty()) {
+        let dir = cwd.join(path);
+        let origin = dir.git(&["remote", "get-url", "origin"])?;
+        if remote_is(&origin, owner, repo) {
+            return Ok(dir);
+        }
+        seen.push(format!("{path} ({origin})"));
+    }
+    anyhow::bail!(
+        "no checkout of {owner}/{repo} in {cwd}: its origin is {} and its submodules are {}",
+        if origin.is_empty() { "unset".to_string() } else { origin },
+        if seen.is_empty() { "none".to_string() } else { seen.join(", ") }
+    )
+}
+
+/// [`branch_change`] of every linked pull request, each in its own
+/// repository's checkout ([`repo_dir`]) against its own base: what tells a
+/// change the agent made from a merge of a base, whichever repository (the
+/// superproject or a submodule) the pull request is on. `Err` when GitHub did
+/// not say a pull request's base, or git fails.
+pub fn pr_change(cwd: &Workdir, live: &[LivePr]) -> Result<String> {
+    let prs: Vec<(&tod_store::github::NodePr, Option<&str>)> = live.iter().map(|p| (&p.pr, p.base_ref.as_deref())).collect();
+    pr_change_of(cwd, &prs)
+}
+
+/// [`pr_change`] of `(pull request, its base)` pairs.
+fn pr_change_of(cwd: &Workdir, prs: &[(&tod_store::github::NodePr, Option<&str>)]) -> Result<String> {
+    let mut out = String::new();
+    for (pr, base) in prs {
+        let base = base.ok_or_else(|| {
+            anyhow::anyhow!(
+                "GitHub did not say which branch {} merges into, so its change cannot be told from a merge of its base",
+                pr.url
+            )
+        })?;
+        let dir = repo_dir(cwd, &pr.owner, &pr.repo)?;
+        let change = branch_change(&dir, base)
+            .map_err(|err| err.context(format!("reading {}'s change against origin/{base} in {dir}", pr.url)))?;
+        out.push_str(&format!("{}={change}\n", pr_label(pr)));
+    }
+    Ok(out)
+}
+
 /// The commit checked out in `cwd`: the head about to be pushed.
 pub fn local_head(cwd: &Workdir) -> Result<String> {
     cwd.git(&["rev-parse", "HEAD"])
@@ -748,6 +820,102 @@ pub fn answer_message(findings: &[ReviewFinding]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_remote_names_its_repository_in_any_url_form() {
+        for url in [
+            "git@github.com:Cofactr/flagship.git",
+            "https://github.com/Cofactr/flagship",
+            "https://github.com/cofactr/flagship.git/",
+            "ssh://git@github.com/Cofactr/flagship.git",
+        ] {
+            assert!(remote_is(url, "Cofactr", "flagship"), "{url}");
+        }
+        assert!(!remote_is("git@github.com:Cofactr/flagship-ui.git", "Cofactr", "flagship"));
+        assert!(!remote_is("git@github.com:Other/xflagship.git", "Cofactr", "flagship"));
+        assert!(!remote_is("", "Cofactr", "flagship"));
+    }
+
+    fn git(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "protocol.file.allow=always", "-c", "init.defaultBranch=main"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// The pull request is on a submodule's repository. Merging that
+    /// repository's moved base in changes the superproject's view of the
+    /// change (its `Subproject commit` line) but not the pull request's own
+    /// change, which is what decides whether a review is owed; a commit of
+    /// the branch's own does change it.
+    #[test]
+    fn a_merge_of_a_submodules_base_is_not_a_change_of_its_pull_request() {
+        let root = tod_test_util::scratch_dir("pr-change-submodule");
+        let lib_origin = root.join("lib.git");
+        let top_origin = root.join("top.git");
+        // The submodule's repository, with a main branch.
+        let seed = root.join("seed");
+        std::fs::create_dir_all(&seed).unwrap();
+        git(&seed, &["init", "-q"]);
+        std::fs::write(seed.join("a.txt"), "one\n").unwrap();
+        git(&seed, &["add", "."]);
+        git(&seed, &["commit", "-qm", "lib"]);
+        git(&root, &["clone", "-q", "--bare", seed.to_str().unwrap(), lib_origin.to_str().unwrap()]);
+        // The superproject, with the submodule.
+        let top_seed = root.join("top-seed");
+        std::fs::create_dir_all(&top_seed).unwrap();
+        git(&top_seed, &["init", "-q"]);
+        git(&top_seed, &["submodule", "add", "-q", lib_origin.to_str().unwrap(), "lib"]);
+        git(&top_seed, &["commit", "-qm", "top"]);
+        git(&root, &["clone", "-q", "--bare", top_seed.to_str().unwrap(), top_origin.to_str().unwrap()]);
+        let work = root.join("work");
+        git(&root, &["clone", "-q", "--recurse-submodules", top_origin.to_str().unwrap(), work.to_str().unwrap()]);
+        let lib = work.join("lib");
+        git(&work, &["remote", "set-url", "origin", "git@github.com:acme/top.git"]);
+        git(&lib, &["remote", "set-url", "origin", "git@github.com:acme/lib.git"]);
+        // The node's branch in the submodule, with its own change.
+        git(&lib, &["checkout", "-qb", "task/x"]);
+        std::fs::write(lib.join("b.txt"), "mine\n").unwrap();
+        git(&lib, &["add", "."]);
+        git(&lib, &["commit", "-qm", "own change"]);
+        git(&work, &["add", "lib"]);
+        git(&work, &["commit", "-qm", "bump lib"]);
+
+        let cwd = Workdir::host(&work);
+        let pr = tod_store::github::NodePr::new("acme", "lib", 7);
+        assert_eq!(repo_dir(&cwd, "acme", "lib").unwrap(), Workdir::host(&lib));
+        assert_eq!(repo_dir(&cwd, "acme", "top").unwrap(), cwd);
+        assert!(repo_dir(&cwd, "acme", "other").is_err());
+        let before = pr_change_of(&cwd, &[(&pr, Some("main"))]).unwrap();
+        let top_before = branch_change(&cwd, "main").unwrap();
+
+        // The base moves upstream, and the agent merges it in.
+        git(&seed, &["remote", "add", "up", lib_origin.to_str().unwrap()]);
+        std::fs::write(seed.join("c.txt"), "theirs\n").unwrap();
+        git(&seed, &["add", "."]);
+        git(&seed, &["commit", "-qm", "base moved"]);
+        git(&seed, &["push", "-q", "up", "HEAD:main"]);
+        git(&lib, &["fetch", "-q", lib_origin.to_str().unwrap(), "main"]);
+        git(&lib, &["update-ref", "refs/remotes/origin/main", "FETCH_HEAD"]);
+        git(&lib, &["merge", "-q", "--no-edit", "origin/main"]);
+        git(&work, &["add", "lib"]);
+        git(&work, &["commit", "-qm", "bump lib again"]);
+
+        assert_ne!(branch_change(&cwd, "main").unwrap(), top_before, "the superproject sees any submodule commit");
+        assert_eq!(pr_change_of(&cwd, &[(&pr, Some("main"))]).unwrap(), before, "a merge of the base alone is no change");
+
+        // A commit of the branch's own is.
+        std::fs::write(lib.join("b.txt"), "mine, fixed\n").unwrap();
+        git(&lib, &["commit", "-qam", "fix"]);
+        assert_ne!(pr_change_of(&cwd, &[(&pr, Some("main"))]).unwrap(), before);
+        // A pull request GitHub gave no base for cannot be told.
+        assert!(pr_change_of(&cwd, &[(&pr, None)]).is_err());
+    }
 
     fn finding(file: Option<&str>, line: Option<i64>) -> ReviewFinding {
         ReviewFinding {
