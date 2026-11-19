@@ -1874,13 +1874,48 @@ fn needs_push(dir: &Workdir) -> Result<bool> {
 
 /// Whether `repo`'s HEAD is something its `origin/<branch>` does not have. A
 /// repository on a detached HEAD has nothing of its own to push.
+///
+/// **The one place "the remote already has it" is decided**, for every path
+/// that pushes before it removes or recreates a location (`push_branches`:
+/// `remove_location`, `ensure_work_pushed_in` and so the sandbox delete guard,
+/// the stale-location removal, Reset environment, Migrate, and the step-boundary
+/// `push_node_branch`). A local tracking ref equal to HEAD answers without the
+/// network (the autopilot asks at every step). Otherwise the remote branch is
+/// fetched, so the answer is current, and HEAD counts as already pushed when it
+/// is an ancestor of the remote branch (or equal): a push of it would be
+/// refused non-fast-forward though there is nothing of ours to send (shepherd
+/// gap 69, ENG-2157: a `ui` submodule 2 commits behind its branch kept the
+/// worktree). A branch ahead of or diverged from the remote still needs a push,
+/// which is never forced. A failed look at the remote is an error.
 fn repo_needs_push(repo: &Workdir) -> Result<bool> {
     let Some(branch) = worktree::current_branch(repo) else {
         return Ok(false);
     };
     let head = repo.git(&["rev-parse", "HEAD"])?;
-    let tracking = repo.git(&["rev-parse", "--verify", "-q", &format!("refs/remotes/origin/{branch}")]).ok();
-    Ok(tracking.as_deref().map(str::trim) != Some(head.trim()))
+    let tracking_ref = format!("refs/remotes/origin/{branch}");
+    let tracking = repo.git(&["rev-parse", "--verify", "-q", &tracking_ref]).ok();
+    if tracking.as_deref().map(str::trim) == Some(head.trim()) {
+        return Ok(false);
+    }
+    if repo.git(&["remote"])?.lines().all(|r| r.trim() != "origin") {
+        // Nothing to compare with; the push says so.
+        return Ok(true);
+    }
+    let heads_ref = format!("refs/heads/{branch}");
+    let listed = repo
+        .git(&["ls-remote", "--heads", "origin", &heads_ref])
+        .with_context(|| format!("look for {branch} on origin in {repo}"))?;
+    if listed.trim().is_empty() {
+        return Ok(true); // the remote lacks the branch
+    }
+    repo.git(&["fetch", "--quiet", "--no-recurse-submodules", "origin", &format!("+{heads_ref}:{tracking_ref}")])
+        .with_context(|| format!("fetch {branch} from origin in {repo}"))?;
+    let out = repo.git_output(&["merge-base", "--is-ancestor", head.trim(), &tracking_ref])?;
+    match out.status.code() {
+        Some(0) => Ok(false),
+        Some(1) => Ok(true),
+        _ => bail!("git merge-base failed in {repo}: {}", String::from_utf8_lossy(&out.stderr).trim()),
+    }
 }
 
 /// Push the branch of `dir` and of each submodule that is on one (a
@@ -2693,6 +2728,92 @@ mod tests {
         // A commit of ours on top of theirs-unseen is a real divergence, and is refused loudly.
         git(&work, &["commit", "-q", "--allow-empty", "-m", "ours"]);
         assert!(push_branches(&dir).is_err());
+    }
+
+    /// Seen live (shepherd gap 69, ENG-2157): Reset environment refused with
+    /// "worktree kept" because a branch whose local head was an ancestor of the
+    /// remote's (behind by two, nothing of ours) was pushed and rejected
+    /// non-fast-forward. Behind-or-equal counts as already pushed; ahead or
+    /// diverged is still pushed (never forced) and refused when it cannot be.
+    #[test]
+    fn a_branch_behind_its_remote_counts_as_pushed_and_a_diverged_one_is_refused() {
+        let (tmp, remote, work) = unpushed_fixture();
+        let dir = Workdir::host(&work);
+        git(&work, &["commit", "-q", "--allow-empty", "-m", "ours"]);
+        // The remote's branch is two commits ahead of ours, and this clone has
+        // no remote-tracking ref for it (so the local refs cannot answer).
+        let other = tmp.path().join("other");
+        git(&work, &["push", "-q", "origin", "task/x"]);
+        git(tmp.path(), &["clone", "-q", "-b", "task/x", &remote.to_string_lossy(), &other.to_string_lossy()]);
+        git(&other, &["config", "user.email", "o@example.com"]);
+        git(&other, &["config", "user.name", "o"]);
+        git(&other, &["commit", "-q", "--allow-empty", "-m", "theirs 1"]);
+        git(&other, &["commit", "-q", "--allow-empty", "-m", "theirs 2"]);
+        git(&other, &["push", "-q", "origin", "task/x"]);
+        git(&work, &["update-ref", "-d", "refs/remotes/origin/task/x"]);
+        assert!(!needs_push(&dir).unwrap(), "behind the remote: nothing of ours to send");
+        push_branches(&dir).expect("behind the remote counts as pushed");
+        ensure_work_pushed_in(&dir).expect("and so does the delete guard");
+        assert!(git(&remote, &["log", "--format=%s", "task/x"]).contains("theirs 2"), "never force-pushed");
+        // Equal to the remote.
+        git(&work, &["merge", "-q", "--ff-only", "origin/task/x"]);
+        assert!(!needs_push(&dir).unwrap());
+        // Diverged: a commit of ours, the remote has another since.
+        git(&work, &["commit", "-q", "--allow-empty", "-m", "ours 2"]);
+        git(&other, &["commit", "-q", "--allow-empty", "-m", "theirs 3"]);
+        git(&other, &["push", "-q", "origin", "task/x"]);
+        git(&work, &["update-ref", "-d", "refs/remotes/origin/task/x"]);
+        assert!(needs_push(&dir).unwrap());
+        let err = format!("{:#}", push_branches(&dir).unwrap_err());
+        assert!(err.contains("push task/x"), "{err}");
+        let err = format!("{:#}", ensure_work_pushed_in(&dir).unwrap_err());
+        assert!(err.contains("ours 2") && err.contains("no remote has"), "{err}");
+        assert!(!git(&remote, &["log", "--format=%s", "task/x"]).contains("ours 2"), "never force-pushed");
+    }
+
+    /// The same for a submodule's branch, the case seen live (the `ui`
+    /// submodule): the checkout's own branch is pushed, the submodule's is
+    /// behind its remote and counts as pushed; once it has a commit of its own
+    /// on top of a moved remote the whole push is refused.
+    #[test]
+    fn a_submodule_branch_behind_its_remote_counts_as_pushed() {
+        let (tmp, _remote, work) = unpushed_fixture();
+        let sub_remote = tmp.path().join("sub.git");
+        let sub_seed = tmp.path().join("subseed");
+        std::fs::create_dir_all(&sub_remote).unwrap();
+        std::fs::create_dir_all(&sub_seed).unwrap();
+        git(&sub_remote, &["init", "-q", "--bare", "-b", "main"]);
+        git(&sub_seed, &["init", "-q", "-b", "main"]);
+        git(&sub_seed, &["config", "user.email", "t@example.com"]);
+        git(&sub_seed, &["config", "user.name", "t"]);
+        git(&sub_seed, &["commit", "-q", "--allow-empty", "-m", "sub base"]);
+        git(&sub_seed, &["remote", "add", "origin", &sub_remote.to_string_lossy()]);
+        git(&sub_seed, &["push", "-q", "origin", "main"]);
+        git(&work, &["-c", "protocol.file.allow=always", "submodule", "add", "-q", &sub_remote.to_string_lossy(), "ui"]);
+        git(&work, &["commit", "-q", "-m", "add ui"]);
+        let ui = work.join("ui");
+        git(&ui, &["config", "user.email", "t@example.com"]);
+        git(&ui, &["config", "user.name", "t"]);
+        git(&ui, &["checkout", "-q", "-b", "task/x"]);
+        let dir = Workdir::host(&work);
+        push_branches(&dir).unwrap();
+        // The submodule's remote branch moves two ahead; the clone never sees it.
+        git(&sub_seed, &["fetch", "-q", "origin", "task/x"]);
+        git(&sub_seed, &["checkout", "-q", "-B", "task/x", "FETCH_HEAD"]);
+        git(&sub_seed, &["commit", "-q", "--allow-empty", "-m", "theirs 1"]);
+        git(&sub_seed, &["commit", "-q", "--allow-empty", "-m", "theirs 2"]);
+        git(&sub_seed, &["push", "-q", "origin", "task/x"]);
+        git(&ui, &["update-ref", "-d", "refs/remotes/origin/task/x"]);
+        assert!(!needs_push(&dir).unwrap());
+        push_branches(&dir).expect("the submodule is behind its remote: nothing of ours to send");
+        ensure_work_pushed_in(&dir).unwrap();
+        // The submodule diverges.
+        git(&ui, &["commit", "-q", "--allow-empty", "-m", "ui ours"]);
+        git(&sub_seed, &["commit", "-q", "--allow-empty", "-m", "theirs 3"]);
+        git(&sub_seed, &["push", "-q", "origin", "task/x"]);
+        git(&ui, &["update-ref", "-d", "refs/remotes/origin/task/x"]);
+        let err = format!("{:#}", push_branches(&dir).unwrap_err());
+        assert!(err.contains("submodule") && err.contains("task/x"), "{err}");
     }
 
     /// Seen live (ENG-2287): commits that only a sandbox had went with the
