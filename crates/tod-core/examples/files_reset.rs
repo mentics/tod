@@ -15,7 +15,7 @@ fn main() -> anyhow::Result<()> {
     let mut sandboxes = Sandboxes::load(&root)?;
     let bx = sandboxes.blaxel()?;
     let info = bx.get(&name)?;
-    let cleared = provision::secure_sandbox_commits(info.as_ref(), &name, Some(&location))?;
+    let cleared = provision::secure_sandbox_commits(info.as_ref(), &name, Some(&location), provision::Uncommitted::Checkpoint(&node))?;
     sandboxes.delete(&bx, &cleared)?;
     fleet.enqueue(FleetMutation::DeleteFilesLocation { node_id: node })?;
     fleet.writer().flush()?;

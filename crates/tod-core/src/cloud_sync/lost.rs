@@ -1101,7 +1101,7 @@ trait SandboxBackend {
     /// Refuses (an error naming the commits) while the sandbox holds commits
     /// of the node's that no remote has, after pushing what can be pushed.
     /// Runs even when the checkpoint is skipped.
-    fn secure_commits(&mut self, fleet: &FleetStore, node_id: &str, name: &str) -> Result<()>;
+    fn secure_commits(&mut self, fleet: &FleetStore, node_id: &str, name: &str, force: bool) -> Result<()>;
     /// Keeps the node's uncommitted work, found through its Files location;
     /// an error means nothing may be deleted.
     fn checkpoint(&mut self, fleet: &FleetStore, node_id: &str, name: &str) -> Result<()>;
@@ -1138,9 +1138,15 @@ impl SandboxBackend for BlaxelBackend {
         Ok(self.bx.get(name).with_context(|| format!("look up sandbox {name}"))?.is_some())
     }
 
-    fn secure_commits(&mut self, fleet: &FleetStore, node_id: &str, name: &str) -> Result<()> {
+    fn secure_commits(&mut self, fleet: &FleetStore, node_id: &str, name: &str, force: bool) -> Result<()> {
         let info = self.bx.get(name).with_context(|| format!("look up sandbox {name}"))?;
-        self.cleared = Some(tod_store::fleet::provision::ensure_work_pushed(fleet, node_id, name, info.as_ref())?);
+        self.cleared = Some(tod_store::fleet::provision::ensure_work_pushed(
+            fleet,
+            node_id,
+            name,
+            info.as_ref(),
+            if force { tod_store::fleet::provision::Uncommitted::Discard } else { tod_store::fleet::provision::Uncommitted::Checkpoint(node_id) },
+        )?);
         Ok(())
     }
 
@@ -1225,7 +1231,7 @@ fn delete_with(
     } else if present {
         // Commits no remote has are never lost by a delete, not even the one
         // that skips the checkpoint (that one gives up *uncommitted* work).
-        backend.secure_commits(fleet, node_id, name)?;
+        backend.secure_commits(fleet, node_id, name, force)?;
         if !force {
             backend.checkpoint(fleet, node_id, name)?;
         }
@@ -1543,7 +1549,7 @@ mod tests {
         fn exists(&mut self, name: &str) -> Result<bool> {
             Ok(self.has.iter().any(|n| n == name))
         }
-        fn secure_commits(&mut self, _: &FleetStore, _: &str, name: &str) -> Result<()> {
+        fn secure_commits(&mut self, _: &FleetStore, _: &str, name: &str, _: bool) -> Result<()> {
             match &self.unpushed {
                 Some(work) => anyhow::bail!("sandbox {name} was not deleted: {work}"),
                 None => Ok(()),

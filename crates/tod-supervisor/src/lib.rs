@@ -385,6 +385,14 @@ impl StepHook for Hook<'_> {
                 tod_core::autopilot::local::PAUSED.to_string()
             }));
         }
+        // Every step, and a turn once the period has passed: what is not
+        // committed survives the sandbox too. Before the push, which ends the
+        // run when it fails: a failing push (ENG-3311: a fetch lost a race for
+        // a remote-tracking ref) must not be what keeps the uncommitted work
+        // from being saved.
+        if let Some(checkpoints) = &mut self.checkpoints {
+            checkpoints.tick(boundary == Boundary::Step);
+        }
         // After the stop check, so a user's stop wins over a failing push (the
         // run-end push still reports it). At a turn too: an implement or fix turn's commits (in a submodule,
         // the parent records only their id) must not wait for the step to
@@ -393,11 +401,6 @@ impl StepHook for Hook<'_> {
             // A failure stops the run with the repositories named: work that
             // cannot reach the remote is not something to carry on past.
             git::push_branch(self.workspace).context("pushing the node's branch at a turn or step boundary")?;
-        }
-        // Every step, and a turn once the period has passed: what is not
-        // committed survives the sandbox too.
-        if let Some(checkpoints) = &mut self.checkpoints {
-            checkpoints.tick(boundary == Boundary::Step);
         }
         if fresh_marker(self.state_dir)
             || tod_store::node_requests::any_of(&pending, tod_store::node_requests::KIND_FRESH_SESSION)

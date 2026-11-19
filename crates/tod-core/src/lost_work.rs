@@ -684,6 +684,29 @@ pub fn lost_submodules(repos: &[(String, RepoState)], done_steps: usize) -> Vec<
     repos.iter().filter(|(name, s)| name != "." && *s == RepoState::Untouched).map(|(name, _)| name.clone()).collect()
 }
 
+/// What the note [`record_replacement`] leaves says of `repos`: whether it is
+/// `failed`, the per-repository list, the verdict, and the submodules found
+/// lost. A repository that could not be inspected ([`RepoState::Unknown`]) is
+/// never read as "nothing was lost": the verdict says so, names it, and the
+/// note is `failed` so it is counted.
+pub fn replacement_verdict(repos: &[(String, RepoState)], done: usize) -> (bool, String, String, Vec<String>) {
+    let lost = lost_submodules(repos, done);
+    let per_repo = repos.iter().map(|(name, s)| format!("{name}: {s:?}")).collect::<Vec<_>>().join("; ");
+    let unknown: Vec<&str> = repos.iter().filter(|(_, s)| matches!(s, RepoState::Unknown(_))).map(|(n, _)| n.as_str()).collect();
+    let mut verdict = if lost.is_empty() {
+        "No submodule commit of the node's is known to be lost.".to_string()
+    } else {
+        format!("Submodule commits were on no remote branch when the sandbox was lost: {}.", lost.join(", "))
+    };
+    if !unknown.is_empty() {
+        verdict.push_str(&format!(
+            " Could not tell whether the node's work survived in {}: those repositories could not be inspected, so it may be lost (uncommitted work is only kept if a checkpoint was saved).",
+            unknown.join(", ")
+        ));
+    }
+    (!lost.is_empty() || !unknown.is_empty(), per_repo, verdict, lost)
+}
+
 /// Records, on the node's activity, what a freshly made replacement for the
 /// lost sandbox `old` holds of the node's work, per repository: the commits
 /// the old sandbox had that no remote branch had are not in the new checkout,
@@ -702,14 +725,8 @@ pub fn record_replacement(fleet: &FleetStore, node: Uuid, old: &str, new: &str) 
     let (failed, detail, lost) = match &repos {
         None => (false, format!("Sandbox {old} was replaced by {new}; the new checkout is not made yet, so nothing could be compared. {done} implementation step(s) were done."), Vec::new()),
         Some(repos) => {
-            let lost = lost_submodules(repos, done);
-            let per_repo = repos.iter().map(|(name, s)| format!("{name}: {s:?}")).collect::<Vec<_>>().join("; ");
-            let verdict = if lost.is_empty() {
-                "No submodule commits of the node's were lost.".to_string()
-            } else {
-                format!("Submodule commits were on no remote branch when the sandbox was lost: {}.", lost.join(", "))
-            };
-            (!lost.is_empty(), format!("Sandbox {old} was replaced by {new}. {done} implementation step(s) were done. In the new checkout: {per_repo}. {verdict}"), lost)
+            let (failed, per_repo, verdict, lost) = replacement_verdict(repos, done);
+            (failed, format!("Sandbox {old} was replaced by {new}. {done} implementation step(s) were done. In the new checkout: {per_repo}. {verdict}"), lost)
         }
     };
     tracing::info!("cloud: node {node}: {detail}");

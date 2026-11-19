@@ -331,7 +331,7 @@ fn delete_orphans_with(root: &Path, names: &[String], still: HashSet<String>) ->
         // hold, a lost location): the same guard as every node-sandbox delete.
         &mut |name| {
             let info = bx.get(name).with_context(|| format!("look up sandbox {name}"))?;
-            *cleared.borrow_mut() = Some(tod_store::fleet::provision::secure_sandbox_commits(info.as_ref(), name, None)?);
+            *cleared.borrow_mut() = Some(tod_store::fleet::provision::secure_sandbox_commits(info.as_ref(), name, None, tod_store::fleet::provision::Uncommitted::Refuse)?);
             Ok(())
         },
         &mut |name| {

@@ -526,6 +526,27 @@ fn a_replaced_sandbox_records_what_its_checkout_holds_of_the_nodes_work() {
     assert!(!note.failed);
 }
 
+/// Shepherd gap 63: every repository "Unknown" must not read "No submodule
+/// commits were lost" (ENG-3311's five notes said both).
+#[test]
+fn a_replacement_note_never_claims_nothing_was_lost_for_repositories_it_could_not_inspect() {
+    use crate::lost_work::{RepoState, replacement_verdict};
+    let repos = vec![
+        (".".to_string(), RepoState::Unknown("stub or merged".into())),
+        ("flagship".to_string(), RepoState::Unknown("recreated at a newer base".into())),
+        ("infra".to_string(), RepoState::OwnCommits),
+    ];
+    let (failed, per_repo, verdict, lost) = replacement_verdict(&repos, 4);
+    assert!(failed, "an uninspectable repository is a failed note, so it is counted");
+    assert!(lost.is_empty());
+    assert!(per_repo.contains("infra: OwnCommits"));
+    assert!(verdict.contains("Could not tell") && verdict.contains(".") && verdict.contains("flagship"), "{verdict}");
+    assert!(!verdict.contains("were lost: ") && !verdict.contains("No submodule commits of the node's were lost"), "{verdict}");
+    // Nothing unknown, nothing lost: the note is clean.
+    let (failed, _, verdict, _) = replacement_verdict(&[(".".to_string(), RepoState::OwnCommits)], 4);
+    assert!(!failed && !verdict.contains("Could not tell"), "{verdict}");
+}
+
 #[test]
 fn a_submodule_with_no_commit_of_the_nodes_own_is_lost_work_only_when_steps_were_done() {
     use crate::lost_work::{RepoState, lost_submodules};
