@@ -314,43 +314,82 @@ mod tests {
         assert!(!p.made());
     }
 
-    /// A submodule that is not at the commit the branch records is not
-    /// "exactly a commit": the release keeps the worktree (the checks' head key
-    /// could not stand for it), and gives it back once it is.
-    #[test]
-    fn a_submodule_off_its_recorded_commit_keeps_the_worktree() {
-        let p = parked("pr_draft");
+    /// tod's real layout: the superproject has a submodule, the node's work is
+    /// committed in the submodule on the node's branch and pushed, and the
+    /// superproject's pointer is never committed (so `git status` shows the
+    /// submodule modified). Returns the worktree and the submodule's directory.
+    fn with_submodule_work(p: &Parked) -> (PathBuf, PathBuf) {
         let dir = provision::node_location(&p.fx.fleet, &p.node).unwrap().unwrap().directory().unwrap();
         let dir = dir.host_path().unwrap().to_path_buf();
         let sub = p.fx.root.join("sub");
+        let sub_origin = p.fx.root.join("sub-origin.git");
         std::fs::create_dir_all(&sub).unwrap();
+        std::fs::create_dir_all(&sub_origin).unwrap();
+        git(&sub_origin, &["init", "-q", "--bare", "-b", "main"]);
         git(&sub, &["init", "-q", "-b", "main"]);
         git(&sub, &["commit", "-q", "--allow-empty", "-m", "sub init"]);
-        git(&dir, &["-c", "protocol.file.allow=always", "submodule", "add", "-q", sub.to_str().unwrap(), "vendor"]);
+        git(&sub, &["remote", "add", "origin", sub_origin.to_str().unwrap()]);
+        git(&sub, &["push", "-q", "-u", "origin", "main"]);
+        git(&dir, &["-c", "protocol.file.allow=always", "submodule", "add", "-q", sub_origin.to_str().unwrap(), "vendor"]);
         git(&dir, &["commit", "-qm", "add submodule"]);
         git(&dir, &["push", "-q", "origin", &p.branch]);
-        assert_eq!(release_due(&p.fx.fleet).unwrap().kept.len(), 0, "a submodule at its recorded commit is clean");
-        // Make another lease for the next half of the test.
-        drop(p);
+        // The check runs for this head; the submodule is then given work.
+        let vendor = dir.join("vendor");
+        git(&vendor, &["checkout", "-q", "-B", &p.branch]);
+        std::fs::write(vendor.join("work.txt"), "w").unwrap();
+        git(&vendor, &["add", "."]);
+        git(&vendor, &["commit", "-qm", "the node's work"]);
+        git(&vendor, &["push", "-q", "origin", &p.branch]);
+        let status = git(&dir, &["status", "--porcelain"]);
+        assert!(status.contains("vendor"), "the pointer is not committed: {status:?}");
+        (dir, vendor)
+    }
+
+    /// A node with submodule work that is pushed and whose pointer was never
+    /// committed is released after idle, and then its passed checks answer from
+    /// the remotes: no lease is made again, however often it is woken.
+    #[test]
+    fn a_node_with_pushed_submodule_work_is_released_and_never_leased_again() {
         let p = parked("pr_draft");
-        let dir = provision::node_location(&p.fx.fleet, &p.node).unwrap().unwrap().directory().unwrap();
-        let dir = dir.host_path().unwrap().to_path_buf();
-        let sub = p.fx.root.join("sub2");
-        std::fs::create_dir_all(&sub).unwrap();
-        git(&sub, &["init", "-q", "-b", "main"]);
-        git(&sub, &["commit", "-q", "--allow-empty", "-m", "sub init"]);
-        git(&dir, &["-c", "protocol.file.allow=always", "submodule", "add", "-q", sub.to_str().unwrap(), "vendor"]);
-        git(&dir, &["commit", "-qm", "add submodule"]);
-        git(&dir, &["push", "-q", "origin", &p.branch]);
-        // The submodule moves to a newer commit its remote has.
-        git(&sub, &["commit", "-q", "--allow-empty", "-m", "drift"]);
-        git(&dir.join("vendor"), &["fetch", "-q", "origin"]);
-        git(&dir.join("vendor"), &["checkout", "-q", "origin/main"]);
+        let (_dir, _vendor) = with_submodule_work(&p);
+        let round = crate::checks::run_stale(&p.fx.fleet, p.fx.node, "pr_draft").unwrap();
+        assert!(round.clear() && round.runs.len() == 1, "{round:?}");
+        let ran = p.fx.fleet.read(|c| tod_store::check_runs::CheckRunRepo::new(c).latest(p.fx.node, "pr_draft", "", "true")).unwrap().unwrap();
+        // The checks run for exactly these heads: submodule HEAD, not pointer.
+        p.idle();
+        let report = release_due(&p.fx.fleet).unwrap();
+        assert_eq!(report.released.len(), 1, "a moved pointer must not keep the lease: {report:?}");
+        assert!(!p.made());
+        // A push of a released location is nothing to push, not a failure.
+        assert_eq!(provision::push_node_branch(&p.fx.fleet, &p.node).unwrap(), None);
+        for wake in 0..4 {
+            let round = crate::checks::run_stale(&p.fx.fleet, p.fx.node, "pr_draft").unwrap();
+            assert!(round.clear() && round.runs.len() == 1, "wake {wake}: {round:?}");
+            assert!(!p.made(), "wake {wake} leased a worktree again");
+        }
+        assert_eq!(treehouse_calls(&p).len(), 1, "only the one return: {:?}", treehouse_calls(&p));
+        let after = p.fx.fleet.read(|c| tod_store::check_runs::CheckRunRepo::new(c).latest(p.fx.node, "pr_draft", "", "true")).unwrap().unwrap();
+        assert_eq!(after.ran_at, ran.ran_at, "the check was not run again");
+    }
+
+    /// The release stays strict: uncommitted or untracked files in a submodule,
+    /// or a submodule commit no remote has, keep the lease.
+    #[test]
+    fn a_dirty_or_unpushed_submodule_keeps_the_lease() {
+        let p = parked("pr_draft");
+        let (_dir, vendor) = with_submodule_work(&p);
+        std::fs::write(vendor.join("wip.txt"), "wip").unwrap();
         let report = release_due(&p.fx.fleet).unwrap();
         assert!(report.released.is_empty() && report.kept.len() == 1, "{report:?}");
-        assert!(report.kept[0].1.contains("not at the commit the branch records"), "{report:?}");
+        assert!(report.kept[0].1.contains("uncommitted"), "{report:?}");
         assert!(p.made());
-        git(&dir, &["-c", "protocol.file.allow=always", "submodule", "update", "--force"]);
+        std::fs::remove_file(vendor.join("wip.txt")).unwrap();
+        git(&vendor, &["commit", "-q", "--allow-empty", "-m", "local only"]);
+        let report = release_due(&p.fx.fleet).unwrap();
+        assert!(report.released.is_empty() && report.kept.len() == 1, "{report:?}");
+        assert!(report.kept[0].1.contains("no remote has"), "{report:?}");
+        assert!(p.made());
+        git(&vendor, &["push", "-q", "origin", &p.branch]);
         let report = release_due(&p.fx.fleet).unwrap();
         assert_eq!(report.released.len(), 1, "{report:?}");
     }

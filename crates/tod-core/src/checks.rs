@@ -120,18 +120,14 @@ impl Tree {
         Ok(Self { repos, fingerprints: Default::default(), changes: Default::default() })
     }
 
-    /// The root's `HEAD` commit when the files are exactly that commit:
-    /// nothing uncommitted or untracked in the repository or any submodule
-    /// (`git status` covers them all). Gitignored files are not looked at, as
-    /// in [`repo_fingerprint`]. `None` otherwise.
+    /// The key naming the files' commits ([`tod_store::fleet::provision::heads_key`]:
+    /// the root's `HEAD` and each submodule's own) when the files are exactly
+    /// those commits: nothing uncommitted or untracked in the repository or any
+    /// submodule. A submodule pointer that moved does not count (tod never
+    /// commits one). Gitignored files are not looked at, as in
+    /// [`repo_fingerprint`]. `None` otherwise.
     fn clean_head(&self) -> Result<Option<String>> {
-        let root = &self.repos[0].1;
-        let status = root.git_output(&["status", "--porcelain"])?;
-        anyhow::ensure!(status.status.success(), "git status failed in {root}: {}", String::from_utf8_lossy(&status.stderr).trim());
-        if !status.stdout.iter().all(u8::is_ascii_whitespace) {
-            return Ok(None);
-        }
-        Ok(Some(root.git(&["rev-parse", "HEAD"]).with_context(|| format!("read HEAD in {root}"))?))
+        tod_store::fleet::provision::clean_heads_key(&self.repos[0].1)
     }
 
     fn fingerprint_of(&self, index: usize) -> Result<String> {

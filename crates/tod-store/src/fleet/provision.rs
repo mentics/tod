@@ -592,18 +592,11 @@ pub fn release_parked_worktree(
         }
         LocationState::Gone => return Ok(Release::Kept("its directory is gone".into())),
     }
-    // The tree must be exactly the commit the branch tip records: a submodule
-    // sitting elsewhere (a pointer change `location_state` ignores) is not, and
-    // a worktree given back in that state could not be told from the branch by
-    // the checks' head key (`tod_core::checks::tree_key`), so every wake would
-    // lease it again.
-    let drift = dir.git(&["status", "--porcelain"])?;
-    if !drift.trim().is_empty() {
-        return Ok(Release::Kept(format!(
-            "a submodule is not at the commit the branch records: {}",
-            drift.lines().take(3).collect::<Vec<_>>().join("; ")
-        )));
-    }
+    // Nothing about which commit a submodule is on is asked: tod never commits
+    // a submodule pointer, so every node with work in a submodule shows a
+    // moved pointer. What matters is that nothing is lost, which `location_state`
+    // (no uncommitted or untracked file in the checkout or any submodule) and
+    // `unpushed_commits` (no commit in any of them that no remote has) say.
     let unpushed = unpushed_commits(&dir)?;
     if !unpushed.is_empty() {
         return Ok(Release::Kept(unpushed.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ")));
@@ -635,7 +628,139 @@ pub fn unmade_branch_head(fleet: &FleetStore, node_id: &str) -> Result<Option<St
     let listed = repo
         .git(&["ls-remote", "origin", &format!("refs/heads/{branch}")])
         .with_context(|| format!("ask origin for the head of {branch} in {repo}"))?;
-    Ok(listed.lines().next().and_then(|line| line.split_whitespace().next()).map(str::to_string))
+    let Some(head) = listed.lines().next().and_then(|line| line.split_whitespace().next()).map(str::to_string) else {
+        return Ok(None);
+    };
+    unmade_heads_key(&repo, &branch, &head)
+}
+
+/// What names a checkout's commits for the checks ([`unmade_branch_head`],
+/// [`clean_heads_key`]): the superproject's head, and when it has submodules
+/// each one's path and head commit, sorted by path. A submodule's pointer is
+/// not used: tod never commits it, so the commit a node's work is on is the
+/// submodule's own head.
+pub fn heads_key(head: &str, mut submodules: Vec<(String, String)>) -> String {
+    if submodules.is_empty() {
+        return head.to_string();
+    }
+    submodules.sort();
+    let parts: Vec<String> = submodules.iter().map(|(path, sha)| format!("{path}={sha}")).collect();
+    format!("{head}+{}", parts.join(";"))
+}
+
+/// The submodules (`path`, commit recorded) `rev` holds, or `None` when a path
+/// is one this cannot read plainly (git quotes it).
+fn gitlinks(dir: &Workdir, rev: &str) -> Result<Option<Vec<(String, String)>>> {
+    let listed = dir.git(&["ls-tree", "-r", rev])?;
+    let mut out = Vec::new();
+    for line in listed.lines() {
+        let Some((meta, path)) = line.split_once('\t') else { continue };
+        let mut fields = meta.split_whitespace();
+        if fields.next() != Some("160000") {
+            continue;
+        }
+        let Some(sha) = fields.nth(1) else { continue };
+        if path.starts_with('"') {
+            return Ok(None);
+        }
+        out.push((path.to_string(), sha.to_string()));
+    }
+    Ok(Some(out))
+}
+
+/// The key ([`heads_key`]) of a checkout that is exactly its commits: nothing
+/// uncommitted or untracked in it or any submodule (the test
+/// [`location_state`] applies, so a submodule pointer that moved does not
+/// count), each submodule at its own head. `None` when it is not clean.
+pub fn clean_heads_key(dir: &Workdir) -> Result<Option<String>> {
+    let status = dir.git(&["status", "--porcelain", "--ignore-submodules=all"])?;
+    if !status.trim().is_empty() || !submodule_dirty_lines(dir)?.is_empty() {
+        return Ok(None);
+    }
+    let head = dir.git(&["rev-parse", "HEAD"]).with_context(|| format!("read HEAD in {dir}"))?;
+    let Some(links) = gitlinks(dir, "HEAD")? else { return Ok(None) };
+    let initialized: BTreeSet<String> = worktree::submodule_paths(dir)?.into_iter().collect();
+    let mut submodules = Vec::new();
+    for (path, recorded) in links {
+        let sha = if initialized.contains(&path) {
+            dir.join(&path).git(&["rev-parse", "HEAD"]).with_context(|| format!("read HEAD in submodule {path}"))?
+        } else {
+            recorded
+        };
+        submodules.push((path, sha));
+    }
+    Ok(Some(heads_key(&head, submodules)))
+}
+
+/// [`heads_key`] for the node branch `branch` at `head` on `origin`, asked of
+/// the remotes without a worktree: the superproject's tree at `head` (fetched
+/// into the shared repository if it lacks it) says which submodules there are
+/// and where; each one's key part is its `origin` branch of the same name when
+/// that exists, else the commit `head` records for it. `None` when any of it
+/// cannot be determined (an unreadable `.gitmodules`, a remote that cannot be
+/// asked): the caller then makes the files, which costs one lease; nothing is
+/// guessed.
+fn unmade_heads_key(repo: &Workdir, branch: &str, head: &str) -> Result<Option<String>> {
+    let have = repo.git_output(&["cat-file", "-e", &format!("{head}^{{commit}}")])?;
+    if !have.status.success() {
+        repo.git(&["fetch", "-q", "origin", &format!("refs/heads/{branch}")])
+            .with_context(|| format!("fetch {branch} from origin in {repo}"))?;
+    }
+    let Some(links) = gitlinks(repo, head)? else { return Ok(None) };
+    if links.is_empty() {
+        return Ok(Some(head.to_string()));
+    }
+    let Ok(configured) = repo.git(&["config", "--blob", &format!("{head}:.gitmodules"), "--get-regexp", r"^submodule\..*\.(path|url)$"]) else {
+        return Ok(None);
+    };
+    let (mut paths, mut urls): (HashMap<String, String>, HashMap<String, String>) = Default::default();
+    for line in configured.lines() {
+        let Some((key, value)) = line.split_once(' ') else { continue };
+        let Some(key) = key.strip_prefix("submodule.") else { continue };
+        if let Some(name) = key.strip_suffix(".path") {
+            paths.insert(name.to_string(), value.trim().to_string());
+        } else if let Some(name) = key.strip_suffix(".url") {
+            urls.insert(name.to_string(), value.trim().to_string());
+        }
+    }
+    let url_of_path: HashMap<&String, &String> = paths.iter().filter_map(|(name, path)| urls.get(name).map(|u| (path, u))).collect();
+    let origin = repo.git(&["remote", "get-url", "origin"])?;
+    let mut submodules = Vec::new();
+    for (path, recorded) in links {
+        let Some(url) = url_of_path.get(&path) else { return Ok(None) };
+        let url = resolve_submodule_url(origin.trim(), url);
+        let Ok(listed) = repo.git(&["ls-remote", &url, &format!("refs/heads/{branch}")]) else {
+            return Ok(None);
+        };
+        let sha = listed.lines().next().and_then(|l| l.split_whitespace().next()).map(str::to_string).unwrap_or(recorded);
+        submodules.push((path, sha));
+    }
+    Ok(Some(heads_key(head, submodules)))
+}
+
+/// A submodule url as git resolves it: one starting `./` or `../` is relative
+/// to the superproject's own remote url.
+fn resolve_submodule_url(origin: &str, url: &str) -> String {
+    if !url.starts_with("./") && !url.starts_with("../") {
+        return url.to_string();
+    }
+    let mut base = origin.trim_end_matches('/').to_string();
+    let mut rest = url;
+    loop {
+        if let Some(r) = rest.strip_prefix("./") {
+            rest = r;
+        } else if let Some(r) = rest.strip_prefix("../") {
+            rest = r;
+            match (base.rfind('/'), base.rfind(':')) {
+                (Some(i), _) => base.truncate(i),
+                (None, Some(i)) => base.truncate(i + 1),
+                (None, None) => {}
+            }
+        } else {
+            break;
+        }
+    }
+    if base.ends_with(':') { format!("{base}{rest}") } else { format!("{base}/{rest}") }
 }
 
 /// The longest a sandbox name made here may be (the name also goes into the
@@ -2062,6 +2187,11 @@ fn ensure_submodule_commits(repo: &Workdir) -> Result<()> {
 /// checked out there is not its branch). Refuses a default branch. Runs git
 /// and the network: never on the UI thread.
 pub fn push_node_branch(fleet: &FleetStore, node_id: &str) -> Result<Option<String>> {
+    // Under the node's lock, so a release ([`release_parked_worktree`]) cannot
+    // give the worktree back mid-push; one that came first has removed the
+    // location, which is then nothing to push, not a failure.
+    let lock = node_lock(node_id);
+    let _held = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let Some(location) = node_location(fleet, node_id)? else {
         return Ok(None);
     };
@@ -2778,6 +2908,21 @@ pub fn stale_locations(fleet: &FleetStore) -> Result<Vec<AffectedLocation>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_relative_submodule_url_is_resolved_against_the_origin() {
+        use super::resolve_submodule_url as r;
+        assert_eq!(r("git@github.com:org/repo.git", "../kb.git"), "git@github.com:org/kb.git");
+        assert_eq!(r("https://github.com/org/repo.git", "../../other/kb.git"), "https://github.com/other/kb.git");
+        assert_eq!(r("git@host:repo.git", "../kb.git"), "git@host:kb.git");
+        assert_eq!(r("/srv/o/repo.git", "./sub.git"), "/srv/o/repo.git/sub.git");
+        assert_eq!(r("/srv/o/repo.git", "/abs/kb"), "/abs/kb");
+    }
+
+    #[test]
+    fn heads_key_is_the_head_alone_without_submodules_and_sorted_with_them() {
+        assert_eq!(super::heads_key("h", vec![]), "h");
+        assert_eq!(super::heads_key("h", vec![("b".into(), "2".into()), ("a".into(), "1".into())]), "h+a=1;b=2");
+    }
 
     /// The commit before a location is removed stages through the shared
     /// retrying `stage_all` (a file vanishing under `add -A` must not fail

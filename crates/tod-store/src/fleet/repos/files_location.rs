@@ -57,8 +57,11 @@ pub fn ensure_used_at(conn: &Connection) -> Result<()> {
         )
         .optional()?;
     if trigger.is_some_and(|sql| !sql.contains(" WHEN ")) {
-        conn.execute_batch("DROP TRIGGER trg_journey_node_files_locations_update;")?;
-        conn.execute_batch(&crate::journey_changes::files_locations_triggers_sql())?;
+        // One transaction: a failure part way leaves the old trigger, never none.
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch("DROP TRIGGER IF EXISTS trg_journey_node_files_locations_update;")?;
+        tx.execute_batch(&crate::journey_changes::files_locations_triggers_sql())?;
+        tx.commit()?;
     }
     Ok(())
 }
