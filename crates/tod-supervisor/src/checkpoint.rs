@@ -72,6 +72,9 @@ impl Checkpointer {
 }
 
 fn save(workspace: &Path, node: &str) {
+    // On the checkpoint thread too (`tick` spawns it): retried `ls-remote`s
+    // are counted against the node.
+    let _retries = tod_store::fleet::workdir::scope_retries_to_node(node);
     match checkpoint_dir(&Workdir::Host(workspace.to_path_buf()), node, &Limits::default()) {
         Ok(saved) => {
             for (repo, saved) in saved {

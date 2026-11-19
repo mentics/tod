@@ -125,12 +125,19 @@ pub fn restore_into(dir: &Workdir, node_id: &str, none_saved: Option<bool>) -> R
     };
     // Looking for a checkpoint is one round trip per repository (a sandbox's
     // checkout has several), almost always to find none: ask side by side.
+    // A thread-local does not reach spawned threads: each re-enters the node's
+    // retry scope, so a retried `ls-remote` is counted against the node.
+    let retry_node = tod_sandbox::git_retry::current_node();
     let found: Vec<bool> = std::thread::scope(|scope| {
         let handles: Vec<_> = repos
             .iter()
             .map(|repo| {
                 let reference = checkpoint::ref_name(node_id, &rel(dir, repo));
-                scope.spawn(move || checkpoint::remote_ref(repo, &reference).map_or(true, |found| found.is_some()))
+                let retry_node = retry_node.clone();
+                scope.spawn(move || {
+                    let _retries = tod_sandbox::git_retry::scope_node(retry_node);
+                    checkpoint::remote_ref(repo, &reference).map_or(true, |found| found.is_some())
+                })
             })
             .collect();
         handles.into_iter().map(|h| h.join().unwrap_or(true)).collect()
@@ -246,6 +253,32 @@ fn finished(fleet: &FleetStore, node: &str) -> Result<bool> {
 mod tests {
     use super::*;
     use crate::fleet::provision::node_location;
+
+    /// `restore_into` asks each repository side by side; a retried `ls-remote`
+    /// on those threads is still counted against the node (shepherd gap 49).
+    #[test]
+    fn a_checkpoint_lookup_retried_on_a_spawned_thread_is_counted_against_the_node() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        tod_sandbox::git_retry::set_sink(std::sync::Arc::new(move |r| {
+            sink.lock().unwrap().push(r);
+            Ok(())
+        }));
+        let dir = tod_test_util::scratch_dir(format!("tod-ckpt-retry-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for args in [&["init", "-q"][..], &["remote", "add", "origin", "https://tod-no-such-host.invalid/r.git"][..]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(&dir).args(args).status().unwrap().success());
+        }
+        let node = uuid::Uuid::new_v4();
+        {
+            let _scope = crate::fleet::workdir::scope_retries_to_node(&node.to_string());
+            restore_into(&Workdir::Host(dir.clone()), &node.to_string(), Some(false));
+        }
+        let seen = seen.lock().unwrap();
+        let mine: Vec<_> = seen.iter().filter(|r| r.node.as_deref() == Some(&node.to_string()[..])).collect();
+        assert!(mine.iter().any(|r| r.op == "ls-remote"), "the lookup is counted against the node: {seen:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_submodule_is_named_by_its_path_from_the_checkout() {
