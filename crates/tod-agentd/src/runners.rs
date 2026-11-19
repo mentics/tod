@@ -361,7 +361,12 @@ impl Runners {
                 match &slot.outcome {
                     Some(Outcome::Waiting { due_at_ms, .. }) if *due_at_ms <= now => due.push(*node),
                     Some(Outcome::Waiting { .. }) => parked.push((*node, slot.since)),
-                    Some(Outcome::NeedsHuman { reason }) if reason.is_request() => requests.push(*node),
+                    // A run the user paused or stopped by hand is theirs to resume.
+                    Some(Outcome::NeedsHuman { reason })
+                        if reason.is_request() && !matches!(slot.desired, Desired::Pause | Desired::Stop) =>
+                    {
+                        requests.push((*node, matches!(reason, tod_core::autopilot::NeedsHuman::Decision { .. })))
+                    }
                     _ => {}
                 }
             }
@@ -386,7 +391,8 @@ impl Runners {
         if request_nodes.is_empty() {
             return;
         }
-        let waiting = match self.inner.store.read(|conn| attention::for_nodes(conn, &request_nodes)) {
+        let ids: Vec<Uuid> = request_nodes.iter().map(|(n, _)| *n).collect();
+        let waiting = match self.inner.store.read(|conn| attention::for_nodes(conn, &ids)) {
             Ok(waiting) => waiting,
             Err(err) => {
                 tracing::error!("could not read what the nodes wait on: {err:#}");
@@ -396,12 +402,20 @@ impl Runners {
         let mut resume = Vec::new();
         {
             let mut slots = self.inner.slots.lock().expect("runner slots");
-            for node in request_nodes {
+            for (node, is_decision) in request_nodes {
                 let Some(slot) = slots.get_mut(&node) else { continue };
                 let is_waiting = waiting.get(&node).is_some_and(|a| a.waiting_since.is_some());
                 if is_waiting {
                     slot.seen_waiting = true;
-                } else if slot.seen_waiting {
+                } else if slot.seen_waiting || is_decision {
+                    // A run that stopped on a question was stopped because a
+                    // decision was pending, so one that is no longer pending
+                    // is an answer even if this daemon never saw it pending
+                    // (answered while it was down, or between two ticks, or
+                    // the run was read from its saved state). Without that,
+                    // the stale "waiting on N question(s)" kept the node
+                    // from being started, and `decide` leaves it alone for
+                    // having an outcome.
                     resume.push(node);
                 }
             }
@@ -1123,6 +1137,44 @@ mod tests {
         assert!(!fx.runners.inner.slots.lock().unwrap().contains_key(&ghost));
         // The saved file is left alone.
         assert!(fx.root.join("autopilot").join(format!("{ghost}.json")).exists());
+    }
+
+    /// Gap 58: a run stopped on a question whose answer this daemon never saw
+    /// pending (answered while it was down, or read from its saved state) kept
+    /// "waiting on 1 question(s)" until someone pressed Start.
+    #[test]
+    fn a_run_stopped_on_a_question_that_is_no_longer_pending_continues_though_never_seen_waiting() {
+        let fx = fixture();
+        {
+            let mut slots = fx.runners.inner.slots.lock().unwrap();
+            let slot = slots.entry(fx.node).or_default();
+            slot.outcome = Some(Outcome::NeedsHuman { reason: tod_core::autopilot::NeedsHuman::Decision { pending: 1 } });
+            assert!(!slot.seen_waiting);
+        }
+        fx.runners.start_due();
+        // The run was started again (it fails here for want of media, and says
+        // so), so the stale question text is gone.
+        let slots = fx.runners.inner.slots.lock().unwrap();
+        let slot = slots.get(&fx.node).unwrap();
+        assert!(
+            matches!(&slot.outcome, Some(Outcome::Stopped { reason }) if reason.starts_with(FAILED_PREFIX)),
+            "{:?}",
+            slot.outcome
+        );
+    }
+
+    #[test]
+    fn a_run_the_user_paused_is_not_continued_by_a_question_being_gone() {
+        let fx = fixture();
+        {
+            let mut slots = fx.runners.inner.slots.lock().unwrap();
+            let slot = slots.entry(fx.node).or_default();
+            slot.desired = Desired::Pause;
+            slot.outcome = Some(Outcome::NeedsHuman { reason: tod_core::autopilot::NeedsHuman::Decision { pending: 1 } });
+        }
+        fx.runners.start_due();
+        let slots = fx.runners.inner.slots.lock().unwrap();
+        assert!(matches!(slots.get(&fx.node).unwrap().outcome, Some(Outcome::NeedsHuman { .. })));
     }
 
     #[test]
