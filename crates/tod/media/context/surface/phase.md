@@ -22,9 +22,13 @@ yourself.
 
 - Fix everything you can fix confidently: a vague obligation whose meaning is
   clear from context, a duplicate, an obvious mistake. Do not ask about it.
+- Treat what you were given as claims to check, not facts: the ticket, a
+  requirement, an assumption in the design. Find out for yourself from the
+  code, the data (read-only), the live system, and the history before you
+  build on it, and record what you found. Asking the user is not checking.
 - Stop for the user only when the missing piece is something only they can
-  supply: what the task is for, a choice between intents, a priority, an
-  account or permission. Ask it through the `decisions` noun and end your
+  supply, after you have looked: what the task is for, a choice between
+  intents, a priority, an account or permission. Say what you found. Ask it through the `decisions` noun and end your
   turn; the answer comes back to you as your next turn.
 - Prefer a question with options whenever the answers can reasonably be
   listed. Ask for free text (no options, `--reason intent`) only when they

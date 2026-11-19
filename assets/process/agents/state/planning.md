@@ -15,7 +15,8 @@
 3. Resolve planning and implementation unknowns here. Spikes are complete, or deferred with decision trees, before the phase is done.
 4. Drain parked items: promote every open parked interview memory item to a plan step or obligation, or discard it.
 5. Work that belongs to a different releasable chunk (a follow-up that needs this one released first, or an out-of-scope bug or opportunity you found) does not go in this plan. Offer it as a new task: see "Follow-up work" in the base doc.
-6. Ask the user only for a decision you genuinely cannot make yourself: a tradeoff with no right answer the obligations and code settle, or a gap design left open that turns on what the user wants. Offer options with your recommendation first.
+6. **Line up what verification will need.** For each obligation that acts in `verifying` (and every other one verification will check against the real system), list what the check needs: credentials and access (the `secrets`, `access` and `db` nouns list what you have), test data, API quota. Ask the user now for anything missing, with the `access` reason, so it is in place by `verifying`. Missing access is never a reason to move a check to `merged` or `released`.
+7. Ask the user only for a decision you genuinely cannot make yourself: a tradeoff with no right answer the obligations and code settle, or a gap design left open that turns on what the user wants. Offer options with your recommendation first.
 
 ## Done when
 
@@ -27,6 +28,7 @@
 - [ ] **Constraints, both directions:** the plan does nothing a constraint forbids, and does everything one requires.
 - [ ] Assumptions are listed; spikes are complete or deferred with decision trees.
 - [ ] No open parked item remains on the task.
+- [ ] Everything verification will need to check against the real system (credentials, access, test data, quota) is available, or asked for.
 - [ ] Obligations and plan are reconciled: nothing the plan does contradicts an obligation, and nothing an obligation asks for is missing from the plan.
 
 There is no `ready` state agent: once the gate passes, the app starts `active` as soon as the `ready` → `active` gate does.

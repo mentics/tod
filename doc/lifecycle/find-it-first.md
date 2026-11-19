@@ -703,6 +703,21 @@ rules:
 In order. Items 1–4 are prompt changes and stop most of the damage at once;
 5–9 are app changes that enforce them.
 
+**Items 1–4 are done (2026-11-19).** Until the app changes land, the prompts
+use what exists:
+
+- **Send-back** (item 5 makes it a command of its own): an agent asks a
+  decision whose option carries the move.
+- **Root cause** (item 6 adds `--root-cause`): a finding's detail starts with
+  `Root cause:`, in the same words for every finding that shares it.
+- **Coverage** (item 6): the lens sweep is asked for but not yet recorded.
+- **Fix surface** (from item 9): `surface/fix.md` already says to fix the
+  class and to send a redesign back to `design`. The autopilot's own
+  escalation is still item 9.
+- **Pushing:** an agent pushes only until the task's branch has a pull
+  request. That keeps work in a cloud sandbox from being lost. After that,
+  only the pull request agent pushes.
+
 | # | Item | Files | Done when |
 |---|---|---|---|
 | 1 | Review prompts: remove the discouraging and delta-only text; whole change every round; lenses; variant analysis; saturation pass; evidence audit | `surface/review.md`, `surface/review-on-pr.md`, `state/review.md` | The surface asks for all of 6a–6f; context tests pass |

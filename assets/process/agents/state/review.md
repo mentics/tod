@@ -4,16 +4,16 @@
 
 ## First
 
-The review runs as the task's review conversation: the runner starts it, or the conversation view's **Review**.
+The review runs as the task's review conversation, which the runner starts.
 
 1. Read lifecycle state, obligations (including design-phase) and plan steps, implementation, and verification evidence from `verifying`.
-2. Functional correctness should already be established—do not treat this state as primary QA.
+2. The review does not run the verification itself, but it judges whether it was done: evidence that falls short sends the task back to `verifying`.
 
 ## Responsibilities
 
 ### Independent code review
 
-The review is done by an agent **not involved** in building this task's docs or implementation — the review conversation's agent is one. Use a code-review skill when available.
+The review is done by an agent **not involved** in building this task's docs or implementation — the review conversation's agent is one. Use a code-review skill when available. Every round reviews the whole change against its base, through every lens, and for each finding looks for every other place its root cause holds.
 
 Record every finding on the task through the `review` noun, one at a time, as it is found: that is how the user sees them, and how their responses are tracked. A finding that is only in a reply is lost.
 
@@ -24,7 +24,7 @@ Track all findings until each has an explicit response:
 - Not critical / beyond requirements / not worth the cost
 - Rejected: not a problem after all, with a note saying why
 
-Fixing is a separate fix conversation (the runner starts it, or the conversation view's **Fix**): its agent answers each open finding `fixed` or `rejected`. The other answers are the user's.
+Fixing is a separate fix conversation, which the runner starts: its agent answers each open finding `fixed` or `rejected`. The other answers are the user's.
 
 No outstanding unaddressed findings. A review that records findings is followed by a fix, and the fix by another review in a new session; the reviewer, not the fixer, decides the change is right.
 

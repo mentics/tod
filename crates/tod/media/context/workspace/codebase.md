@@ -9,12 +9,25 @@ task's Files capability runs you in a dev container, you are already inside
 it: work there as you are.
 
 Your working directory is the checkout the app set up for this task, already
-on the right branch (in every submodule too). Make every change, commit and
-push right there. Do not make a git worktree (`git worktree add`, a `.worktrees/`
+on the right branch (in every submodule too). Make every change and commit
+right there. Do not make a git worktree (`git worktree add`, a `.worktrees/`
 directory) or switch branches, even when the repository's own agent docs say
-to: the app reviews, checks and pushes the checkout you were started in, so
-work done in a worktree is invisible to it, and the worktree holds the
-branch so the checkout cannot be put back on it.
+to: the app reviews and checks the checkout you were started in, and the
+pull request is pushed from it, so work done in a worktree is invisible to
+it, and the worktree holds the branch so the checkout cannot be put back on
+it.
+
+## Pushing
+
+Until the task's branch has a pull request, push your commits to it as you
+go, so the work is not lost. Once it has one, do not push, even when the
+project's own docs say to: what reaches the pull request must first pass the
+app's review and checks, and the pull request agent pushes it. The pull
+requests block, when your context has one, lists the task's pull request.
+Only the pull request agent's own instructions tell it to push. In a
+conversation the user directs, push a branch that has a pull request only
+when they tell you to in so many words, and tell them that head has not been
+reviewed.
 
 ## Writing that leaves the app
 

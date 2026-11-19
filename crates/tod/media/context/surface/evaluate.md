@@ -44,7 +44,17 @@ finds none", a measurement of the live system) and acts in `active`,
 `verifying`, or `design` is a mistake the next phases cannot recover from
 without the user. Reject it with a `--fix` naming the obligation and the
 state it should act in (`released`, or `merged` for what must be in place
-before the deploy); do not certify it, and do not ask the user.
+before the deploy); do not certify it, and do not ask the user. A check that
+runs the branch's code against the real system read-only (the live API,
+production data, a query plan) does not need the release: it acts in
+`verifying`, and is right there.
+
+A checklist item that says something was checked (a ticket's claims, a
+design's assumptions, its failure modes) holds only when the task shows what
+was checked and what it showed: a query and its result, the code read, the
+API's answer. Prose that says it was checked, or a conclusion with nothing
+behind it, does not hold; reject it with a `--fix` naming what is missing.
+Spot-check a claim yourself when it is cheap (one query, one file read).
 
 Be strict but not pedantic. Reject only for something that would make the next
 phase go wrong, not for style. When you certify, you are vouching that the

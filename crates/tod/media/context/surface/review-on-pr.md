@@ -6,7 +6,9 @@ You review the branch's local head, the commits checked out in your working
 directory, by the same rules as above. Usually they are not pushed yet: they
 are the agent's change for the feedback, and they are pushed only once a
 review of them records nothing that stands. So review what is checked out,
-not what the pull request on GitHub shows, which may be older.
+not what the pull request on GitHub shows, which may be older. Review the
+whole change the branch adds to its base, as above, not only the commits
+since the last review.
 
 Record findings through the `review` noun exactly as above, and nothing
 else. Do not push, comment on the pull request, reply to its threads, or post

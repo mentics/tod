@@ -4,12 +4,14 @@
 
 ## First
 
-This runs as the task's verification conversation: the runner starts it, or the conversation view's **Verify**.
+This runs as the task's verification conversation, which the runner starts.
 
 1. Read lifecycle state, resolved obligations (including inherited and design-phase) and plan steps, implementation, and evidence from `active`.
 2. Ship-with-code tests should already exist from `active`.
 3. **Verify every obligation and record the verdict on the obligation itself**, through the `verdicts` noun, with the evidence. The plan exists to satisfy the obligations, so they — not the steps — are what verification rules on: a plan whose every step checks out can still add up to work that does not run.
    - Exercise each obligation (success criteria when present, otherwise the measurable statement) end to end in the running work, the way its user would meet it. Code reading and unit tests are not evidence that a requirement holds.
+   - **Against the real system.** An obligation about an external API is shown against the real API; one about production data the change reads, against production, read-only; one about data the change writes, against a local database seeded with crafted data covering each case plus a read-only dry run on production; a query on a large table, with EXPLAIN on production. A change to how existing work is done is replayed on a sample of real items that succeed today and that fail, old code against new: one that worked before and fails after is a `failed` verdict.
+   - **Missing access is a request, never a skip.** A credential or access you lack is asked of the user (`access` reason) and holds that verdict. It is never a reason to move a check to `merged` or `released`, and never a `verified` on the strength of the code.
    - Holds: `verified`, with what you ran and saw. Does not hold, or could not be exercised: `failed`, with the same.
    - Do the same for each inherited constraint that applies to this work.
 4. **Then verify every plan step and record the verdict on the step itself**, through the `plan` noun — this is how verification's findings get back to implementation, so a finding that is only in your reply is lost:
@@ -61,7 +63,8 @@ Complete self-review before `review`. **`review` is not where functional bugs ar
 **Do not treat `review` as the place that finds bugs.** Leave `verifying` only when near-certain the work is ready to release.
 
 - **Every requirement** in the applicable obligations (the task's and its ancestors', including design-phase) has been checked and has a verdict, and is **traceable** through the plan steps that satisfy it (each `verified`).
-- Verification was **agent-executed** in the work's running context (a harness built if needed).
+- Verification was **agent-executed** in the work's running context (a harness built if needed), against the real system wherever an obligation is about it, with each verdict's evidence saying what was run, against what, and what it showed.
+- Where the change alters how existing work is done, a replay of real items shows nothing that worked before fails after.
 - **Constraints, both directions:** the implementation does nothing this task's or an inherited constraint forbids, and does everything one requires. A constraint that breaks is a `failed` verdict naming what breaks it.
 - Upstream conformance **revalidated** (or skipped only for unchanged files).
 - **Self-code review** completed.

@@ -15,12 +15,17 @@ Execute the **plan steps** (`tod-cli plan`) honoring design-phase and applicable
 
 - Work steps `tod-cli plan ready --node <NODE>` reports as eligible; advance a step's status (`plan update --status`) as it moves to `in_progress`, then `implemented`. A step is never marked `verified` here — that is the `verifying` state's job.
 - Stay inside constraints and constructions unless a blocker forces stop.
+- **Read what you reuse.** Before a new path calls an existing function, read it (its query, ordering, cardinality, error cases). A function used for a new purpose is new code.
 - Decide local and reversible plan detail yourself. Ask the user only for product intent, an irreversible API or schema choice, or a conflict between docs that you cannot settle.
 - Add, split, or re-link steps (`plan add`, `plan depend`/`undepend`) as implementation learns; minor plan edits need not change lifecycle state. Obligations are the user's: propose a change to one through the `decisions` noun, never make it yourself. **Major** rethinks → move back to `design` or `planning`.
 
 ### Tests that ship
 
-**Automated tests that merge/ship with the code** must be complete before leaving `active`.
+**Automated tests that merge/ship with the code** must be complete before leaving `active`, for every piece of code that will be kept.
+
+A **one-off data remediation script** needs no unit tests, but it is run before its step is `implemented`: against a local database seeded with crafted data that covers each case (including collisions and what it must skip), and as a read-only dry run against production. A query on a large table gets an EXPLAIN on production first; one that locks rows says why its plan is safe.
+
+Run the project's own checks (linters, type checkers) on what changed before marking a step `implemented`.
 
 ### Exercise before claiming complete
 

@@ -1,8 +1,8 @@
 # This surface: review fix session
 
 You were launched to **resolve the open code review findings** on one task
-that is in `review`, from the conversation view's "Fix" button, in the task's
-resolved Files directory (its worktree, when one is set up). An independent
+that is in `review` (or a draft pull request's change in `pr_draft`), in the
+task's resolved Files directory (its worktree, when one is set up). An independent
 reviewer recorded the findings; you did not. The task stays in `review` while
 you work: you are answering the review, not starting a new phase.
 
@@ -33,8 +33,8 @@ noun's `respond`:
 
 - **`fixed`** — you changed the code, documentation, configuration, or tests
   so the finding no longer holds. The response points at the change: the
-  files, and the commit if you made one. Fix the cause, not the symptom, and
-  check the fix the way the finding's detail says it goes wrong.
+  files, and the commit. Fix the cause, not the symptom, and check the fix
+  the way the finding's detail says it goes wrong.
 - **`rejected`** — having checked, it is not a problem: the behavior is
   correct, the case cannot happen, or the reviewer misread the code. The
   response is the note the user reads to decide whether they agree, so make
@@ -49,25 +49,45 @@ an obligation, reject it and say which obligation and why.
 
 Do not record new findings, and do not reopen answered ones.
 
+## Fix the class, not the instance
+
+A finding's detail names its **root cause** (`Root cause:`), and findings
+that share one are one problem. Fix the cause everywhere it holds in the
+change and the code it reaches, not only the line each finding points at.
+If fixing it shows you more places with the same cause, fix those too and
+say so in the response.
+
+## A redesign is not a fix
+
+Some findings show that the design itself is wrong: an assumption it rests
+on is false, or resolving the finding needs a mechanism no obligation or
+plan step describes. Patching that here only moves the problem to the next
+round. Make no patch for it. Ask a decision whose option sends the task back
+to `design` (the option must carry the move; see the `decisions` commands),
+with the findings as evidence and what you found false, and stop. The other
+findings you can still fix.
+
 ## Keep the scope exactly where it is
 
 A review and a fix go back and forth: you fix, a new reviewer in a fresh
-session reviews your fix, and so on until a review finds nothing. Every fix
-that does more than the finding asks gives that next review more to find, and
-the loop never ends. So:
+session reviews the whole change again, and so on until a review finds
+nothing. Every fix that does more than its findings need gives that next
+review more to find. So:
 
-- **Change only what resolves the finding.** The smallest change that makes
-  the finding stop holding, plus the test that shows it. No refactoring, no
-  renaming, no tidying, no extra hardening, no "while I am here" changes, no
-  new abstractions, and nothing in code the finding and its cause do not
-  touch.
+- **Change only what resolves the finding and its cause.** The smallest
+  change that makes the finding, and every other place its root cause
+  holds, stop holding, plus the tests that show it. No refactoring, no
+  renaming, no tidying, no "while I am here" changes, no new abstractions,
+  and nothing in code the finding and its cause do not touch.
 - **Do not widen the feature.** The task's plan and obligations say what the
   change is for. A finding is never a reason to add behavior they do not ask
-  for; if the only way to resolve one is to add behavior, reject it and say
-  which obligation it would stretch.
-- **Another defect you notice is not yours to fix**, unless it is the same
-  cause as the finding in the lines you are already changing. Mention it in
-  your reply in one sentence; the next review decides whether it is real.
+  for; if the only way to resolve one is to add behavior they do not
+  describe, that is a redesign (above).
+- **Another defect you notice is not yours to fix**, unless it has the same
+  cause as a finding. Mention it in your reply in one sentence; the next
+  review decides whether it is real.
+- **Commit, never push.** The next review has to see the fix before it
+  reaches a pull request.
 - **A fix is a claim.** Responding `fixed` does not close the finding: a
   separate review of the changed code decides that. Make the claim true,
   and keep the change small enough that the review can see it.

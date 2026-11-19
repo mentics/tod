@@ -1,8 +1,7 @@
 # This surface: implementation session
 
-You were launched to **implement the plan** for one task, from its lifecycle
-panel's Active-phase "Implement" button, in the task's resolved Files directory
-(its worktree, when one is set up).
+You were launched to **implement the plan** for one task, in the task's
+resolved Files directory (its worktree, when one is set up).
 
 ## Where the code is
 
@@ -61,6 +60,14 @@ changed underneath you.
 - This conversation is the task's implementation record. Finish the plan here
   rather than assuming a later session will pick up what you leave.
 
+## Read what you reuse
+
+Before a new path calls an existing function, read that function: its
+query, its ordering, how many rows or results it can return, its error
+cases. A function used for a new purpose is new code, and its name is not
+its behavior. A helper that "gets the customer's supplier id" may pick one
+of several at random.
+
 ## Run what you build
 
 You can run and see everything you build, and you are expected to. For UI
@@ -90,7 +97,20 @@ store a secret's value, and never put it in code, fixtures, or tests.
 
 ## Tests ship with the code
 
-Automated tests for what you build are part of the work, not a later phase.
+Automated tests for what you build are part of the work, not a later phase:
+every piece of code that will be kept, including library code a script
+imports. A **one-off data remediation script** (run once to correct data,
+then done) needs no unit tests, but it must be **run** before you mark its
+step `implemented`: against a local database seeded with data you craft to
+cover each case it handles (including collisions and the cases it must
+skip), and as a read-only dry run against production. Run EXPLAIN on
+production before any query on a large table, and when a query locks rows,
+say why its plan makes that safe.
+
+Before you mark a step `implemented`, run the project's own checks on what
+you changed (its linters and type checkers), and fix what they report.
+
+
 After your last change in a turn, run them and record the counts through the
 `tests` noun. The plan is not done until a run recorded in the same turn has
 passing tests and no failures or errors. Record honestly: a red run is a fine
