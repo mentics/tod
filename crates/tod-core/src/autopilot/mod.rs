@@ -2012,6 +2012,10 @@ impl Autopilot {
                     reason: found.describe(),
                     raised: crate::check_unrelated::Raised::BaseBranch,
                 };
+                if self.inherit_carried_on(fleet, &claim, phase)? {
+                    asked = true;
+                    continue;
+                }
                 tracing::info!(%node, pr = %label, check = %found.check, "a failing check is also failing on the base: asking the user once");
                 fleet
                     .interview(
@@ -2080,6 +2084,10 @@ impl Autopilot {
                     reason: reason.clone(),
                     raised: cu::Raised::QuietTurns,
                 };
+                if self.inherit_carried_on(fleet, &claim, phase)? {
+                    asked = true;
+                    continue;
+                }
                 tracing::info!(%node, pr = %label, %check, "two turns changed nothing on a failing check: asking the user instead of stopping");
                 fleet
                     .interview(
@@ -2100,6 +2108,41 @@ impl Autopilot {
             }
         }
         Ok(asked)
+    }
+
+    /// When the user already said, on another node, to carry on without this
+    /// check for the same failure in the same repository
+    /// ([`crate::check_unrelated::carried_on_elsewhere`]), records that answer
+    /// on this node instead of asking again: the request is raised already
+    /// answered, naming where the answer was given, so the standing is on this
+    /// node like any other. Returns whether it did.
+    fn inherit_carried_on(&self, fleet: &FleetStore, claim: &crate::check_unrelated::Claim, phase: &str) -> Result<bool> {
+        use crate::check_unrelated as cu;
+        let node = self.node;
+        let Some(carried) =
+            fleet.read(|conn| Ok(cu::carried_on_elsewhere(conn, node, &claim.pr, &claim.check, &claim.signature)?))?
+        else {
+            return Ok(false);
+        };
+        let made = fleet
+            .interview(
+                "autopilot",
+                InterviewCommand::AskDecision {
+                    node_id: node,
+                    conversation_id: None,
+                    protocol: Some(cu::PROTOCOL.to_string()),
+                    decision: cu::new_decision(claim),
+                },
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let id = made
+            .get("id")
+            .and_then(|v| v.as_str())
+            .and_then(|v| uuid::Uuid::parse_str(v).ok())
+            .ok_or_else(|| anyhow::anyhow!("the recorded request has no id"))?;
+        tracing::info!(%node, pr = %claim.pr, check = %claim.check, from = %carried.node_name, "carrying on without a check the user said so for on another node");
+        cu::inherit(fleet, node, id, &carried, &claim.pr, &claim.check, phase)?;
+        Ok(true)
     }
 
     /// Tends the node's pending check-unrelated questions
@@ -2129,6 +2172,21 @@ impl Autopilot {
         let state = lifecycle::current_state(fleet, node)?;
         let mut withdrew = false;
         for (decision, pr, check, head) in questions {
+            // The user may have answered the same failure on another node
+            // since this was raised: that answer covers this one too.
+            if let Some(p) = live.iter().find(|p| pr_readiness::pr_label(&p.pr).eq_ignore_ascii_case(&pr)) {
+                let signature = crate::check_unrelated::signature_of(&decision);
+                if p.assessment.failing_checks.iter().any(|c| c.eq_ignore_ascii_case(&check)) {
+                    let carried = fleet.read(|conn| {
+                        Ok(crate::check_unrelated::carried_on_elsewhere(conn, node, &pr, &check, &signature)?)
+                    })?;
+                    if let Some(carried) = carried {
+                        crate::check_unrelated::inherit(fleet, node, decision.id, &carried, &pr, &check, &state)?;
+                        withdrew = true;
+                        continue;
+                    }
+                }
+            }
             let live_pr = live.iter().find(|p| pr_readiness::pr_label(&p.pr).eq_ignore_ascii_case(&pr));
             let why = match live_pr {
                 None => format!("{pr} is no longer linked to the node"),

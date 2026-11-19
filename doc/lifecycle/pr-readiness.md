@@ -579,6 +579,14 @@ request*.
   `pr-approved.mergeable` accepts GitHub's `unstable` when every failing
   check is waived and none is running. A check still running while only
   waived ones fail is still waited for (`PrStatus::checks_running`).
+- **One carry-on covers every node's pull request in the repository** that
+  has the same check failing with the same, known signature
+  (`check_unrelated::carried_on_elsewhere`): a pending request on another
+  node is answered by it on that node's next tick (`tend_unrelated_check_questions`),
+  and one not yet raised is raised already answered
+  (`Autopilot::inherit_carried_on`). Each node's answer text and timeline
+  note name the node and request where it was given. *Fix it here* never
+  spreads; a changed signature, or an unknown one, asks again.
 - **Fix it here** makes the check work again, tells the agent the user
   decided so, and `checks unrelated` is refused for it afterwards.
 - A pending question whose check no longer fails, or whose pull request is

@@ -259,6 +259,100 @@ pub fn pending(conn: &rusqlite::Connection, node: Uuid) -> anyhow::Result<Vec<(D
         .collect())
 }
 
+/// The answer another node's user gave that covers a failure
+/// ([`carried_on_elsewhere`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Carried {
+    pub node: Uuid,
+    /// The node's slug, for the record.
+    pub node_name: String,
+    pub decision: Uuid,
+}
+
+/// The repository part of `owner/repo#number`, lowercase.
+fn repo_of(pr: &str) -> String {
+    pr.rsplit_once('#').map(|(r, _)| r).unwrap_or(pr).to_ascii_lowercase()
+}
+
+/// Whether another node's user already said to carry on without `check` for
+/// a failure with this `signature` in the same repository as `pr`
+/// (`owner/repo#number`): one answer covers every pull request of the
+/// repository that fails the same way. Only a carry-on spreads: "fix it in
+/// this pull request" is about one pull request, and a failure that changed
+/// its signature, or whose signature is not known (empty), is asked again.
+/// The latest such carry-on on any node other than `node` wins.
+pub fn carried_on_elsewhere(
+    conn: &rusqlite::Connection,
+    node: Uuid,
+    pr: &str,
+    check: &str,
+    signature: &str,
+) -> anyhow::Result<Option<Carried>> {
+    if signature.is_empty() {
+        return Ok(None);
+    }
+    let repo = repo_of(pr);
+    let decisions = DecisionRepo::new(conn);
+    let mut best: Option<(i64, Decision)> = None;
+    for d in decisions.list_by_protocol(PROTOCOL)? {
+        if d.node_id == node || d.status != "answered" {
+            continue;
+        }
+        let Some((d_pr, d_check, _, d_sig)) = key_and_signature(&d) else { continue };
+        if d_sig != signature || !d_check.eq_ignore_ascii_case(check) || repo_of(&d_pr) != repo {
+            continue;
+        }
+        let Some(found) = decisions.get_with_answers(d.id)? else { continue };
+        let Some(answer) = found.answers.last() else { continue };
+        if answer.option != Some(1) || best.as_ref().is_some_and(|(at, _)| *at > answer.answered_at) {
+            continue;
+        }
+        best = Some((answer.answered_at, d));
+    }
+    let Some((_, d)) = best else { return Ok(None) };
+    let node_name = conn
+        .query_row("SELECT slug FROM nodes WHERE id = ?1", [d.node_id.as_bytes().as_slice()], |r| r.get::<_, String>(0))
+        .unwrap_or_else(|_| d.node_id.to_string());
+    Ok(Some(Carried { node: d.node_id, node_name, decision: d.id }))
+}
+
+/// What a carry-on inherited from another node says in its record.
+pub fn inherited_note(carried: &Carried, pr: &str, check: &str) -> String {
+    format!(
+        "Carried on without \"{check}\" on {pr}: you said so on {} (request {}) for the same check failing the same way in the same repository",
+        carried.node_name,
+        &carried.decision.simple().to_string()[..8]
+    )
+}
+
+/// Answers the pending question `decision` on `node` with the carry-on
+/// `carried` gave elsewhere, and records on the node's timeline whose answer
+/// it was. The question is the user's to answer; this applies the answer they
+/// already gave.
+pub fn inherit(
+    fleet: &tod_store::fleet::FleetStore,
+    node: Uuid,
+    decision: Uuid,
+    carried: &Carried,
+    pr: &str,
+    check: &str,
+    phase: &str,
+) -> anyhow::Result<()> {
+    use tod_store::interview::InterviewCommand;
+    use tod_store::node_timeline::{KIND_NOTE, TimelineEntry};
+    let note = inherited_note(carried, pr, check);
+    fleet
+        .interview(
+            "autopilot",
+            InterviewCommand::AnswerDecision { decision_id: decision, option: Some(1), text: Some(note.clone()) },
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let entry = TimelineEntry::new(node, KIND_NOTE, phase, note.clone(), false, note);
+    fleet.enqueue(tod_store::fleet::FleetMutation::RecordTimeline(Box::new(entry)))?;
+    fleet.writer().flush()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,5 +434,111 @@ mod tests {
         assert!(!all_waived(&settings, "o/r#1", "h1", &[], &[]));
         // A waiver given for another head never covers this one.
         assert!(!all_waived(&settings, "o/r#1", "h2", &["a".to_string()], &[]));
+    }
+
+    mod across_nodes {
+        use super::*;
+        use tod_store::fleet::FleetStore;
+        use tod_store::interview::InterviewCommand;
+        use tod_store::outline::{CreatePosition, OutlineMutation};
+
+        fn fleet_with(n: usize) -> (tempfile::TempDir, FleetStore, Vec<Uuid>) {
+            let dir = tempfile::Builder::new().prefix("tod-cu-").tempdir().unwrap();
+            let fleet = FleetStore::open(dir.path()).unwrap();
+            fleet.enqueue_outline(OutlineMutation::CreateList { slug: "t".into(), title: "T".into() }).unwrap();
+            fleet.writer().flush().unwrap();
+            let list_id = fleet.list_outline_lists().unwrap()[0].id;
+            let mut nodes = Vec::new();
+            for i in 0..n {
+                let node = Uuid::new_v4();
+                fleet
+                    .enqueue_outline(OutlineMutation::CreateNode {
+                        node_id: Some(node),
+                        list_id,
+                        parent_id: None,
+                        anchor_id: None,
+                        position: CreatePosition::Below,
+                        title: format!("Node {i}"),
+                    })
+                    .unwrap();
+                nodes.push(node);
+            }
+            fleet.writer().flush().unwrap();
+            fleet.reload_if_stale().unwrap();
+            (dir, fleet, nodes)
+        }
+
+        fn ask(fleet: &FleetStore, node: Uuid, pr: &str, check: &str, sig: &str) -> Uuid {
+            let claim = Claim {
+                pr: pr.into(),
+                pr_url: format!("https://github.com/{}", pr.replace('#', "/pull/")),
+                check: check.into(),
+                head: "abc1234".into(),
+                signature: sig.into(),
+                reason: "main fails it too".into(),
+                raised: Raised::BaseBranch,
+            };
+            let made = fleet
+                .interview(
+                    "autopilot",
+                    InterviewCommand::AskDecision {
+                        node_id: node,
+                        conversation_id: None,
+                        protocol: Some(PROTOCOL.into()),
+                        decision: new_decision(&claim),
+                    },
+                )
+                .unwrap();
+            Uuid::parse_str(made["id"].as_str().unwrap()).unwrap()
+        }
+
+        fn answer(fleet: &FleetStore, id: Uuid, option: i64) {
+            fleet
+                .interview("user", InterviewCommand::AnswerDecision { decision_id: id, option: Some(option), text: None })
+                .unwrap();
+        }
+
+        fn carried(fleet: &FleetStore, node: Uuid, pr: &str, check: &str, sig: &str) -> Option<Carried> {
+            fleet.read(|c| carried_on_elsewhere(c, node, pr, check, sig)).unwrap()
+        }
+
+        #[test]
+        fn answering_on_one_node_resolves_the_same_failure_on_another() {
+            let (_d, fleet, n) = fleet_with(2);
+            let a = ask(&fleet, n[0], "acme/app#1", "pyright", "sig");
+            let b = ask(&fleet, n[1], "acme/app#2", "Pyright", "sig");
+            assert!(carried(&fleet, n[1], "acme/app#2", "pyright", "sig").is_none(), "nothing answered yet");
+            answer(&fleet, a, 1);
+            let found = carried(&fleet, n[1], "ACME/app#2", "pyright", "sig").expect("carried");
+            assert_eq!((found.node, found.decision), (n[0], a));
+            inherit(&fleet, n[1], b, &found, "acme/app#2", "pyright", "pr_draft").unwrap();
+            let standings = fleet.read(|c| standings(c, n[1])).unwrap();
+            assert_eq!(standings[0].standing, UnrelatedStanding::Waived);
+            let record = fleet.read(|c| DecisionRepo::new(c).get_with_answers(b)).unwrap().unwrap();
+            let text = record.answers[0].text.clone().unwrap();
+            assert!(text.contains(&found.node_name) && text.contains(&a.simple().to_string()[..8]), "{text}");
+        }
+
+        #[test]
+        fn another_failure_or_repository_is_asked_again() {
+            let (_d, fleet, n) = fleet_with(2);
+            let a = ask(&fleet, n[0], "acme/app#1", "pyright", "sig");
+            answer(&fleet, a, 1);
+            assert!(carried(&fleet, n[1], "acme/app#2", "pyright", "other-sig").is_none());
+            assert!(carried(&fleet, n[1], "acme/other#2", "pyright", "sig").is_none());
+            assert!(carried(&fleet, n[1], "acme/app#2", "mypy", "sig").is_none());
+            assert!(carried(&fleet, n[1], "acme/app#2", "pyright", "").is_none(), "an unknown failure is never matched");
+            assert!(carried(&fleet, n[1], "acme/app#2", "pyright", "sig").is_some());
+            // The node's own answer is not "elsewhere".
+            assert!(carried(&fleet, n[0], "acme/app#1", "pyright", "sig").is_none());
+        }
+
+        #[test]
+        fn fixing_it_here_does_not_spread() {
+            let (_d, fleet, n) = fleet_with(2);
+            let a = ask(&fleet, n[0], "acme/app#1", "pyright", "sig");
+            answer(&fleet, a, 2);
+            assert!(carried(&fleet, n[1], "acme/app#2", "pyright", "sig").is_none());
+        }
     }
 }
