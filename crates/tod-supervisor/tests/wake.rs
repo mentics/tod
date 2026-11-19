@@ -170,6 +170,10 @@ fn a_wake_runs_the_node_and_its_work_reaches_the_orchestrator() {
     git(&workspace, &["add", "README"]);
     git(&workspace, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "--quiet", "-m", "init"]);
     git(&workspace, &["remote", "add", "origin", &origin.to_string_lossy()]);
+    // The base the node's branch is judged against (a branch holding none of
+    // the work is told from it), as a clone would have it.
+    git(&workspace, &["push", "--quiet", "origin", "HEAD:refs/heads/main"]);
+    git(&workspace, &["fetch", "--quiet", "origin"]);
 
     // A Claude session file, as Claude would have written it.
     let projects = base.join("claude-projects");
