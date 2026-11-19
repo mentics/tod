@@ -80,7 +80,10 @@ pub fn detail(actor: &NextActor) -> String {
             }
             YouReason::Failed { error } => error.clone(),
             YouReason::Stopped { reason } => reason.clone(),
-            YouReason::Permission { title } => title.clone(),
+            YouReason::Permission { title, ended: Some(ended) } => {
+                format!("{title}; the run ended: {}", detail(&NextActor::You { why: (**ended).clone(), since: 0 }))
+            }
+            YouReason::Permission { title, .. } => title.clone(),
             YouReason::Request { count, .. } => format!("{count} open"),
             YouReason::Paused | YouReason::NotStarted => String::new(),
         },
@@ -225,5 +228,16 @@ mod tests {
     #[test]
     fn recording_without_a_sink_does_nothing() {
         record(&[Change { node: Uuid::new_v4(), from: String::new(), to: "done".into(), detail: String::new() }]);
+    }
+
+    #[test]
+    fn the_detail_of_a_request_or_permission_says_how_the_run_ended() {
+        let failed = || Some(Box::new(YouReason::Failed { error: "boom".into() }));
+        let request = you(YouReason::Request { count: 2, ended: failed() });
+        let permission = you(YouReason::Permission { title: "rm".into(), ended: failed() });
+        assert_eq!(detail(&request), "2 open; the run ended: boom");
+        assert_eq!(detail(&permission), "rm; the run ended: boom");
+        assert_eq!(detail(&you(YouReason::Request { count: 2, ended: None })), "2 open");
+        assert_eq!(key(&request), "you:request");
     }
 }

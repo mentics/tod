@@ -128,7 +128,10 @@ pub enum YouReason {
     /// answer will not make a stopped run go on by itself.
     Request { count: usize, ended: Option<Box<YouReason>> },
     /// An agent asked for a permission nobody has granted.
-    Permission { title: String },
+    ///
+    /// `ended` is as for [`YouReason::Request`]: a pending permission never
+    /// hides how the run ended.
+    Permission { title: String, ended: Option<Box<YouReason>> },
     /// The last run failed, or the app itself did.
     Failed { error: String },
     /// The run stopped for a reason that is not a request (its budget, a step
@@ -586,6 +589,15 @@ fn done_actor(facts: &Facts<'_>) -> (NextActor, i64) {
     (NextActor::Others { wait }, 0)
 }
 
+/// The run row saying the app sent the node to the cloud, while no supervisor
+/// heartbeat is newer than it.
+fn starting_row<'a>(facts: &Facts<'a>) -> Option<&'a RunState> {
+    facts
+        .run_state
+        .filter(|r| r.phase == Phase::Starting)
+        .filter(|r| facts.cloud.is_none_or(|b| b.heartbeat_at <= r.updated_at))
+}
+
 /// How the node's run ended, when it did, and since when: its sandbox gone, a
 /// stop question the user answered "leave it", the run's own stopped row, what
 /// its supervisor left in its idle heartbeat, or the saved local run's end.
@@ -594,6 +606,22 @@ fn done_actor(facts: &Facts<'_>) -> (NextActor, i64) {
 fn run_end(facts: &Facts<'_>) -> Option<(YouReason, i64)> {
     let run = facts.run;
     let run_state = facts.run_state;
+    // Sent to the cloud and nothing reported in for longer than a boot and a
+    // seed may take: a failure that says so (never the silence of "not
+    // started"). Within that time it is `Working` (`actor_for`), not an end.
+    if let Some(row) = starting_row(facts) {
+        let waited = facts.now_ms - row.updated_at;
+        if waited <= START_REPORTS_WITHIN_MS {
+            return None;
+        }
+        let error = format!(
+            "the cloud supervisor has not reported in {} after the node was sent ({}); \
+             Start sends it again",
+            format_elapsed(waited),
+            row.reason_text,
+        );
+        return Some((YouReason::Failed { error }, row.since));
+    }
     // A replacement that failed for good is the run row's `failed` (written
     // after the loss), which says why; the loss alone would hide it.
     let replacement_failed = |lost: &CloudLost| {
@@ -648,7 +676,10 @@ fn actor_for(facts: &Facts<'_>) -> (NextActor, i64) {
     if let Some((title, since)) = &run.permission {
         return (
             NextActor::You {
-                why: YouReason::Permission { title: title.clone() },
+                why: YouReason::Permission {
+                    title: title.clone(),
+                    ended: run_end(facts).map(|(why, _)| Box::new(why)),
+                },
                 since: *since,
             },
             *since,
@@ -681,7 +712,10 @@ fn actor_for(facts: &Facts<'_>) -> (NextActor, i64) {
                     && first.reason == crate::attention::RequestReason::Access
                     && rest.iter().all(|i| i.permission && i.reason == crate::attention::RequestReason::Access) =>
             {
-                YouReason::Permission { title: first.summary.clone() }
+                YouReason::Permission {
+                    title: first.summary.clone(),
+                    ended: run_end(facts).map(|(why, _)| Box::new(why)),
+                }
             }
             _ => YouReason::Request { count: requests.count, ended: run_end(facts).map(|(why, _)| Box::new(why)) },
         };
@@ -698,22 +732,12 @@ fn actor_for(facts: &Facts<'_>) -> (NextActor, i64) {
     // before the table writes no row, and its beat is then the later word.
     let run_state = facts.run_state;
     // The app sent the node to the cloud and nothing has reported in yet:
-    // starting, for as long as a supervisor may take to boot and seed, then
-    // a failure that says so (never the silence of "not started").
-    if let Some(row) = run_state.filter(|r| r.phase == Phase::Starting)
-        && facts.cloud.is_none_or(|b| b.heartbeat_at <= row.updated_at)
+    // starting, for as long as a supervisor may take to boot and seed (past
+    // that it is a failure, in `run_end`).
+    if let Some(row) = starting_row(facts)
+        && facts.now_ms - row.updated_at <= START_REPORTS_WITHIN_MS
     {
-        let waited = facts.now_ms - row.updated_at;
-        if waited <= START_REPORTS_WITHIN_MS {
-            return (NextActor::Working { what: Work::CloudStart, since: row.since }, 0);
-        }
-        let error = format!(
-            "the cloud supervisor has not reported in {} after the node was sent ({}); \
-             Start sends it again",
-            format_elapsed(waited),
-            row.reason_text,
-        );
-        return (NextActor::You { why: YouReason::Failed { error }, since: row.since }, row.since);
+        return (NextActor::Working { what: Work::CloudStart, since: row.since }, 0);
     }
     // A node in the cloud: its sandbox gone, a stop question the user
     // answered "leave it", or a wake that ended needing someone (what the
@@ -1295,7 +1319,7 @@ mod tests {
         let mut c = case("active");
         c.leases = vec![live_lease(&Work::conversation_kind(ProtocolKind::Implementation), 30)];
         c.run.permission = Some(("Run `rm`".into(), 40));
-        assert_eq!(standing(&c).actor, you(YouReason::Permission { title: "Run `rm`".into() }, 40));
+        assert_eq!(standing(&c).actor, you(YouReason::Permission { title: "Run `rm`".into(), ended: None }, 40));
     }
 
     #[test]
@@ -1341,7 +1365,7 @@ mod tests {
     fn a_pending_permission_is_its_own_reason() {
         let mut c = case("active");
         c.attention = attention_of(Uuid::nil(), vec![permission_request(Uuid::nil(), 40, "Run `rm`")]);
-        assert_eq!(standing(&c).actor, you(YouReason::Permission { title: "Run `rm`".into() }, 40));
+        assert_eq!(standing(&c).actor, you(YouReason::Permission { title: "Run `rm`".into(), ended: None }, 40));
     }
 
     #[test]
@@ -1379,6 +1403,58 @@ mod tests {
         c.cloud = None;
         c.cloud_lost = Some(CloudLost { since: 900, deleted_by_user: false });
         assert!(matches!(ended(&c), Some(YouReason::Stopped { .. })));
+    }
+
+    #[test]
+    fn a_pending_permission_never_hides_the_runs_end_either() {
+        use crate::run_state::kind;
+        let mut c = case("planning");
+        c.run_state = Some(row(Phase::Stopped, kind::FAILED, "push failed", 800, 800));
+        // A permission the app knows of.
+        c.run.permission = Some(("Run `rm`".into(), 40));
+        assert_eq!(
+            standing(&c).actor,
+            you(
+                YouReason::Permission {
+                    title: "Run `rm`".into(),
+                    ended: Some(Box::new(YouReason::Failed { error: "push failed".into() }))
+                },
+                40
+            )
+        );
+        // Unanswered access requests.
+        c.run.permission = None;
+        c.attention = attention_of(Uuid::nil(), vec![permission_request(Uuid::nil(), 40, "Run `rm`")]);
+        assert!(matches!(
+            standing(&c).actor,
+            NextActor::You { why: YouReason::Permission { ended: Some(_), .. }, .. }
+        ));
+    }
+
+    #[test]
+    fn the_saved_local_outcome_and_a_starting_timeout_show_beside_a_request() {
+        let mut c = case("planning");
+        c.attention = requests(Uuid::nil(), &[40]);
+        let ended = |c: &Case| match standing(c).actor {
+            NextActor::You { why: YouReason::Request { ended, .. }, .. } => ended.map(|b| *b),
+            other => panic!("{other:?}"),
+        };
+        c.run.last_outcome = Some((Outcome::Stopped { reason: format!("{FAILED_PREFIX}disk full") }, 700));
+        assert_eq!(ended(&c), Some(YouReason::Failed { error: "disk full".into() }));
+        // A starting row past what a boot and a seed may take.
+        c.run.last_outcome = None;
+        c.run_state = Some(row(Phase::Starting, crate::run_state::kind::SENDING, "sending the node", 100, 100));
+        let Some(YouReason::Failed { error }) = ended(&c) else { panic!("{:?}", standing(&c).actor) };
+        assert!(error.contains("has not reported in") && error.contains("Start sends it again"), "{error}");
+        // Within that time it is only starting: nothing has ended.
+        c.run_state = Some(row(
+            Phase::Starting,
+            crate::run_state::kind::SENDING,
+            "sending the node",
+            NOW - 10_000,
+            NOW - 10_000,
+        ));
+        assert_eq!(ended(&c), None);
     }
 
     #[test]

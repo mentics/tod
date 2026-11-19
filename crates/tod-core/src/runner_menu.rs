@@ -360,49 +360,55 @@ pub fn derive_run_state(f: &RunFacts) -> RunState {
     match f.outcome {
         Some(Outcome::BudgetExhausted { .. }) => return RunState::Ended(EndedHow::Budget),
         Some(Outcome::Stopped { .. }) => return RunState::Ended(EndedHow::Stopped),
-        // A stop for a request is stale once none is left (the run continues
-        // by itself: `next_actor::outcome_reason`), so it says "for a
-        // request" only while who-is-next still shows one.
-        Some(Outcome::NeedsHuman { reason }) => {
-            let still_asking = !reason.is_request()
-                || !matches!(
-                    f.actor,
-                    Some(NextActor::You { .. }) | Some(NextActor::Others { .. }) | Some(NextActor::Working { .. })
-                )
-                || matches!(
-                    f.actor,
-                    Some(NextActor::You { why: YouReason::Request { .. } | YouReason::Permission { .. }, .. })
-                );
+        // The run stopped for a request: that is its end only while
+        // who-is-next still shows one, and shows no other end beside it (a
+        // failed or stopped run under a request is that failure: the answer
+        // would not make it go on). A stop for a request is stale once none
+        // is left (the run continues by itself: `next_actor::outcome_reason`).
+        // A stop for any other reason is not decided here: who-is-next
+        // below says how it ended.
+        Some(Outcome::NeedsHuman { reason }) if reason.is_request() => {
+            let still_asking = matches!(
+                f.actor,
+                Some(NextActor::You {
+                    why: YouReason::Request { ended: None, .. } | YouReason::Permission { ended: None, .. },
+                    ..
+                })
+            ) || !matches!(
+                f.actor,
+                Some(NextActor::You { .. }) | Some(NextActor::Others { .. }) | Some(NextActor::Working { .. })
+            );
             if still_asking {
                 return RunState::Ended(EndedHow::Request);
             }
         }
+        Some(Outcome::NeedsHuman { .. }) => {}
         Some(Outcome::Waiting { .. }) => return RunState::Ended(EndedHow::Waiting),
         Some(Outcome::Done) | None => {}
     }
     match f.actor {
-        // A request beside an ended run: the run's end is what the menu acts on.
-        Some(NextActor::You { why: YouReason::Request { ended: Some(ended), .. }, .. }) => match &**ended {
-            YouReason::Paused => RunState::Ended(EndedHow::Paused),
-            YouReason::Failed { .. } => RunState::Ended(EndedHow::Failed),
-            YouReason::Stopped { reason } if reason.to_lowercase().contains("budget") => RunState::Ended(EndedHow::Budget),
-            _ => RunState::Ended(EndedHow::Stopped),
-        },
-        Some(NextActor::You { why, .. }) => match why {
-            YouReason::Paused => RunState::Ended(EndedHow::Paused),
-            YouReason::Stopped { reason } if reason.to_lowercase().contains("budget") => {
-                RunState::Ended(EndedHow::Budget)
-            }
-            YouReason::Stopped { .. } => RunState::Ended(EndedHow::Stopped),
-            YouReason::Failed { .. } => RunState::Ended(EndedHow::Failed),
-            YouReason::Request { .. } | YouReason::Permission { .. } => RunState::Ended(EndedHow::Request),
-            YouReason::NotStarted => RunState::NeverRun,
-        },
+        Some(NextActor::You { why, .. }) => ended_how(why),
         // Waiting on something else, or worked by a process this one has not
         // heard from: there is nothing to start or resume.
         Some(NextActor::Others { .. }) | Some(NextActor::Working { .. }) => RunState::Ended(EndedHow::Waiting),
         Some(NextActor::Done) => RunState::Done,
         None => RunState::NeverRun,
+    }
+}
+
+/// How the run ended, from who-is-next's reason. A request or permission with
+/// an `ended` beside it is that end (the answer would not make the run go on).
+fn ended_how(why: &YouReason) -> RunState {
+    match why {
+        YouReason::Request { ended: Some(ended), .. } | YouReason::Permission { ended: Some(ended), .. } => {
+            ended_how(ended)
+        }
+        YouReason::Request { .. } | YouReason::Permission { .. } => RunState::Ended(EndedHow::Request),
+        YouReason::Paused => RunState::Ended(EndedHow::Paused),
+        YouReason::Stopped { reason } if reason.to_lowercase().contains("budget") => RunState::Ended(EndedHow::Budget),
+        YouReason::Stopped { .. } => RunState::Ended(EndedHow::Stopped),
+        YouReason::Failed { .. } => RunState::Ended(EndedHow::Failed),
+        YouReason::NotStarted => RunState::NeverRun,
     }
 }
 
@@ -739,5 +745,39 @@ mod tests {
         let you = |why| NextActor::You { why, since: 1 };
         assert_eq!(run(&you(YouReason::Request { count: 1, ended: None })), RunState::Ended(EndedHow::Request));
         assert_eq!(run(&you(YouReason::NotStarted)), RunState::NeverRun);
+    }
+
+    #[test]
+    fn a_request_or_permission_beside_an_ended_run_reads_as_that_end() {
+        use crate::autopilot::NeedsHuman;
+        let run = |outcome: Option<&Outcome>, actor: &NextActor| {
+            derive_run_state(&RunFacts {
+                done: false,
+                supervised: true,
+                runner_running: false,
+                pausing: false,
+                hand_turn: false,
+                outcome,
+                actor: Some(actor),
+                pause_asked: false,
+            })
+        };
+        let boxed = |why: YouReason| Some(Box::new(why));
+        let failed = || boxed(YouReason::Failed { error: "push failed".into() });
+        let asked = |ended| NextActor::You { why: YouReason::Request { count: 1, ended }, since: 1 };
+        let permission = |ended| NextActor::You { why: YouReason::Permission { title: "rm".into(), ended }, since: 1 };
+        assert_eq!(run(None, &asked(failed())), RunState::Ended(EndedHow::Failed));
+        assert_eq!(run(None, &permission(failed())), RunState::Ended(EndedHow::Failed));
+        assert_eq!(run(None, &asked(boxed(YouReason::Paused))), RunState::Ended(EndedHow::Paused));
+        assert_eq!(
+            run(None, &asked(boxed(YouReason::Stopped { reason: "budget spent: 6 sessions".into() }))),
+            RunState::Ended(EndedHow::Budget)
+        );
+        assert_eq!(run(None, &asked(None)), RunState::Ended(EndedHow::Request));
+        // A NeedsHuman-for-a-request outcome is the run's end only while the
+        // request is the only thing: with a failure beside it, the failure is.
+        let outcome = Outcome::NeedsHuman { reason: NeedsHuman::Decision { pending: 1 } };
+        assert_eq!(run(Some(&outcome), &asked(None)), RunState::Ended(EndedHow::Request));
+        assert_eq!(run(Some(&outcome), &asked(failed())), RunState::Ended(EndedHow::Failed));
     }
 }

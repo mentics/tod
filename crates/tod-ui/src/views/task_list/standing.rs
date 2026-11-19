@@ -339,7 +339,13 @@ pub fn you_reason_label(why: &YouReason) -> String {
                 None => asked,
             }
         }
-        YouReason::Permission { title } => format!("a permission is asked: {title}"),
+        YouReason::Permission { title, ended } => {
+            let asked = format!("a permission is asked: {title}");
+            match ended {
+                Some(ended) => format!("{asked}; the run also ended, {}", you_reason_label(ended)),
+                None => asked,
+            }
+        }
         YouReason::Failed { error } => format!("failed: {error}"),
         YouReason::Stopped { reason } => format!("stopped: {reason}"),
         YouReason::Paused => "paused".to_string(),
@@ -470,6 +476,14 @@ pub fn runner_parts(standing: &NodeStanding, now_ms: i64) -> Vec<RunnerPart> {
                     parts.push(part(format!(
                         "and {}",
                         you_reason_label(&YouReason::Request { count: *count, ended: None })
+                    )));
+                    None
+                }
+                YouReason::Permission { ended: Some(ended), title } => {
+                    parts.extend(end_parts(ended));
+                    parts.push(part(format!(
+                        "and {}",
+                        you_reason_label(&YouReason::Permission { title: title.clone(), ended: None })
                     )));
                     None
                 }
@@ -773,5 +787,31 @@ mod tests {
             "failed: auth failed"
         );
         assert_eq!(you_reason_label(&YouReason::Request { count: 3, ended: None }), "3 requests to answer");
+    }
+
+    #[test]
+    fn a_request_or_permission_shows_how_the_run_ended_beside_it() {
+        let failed = || Some(Box::new(YouReason::Failed { error: "push failed: fetch first".into() }));
+        let request = YouReason::Request { count: 1, ended: failed() };
+        let permission = YouReason::Permission { title: "rm".into(), ended: failed() };
+        assert_eq!(
+            you_reason_label(&request),
+            "1 request to answer; the run also ended, failed: push failed: fetch first"
+        );
+        assert_eq!(
+            you_reason_label(&permission),
+            "a permission is asked: rm; the run also ended, failed: push failed: fetch first"
+        );
+        for why in [request, permission] {
+            let parts = runner_parts(&you(why, 0), 3_600_000);
+            let texts: Vec<&str> = parts.iter().map(|p| p.text.as_str()).collect();
+            assert_eq!(texts[..2], ["failed", "push failed: fetch first"], "{texts:?}");
+            assert!(parts[0].tone == PartTone::Error && parts[1].tone == PartTone::Error);
+            assert!(texts[2].starts_with("and "), "{texts:?}");
+        }
+        let stopped = YouReason::Request { count: 2, ended: Some(Box::new(YouReason::Stopped { reason: "stuck".into() })) };
+        let parts = runner_parts(&you(stopped, 0), 1000);
+        assert_eq!(parts[0].text, "stopped");
+        assert_eq!(parts[2].text, "and 2 requests to answer");
     }
 }
