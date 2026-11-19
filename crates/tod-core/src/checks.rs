@@ -602,7 +602,10 @@ fn ensure_setup(fleet: &FleetStore, node: Uuid, key: &str, dir: &str, cwd: &Work
     // worktree does: a recreated one at the same path (Reset environment, a removed
     // location, a replaced sandbox) has none and runs the setup again. The database
     // record is only for display; a path or sandbox name is not an instance.
-    let marker = format!("\"$(git rev-parse --absolute-git-dir)/tod-setup-{}\"", &hex(&Sha256::digest(setup.as_bytes()))[..16]);
+    // The git directory is shared by every directory of the repository, so the marker names
+    // the (normalized) directory too: the same setup in `ui` and `api` is two setups.
+    let id = hex(&Sha256::digest(format!("{}\0{setup}", clean_dir(dir)).as_bytes()));
+    let marker = format!("\"$(git rev-parse --absolute-git-dir)/tod-setup-{}\"", &id[..16]);
     let (present, _) = run_shell(cwd, &format!("test -f {marker}"), &[], CHECK_TIMEOUT);
     if present == Verdict::Passed {
         return Ok(None);

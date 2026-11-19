@@ -3181,6 +3181,37 @@ fn with_check_setup(fx: &Fixture, phase: &str, label: &str, command: &str, setup
 }
 
 #[test]
+fn identical_setup_text_in_two_directories_runs_in_each() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    let workspace = fx.root.join("workspace");
+    with_check(&fx, "review", "a", "true");
+    for d in ["a", "b"] {
+        std::fs::create_dir_all(workspace.join(d)).unwrap();
+        std::fs::write(workspace.join(d).join("x"), "changed").unwrap();
+    }
+    let check = |label: &str, dir: &str| tod_store::lifecycle_config::Check {
+        label: label.into(),
+        command: "true".into(),
+        dir: dir.into(),
+        setup: "echo run >> setup-runs".into(),
+        ..Default::default()
+    };
+    fx.fleet
+        .enqueue_outline(OutlineMutation::SetNodeLifecycleChecks {
+            node_id: fx.node,
+            checks: [("review".to_string(), vec![check("in a", "a"), check("in b", "b")])].into(),
+        })
+        .unwrap();
+    fx.fleet.writer().flush().unwrap();
+    let round = crate::checks::run_stale(&fx.fleet, fx.node, "review").unwrap();
+    assert!(round.clear(), "{round:?}");
+    for d in ["a", "b"] {
+        assert_eq!(std::fs::read_to_string(workspace.join(d).join("setup-runs")).unwrap().lines().count(), 1, "{d}");
+    }
+}
+
+#[test]
 fn a_checks_setup_runs_once_per_worktree_before_the_check_and_a_failed_one_stops_it() {
     let fx = setup();
     retire_outside_criteria(&fx);
