@@ -1055,31 +1055,132 @@ fn treehouse_get_lease(
     })
 }
 
-fn with_creation_lock<T>(data_root: &Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
+/// How long a caller waits for another to finish making a worktree of the
+/// same repository before giving up with [`WorktreeLockBusy`]. The holder's
+/// work (a Treehouse lease with submodules, a checkout, a submodule fetch)
+/// can take minutes, and many nodes starting together queue behind it, so
+/// this is far longer than any one holder needs. It only bounds a holder that
+/// is stuck (a hung git); a holder that died releases the lock by itself.
+pub const CREATION_LOCK_WAIT: Duration = Duration::from_secs(20 * 60);
+
+/// Another node has been making a worktree of the same repository for longer
+/// than the caller could wait. It is a wait, not a failure of the caller's
+/// own work: callers that can retry later (the autopilot) treat it as a
+/// transient wait, and its message names the holder.
+#[derive(Debug, Clone)]
+pub struct WorktreeLockBusy {
+    pub repo: String,
+    pub holder: String,
+    pub waited: Duration,
+}
+
+impl std::fmt::Display for WorktreeLockBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "timed out after {}s waiting to make a worktree of {}: it is held by {}",
+            self.waited.as_secs(),
+            self.repo,
+            self.holder
+        )
+    }
+}
+
+impl std::error::Error for WorktreeLockBusy {}
+
+/// Whether `err` is (or was caused by) [`WorktreeLockBusy`].
+pub fn is_lock_busy(err: &anyhow::Error) -> bool {
+    err.chain().any(|e| e.downcast_ref::<WorktreeLockBusy>().is_some())
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// What a lock holder is doing, for the waiters' error message. Written to
+/// the lock's `.holder` file, so another process (the daemon, the app) can
+/// name it too.
+pub struct LockProgress<'a> {
+    info_path: &'a Path,
+    who: &'a str,
+    since: u64,
+}
+
+impl LockProgress<'_> {
+    pub fn phase(&self, phase: &str) {
+        // Best effort: it only improves a message.
+        let _ = std::fs::write(self.info_path, format!("{}\t{}\t{}\t{}", self.who, phase, self.since, unix_now()));
+    }
+}
+
+/// `"<who>, <phase>, for <n>s"` from a holder file, if there is one.
+fn describe_holder(info_path: &Path) -> String {
+    const NONE: &str = "another node (no details recorded)";
+    let Ok(text) = std::fs::read_to_string(info_path) else { return NONE.into() };
+    let mut parts = text.trim().split('\t');
+    let (Some(who), Some(phase), Some(since), Some(phase_at)) = (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return NONE.into();
+    };
+    let now = unix_now();
+    let since: u64 = since.parse().unwrap_or(now);
+    let phase_at: u64 = phase_at.parse().unwrap_or(now);
+    if who.is_empty() {
+        return NONE.into();
+    }
+    format!(
+        "{who}, {phase} (holding for {}s, in this step for {}s)",
+        now.saturating_sub(since),
+        now.saturating_sub(phase_at)
+    )
+}
+
+/// Run `f` with exclusive use of making worktrees of `repo_key`.
+///
+/// One lock per repository (not one for the data root: two repositories never
+/// contend), an OS file lock, so a holder that crashes releases it and no
+/// stale file can starve anyone. A caller waits up to `max_wait` and then
+/// fails with [`WorktreeLockBusy`] naming the holder and what it is doing.
+fn with_creation_lock<T>(
+    data_root: &Path,
+    repo_key: &str,
+    who: &str,
+    max_wait: Duration,
+    f: impl FnOnce(&LockProgress<'_>) -> Result<T>,
+) -> Result<T> {
+    use fs2::FileExt;
     let lock_dir = data_root.join("worktrees");
     std::fs::create_dir_all(&lock_dir)?;
-    let lock_path = lock_dir.join(".lock");
+    // FNV-1a: stable across runs and processes, which `DefaultHasher` is not
+    // promised to be.
+    let hash = repo_key.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x100000001b3));
+    let lock_path = lock_dir.join(format!(".lock-{hash:016x}"));
+    let info_path = lock_dir.join(format!(".holder-{hash:016x}"));
+    let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&lock_path)?;
     let start = std::time::Instant::now();
     loop {
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lock_path)
-        {
-            Ok(_) => {
-                let result = f();
-                let _ = std::fs::remove_file(&lock_path);
-                return result;
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                if start.elapsed() > Duration::from_secs(30) {
-                    bail!("timed out waiting for worktree creation lock");
+        match file.try_lock_exclusive() {
+            Ok(()) => break,
+            Err(err) if err.kind() == fs2::lock_contended_error().kind() => {
+                if start.elapsed() > max_wait {
+                    return Err(WorktreeLockBusy {
+                        repo: repo_key.to_string(),
+                        holder: describe_holder(&info_path),
+                        waited: start.elapsed(),
+                    }
+                    .into());
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
             Err(err) => return Err(err.into()),
         }
     }
+    let progress = LockProgress { info_path: &info_path, who, since: unix_now() };
+    progress.phase("starting");
+    let result = f(&progress);
+    let _ = std::fs::remove_file(&info_path);
+    let _ = file.unlock();
+    result
 }
 
 /// A git worktree of `repo` for `branch` at [`worktree_dest_for`].
@@ -1129,11 +1230,12 @@ pub fn ensure_worktree(
             warnings: Vec::new(),
         });
     }
-    // Outside the creation lock, which others wait on for only 30s: a new
-    // branch starts from the latest of origin.
+    // Outside the creation lock, which others queue on: a new branch starts
+    // from the latest of origin.
     fetch_origin(repo)?;
 
-    with_creation_lock(data_root, || {
+    let who = format!("{lease_holder} on branch {branch_key}");
+    with_creation_lock(data_root, &repo.to_string(), &who, CREATION_LOCK_WAIT, |progress| {
         if let Some(path) = shared()? {
             return Ok(WorktreeHandle {
                 path,
@@ -1142,6 +1244,7 @@ pub fn ensure_worktree(
             });
         }
 
+        progress.phase("adding the worktree");
         let mut handle = match backend {
             WorktreeBackend::GitOnly => git_worktree(data_root, repo, &branch_key)?,
             WorktreeBackend::TreehouseRequired => {
@@ -1171,7 +1274,9 @@ pub fn ensure_worktree(
         match worktree_holding_branch(repo, &branch_key)? {
             Some(holder) if !holder.same_location(&handle.path) => {}
             _ => {
+                progress.phase("checking out the branch");
                 checkout_branch(&handle.path, &branch_key)?;
+                progress.phase("setting up submodules");
                 // Whichever way the worktree was made, its submodules are set
                 // up before they are put on the branch.
                 if let Err(err) = init_submodules(&handle.path) {
@@ -1510,6 +1615,97 @@ mod tests {
         settings.worktree_backend = WorktreeBackend::TreehouseRequired;
         let problem = treehouse_required_problem(&repo, &settings).expect("required and missing");
         assert!(problem.contains("Treehouse required") && problem.contains("/nonexistent/treehouse"), "{problem}");
+    }
+
+    #[test]
+    fn creators_queue_on_the_lock_while_the_holder_progresses() {
+        let root = crate::fleet::test_util::scratch_dir("tod-wt-lock-");
+        let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        // Four callers at once, each holding for 300ms: the last waits about
+        // a second, and none gives up while the holders progress.
+        let handles: Vec<_> = (0..4)
+            .map(|i| {
+                let root = root.clone();
+                let order = order.clone();
+                std::thread::spawn(move || {
+                    with_creation_lock(&root, "/repo", &format!("tod-n{i}"), Duration::from_secs(30), |progress| {
+                        progress.phase("working");
+                        order.lock().unwrap().push(format!("in{i}"));
+                        std::thread::sleep(Duration::from_millis(300));
+                        order.lock().unwrap().push(format!("out{i}"));
+                        Ok(i)
+                    })
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap().unwrap();
+        }
+        // Exclusion: every "in" is followed by its own "out".
+        let order = order.lock().unwrap();
+        for pair in order.chunks(2) {
+            assert_eq!(pair[0].replace("in", ""), pair[1].replace("out", ""), "{order:?}");
+        }
+    }
+
+    #[test]
+    fn a_repository_the_holder_is_not_making_a_worktree_of_is_not_waited_on() {
+        let root = crate::fleet::test_util::scratch_dir("tod-wt-lock-");
+        with_creation_lock(&root, "/repo-a", "tod-a", Duration::from_secs(1), |_| {
+            with_creation_lock(&root, "/repo-b", "tod-b", Duration::from_millis(100), |_| Ok(()))
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn a_stuck_holder_is_named_when_the_wait_runs_out() {
+        let root = crate::fleet::test_util::scratch_dir("tod-wt-lock-");
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let root = root.clone();
+            std::thread::spawn(move || {
+                with_creation_lock(&root, "/repo", "tod-stuck-node on branch task/stuck", Duration::from_secs(5), |progress| {
+                    progress.phase("setting up submodules");
+                    held_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(())
+                })
+            })
+        };
+        held_rx.recv().unwrap();
+        let err = with_creation_lock(&root, "/repo", "tod-late", Duration::from_millis(200), |_| Ok(())).unwrap_err();
+        release_tx.send(()).unwrap();
+        holder.join().unwrap().unwrap();
+        assert!(is_lock_busy(&err), "{err:#}");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("tod-stuck-node on branch task/stuck") && message.contains("setting up submodules"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn the_same_path_in_two_places_is_two_locks() {
+        let root = crate::fleet::test_util::scratch_dir("tod-wt-lock-");
+        let a = Workdir::sandbox("sb-a".to_string(), "/workspace/repo").to_string();
+        let b = Workdir::sandbox("sb-b".to_string(), "/workspace/repo").to_string();
+        let c = Workdir::container("dev-1".to_string(), "/workspace/repo").to_string();
+        assert!(a != b && a != c);
+        with_creation_lock(&root, &a, "tod-a", Duration::from_secs(1), |_| {
+            with_creation_lock(&root, &b, "tod-b", Duration::from_millis(100), |_| {
+                with_creation_lock(&root, &c, "tod-c", Duration::from_millis(100), |_| Ok(()))
+            })
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn a_holder_that_died_leaves_no_lock_behind() {
+        let root = crate::fleet::test_util::scratch_dir("tod-wt-lock-");
+        let failed: Result<()> = with_creation_lock(&root, "/repo", "tod-x", Duration::from_secs(1), |_| bail!("boom"));
+        assert!(failed.is_err());
+        with_creation_lock(&root, "/repo", "tod-y", Duration::from_millis(100), |_| Ok(())).unwrap();
     }
 
     use super::*;

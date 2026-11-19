@@ -940,7 +940,13 @@ impl Autopilot {
         lifecycle: &str,
     ) -> Result<ChecksStep> {
         let node = self.node;
-        let round = crate::checks::run_stale(fleet, node, lifecycle)?;
+        let round = match crate::checks::run_stale(fleet, node, lifecycle) {
+            Ok(round) => round,
+            Err(err) if tod_store::fleet::worktree::is_lock_busy(&err) => {
+                return Ok(ChecksStep::Stop(self.files_busy(fleet, &err)?));
+            }
+            Err(err) => return Err(err),
+        };
         if round.runs.is_empty() {
             return Ok(ChecksStep::Proceed);
         }
@@ -987,6 +993,26 @@ impl Autopilot {
         self.owe_groups(fleet, ProtocolKind::Fix, "fix", lifecycle)?;
         self.record(fleet, "fix_checks", lifecycle, None)?;
         Ok(ChecksStep::Fixed)
+    }
+
+    /// Another node has held the repository's worktree lock for longer than
+    /// this run could wait to make its files. Not this node's failure: the run
+    /// ends waiting (a timer wake a minute on) with the holder named, and
+    /// looks again.
+    fn files_busy(&self, fleet: &FleetStore, err: &anyhow::Error) -> Result<Outcome> {
+        const RETRY_MS: i64 = 60_000;
+        let now = chrono::Utc::now().timestamp_millis();
+        let what = format!("another node is still making its files: {err:#}");
+        fleet
+            .interview(
+                "autopilot",
+                tod_store::interview::InterviewCommand::RecordWait {
+                    node_id: self.node,
+                    wait: tod_store::waits::NewWait::until(now + RETRY_MS).with_detail(&what),
+                },
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(Outcome::Waiting { what, due_at_ms: now + RETRY_MS })
     }
 
     /// Settle the gate and advance through it: the `GateCheck` step.
