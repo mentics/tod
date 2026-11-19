@@ -170,7 +170,7 @@ impl LocalRun {
                 crate::pr_readiness::set_feed_override(feed_override);
                 let mut hook = Hook::new(node, fleet.clone(), hook_request, hook_poll, &mut on_event);
                 let result = (|| -> Result<Outcome> {
-                    crate::run_state::record(&fleet, node, crate::run_state::working("running on this machine"), WRITER)?;
+                    hook.resume(&fleet)?;
                     let mut pilot = Autopilot::new(config, node, budget)?;
                     if let Some(poll) = poll {
                         pilot = pilot.with_poll_interval(poll);
@@ -347,6 +347,14 @@ pub(crate) struct Hook<'a, F: FnMut(LocalEvent)> {
     /// The run is waiting on something outside (`StepHook::waiting`), so
     /// reaching a step boundary does not show it as idle.
     waiting: bool,
+    /// The run was resumed while the node's run state says it waits on
+    /// something outside, and has done no work yet: the re-check of an overdue
+    /// wait. The `waiting` row stays as it is (every flip to `working` is a
+    /// change to watchers, and the push look can take minutes) until the run
+    /// does work an agent or a push needs ([`Hook::begin_work`]).
+    quiet: bool,
+    /// What the run would have said while `quiet`.
+    pending_say: Option<String>,
     /// A step boundary's push failed in a way asking again may fix: what to
     /// say and when to try again. The run stops with [`PUSH_RETRY`] and ends
     /// as this wait.
@@ -377,6 +385,8 @@ impl<'a, F: FnMut(LocalEvent)> Hook<'a, F> {
             last: None,
             last_at: None,
             waiting: false,
+            quiet: false,
+            pending_say: None,
             push_retry: None,
             push_failed: false,
         }
@@ -448,12 +458,22 @@ pub(crate) const PUSH_RETRY: &str = "push-retry";
 /// does not: a push with nothing to send is never attempted, a node with no
 /// checkout of its own has none, and the push at the run's end, where nothing
 /// is left to block, is recorded without changing the outcome.
+#[cfg(test)]
 pub(crate) fn push_branch(fleet: &FleetStore, node: Uuid) -> Result<Option<Outcome>> {
     push_branch_as(fleet, node, PushRetrier::Run)
 }
 
 fn push_branch_as(fleet: &FleetStore, node: Uuid, retrier: PushRetrier) -> Result<Option<Outcome>> {
-    match tod_store::fleet::provision::push_node_branch(fleet, &node.to_string()) {
+    push_branch_notifying(fleet, node, retrier, || {})
+}
+
+fn push_branch_notifying(
+    fleet: &FleetStore,
+    node: Uuid,
+    retrier: PushRetrier,
+    on_push: impl FnOnce(),
+) -> Result<Option<Outcome>> {
+    match tod_store::fleet::provision::push_node_branch_notifying(fleet, &node.to_string(), on_push) {
         Ok(pushed) => {
             super::branch_push_ok(fleet, node)?;
             if let Some(branch) = pushed {
@@ -541,8 +561,39 @@ pub(crate) fn push_at_run_end(
 }
 
 impl<F: FnMut(LocalEvent)> Hook<'_, F> {
+    /// The run starts: it is working, unless the node's row says it waits on
+    /// something outside, in which case it re-checks quietly until it has
+    /// work (gap 79).
+    pub(crate) fn resume(&mut self, fleet: &FleetStore) -> Result<()> {
+        let node = self.node;
+        let row = fleet.read(|conn| Ok(tod_store::run_state::get(conn, node)?))?;
+        if row.is_some_and(|r| r.reason_kind == crate::run_state::kind::WAITING_OUTSIDE) {
+            self.quiet = true;
+            return Ok(());
+        }
+        crate::run_state::record(fleet, node, crate::run_state::working("running on this machine"), WRITER)?;
+        Ok(())
+    }
+
+    /// Real work starts (a push the remote needs, an agent turn, a step of
+    /// the phase): a quiet run now says so.
+    fn begin_work(&mut self, what: Option<&str>) {
+        if !self.quiet {
+            return;
+        }
+        self.quiet = false;
+        let what = what.map(str::to_string).or_else(|| self.pending_say.take());
+        let what = what.unwrap_or_else(|| "running on this machine".to_string());
+        self.say(&what);
+        self.hold();
+    }
+
     /// Say in the node's run state what this runner is doing now.
     fn say(&mut self, what: &str) {
+        if self.quiet {
+            self.pending_say = Some(what.to_string());
+            return;
+        }
         if let Err(err) = crate::run_state::record(&self.fleet, self.node, crate::run_state::working(what), WRITER) {
             self.state_error = Some(format!("{err:#}"));
         }
@@ -551,6 +602,7 @@ impl<F: FnMut(LocalEvent)> Hook<'_, F> {
 
 impl<F: FnMut(LocalEvent)> StepHook for Hook<'_, F> {
     fn working_on(&mut self, what: &str) {
+        self.begin_work(Some(what));
         self.say(what);
     }
 
@@ -560,7 +612,12 @@ impl<F: FnMut(LocalEvent)> StepHook for Hook<'_, F> {
             // Pushing can take seconds in a checkout with submodules: say so
             // rather than leave "deciding the next step" on screen.
             self.say("saving the branch to GitHub");
-            let pushed = push_branch(fleet, self.node)?;
+            let node = self.node;
+            let mut start_work = false;
+            let pushed = push_branch_notifying(fleet, node, PushRetrier::Run, || start_work = true)?;
+            if start_work {
+                self.begin_work(Some("saving the branch to GitHub"));
+            }
             self.push_failed |= pushed.is_some();
             match pushed {
                 None => {}
@@ -571,7 +628,7 @@ impl<F: FnMut(LocalEvent)> StepHook for Hook<'_, F> {
                 Some(Outcome::Stopped { reason }) => blocked = Some(reason),
                 Some(other) => anyhow::bail!("pushing the branch ended the run as {other:?}"),
             }
-            if !self.waiting {
+            if !self.waiting && !self.quiet {
                 // A group of skills run in its own session said so at the last
                 // step; the next one is the run at large again.
                 self.say("running on this machine");
@@ -599,6 +656,11 @@ impl<F: FnMut(LocalEvent)> StepHook for Hook<'_, F> {
         self.waiting = on.is_some();
         let draft = match on {
             Some(what) => crate::run_state::waiting_outside(what),
+            None if self.quiet => {
+                // Not work yet: the wait row stays until something is done.
+                self.pending_say = Some("running on this machine".to_string());
+                return;
+            }
             None => crate::run_state::working("running on this machine"),
         };
         if let Err(err) = crate::run_state::record(&self.fleet, self.node, draft, WRITER) {
@@ -630,6 +692,7 @@ impl<F: FnMut(LocalEvent)> StepHook for Hook<'_, F> {
     }
 
     fn watch(&mut self, turn: Turn<'_>) -> Option<String> {
+        self.begin_work(None);
         match self.requested() {
             Request::StopNow => return Some(STOPPED.to_string()),
             Request::HandoverNow => return Some(HANDOVER.to_string()),

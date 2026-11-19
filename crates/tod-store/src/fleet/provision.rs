@@ -2198,6 +2198,13 @@ fn ensure_submodule_commits(repo: &Workdir) -> Result<()> {
 /// checked out there is not its branch). Refuses a default branch. Runs git
 /// and the network: never on the UI thread.
 pub fn push_node_branch(fleet: &FleetStore, node_id: &str) -> Result<Option<String>> {
+    push_node_branch_notifying(fleet, node_id, || {})
+}
+
+/// [`push_node_branch`], calling `on_push` just before a push that is really
+/// needed (the remote lacks something), never for the look that finds it has
+/// everything. A run that is only waiting says it is working only from then.
+pub fn push_node_branch_notifying(fleet: &FleetStore, node_id: &str, on_push: impl FnOnce()) -> Result<Option<String>> {
     let _retries = crate::fleet::workdir::scope_retries_to_node(node_id);
     // Under the node's lock, so a release ([`release_parked_worktree`]) cannot
     // give the worktree back mid-push; one that came first has removed the
@@ -2222,6 +2229,7 @@ pub fn push_node_branch(fleet: &FleetStore, node_id: &str) -> Result<Option<Stri
     // pre-push hook) even when it has nothing to send, so it runs only when a
     // repository's HEAD is not what its remote-tracking branch already has.
     if needs_push(&dir)? {
+        on_push();
         push_branches(&dir)?;
     }
     // Everything is committed and pushed: a checkpoint of work that has

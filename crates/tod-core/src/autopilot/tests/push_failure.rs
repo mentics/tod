@@ -352,3 +352,64 @@ fn nothing_to_send_and_no_checkout_of_its_own_fail_nothing() {
     assert!(crate::autopilot::local::push_branch(&fx.fleet, fx.node).unwrap().is_none());
     assert!(push_waits(&fx).is_empty());
 }
+
+/// What a re-check of an overdue wait shows (gap 79): the node's run state
+/// reads `waiting` and a run resumed to look again does no work, so it must not
+/// write `working` in between (every write is a change to watchers, and the
+/// push look can take minutes). `since` moves on every write, so an unchanged
+/// `since` proves there was none.
+fn wait_row(fx: &Fixture) -> tod_store::run_state::RunState {
+    fx.fleet.read(|conn| tod_store::run_state::get(conn, fx.node)).unwrap().unwrap()
+}
+
+#[test]
+fn a_re_check_of_a_wait_with_nothing_to_push_keeps_its_waiting_row_and_never_writes_working() {
+    use crate::autopilot::StepHook;
+    let fx = setup();
+    let workspace = workspace_is_a_clone(&fx);
+    node_works_in(&fx, &workspace);
+    // The remote already has everything.
+    git_in(&workspace, &["push", "-q", "origin", "HEAD"]);
+    crate::run_state::record(
+        &fx.fleet,
+        fx.node,
+        crate::run_state::waiting_outside("pull request #1 to be marked ready for review"),
+        "test",
+    )
+    .unwrap();
+    let before = wait_row(&fx);
+
+    let mut sink = |_: LocalEvent| {};
+    let mut hook = hook(&fx, &mut sink);
+    hook.resume(&fx.fleet).unwrap();
+    // The run's re-check: a step boundary, the gate's "not working" hand-offs,
+    // then the wait again, and a boundary of the sleep.
+    assert_eq!(run_at_step(&mut hook, &fx), None);
+    hook.waiting(None, None);
+    assert_eq!(run_at_step(&mut hook, &fx), None);
+    hook.waiting(Some("pull request #1 to be marked ready for review"), Some(1));
+    assert_eq!(hook.at(&fx.fleet, Boundary::Wait).unwrap(), None);
+
+    let after = wait_row(&fx);
+    assert_eq!(after.since, before.since, "no write in between: {after:?}");
+    assert_eq!(after.reason_kind, tod_core_kind_waiting());
+}
+
+fn tod_core_kind_waiting() -> String {
+    crate::run_state::kind::WAITING_OUTSIDE.to_string()
+}
+
+#[test]
+fn a_waiting_run_says_working_once_a_push_is_needed() {
+    let fx = setup();
+    let outage = Outage::new(&fx);
+    outage.up();
+    crate::run_state::record(&fx.fleet, fx.node, crate::run_state::waiting_outside("a release"), "test").unwrap();
+    let mut sink = |_: LocalEvent| {};
+    let mut hook = hook(&fx, &mut sink);
+    hook.resume(&fx.fleet).unwrap();
+    assert_eq!(wait_row(&fx).reason_kind, tod_core_kind_waiting());
+    assert_eq!(run_at_step(&mut hook, &fx), None);
+    let row = wait_row(&fx);
+    assert_eq!(row.reason_kind, crate::run_state::kind::WORKING, "a real push is work: {row:?}");
+}
