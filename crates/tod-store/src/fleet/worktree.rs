@@ -1063,6 +1063,18 @@ fn treehouse_get_lease(
 /// is stuck (a hung git); a holder that died releases the lock by itself.
 pub const CREATION_LOCK_WAIT: Duration = Duration::from_secs(20 * 60);
 
+thread_local! {
+    static UI_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Declare the calling thread the UI thread. It never waits for the creation
+/// lock: a contended lock is [`WorktreeLockBusy`] at once, naming the holder,
+/// so a path that reaches a worktree's creation from the UI thread by mistake
+/// shows "busy, held by X" instead of freezing the window for minutes.
+pub fn mark_current_thread_as_ui() {
+    UI_THREAD.with(|flag| flag.set(true));
+}
+
 /// Another node has been making a worktree of the same repository for longer
 /// than the caller could wait. It is a wait, not a failure of the caller's
 /// own work: callers that can retry later (the autopilot) treat it as a
@@ -1158,6 +1170,7 @@ fn with_creation_lock<T>(
     let info_path = lock_dir.join(format!(".holder-{hash:016x}"));
     let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&lock_path)?;
     let start = std::time::Instant::now();
+    let max_wait = if UI_THREAD.with(std::cell::Cell::get) { Duration::ZERO } else { max_wait };
     loop {
         match file.try_lock_exclusive() {
             Ok(()) => break,
@@ -1683,6 +1696,39 @@ mod tests {
             message.contains("tod-stuck-node on branch task/stuck") && message.contains("setting up submodules"),
             "{message}"
         );
+    }
+
+    #[test]
+    fn the_ui_thread_never_waits_for_the_lock() {
+        let root = crate::fleet::test_util::scratch_dir("tod-wt-lock-");
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let root = root.clone();
+            std::thread::spawn(move || {
+                with_creation_lock(&root, "/repo", "tod-slow on branch task/slow", Duration::from_secs(5), |progress| {
+                    progress.phase("adding the worktree");
+                    held_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(())
+                })
+            })
+        };
+        held_rx.recv().unwrap();
+        // A thread of its own stands for the UI thread.
+        let root2 = root.clone();
+        let ui = std::thread::spawn(move || {
+            mark_current_thread_as_ui();
+            let start = std::time::Instant::now();
+            let result = with_creation_lock(&root2, "/repo", "tod-ui", Duration::from_secs(60), |_| Ok(()));
+            (result, start.elapsed())
+        });
+        let (result, took) = ui.join().unwrap();
+        release_tx.send(()).unwrap();
+        holder.join().unwrap().unwrap();
+        let err = result.unwrap_err();
+        assert!(is_lock_busy(&err) && format!("{err:#}").contains("tod-slow on branch task/slow"), "{err:#}");
+        assert!(took < Duration::from_secs(2), "{took:?}");
     }
 
     #[test]

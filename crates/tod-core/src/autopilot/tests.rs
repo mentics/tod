@@ -1915,6 +1915,36 @@ fn scripted_pr(script: Vec<Look>) -> (Fixture, Arc<Scripted>, FakeAgent) {
     (fx, feed, agent)
 }
 
+/// A step that cannot get the node's files because another node holds the
+/// repository's worktree lock.
+struct FilesBusy;
+
+impl StepHook for FilesBusy {
+    fn at(&mut self, _: &FleetStore, _: Boundary) -> Result<Option<String>> {
+        let busy = tod_store::fleet::worktree::WorktreeLockBusy {
+            repo: "/repo".into(),
+            holder: "tod-other on branch task/other, setting up submodules".into(),
+            waited: Duration::from_secs(1200),
+        };
+        Err(anyhow::Error::new(busy).context("this node's files are not available"))
+    }
+}
+
+#[test]
+fn a_step_that_waits_too_long_for_the_files_lock_ends_waiting_not_failed() {
+    let fx = setup();
+    lifecycle::set_lifecycle(&fx.fleet, fx.node, "active").unwrap();
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let outcome = autopilot(&fx, Budget::default()).run_with(&fx.fleet, &mut agent, &mut FilesBusy).unwrap();
+    match outcome {
+        Outcome::Waiting { what, due_at_ms } => {
+            assert!(what.contains("tod-other on branch task/other"), "{what}");
+            assert!(due_at_ms > chrono::Utc::now().timestamp_millis());
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
 /// Stops the run after `n` looks at the pull request.
 struct StopAfter(u32);
 

@@ -638,7 +638,27 @@ impl Autopilot {
     }
 
     /// [`Self::run`], calling `hook` at every [`Boundary`].
+    ///
+    /// The one place a step's failure to get the node's files because another
+    /// node is making its own (`WorktreeLockBusy`: a checks round, the gate,
+    /// a protocol's working directory, the pull request's change review)
+    /// becomes a wait with the holder named, never a failed run.
     pub fn run_with<A: AgentAccess + ?Sized, H: StepHook + ?Sized>(
+        &mut self,
+        fleet: &FleetStore,
+        agent: &mut A,
+        hook: &mut H,
+    ) -> Result<Outcome> {
+        match self.run_steps(fleet, agent, hook) {
+            Err(err) if tod_store::fleet::worktree::is_lock_busy(&err) => {
+                let outcome = self.files_busy(fleet, &err)?;
+                self.finish(outcome)
+            }
+            other => other,
+        }
+    }
+
+    fn run_steps<A: AgentAccess + ?Sized, H: StepHook + ?Sized>(
         &mut self,
         fleet: &FleetStore,
         agent: &mut A,
@@ -940,13 +960,7 @@ impl Autopilot {
         lifecycle: &str,
     ) -> Result<ChecksStep> {
         let node = self.node;
-        let round = match crate::checks::run_stale(fleet, node, lifecycle) {
-            Ok(round) => round,
-            Err(err) if tod_store::fleet::worktree::is_lock_busy(&err) => {
-                return Ok(ChecksStep::Stop(self.files_busy(fleet, &err)?));
-            }
-            Err(err) => return Err(err),
-        };
+        let round = crate::checks::run_stale(fleet, node, lifecycle)?;
         if round.runs.is_empty() {
             return Ok(ChecksStep::Proceed);
         }
@@ -2624,6 +2638,9 @@ impl Autopilot {
         if let Err(err) = driver.send(fleet, agent, &message) {
             self.state.current = None;
             self.save()?;
+            if tod_store::fleet::worktree::is_lock_busy(&err) {
+                return Ok(Some(self.files_busy(fleet, &err)?));
+            }
             return Ok(Some(Outcome::NeedsHuman {
                 reason: NeedsHuman::AgentFailed {
                     error: format!("{err:#}"),

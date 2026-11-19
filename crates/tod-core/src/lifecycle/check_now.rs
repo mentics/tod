@@ -47,6 +47,19 @@ fn reads_github(state: &str) -> bool {
     matches!(state, "pr_draft" | "approved" | "merged")
 }
 
+/// Nothing was checked: another node has been making its files for longer than
+/// this check could wait. Held, never advanced, and never a failure.
+fn files_busy(fleet: &FleetStore, node: Uuid, err: &anyhow::Error) -> Result<CheckNow> {
+    let from = current_state(fleet, node)?;
+    Ok(CheckNow {
+        gate: GateCheck { to: crate::task::model::next_lifecycle(&from).map(str::to_string), from, criteria: Vec::new() },
+        advanced: None,
+        github: None,
+        held: Some(format!("another node is still making its files, so nothing was checked: {err:#}")),
+        needs_agent: false,
+    })
+}
+
 /// Check `node`'s gate now, advance it when clear, and read GitHub where the
 /// state waits on it. An error (not a no-op) when a run holds the node.
 pub fn check_now(fleet: &FleetStore, node: Uuid, data_root: &std::path::Path) -> Result<CheckNow> {
@@ -59,7 +72,13 @@ pub fn check_now(fleet: &FleetStore, node: Uuid, data_root: &std::path::Path) ->
         bail!("this node is being run: check it once the run has ended, or pause it first");
     }
     let branch_template = tod_store::TodSettings::load(&tod_store::TodPaths::at(data_root))?.branch_template;
-    let gate = settle_gate(fleet, node, &branch_template)?;
+    let gate = match settle_gate(fleet, node, &branch_template) {
+        Ok(gate) => gate,
+        // Another node is making its files, which the phase's checks need:
+        // nothing was checked, and nothing is advanced. A wait, not a failure.
+        Err(err) if tod_store::fleet::worktree::is_lock_busy(&err) => return files_busy(fleet, node, &err),
+        Err(err) => return Err(err),
+    };
     let from = current_state(fleet, node)?;
     // `pr_draft` reads GitHub before the gate, as the autopilot's
     // `hold_for_github` does: a draft waiting for a person to mark it ready
@@ -106,6 +125,25 @@ mod tests {
     use tod_store::fleet::FleetMutation;
     use tod_store::github::{PrSnapshot, PrStatus};
     use tod_store::outline::{Capability, OutlineMutation};
+
+    #[test]
+    fn a_busy_files_lock_holds_the_check_and_does_not_fail_it() {
+        let fx = fixture();
+        enable_lifecycle(&fx, "proposed");
+        let busy: anyhow::Error = tod_store::fleet::worktree::WorktreeLockBusy {
+            repo: "/repo".into(),
+            holder: "tod-x on branch task/x, adding the worktree".into(),
+            waited: std::time::Duration::from_secs(1200),
+        }
+        .into();
+        let err = busy.context("find the files to run the proposed checks in");
+        assert!(tod_store::fleet::worktree::is_lock_busy(&err));
+        let found = files_busy(&fx.fleet, fx.node, &err).unwrap();
+        assert!(found.advanced.is_none() && !found.needs_agent);
+        let held = found.held.expect("held");
+        assert!(held.contains("tod-x on branch task/x"), "{held}");
+        assert_eq!(super::super::current_state(&fx.fleet, fx.node).unwrap(), "proposed");
+    }
 
     fn enable_lifecycle(fx: &Fixture, state: &str) {
         fx.fleet

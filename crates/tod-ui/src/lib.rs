@@ -24,6 +24,8 @@ fn verify_process_bundle() -> anyhow::Result<()> {
 }
 
 pub fn run() {
+    // The GPUI thread must never wait for a worktree's creation lock.
+    tod_store::fleet::worktree::mark_current_thread_as_ui();
     // A launch makes a node's sandbox through `tod-store`'s one creator.
     tod_core::cloud_sync::register_sandbox_host();
     let opts = match cli::LaunchOptions::from_args(std::env::args()) {
