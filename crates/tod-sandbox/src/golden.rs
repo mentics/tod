@@ -447,15 +447,17 @@ pub fn clone_script(repo: &str) -> Result<String> {
     let dir = crate::relay::shell_quote(crate::node::WORKSPACE_DIR);
     Ok(format!(
         "set -e\n\
+         {retry}\n\
          if [ -n \"$SSL_CERT_FILE\" ]; then git config --system http.sslCAInfo \"$SSL_CERT_FILE\"; fi\n\
          git config --system --replace-all url.https://github.com/.insteadOf git@github.com:\n\
          git config --system --add url.https://github.com/.insteadOf ssh://git@github.com/\n\
          if [ -d {dir}/.git ]; then echo \"{dir} already holds a checkout\" >&2; exit 1; fi\n\
          mkdir -p \"$(dirname {dir})\"\n\
-         if ! git clone --quiet {url} {dir}; then echo \"cloning {repo} failed (see git's message above): a private repository needs the GitHub token stored in tod, with access to it\" >&2; exit 1; fi\n\
+         if ! tod_fetch_retry git clone --quiet {url} {dir}; then echo \"$out\" >&2; echo \"cloning {repo} failed (git's message is above): a private repository needs the GitHub token stored in tod, with access to it\" >&2; exit 1; fi\n\
          cd {dir}\n\
          if [ -f .gitmodules ]; then \
-         if ! git submodule update --init --recursive --quiet; then echo \"{repo} cloned, but its submodules did not initialize: the token needs access to them too\" >&2; exit 1; fi; fi\n"
+         if ! tod_fetch_retry git submodule update --init --recursive --quiet; then echo \"$out\" >&2; echo \"{repo} cloned, but its submodules did not initialize: the token needs access to them too\" >&2; exit 1; fi; fi\n",
+        retry = crate::git_retry::FETCH_RETRY_SH,
     ))
 }
 
@@ -769,7 +771,9 @@ mod tests {
     #[test]
     fn the_clone_goes_to_the_directory_a_fork_looks_in_and_takes_submodules() {
         let s = clone_script("joel-cofactr/build-test").unwrap();
-        assert!(s.contains("git clone --quiet https://github.com/joel-cofactr/build-test.git /workspace/repo"), "{s}");
+        assert!(s.contains("tod_fetch_retry git clone --quiet https://github.com/joel-cofactr/build-test.git /workspace/repo"), "{s}");
+        assert!(s.contains("tod_fetch_retry git submodule update --init --recursive"), "{s}");
+        assert!(s.contains(crate::git_retry::FETCH_RETRY_SH), "{s}");
         assert!(s.contains("submodule update --init --recursive"), "{s}");
         // Submodules named by SSH URL come over HTTPS, through the proxy.
         assert!(s.contains("--replace-all url.https://github.com/.insteadOf git@github.com:"), "{s}");

@@ -54,21 +54,64 @@ pub fn is_transient_fetch_failure(stderr: &str) -> bool {
     is_ref_lock_race(stderr) || is_transient_network_error(stderr)
 }
 
-/// Run `run` (one git call with `args`); when `args` is a `git fetch` that
-/// fails transiently ([`is_transient_fetch_failure`]: a lock race or a network error), run it again after each wait
-/// in `backoff`. The last attempt's output is returned as it is, so a race
-/// that outlasts the retries is still an error naming git's own message.
-/// Concurrent fetches of one repository come from this app, the daemon, and
-/// the supervisor's boundary push, in separate processes, so a lock in
-/// process would not cover them.
+/// The git subcommand of `args`, past `-c k=v` / `-C dir` pairs and flags.
+fn git_subcommand<'a>(args: &[&'a str]) -> Option<&'a str> {
+    let mut it = args.iter().copied();
+    while let Some(a) = it.next() {
+        if a == "-c" || a == "-C" {
+            it.next();
+        } else if !a.starts_with('-') {
+            return Some(a);
+        }
+    }
+    None
+}
+
+/// Whether `args` is a git call that talks to a remote, and so is retried on a
+/// transient failure: `fetch`, `clone`, `ls-remote`, `pull`, and
+/// `submodule update` (which clones and fetches submodules). `push` is not
+/// here: its refusals are classified by `provision::is_transient_push_error`.
+fn is_network_git(args: &[&str]) -> bool {
+    match git_subcommand(args) {
+        Some("fetch" | "clone" | "ls-remote" | "pull") => true,
+        Some("submodule") => is_submodule_update(args),
+        _ => false,
+    }
+}
+
+fn is_submodule_update(args: &[&str]) -> bool {
+    if git_subcommand(args) != Some("submodule") {
+        return false;
+    }
+    let pos = args.iter().position(|a| *a == "submodule").unwrap_or(0);
+    args[pos + 1..].iter().find(|a| !a.starts_with('-')) == Some(&"update")
+}
+
+/// Run `run` (one git call with `args`); when `args` is a network git call
+/// ([`is_network_git`]) that fails transiently ([`is_transient_fetch_failure`]:
+/// a lock race or a network error), run it again after each wait in
+/// `backoff`. The last attempt's output is returned as it is, so a failure
+/// that outlasts the retries is still an error naming git's own message; any
+/// other failure returns at once. Concurrent fetches of one repository come
+/// from this app, the daemon, and the supervisor's boundary push, in separate
+/// processes, so a lock in process would not cover them.
 pub fn retry_ref_lock_race(
     args: &[&str],
     backoff: &[std::time::Duration],
-    mut run: impl FnMut() -> Result<Output>,
+    run: impl FnMut() -> Result<Output>,
 ) -> Result<Output> {
-    let is_fetch = args.iter().find(|a| !a.starts_with('-') && **a != "safe.directory=*") == Some(&"fetch");
+    retry_network_git(args, backoff, run, || {})
+}
+
+/// [`retry_ref_lock_race`], calling `before_retry` before each new attempt.
+fn retry_network_git(
+    args: &[&str],
+    backoff: &[std::time::Duration],
+    mut run: impl FnMut() -> Result<Output>,
+    mut before_retry: impl FnMut(),
+) -> Result<Output> {
     let mut out = run()?;
-    if !is_fetch {
+    if !is_network_git(args) {
         return Ok(out);
     }
     for wait in backoff {
@@ -76,10 +119,20 @@ pub fn retry_ref_lock_race(
             break;
         }
         std::thread::sleep(*wait);
+        before_retry();
         out = run()?;
     }
     Ok(out)
 }
+
+/// Removes what a `git submodule update` cut off mid-clone leaves behind, so
+/// running it again starts clean: a `.git/modules/<name>` that never got a
+/// HEAD, for a submodule whose own directory has no `.git` yet.
+const SUBMODULE_CLEANUP_SH: &str = r#"mods=$(git rev-parse --git-path modules) || exit 0
+git config -f .gitmodules --get-regexp '^submodule\..*\.path$' 2>/dev/null | while read -r key path; do
+  name=${key#submodule.}; name=${name%.path}
+  if [ -d "$mods/$name" ] && [ ! -f "$mods/$name/HEAD" ] && [ ! -e "$path/.git" ]; then rm -rf "$mods/$name"; fi
+done"#;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Workdir {
@@ -328,7 +381,28 @@ impl Workdir {
     /// `git args…` in this directory. In a container or sandbox, git's
     /// ownership check is off (see [`CONTAINER_GIT_CONFIG`]).
     pub fn git_output(&self, args: &[&str]) -> Result<Output> {
-        retry_ref_lock_race(args, FETCH_RETRY_BACKOFF, || self.git_output_once(args))
+        retry_network_git(
+            args,
+            FETCH_RETRY_BACKOFF,
+            || self.git_output_once(args),
+            || {
+                if is_submodule_update(args) {
+                    // Best effort: the retry itself reports whatever remains.
+                    let _ = self.sh_once(SUBMODULE_CLEANUP_SH);
+                }
+            },
+        )
+    }
+
+    fn sh_once(&self, script: &str) -> Result<Output> {
+        match self {
+            Self::Host(path) => Ok(Command::new("sh")
+                .args(["-c", script])
+                .current_dir(strip_verbatim(path))
+                .stdin(std::process::Stdio::null())
+                .output()?),
+            Self::Container { .. } | Self::Sandbox { .. } => self.output("sh", &["-c", script]),
+        }
     }
 
     fn git_output_once(&self, args: &[&str]) -> Result<Output> {
@@ -485,6 +559,78 @@ mod retry_tests {
         assert!(!r.status.success());
         assert_eq!(calls, 4);
         assert!(String::from_utf8_lossy(&r.stderr).contains("GnuTLS recv error"));
+    }
+
+    const BLIP: &str = "fatal: unable to access 'https://x/': Could not resolve host: github.com";
+
+    #[test]
+    fn submodule_update_and_clone_retry_a_transient_failure_then_succeed() {
+        for args in [
+            &["submodule", "update", "--init", "--", "kb"][..],
+            &["-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive"][..],
+            &["clone", "-q", "https://x/r.git", "dest"][..],
+            &["ls-remote", "origin", "refs/heads/b"][..],
+        ] {
+            let mut calls = 0;
+            let mut cleaned = 0;
+            let r = retry_network_git(
+                args,
+                &[Duration::ZERO; 3],
+                || {
+                    calls += 1;
+                    Ok(if calls == 1 { out(128, BLIP) } else { out(0, "") })
+                },
+                || cleaned += 1,
+            )
+            .unwrap();
+            assert!(r.status.success(), "{args:?}");
+            assert_eq!((calls, cleaned), (2, 1), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn persistent_submodule_and_clone_errors_are_not_retried() {
+        for (args, err) in [
+            (&["submodule", "update", "--init"][..], "fatal: Authentication failed for 'https://x/'"),
+            (&["clone", "https://x/r.git"][..], "fatal: repository 'https://x/r.git/' not found"),
+            (&["submodule", "update"][..], "fatal: Fetched in submodule path 'kb', but it did not contain abc. Direct fetching of that commit failed."),
+        ] {
+            let mut calls = 0;
+            let r = retry_ref_lock_race(args, &[Duration::ZERO; 3], || {
+                calls += 1;
+                Ok(out(128, err))
+            })
+            .unwrap();
+            assert!(!r.status.success());
+            assert_eq!(calls, 1, "{err}");
+            assert!(String::from_utf8_lossy(&r.stderr).contains(err));
+        }
+    }
+
+    #[test]
+    fn only_network_git_is_retried() {
+        assert!(is_network_git(&["-c", "safe.directory=*", "fetch", "origin"]));
+        assert!(!is_network_git(&["submodule", "add", "u", "p"]));
+        assert!(!is_network_git(&["submodule", "foreach", "update"]));
+        assert!(!is_network_git(&["push", "origin"]));
+        assert!(!is_network_git(&["worktree", "add", "fetch"]));
+    }
+
+    #[test]
+    fn a_real_submodule_update_cut_off_mid_clone_is_cleaned_before_the_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let top = Workdir::host(dir.path());
+        top.git(&["init", "-q"]).unwrap();
+        std::fs::write(dir.path().join(".gitmodules"), "[submodule \"kb\"]\n\tpath = kb\n\turl = /nowhere\n").unwrap();
+        let half = dir.path().join(".git/modules/kb");
+        std::fs::create_dir_all(half.join("objects")).unwrap();
+        top.sh_once(SUBMODULE_CLEANUP_SH).unwrap();
+        assert!(!half.exists(), "an incomplete module dir (no HEAD) is removed");
+        // A complete one (it has a HEAD) is left alone.
+        std::fs::create_dir_all(&half).unwrap();
+        std::fs::write(half.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        top.sh_once(SUBMODULE_CLEANUP_SH).unwrap();
+        assert!(half.exists());
     }
 
     #[test]
