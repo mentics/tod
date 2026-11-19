@@ -36,9 +36,7 @@ pub const FETCH_RETRY_BACKOFF: &[std::time::Duration] = &[
 /// '...lock': File exists", "cannot lock ref"), or a ref that moved under it
 /// ("is at X but expected Y"). Nothing was changed; trying again succeeds.
 pub fn is_ref_lock_race(stderr: &str) -> bool {
-    stderr.contains("cannot lock ref")
-        || (stderr.contains("is at ") && stderr.contains("but expected"))
-        || (stderr.contains("Unable to create") && stderr.contains(".lock"))
+    tod_sandbox::git_retry::is_ref_lock_race(stderr)
 }
 
 /// Whether git's stderr says a fetch hit a transient network failure: a TLS
@@ -46,24 +44,8 @@ pub fn is_ref_lock_race(stderr: &str) -> bool {
 /// miss, a timeout or reset connection, a premature end of the pack, a
 /// failed RPC (curl 56), or an HTTP 5xx. Trying again normally succeeds.
 pub fn is_transient_network_error(stderr: &str) -> bool {
-    const MARKERS: [&str; 14] = [
-        "GnuTLS recv error",
-        "GnuTLS send error",
-        "SSL_read",
-        "SSL_connect",
-        "Could not resolve host",
-        "Connection timed out",
-        "Connection reset",
-        "Operation timed out",
-        "early EOF",
-        "RPC failed",
-        "curl 56",
-        "curl 28",
-        "unexpected disconnect",
-        "The remote end hung up unexpectedly",
-    ];
-    MARKERS.iter().any(|m| stderr.contains(m))
-        || ["500", "502", "503", "504"].iter().any(|c| stderr.contains(&format!("error: {c}")) || stderr.contains(&format!("returned error: {c}")))
+    // The list is `tod_sandbox::git_retry`'s, the same the shell scripts use.
+    tod_sandbox::git_retry::is_transient_network_error(stderr)
 }
 
 /// A failure of a fetch worth trying again: [`is_ref_lock_race`] or

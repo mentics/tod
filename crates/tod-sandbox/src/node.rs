@@ -657,9 +657,11 @@ pub fn checkout_script(repo_url: &str, branch: &str, identity: &GitIdentity, all
     format!(
         "set -e\n\
          if [ -n \"$SSL_CERT_FILE\" ]; then git config --system http.sslCAInfo \"$SSL_CERT_FILE\"; fi\n\
-         if [ -d {clone_dir}/.git ]; then dir={clone_dir}; git -C \"$dir\" fetch --quiet --prune --no-recurse-submodules origin; \
-         elif [ -d {forked_dir}/.git ]; then dir={forked_dir}; git -C \"$dir\" fetch --quiet --prune --no-recurse-submodules origin; \
+         {retry}\
+         if [ -d {clone_dir}/.git ]; then dir={clone_dir}; \
+         elif [ -d {forked_dir}/.git ]; then dir={forked_dir}; \
          else {missing}; fi\n\
+         if [ -d \"$dir/.git\" ]; then tod_fetch_retry git -C \"$dir\" fetch --quiet --prune --no-recurse-submodules origin || {{ echo \"updating origin in $dir failed: $out\" >&2; exit 1; }}; fi\n\
          cd \"$dir\"\n\
          git config --global user.name {name}\n\
          git config --global user.email {email}\n\
@@ -669,6 +671,7 @@ pub fn checkout_script(repo_url: &str, branch: &str, identity: &GitIdentity, all
          git checkout -q -B {br} origin/{br} && git branch --set-upstream-to=origin/{br}; \
          elif git show-ref --verify --quiet refs/heads/{br}; then git checkout -q {br}; \
          else git checkout -q --no-track -b {br} \"$(git symbolic-ref -q --short refs/remotes/origin/HEAD || echo origin/main)\"; fi\n",
+        retry = crate::git_retry::FETCH_RETRY_SH,
     )
 }
 
@@ -1894,7 +1897,7 @@ mod tests {
     fn the_fetch_prunes_so_a_deleted_branch_is_not_checked_out_stale() {
         let me = GitIdentity::fallback();
         let s = checkout_script("https://github.com/o/r.git", "feat/x", &me, true);
-        assert_eq!(s.matches("fetch --quiet --prune --no-recurse-submodules origin").count(), 2, "{s}");
+        assert_eq!(s.matches("fetch --quiet --prune --no-recurse-submodules origin").count(), 1, "{s}");
         assert!(!s.contains("fetch --quiet origin"), "{s}");
     }
 
@@ -1915,7 +1918,8 @@ mod tests {
         let s = checkout_script("https://github.com/o/r.git", "feat/x", &me, false);
         assert!(!s.contains("git clone"), "{s}");
         // The golden's own checkout is fetched and used where the clone would be.
-        assert!(s.contains("elif [ -d /workspace/.git ]; then dir=/workspace; git -C \"$dir\" fetch --quiet --prune --no-recurse-submodules origin"), "{s}");
+        assert!(s.contains("elif [ -d /workspace/.git ]; then dir=/workspace; "), "{s}");
+        assert!(s.contains("tod_fetch_retry git -C \"$dir\" fetch --quiet --prune --no-recurse-submodules origin"), "{s}");
         // With neither, it fails loudly instead.
         assert!(s.contains("has no repository\" >&2; exit 1"), "{s}");
         assert!(checkout_script("https://github.com/o/r.git", "feat/x", &me, true).contains("git clone"));

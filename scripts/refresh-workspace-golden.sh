@@ -50,9 +50,26 @@ envval() { sed -n "s/^$1=//p" "$SRC/.env" 2>/dev/null | tail -1 | sed -e 's/^"//
 [[ -n "$BL_API_KEY" && -n "$BL_WORKSPACE" ]] || { echo "no BL_API_KEY / BL_WORKSPACE (environment or $SRC/.env)"; false; }
 export BL_API_KEY BL_WORKSPACE
 
+# Kept equal to tod_sandbox::git_retry::FETCH_RETRY_SH (a test checks it).
+tod_fetch_retry() {
+  for _w in 1 2 4 x; do
+    out=$("$@" 2>&1) && return 0
+    _rc=$?
+    case "$out" in
+      *"cannot lock ref"*|*"is at "*"but expected"*|*"Unable to create"*".lock"*|\
+      *"GnuTLS recv error"*|*"GnuTLS send error"*|*"SSL_read"*|*"SSL_connect"*|*"Could not resolve host"*|\
+      *"Connection timed out"*|*"Connection reset"*|*"Operation timed out"*|*"early EOF"*|*"RPC failed"*|\
+      *"curl 56"*|*"curl 28"*|*"unexpected disconnect"*|*"The remote end hung up unexpectedly"*|\
+      *"error: 500"*|*"error: 502"*|*"error: 503"*|*"error: 504"*) ;;
+      *) return "$_rc" ;;
+    esac
+    [ "$_w" = x ] && return "$_rc"
+    sleep "$_w"
+  done
+}
 origin="$(git -C "$SRC" remote get-url origin)"
 if [[ ! -d "$CLONE/.git" ]]; then git clone --quiet "$origin" "$CLONE"; fi
-git -C "$CLONE" fetch --quiet origin
+tod_fetch_retry git -C "$CLONE" fetch --quiet origin || { echo "fetch origin failed: $out" >&2; false; }
 git -C "$CLONE" checkout --quiet --force --detach origin/main
 git -C "$CLONE" clean -fdq
 git -C "$CLONE" submodule sync --quiet

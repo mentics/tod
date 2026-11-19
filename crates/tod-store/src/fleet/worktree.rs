@@ -173,8 +173,15 @@ pub fn fetch_origin(repo: &Workdir) -> Result<()> {
     // by id that a branch moved past meanwhile ("not our ref"); the objects
     // the first try did get are kept, so a second try normally succeeds.
     let fetch = || run_git(repo, &["fetch", "--quiet", "--prune", REMOTE]);
+    // A transient failure was already retried (with backoff) by `Workdir`, so
+    // it is not tried a further two times here.
     fetch()
-        .or_else(|first| fetch().map_err(|_| first))
+        .or_else(|first| {
+            if crate::fleet::workdir::is_transient_fetch_failure(&format!("{first:#}")) {
+                return Err(first);
+            }
+            fetch().map_err(|_| first)
+        })
         .with_context(|| {
             format!("fetch {REMOTE} in {repo}, so the node's new branch starts from the latest")
         })?;
@@ -507,6 +514,7 @@ const CAREFUL_EXIT: i32 = 7;
 fn quick_branch_script() -> String {
     format!(
         r#"export BR="$1" KEY="$2" LC_ALL=C
+{FETCH_RETRY}
 walk() {{
   [ -f "$1/.gitmodules" ] || return 0
   for p in $(git config -f "$1/.gitmodules" --get-regexp '^submodule\..*\.path$' | awk '{{print $2}}'); do
@@ -520,7 +528,7 @@ for sp in $paths; do
   (
     cd "$sp" || exit 1
     if git config --get remote.{REMOTE}.url >/dev/null; then
-      if ! out=$(git fetch --quiet --no-recurse-submodules {REMOTE} "+refs/heads/$BR:refs/remotes/{REMOTE}/$BR" 2>&1); then
+      if ! tod_fetch_retry git fetch --quiet --no-recurse-submodules {REMOTE} "+refs/heads/$BR:refs/remotes/{REMOTE}/$BR"; then
         case "$out" in
           *"couldn't find remote ref"*)
             if git show-ref --verify --quiet "refs/remotes/{REMOTE}/$BR"; then git update-ref -d "refs/remotes/{REMOTE}/$BR"; fi ;;
@@ -564,7 +572,8 @@ done
 [ -n "$fetch" ] && exit {FETCH_FAILED_EXIT}
 [ "$rc" -ne 0 ] && exit 1
 [ -n "$careful" ] && exit {CAREFUL_EXIT}
-exit 0"#
+exit 0"#,
+        FETCH_RETRY = tod_sandbox::git_retry::FETCH_RETRY_SH
     )
 }
 
@@ -1480,6 +1489,15 @@ pub fn validate_git_repo(repo: &Workdir) -> Result<Workdir> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_quick_branch_script_retries_a_transient_fetch_failure() {
+        let s = super::quick_branch_script();
+        assert!(s.contains(tod_sandbox::git_retry::FETCH_RETRY_SH));
+        assert!(s.contains("tod_fetch_retry git fetch --quiet --no-recurse-submodules"));
+        assert!(s.contains("GnuTLS recv error") && s.contains("cannot lock ref"));
+        assert!(!s.contains("out=$(git fetch"));
+    }
+
     #[test]
     fn a_missing_treehouse_is_a_problem_only_when_it_is_required() {
         let repo = Workdir::Host(std::path::PathBuf::from("/tmp/repo"));

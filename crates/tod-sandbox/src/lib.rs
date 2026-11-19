@@ -19,6 +19,7 @@ pub mod drive;
 pub mod edge;
 #[doc(hidden)]
 pub mod fake;
+pub mod git_retry;
 pub mod golden;
 pub mod node;
 #[cfg(test)]
