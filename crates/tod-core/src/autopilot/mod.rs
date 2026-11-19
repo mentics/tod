@@ -2063,10 +2063,14 @@ impl Autopilot {
                     .find(|(n, _)| n.eq_ignore_ascii_case(&check))
                     .map(|(_, s)| s.clone())
                     .unwrap_or_default();
-                let reason = format!(
+                let mut reason = format!(
                     "The check \"{check}\" on {label} ({}) is still failing; tod found no proof that the base branch fails it too.",
                     p.pr.url
                 );
+                // Why there is no proof, when tod tried and could not (never hidden).
+                for (_, why) in a.base_notes.iter().filter(|(n, _)| n.eq_ignore_ascii_case(&check)) {
+                    reason.push_str(&format!(" tod could not compare it with the base branch: {why}"));
+                }
                 let claim = cu::Claim {
                     pr: label.clone(),
                     pr_url: p.pr.url.clone(),

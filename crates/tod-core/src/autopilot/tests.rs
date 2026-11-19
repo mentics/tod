@@ -4581,6 +4581,8 @@ struct FailingCheckFeed {
     /// The proof, when there is one, that the base branch fails `terraform`
     /// the same way (what `Github::base_failures` reads).
     base_failure: std::sync::Mutex<Option<tod_store::github::BaseFailure>>,
+    /// Why the failing check could not be compared with the base (`PrStatus::base_notes`).
+    base_note: std::sync::Mutex<Option<String>>,
 }
 
 impl FailingCheckFeed {
@@ -4618,6 +4620,7 @@ impl crate::pr_readiness::PrFeed for FailingCheckFeed {
                 reviewers: vec!["maria".into()],
                 base_ref: Some("main".into()),
                 base_failures: if fixed { Vec::new() } else { self.base_failure.lock().unwrap().iter().cloned().collect() },
+                base_notes: if fixed { Vec::new() } else { self.base_note.lock().unwrap().iter().map(|w| ("terraform".to_string(), w.clone())).collect() },
                 ..Default::default()
             },
             threads: Vec::new(),
@@ -4650,6 +4653,7 @@ fn failing_check_node(says_unrelated: bool) -> (Fixture, Arc<FailingCheckFeed>, 
         repeats: std::sync::atomic::AtomicBool::new(false),
         signature: std::sync::Mutex::new(String::new()),
         base_failure: std::sync::Mutex::new(None),
+        base_note: std::sync::Mutex::new(None),
     });
     crate::pr_readiness::set_feed_override(Some(feed.clone()));
     linked_to_prs(&fx, "pr_review", &["https://github.com/acme/app/pull/42"]);
@@ -4799,6 +4803,18 @@ fn two_quiet_turns_on_a_failing_check_become_one_request_not_a_stop() {
         Outcome::NeedsHuman { reason: NeedsHuman::PrStuck { why } } => assert!(why.contains("terraform"), "{why}"),
         other => panic!("{other:?}"),
     }
+}
+
+/// A check the base could not be compared with: the quiet-turn request says why.
+#[test]
+fn an_uncomparable_check_that_goes_quiet_raises_a_request_naming_the_compare_failure() {
+    let (fx, feed, mut agent, _) = failing_check_node(false);
+    *feed.base_note.lock().unwrap() = Some("main...abc changes 300 files: too large to compare".into());
+    run_babysitter(&fx, &mut agent);
+    let decisions = unrelated_decisions(&fx);
+    assert_eq!(decisions.len(), 1);
+    let q = &decisions[0].question;
+    assert!(q.contains("could not compare it with the base branch") && q.contains("too large to compare"), "{q}");
 }
 
 fn base_proof_for_terraform(proof: tod_store::github::BaseProof) -> tod_store::github::BaseFailure {
