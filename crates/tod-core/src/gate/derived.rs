@@ -618,7 +618,8 @@ fn unlinked_branches_failure(conn: &Connection, node_id: Uuid, prs: &[NodePr]) -
             None => return Ok(None),
         },
     };
-    Ok(match crate::pr_readiness::unlinked_branches(feed.as_ref(), prs, &prefix) {
+    let others = crate::pr_readiness::branches_of_other_nodes(conn, node_id)?;
+    Ok(match crate::pr_readiness::unlinked_branches(feed.as_ref(), prs, &prefix, &others) {
         Ok(found) if found.is_empty() => None,
         Ok(found) => {
             let names: Vec<String> = found.iter().map(|(repo, branch)| format!("{repo}:{branch}")).collect();

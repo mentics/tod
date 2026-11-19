@@ -3328,12 +3328,43 @@ pub fn node_branch_prefix(conn: &rusqlite::Connection, node_id: uuid::Uuid) -> a
     Ok(pushed_branch_prefix(branch, ticket.as_deref()))
 }
 
+/// The branches other nodes record as their own, and this node's own: never
+/// ones this node owes a pull request for.
+pub fn branches_of_other_nodes(
+    conn: &rusqlite::Connection,
+    node_id: uuid::Uuid,
+) -> anyhow::Result<std::collections::HashSet<String>> {
+    let mut stmt =
+        conn.prepare("SELECT branch FROM node_fields WHERE branch IS NOT NULL AND branch != '' AND node_id != ?1")?;
+    let rows = stmt.query_map(rusqlite::params![node_id.as_bytes().to_vec()], |row| row.get::<_, String>(0))?;
+    let mut set: std::collections::HashSet<String> = rows.collect::<Result<_, _>>()?;
+    // Its own branch is what its linked pull requests are from.
+    if let Some(own) = tod_store::fleet::node_actions::resolve_files_for_node(conn, &node_id.to_string())?
+        .and_then(|f| f.branch().map(str::to_string))
+    {
+        set.insert(own);
+    }
+    Ok(set)
+}
+
+/// Whether `branch`, found by the string prefix `prefix`, is the same ticket's:
+/// a prefix ending in a digit (`task/ENG-3129`) does not take a branch that
+/// goes on with another digit (`task/ENG-31290-x`, another ticket).
+pub fn within_prefix(prefix: &str, branch: &str) -> bool {
+    let Some(rest) = branch.strip_prefix(prefix) else {
+        return false;
+    };
+    !(prefix.ends_with(|c: char| c.is_ascii_digit()) && rest.starts_with(|c: char| c.is_ascii_digit()))
+}
+
 /// Every branch the node pushed (in the repository of each of `prs`, those
-/// starting with `prefix`) that has no pull request, as `(repository, branch)`.
+/// starting with `prefix`, on the same ticket, and not recorded as another
+/// node's: `others`) that has no pull request, as `(repository, branch)`.
 pub fn unlinked_branches(
     feed: &dyn PrFeed,
     prs: &[tod_store::github::NodePr],
     prefix: &str,
+    others: &std::collections::HashSet<String>,
 ) -> Result<Vec<(String, String)>, String> {
     let mut seen: Vec<(String, String)> = Vec::new();
     let mut out = Vec::new();
@@ -3344,7 +3375,9 @@ pub fn unlinked_branches(
         }
         seen.push(key);
         for branch in feed.branches_without_pr(pr, prefix)? {
-            out.push((format!("{}/{}", pr.owner, pr.repo), branch));
+            if within_prefix(prefix, &branch) && !others.contains(&branch) {
+                out.push((format!("{}/{}", pr.owner, pr.repo), branch));
+            }
         }
     }
     Ok(out)
@@ -3420,7 +3453,7 @@ mod pushed_branch_tests {
             tod_store::github::NodePr::new("acme", "app", 2),
             tod_store::github::NodePr::new("acme", "docs", 3),
         ];
-        let found = unlinked_branches(&Branches, &prs, "task/T-1").unwrap();
+        let found = unlinked_branches(&Branches, &prs, "task/T-1", &Default::default()).unwrap();
         assert_eq!(
             found,
             vec![
@@ -3440,5 +3473,43 @@ mod pushed_branch_tests {
         assert!(!work[0].is_feedback() && work[0].agent_can_fix());
         let text = render_work("acme/app#1", &assessment);
         assert!(text.contains("acme/app:task/T-1-in-app") && text.contains("no pull request"), "{text}");
+    }
+
+    struct Listing(Vec<&'static str>);
+    impl PrFeed for Listing {
+        fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<PrSnapshot, String> {
+            Err("unused".into())
+        }
+        fn branches_without_pr(&self, _: &tod_store::github::NodePr, _: &str) -> Result<Vec<String>, String> {
+            Ok(self.0.iter().map(|b| b.to_string()).collect())
+        }
+    }
+
+    /// Another ticket sharing the digits' start, and another node's own
+    /// branch, are not this node's pushed branches.
+    #[test]
+    fn other_tickets_and_other_nodes_branches_are_not_this_nodes() {
+        let feed = Listing(vec![
+            "task/ENG-3129",
+            "task/ENG-31290-x",
+            "task/ENG-31291-x",
+            "task/ENG-3129ci-y",
+            "task/ENG-3129-mirror",
+            "task/ENG-3129-other-node",
+        ]);
+        let prs = [tod_store::github::NodePr::new("acme", "app", 1)];
+        let others: std::collections::HashSet<String> = ["task/ENG-3129-other-node".to_string()].into();
+        let found: Vec<String> = unlinked_branches(&feed, &prs, "task/ENG-3129", &others)
+            .unwrap()
+            .into_iter()
+            .map(|(_, b)| b)
+            .collect();
+        // The node's own branch is in `others` too, as the store reports it.
+        assert_eq!(found, ["task/ENG-3129", "task/ENG-3129ci-y", "task/ENG-3129-mirror"]);
+        let mut with_own = others.clone();
+        with_own.insert("task/ENG-3129".into());
+        let found: Vec<String> =
+            unlinked_branches(&feed, &prs, "task/ENG-3129", &with_own).unwrap().into_iter().map(|(_, b)| b).collect();
+        assert_eq!(found, ["task/ENG-3129ci-y", "task/ENG-3129-mirror"]);
     }
 }

@@ -1404,7 +1404,8 @@ impl Autopilot {
             // without: a pull request may depend on it.
             let node_id = self.node;
             if let Some(prefix) = fleet.read(|conn| pr_readiness::node_branch_prefix(conn, node_id))? {
-                match pr_readiness::unlinked_branches(feed.as_ref(), &links.prs, &prefix) {
+                let others = fleet.read(|conn| pr_readiness::branches_of_other_nodes(conn, node_id))?;
+                match pr_readiness::unlinked_branches(feed.as_ref(), &links.prs, &prefix, &others) {
                     Ok(unlinked) => pr_readiness::attach_unlinked_branches(&mut live, &unlinked),
                     Err(err) => {
                         hook.waiting(None, None);
