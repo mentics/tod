@@ -194,6 +194,21 @@ Each is a panel of its own, opened from a link or from the node's menu, and
 built on the item list (`doc/ui/item-list.md`). Not everything is a list,
 though: settings, for one, is not.
 
+### Activity (the transcript panel watching a node)
+
+The task panel's **Watch** opens the node's Activity: its agent sessions,
+gate checks, command rounds and notes, grouped by stay in a phase
+(`activity_timeline`). Every row is ordered by when it was **last active**
+(a session's last turn, an entry's time), never by when it began. A session
+that lives long (the PR agent keeps one conversation for a whole `pr_draft`
+stay) is cut into **pieces**: consecutive turns with no other Activity item
+(another session's turn, a gate check, a round of commands, a note, a phase
+change) in between are one row, `Pull request · part N`, placed at its own
+time and showing only its turns. A session nothing interrupts stays one row.
+The list offers **Whole session** while a piece is open. Pure logic:
+`activity_timeline::cut_pieces` and `session_items`; the turn times come
+from `ConversationRepo::turn_times` (no bodies are read for the list).
+
 ### Settings
 
 A panel of its own. The current settings are too big and need their own

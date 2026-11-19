@@ -281,6 +281,19 @@ impl<'a> ConversationRepo<'a> {
         rows.into_iter().map(parse_turn_row).collect()
     }
 
+    /// `(seq, created_at)` of every turn of `conversation_id`, in order: all
+    /// that is needed to place a conversation's turns in time, without
+    /// reading their bodies.
+    pub fn turn_times(&self, conversation_id: Uuid) -> Result<Vec<(i64, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT seq, created_at FROM conversation_turns WHERE conversation_id = ?1 ORDER BY seq",
+        )?;
+        let rows = stmt
+            .query_map(params![uuid_to_blob(conversation_id)], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Turns in `[from_seq, to_seq]`, inclusive — the range a bundle exporter
     /// resolves a turn-range reference against.
     pub fn turns_range(
