@@ -30,6 +30,12 @@ impl Poker for FakePoker {
 struct Github(Mutex<Option<String>>);
 
 impl PrFeed for Github {
+
+    fn viewer_login(&self) -> Result<String, String> {
+
+        Ok("tod-test-user".to_string())
+
+    }
     fn snapshot(&self, _: &NodePr) -> Result<PrSnapshot, String> {
         Err("not read here".into())
     }
@@ -166,6 +172,12 @@ fn the_orchestrator_looks_at_github_for_a_due_wait_and_wakes_the_sandbox_only_fo
 struct Review(Mutex<&'static str>);
 
 impl PrFeed for Review {
+
+    fn viewer_login(&self) -> Result<String, String> {
+
+        Ok("tod-test-user".to_string())
+
+    }
     fn snapshot(&self, _: &NodePr) -> Result<PrSnapshot, String> {
         let checks = *self.0.lock().unwrap();
         Ok(PrSnapshot {

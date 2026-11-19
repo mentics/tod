@@ -91,9 +91,15 @@ fn build_request<'a>(
     // The retrospective is the one state agent that has to know what went
     // wrong along the way; the plan and obligations only show how it ended.
     let work_history = if from == "learn" {
-        fleet
+        let history = fleet
             .read(|conn| crate::node_context::render_work_history(conn, node))
-            .context("could not read the node's work history")?
+            .context("could not read the node's work history")?;
+        // What others found on the pull request reads GitHub: here, where the
+        // opening is assembled off the UI thread and no store lock is held.
+        // A failure is the run's error, never a section left out.
+        let outside = crate::outside_findings::for_node_in(fleet, env.data_root, node)
+            .context("could not read the findings made outside tod on the node's pull request")?;
+        crate::node_context::with_outside_findings(history, &outside)
     } else {
         String::new()
     };

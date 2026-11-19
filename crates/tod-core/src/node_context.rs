@@ -442,6 +442,23 @@ pub fn render_work_history(conn: &Connection, node_id: Uuid) -> Result<String> {
     ))
 }
 
+/// `history` (from [`render_work_history`]) with the findings made outside
+/// tod added (`crate::outside_findings`). Those arrive from GitHub, so they
+/// are read apart from the store and joined here. Empty `outside` leaves
+/// `history` as it was.
+pub fn with_outside_findings(history: String, outside: &str) -> String {
+    if outside.is_empty() {
+        return history;
+    }
+    if history.is_empty() {
+        return format!(
+            "\n## Work history\n\n\
+             What this node went through on the way to its current state, from outside tod.\n{outside}"
+        );
+    }
+    format!("{history}{outside}")
+}
+
 /// "Ancestor constraint …" as it reads mid-sentence.
 fn lowercase_first(s: &str) -> String {
     let mut chars = s.chars();

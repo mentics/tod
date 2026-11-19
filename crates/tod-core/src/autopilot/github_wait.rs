@@ -457,11 +457,22 @@ fn check_ready_for_review(fleet: &FleetStore, node: uuid::Uuid, data_root: &std:
         if crate::gate::derived::ready_for_review(&pr.url, status).is_err() {
             standing.push(format!("{label} still a draft"));
             pending.get_or_insert((pr, format!("{} to be marked ready for review", pr.url), "ready_for_review"));
-        } else if crate::gate::derived::has_reviewer(&pr.url, status, &snapshot.reviews).is_err() {
-            standing.push(format!("{label} has no reviewer"));
-            pending.get_or_insert((pr, format!("a reviewer to be put on {}", pr.url), "review_requested"));
         } else {
-            standing.push(format!("{label} ready for review"));
+            // tod's own review is no person's: learn which account it posts as.
+            let own_login = match feed.viewer_login() {
+                Ok(login) => login,
+                Err(err) => {
+                    return Ok(GithubCheck::Unreadable(format!(
+                        "{label}: could not learn which GitHub account tod posts as, so tod's own review cannot be told from a person's: {err}"
+                    )))
+                }
+            };
+            if crate::gate::derived::has_reviewer(&pr.url, &own_login, status, &snapshot.reviews).is_err() {
+                standing.push(format!("{label} has no reviewer"));
+                pending.get_or_insert((pr, format!("a reviewer to be put on {}", pr.url), "review_requested"));
+            } else {
+                standing.push(format!("{label} ready for review"));
+            }
         }
     }
     if !feedback.is_empty() {

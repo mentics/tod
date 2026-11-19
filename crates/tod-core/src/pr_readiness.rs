@@ -2800,6 +2800,11 @@ pub trait PrFeed: Send + Sync {
     fn post_review(&self, _pr: &tod_store::github::NodePr, _post: &ReviewPost) -> Result<(), String> {
         Err("this feed does not post reviews".to_string())
     }
+    /// The GitHub login tod acts as: what tod's own reviews are posted under,
+    /// so they can be told from a person's. An error is never a guess.
+    fn viewer_login(&self) -> Result<String, String> {
+        Err("this feed does not say which account it acts as".to_string())
+    }
     /// Merge the base branch into the pull request's branch on GitHub, as its
     /// "Update branch" button does: how tod brings a branch that is only
     /// behind up to date, with no agent (`Autopilot::update_branches`).
@@ -2824,6 +2829,10 @@ pub struct ReviewPost {
 pub struct GithubFeed(pub tod_store::github::Github);
 
 impl PrFeed for GithubFeed {
+    fn viewer_login(&self) -> Result<String, String> {
+        self.0.viewer_login_cached().map_err(|err| err.to_string())
+    }
+
     fn merge(&self, pr: &tod_store::github::NodePr) -> Result<tod_store::github::PrMerge, String> {
         self.0.get_pr_merge(&pr.owner, &pr.repo, pr.pr_number).map_err(|err| err.to_string())
     }

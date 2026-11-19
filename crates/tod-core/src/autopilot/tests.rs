@@ -399,6 +399,12 @@ fn finished_releases() -> Vec<tod_store::github::Release> {
 struct FinishedGithub;
 
 impl crate::pr_readiness::PrFeed for FinishedGithub {
+
+    fn viewer_login(&self) -> Result<String, String> {
+
+        Ok("tod-test-user".to_string())
+
+    }
     fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
         use tod_store::github::{PrSnapshot, PrStatus};
         Ok(PrSnapshot {
@@ -443,6 +449,12 @@ impl FailingGithub {
 }
 
 impl crate::pr_readiness::PrFeed for FailingGithub {
+
+    fn viewer_login(&self) -> Result<String, String> {
+
+        Ok("tod-test-user".to_string())
+
+    }
     fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
         Err(self.error.lock().unwrap().clone())
     }
@@ -1200,6 +1212,12 @@ struct Sim {
 }
 
 impl crate::pr_readiness::PrFeed for Sim {
+
+    fn viewer_login(&self) -> Result<String, String> {
+
+        Ok("tod-test-user".to_string())
+
+    }
     fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
         use std::sync::atomic::Ordering::SeqCst;
         use tod_store::github::{IssueComment, PrSnapshot, PrStatus, ReviewThread};
@@ -1345,6 +1363,9 @@ fn pr_certifies_the_draft_in_every_stay_even_when_the_pull_request_exists() {
     fx.fleet.reload_if_stale().ok();
     struct Clean;
     impl crate::pr_readiness::PrFeed for Clean {
+        fn viewer_login(&self) -> Result<String, String> {
+            Ok("tod-test-user".to_string())
+        }
         fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
             use tod_store::github::{PrSnapshot, PrStatus};
             Ok(PrSnapshot {
@@ -1520,6 +1541,9 @@ fn pr_draft_runs_the_review_group_when_the_pull_request_reads_clean() {
     retire_outside_criteria(&fx);
     struct Clean;
     impl crate::pr_readiness::PrFeed for Clean {
+        fn viewer_login(&self) -> Result<String, String> {
+            Ok("tod-test-user".to_string())
+        }
         fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
             use tod_store::github::{PrSnapshot, PrStatus};
             Ok(PrSnapshot {
@@ -1562,6 +1586,12 @@ fn pr_draft_runs_the_review_group_when_the_pull_request_reads_clean() {
 struct AwaitingReview;
 
 impl crate::pr_readiness::PrFeed for AwaitingReview {
+
+    fn viewer_login(&self) -> Result<String, String> {
+
+        Ok("tod-test-user".to_string())
+
+    }
     fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
         use tod_store::github::{PrSnapshot, PrStatus};
         Ok(PrSnapshot {
@@ -1613,6 +1643,9 @@ fn pr_review_with_skills_runs_every_group_on_entry_then_waits_for_the_person() {
 fn pr_review_behind_its_base_alone_keeps_waiting_for_the_person() {
     struct Moving(std::sync::Mutex<(u32, bool)>);
     impl crate::pr_readiness::PrFeed for Moving {
+        fn viewer_login(&self) -> Result<String, String> {
+            Ok("tod-test-user".to_string())
+        }
         fn snapshot(&self, pr: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
             let mut snap = AwaitingReview.snapshot(pr)?;
             let (behind, conflict) = *self.0.lock().unwrap();
@@ -1660,6 +1693,9 @@ fn pr_draft_runs_its_agent_on_every_stay_even_with_a_pull_request_and_no_work() 
     retire_outside_criteria(&fx);
     struct Clean;
     impl crate::pr_readiness::PrFeed for Clean {
+        fn viewer_login(&self) -> Result<String, String> {
+            Ok("tod-test-user".to_string())
+        }
         fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
             use tod_store::github::{PrSnapshot, PrStatus};
             Ok(PrSnapshot {
@@ -1706,6 +1742,9 @@ fn a_pull_request_waiting_for_a_person_ends_the_run_with_a_timed_wait() {
     retire_outside_criteria(&fx);
     struct Pending;
     impl crate::pr_readiness::PrFeed for Pending {
+        fn viewer_login(&self) -> Result<String, String> {
+            Ok("tod-test-user".to_string())
+        }
         fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
             use tod_store::github::{PrSnapshot, PrStatus};
             Ok(PrSnapshot {
@@ -1755,6 +1794,9 @@ fn the_wait_for_a_person_records_who_was_asked_to_review() {
     retire_outside_criteria(&fx);
     struct Asked;
     impl crate::pr_readiness::PrFeed for Asked {
+        fn viewer_login(&self) -> Result<String, String> {
+            Ok("tod-test-user".to_string())
+        }
         fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
             use tod_store::github::{PrSnapshot, PrStatus};
             Ok(PrSnapshot {
@@ -1800,6 +1842,9 @@ fn one_pull_request_waiting_for_a_person_does_not_end_the_poll_on_anothers_check
         reads_of_7: AtomicU32,
     }
     impl crate::pr_readiness::PrFeed for Feed {
+        fn viewer_login(&self) -> Result<String, String> {
+            Ok("tod-test-user".to_string())
+        }
         fn snapshot(&self, pr: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
             use tod_store::github::{PrSnapshot, PrStatus};
             // #7's checks finish on its third read.
@@ -1854,6 +1899,9 @@ fn a_pull_request_that_never_changes_stops_for_a_person() {
     retire_outside_criteria(&fx);
     struct Stuck;
     impl crate::pr_readiness::PrFeed for Stuck {
+        fn viewer_login(&self) -> Result<String, String> {
+            Ok("tod-test-user".to_string())
+        }
         fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
             use tod_store::github::{PrSnapshot, PrStatus, ReviewThread};
             Ok(PrSnapshot {
@@ -1928,6 +1976,12 @@ impl Scripted {
 }
 
 impl crate::pr_readiness::PrFeed for Scripted {
+
+    fn viewer_login(&self) -> Result<String, String> {
+
+        Ok("tod-test-user".to_string())
+
+    }
     fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
         use tod_store::github::{IssueComment, PrSnapshot, PrStatus, ReviewThread};
         let turns = self.turns.load(std::sync::atomic::Ordering::SeqCst);
@@ -2060,6 +2114,9 @@ fn a_failed_read_after_a_turn_keeps_the_unchanged_count() {
         turns: Arc<std::sync::atomic::AtomicUsize>,
     }
     impl crate::pr_readiness::PrFeed for FailsAfterATurn {
+        fn viewer_login(&self) -> Result<String, String> {
+            Ok("tod-test-user".to_string())
+        }
         fn snapshot(&self, pr: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
             if self.turns.load(std::sync::atomic::Ordering::SeqCst) >= 1 {
                 return Err("GitHub is down".into());
@@ -2120,10 +2177,19 @@ impl AfterReview {
 }
 
 impl crate::pr_readiness::PrFeed for AfterReview {
-    fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
-        Err("not read after the review".to_string())
+    fn viewer_login(&self) -> Result<String, String> {
+        Ok("tod-test-user".to_string())
     }
-
+    /// The learn agent's opening reads the pull request once for the findings
+    /// made outside tod: nothing outside, here.
+    fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
+        Ok(tod_store::github::PrSnapshot {
+            status: tod_store::github::PrStatus { merged: true, ..Default::default() },
+            threads: Vec::new(),
+            comments: Vec::new(),
+            reviews: Vec::new(),
+        })
+    }
 
     fn merge(&self, pr: &tod_store::github::NodePr) -> Result<tod_store::github::PrMerge, String> {
         let merged = self.merged.load(std::sync::atomic::Ordering::SeqCst);
@@ -2401,6 +2467,9 @@ fn a_pr_draft_wake_leaves_running_checks_to_the_babysitter() {
     use tod_store::github::{PrSnapshot, PrStatus};
     struct Feed(PrSnapshot);
     impl crate::pr_readiness::PrFeed for Feed {
+        fn viewer_login(&self) -> Result<String, String> {
+            Ok("tod-test-user".to_string())
+        }
         fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<PrSnapshot, String> {
             Ok(self.0.clone())
         }
@@ -2449,6 +2518,9 @@ fn check_now_in_pr_draft_waits_for_the_draft_to_be_ready_and_reviewed() {
     use tod_store::github::{PrReview, PrSnapshot, PrStatus};
     struct Feed(std::sync::Mutex<PrSnapshot>);
     impl crate::pr_readiness::PrFeed for Feed {
+        fn viewer_login(&self) -> Result<String, String> {
+            Ok("tod-test-user".to_string())
+        }
         fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<PrSnapshot, String> {
             Ok(self.0.lock().unwrap().clone())
         }
@@ -2515,6 +2587,9 @@ fn a_draft_waiting_to_be_marked_ready_gets_work_when_it_falls_behind_or_conflict
     use tod_store::github::{PrSnapshot, PrStatus};
     struct Feed(std::sync::Mutex<PrSnapshot>);
     impl crate::pr_readiness::PrFeed for Feed {
+        fn viewer_login(&self) -> Result<String, String> {
+            Ok("tod-test-user".to_string())
+        }
         fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<PrSnapshot, String> {
             Ok(self.0.lock().unwrap().clone())
         }
@@ -2576,6 +2651,9 @@ fn check_now_in_pr_draft_sends_new_changes_requested_to_the_agent_even_on_a_draf
     use tod_store::github::{PrReview, PrSnapshot, PrStatus};
     struct Feed(PrSnapshot);
     impl crate::pr_readiness::PrFeed for Feed {
+        fn viewer_login(&self) -> Result<String, String> {
+            Ok("tod-test-user".to_string())
+        }
         fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<PrSnapshot, String> {
             Ok(self.0.clone())
         }
@@ -2627,6 +2705,9 @@ fn check_now_in_pr_draft_clears_a_leftover_review_wait_and_ignores_a_bot_reviewe
     use tod_store::github::{PrSnapshot, PrStatus};
     struct Feed(PrSnapshot);
     impl crate::pr_readiness::PrFeed for Feed {
+        fn viewer_login(&self) -> Result<String, String> {
+            Ok("tod-test-user".to_string())
+        }
         fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<PrSnapshot, String> {
             Ok(self.0.clone())
         }
@@ -2915,6 +2996,12 @@ impl OwnReviewFeed {
 }
 
 impl crate::pr_readiness::PrFeed for OwnReviewFeed {
+
+    fn viewer_login(&self) -> Result<String, String> {
+
+        Ok("tod-test-user".to_string())
+
+    }
     fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
         use tod_store::github::{PrSnapshot, PrStatus};
         Ok(PrSnapshot {
@@ -3390,6 +3477,12 @@ impl BranchFeed {
 }
 
 impl crate::pr_readiness::PrFeed for BranchFeed {
+
+    fn viewer_login(&self) -> Result<String, String> {
+
+        Ok("tod-test-user".to_string())
+
+    }
     fn snapshot(&self, pr: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
         if self.cached {
             crate::pr_readiness::cached_snapshot_with(pr, || Ok::<_, String>(self.read()))
@@ -3691,6 +3784,12 @@ struct MovingHeadFeed {
 }
 
 impl crate::pr_readiness::PrFeed for MovingHeadFeed {
+
+    fn viewer_login(&self) -> Result<String, String> {
+
+        Ok("tod-test-user".to_string())
+
+    }
     fn same_change(&self, _: &tod_store::github::NodePr, _: &str, _: &str, _: &str) -> Result<bool, String> {
         Ok(self.merge_only)
     }
@@ -4044,6 +4143,12 @@ fn drafts_passed_over() -> Vec<tod_store::github::RecentPr> {
 }
 
 impl crate::pr_readiness::PrFeed for BotFeed {
+
+    fn viewer_login(&self) -> Result<String, String> {
+
+        Ok("tod-test-user".to_string())
+
+    }
     fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
         use tod_store::github::{IssueComment, PrSnapshot, PrStatus};
         let read = self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
@@ -4649,6 +4754,12 @@ impl FailingCheckFeed {
 }
 
 impl crate::pr_readiness::PrFeed for FailingCheckFeed {
+
+    fn viewer_login(&self) -> Result<String, String> {
+
+        Ok("tod-test-user".to_string())
+
+    }
     fn merge(&self, _: &tod_store::github::NodePr) -> Result<tod_store::github::PrMerge, String> {
         Ok(tod_store::github::PrMerge { title: "t".into(), merged: false, merged_at: None })
     }
@@ -5291,6 +5402,9 @@ fn a_pushed_branch_without_a_pull_request_is_sent_to_the_agent_by_name() {
         prefixes: std::sync::Mutex<Vec<String>>,
     }
     impl crate::pr_readiness::PrFeed for Bare {
+        fn viewer_login(&self) -> Result<String, String> {
+            Ok("tod-test-user".to_string())
+        }
         fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
             use tod_store::github::{PrSnapshot, PrStatus};
             Ok(PrSnapshot {
@@ -5360,6 +5474,9 @@ fn a_branch_only_behind_is_updated_on_github_without_the_agent() {
         turns: Arc<AtomicUsize>,
     }
     impl crate::pr_readiness::PrFeed for Behind {
+        fn viewer_login(&self) -> Result<String, String> {
+            Ok("tod-test-user".to_string())
+        }
         fn snapshot(&self, pr: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
             let mut snap = AwaitingReview.snapshot(pr)?;
             let behind = *self.behind.lock().unwrap();

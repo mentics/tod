@@ -686,32 +686,46 @@ pub(crate) fn ready_for_review(url: &str, status: &tod_store::github::PrStatus) 
 
 /// Whether a person is on the PR as reviewer: one GitHub still has a review
 /// requested from, or one who has already reviewed (GitHub stops listing a
-/// reviewer once they have). A bot's review does not count.
+/// reviewer once they have). A bot's review does not count, and neither does
+/// `own_login`'s: tod posts its own code review as that account, which is no
+/// person looking at the pull request.
 pub(crate) fn has_reviewer(
     url: &str,
+    own_login: &str,
     status: &tod_store::github::PrStatus,
     reviews: &[tod_store::github::PrReview],
 ) -> std::result::Result<String, String> {
     if status.merged {
         return Ok(format!("{url} is already merged."));
     }
-    let requested: Vec<&str> = status
-        .reviewers
-        .iter()
-        .map(String::as_str)
-        .filter(|login| !login.ends_with("[bot]"))
-        .collect();
+    let requested = requested_people(status, own_login);
     if !requested.is_empty() {
         return Ok(format!("{url}: review requested from {}.", requested.join(", ")));
     }
     match reviews
         .iter()
         .filter_map(|r| r.author.as_deref())
-        .find(|author| !author.ends_with("[bot]"))
+        .find(|author| is_person(author, own_login))
     {
         Some(author) => Ok(format!("{url} has been reviewed by {author}.")),
         None => Err(format!("{url} has no reviewer: request one.")),
     }
+}
+
+/// Whether `login` is a person: not a bot and not tod's own account
+/// (GitHub logins ignore case).
+fn is_person(login: &str, own_login: &str) -> bool {
+    !login.ends_with("[bot]") && !login.eq_ignore_ascii_case(own_login)
+}
+
+/// The people GitHub still has a review requested from.
+fn requested_people<'a>(status: &'a tod_store::github::PrStatus, own_login: &str) -> Vec<&'a str> {
+    status
+        .reviewers
+        .iter()
+        .map(String::as_str)
+        .filter(|login| is_person(login, own_login))
+        .collect()
 }
 
 /// Every linked PR is open and out of draft: the `pr` state opens it as a
@@ -747,14 +761,22 @@ fn pr_reviewer_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutcom
         Ok(found) => found,
         Err(outcome) => return Ok(outcome),
     };
+    let own_login = match github.viewer_login_cached() {
+        Ok(login) => login,
+        Err(err) => {
+            return Ok(fail(format!(
+                "Could not learn which GitHub account tod posts as, so tod's own review cannot be told from a person's: {err}"
+            )))
+        }
+    };
     let mut passed = Vec::new();
     for pr in &prs {
         let status = match github.get_pr_status(&pr.owner, &pr.repo, pr.pr_number) {
             Ok(status) => status,
             Err(err) => return Ok(fail(format!("Could not read {}: {err}", pr.url))),
         };
-        // Reviews are only read when the requested list is empty.
-        let reviews = if status.merged || !status.reviewers.is_empty() {
+        // Reviews are only read when no person is requested.
+        let reviews = if status.merged || !requested_people(&status, &own_login).is_empty() {
             Vec::new()
         } else {
             match github.list_reviews(&pr.owner, &pr.repo, pr.pr_number) {
@@ -762,7 +784,7 @@ fn pr_reviewer_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutcom
                 Err(err) => return Ok(fail(format!("Could not read the reviews of {}: {err}", pr.url))),
             }
         };
-        match has_reviewer(&pr.url, &status, &reviews) {
+        match has_reviewer(&pr.url, &own_login, &status, &reviews) {
             Ok(line) => passed.push(line),
             Err(why) => return Ok(fail(why)),
         }
@@ -1843,12 +1865,22 @@ mod readiness_tests {
     #[test]
     fn a_reviewer_is_one_requested_or_one_who_reviewed_but_not_a_bot() {
         let open = pr_status(false, true, &[]);
-        assert!(has_reviewer("u", &open, &[]).is_err());
-        assert!(has_reviewer("u", &open, &[review("greptile-apps[bot]")]).is_err());
-        assert!(has_reviewer("u", &open, &[review("greptile-apps[bot]"), review("alice")]).unwrap().contains("alice"));
-        assert!(has_reviewer("u", &pr_status(false, true, &["bob"]), &[]).unwrap().contains("bob"));
-        assert!(has_reviewer("u", &pr_status(false, true, &["greptile-apps[bot]"]), &[]).is_err());
-        assert!(has_reviewer("u", &pr_status(false, true, &["greptile-apps[bot]", "bob"]), &[]).unwrap().contains("bob"));
+        assert!(has_reviewer("u", "tod-bot-user", &open, &[]).is_err());
+        assert!(has_reviewer("u", "tod-bot-user", &open, &[review("greptile-apps[bot]")]).is_err());
+        assert!(has_reviewer("u", "tod-bot-user", &open, &[review("greptile-apps[bot]"), review("alice")]).unwrap().contains("alice"));
+        assert!(has_reviewer("u", "tod-bot-user", &pr_status(false, true, &["bob"]), &[]).unwrap().contains("bob"));
+        assert!(has_reviewer("u", "tod-bot-user", &pr_status(false, true, &["greptile-apps[bot]"]), &[]).is_err());
+        assert!(has_reviewer("u", "tod-bot-user", &pr_status(false, true, &["greptile-apps[bot]", "bob"]), &[]).unwrap().contains("bob"));
+    }
+
+    #[test]
+    fn tods_own_account_is_no_reviewer_but_another_person_is() {
+        let open = pr_status(false, true, &[]);
+        assert!(has_reviewer("u", "tod-user", &open, &[review("Tod-User")]).is_err());
+        assert!(has_reviewer("u", "tod-user", &pr_status(false, true, &["tod-user"]), &[]).is_err());
+        let line = has_reviewer("u", "tod-user", &open, &[review("tod-user"), review("alice")]).unwrap();
+        assert!(line.contains("alice") && !line.contains("tod-user"));
+        assert!(has_reviewer("u", "tod-user", &pr_status(false, true, &["tod-user", "bob"]), &[]).unwrap().contains("bob"));
     }
 
 }

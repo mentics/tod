@@ -850,6 +850,28 @@ impl Github {
         Ok(self.get_json::<UserRaw>("/user")?.login)
     }
 
+    /// The login this client acts as, asked of GitHub once per process for
+    /// each API and credential, then remembered (it never changes under a
+    /// token). An error is never cached, and never turned into a guess.
+    pub fn viewer_login_cached(&self) -> Result<String, GithubError> {
+        use std::collections::HashMap;
+        use std::sync::{Mutex, OnceLock};
+        static LOGINS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+        let identity = match &self.auth {
+            GithubAuth::Token(token) => format!("token:{token}"),
+            GithubAuth::Proxy => "proxy".to_string(),
+            GithubAuth::Routed(_) => "routed".to_string(),
+        };
+        let key = format!("{}|{identity}", self.api);
+        let cache = LOGINS.get_or_init(Default::default);
+        if let Some(login) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+            return Ok(login.clone());
+        }
+        let login = self.user_login()?;
+        cache.lock().unwrap_or_else(|e| e.into_inner()).insert(key, login.clone());
+        Ok(login)
+    }
+
     /// Find an already-open pull request from `head` into `owner/repo`, if any.
     /// `create_pr` checks this first — GitHub itself is the source of truth for
     /// whether one exists, not just the node's own links, so a lost local

@@ -166,6 +166,9 @@ mod tests {
 
     struct Draft;
     impl crate::pr_readiness::PrFeed for Draft {
+        fn viewer_login(&self) -> Result<String, String> {
+            Ok("tod-test-user".to_string())
+        }
         fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<PrSnapshot, String> {
             Ok(PrSnapshot {
                 status: PrStatus {
@@ -300,6 +303,9 @@ mod tests {
     /// A feed that cannot find the pull request (a token that cannot see its repository).
     struct NotFound;
     impl crate::pr_readiness::PrFeed for NotFound {
+        fn viewer_login(&self) -> Result<String, String> {
+            Ok("tod-test-user".to_string())
+        }
         fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<PrSnapshot, String> {
             Err("pull request not found (GitHub also answers 404 when tod's token cannot see the repository)".into())
         }
@@ -373,6 +379,9 @@ mod tests {
     /// with the review threads given.
     struct Ready(Vec<tod_store::github::ReviewThread>);
     impl crate::pr_readiness::PrFeed for Ready {
+        fn viewer_login(&self) -> Result<String, String> {
+            Ok("tod-test-user".to_string())
+        }
         fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<PrSnapshot, String> {
             Draft.snapshot(&tod_store::github::NodePr::new("acme", "app", 42)).map(|mut snap| {
                 snap.status.draft = false;

@@ -74,6 +74,7 @@ pub mod logging;
 pub mod media;
 pub mod skills;
 pub mod node_context;
+pub mod outside_findings;
 pub mod bot_silence;
 pub mod check_unrelated;
 pub mod permission;
