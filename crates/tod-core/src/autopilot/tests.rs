@@ -3086,6 +3086,27 @@ fn a_check_killed_for_memory_stops_the_run_for_the_user_and_never_reaches_the_fi
 }
 
 #[test]
+fn a_recorded_timeout_is_not_the_answer_for_unchanged_files_a_retry_reruns_it() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    with_check(&fx, "review", "slow", "exit 0");
+    // The check passes once; then its stored result is replaced by a timeout
+    // on the same fingerprint, as a ten-minute stop leaves it (gap 60).
+    let round = crate::checks::run_stale(&fx.fleet, fx.node, "review").unwrap();
+    let mut run = round.runs[0].clone();
+    run.verdict = tod_store::check_runs::Verdict::Broken;
+    run.output = "the command did not finish in 10 minutes and was stopped".into();
+    fx.fleet.enqueue(tod_store::fleet::FleetMutation::RecordCheckRun(Box::new(run))).unwrap();
+    fx.fleet.writer().flush().unwrap();
+    // The gate criteria say it is a recorded result, and when.
+    let criteria = fx.fleet.read(|conn| crate::checks::gate_criteria(conn, fx.node, "review", "pr")).unwrap();
+    assert!(criteria[0].detail.contains("recorded result") && criteria[0].detail.contains("UTC"), "{:?}", criteria[0].detail);
+    // The next look runs it again (unchanged files) and it passes: no stop.
+    let again = crate::checks::run_stale(&fx.fleet, fx.node, "review").unwrap();
+    assert!(again.clear(), "{again:?}");
+}
+
+#[test]
 fn checks_in_a_phase_are_part_of_its_gate() {
     let fx = setup();
     retire_outside_criteria(&fx);

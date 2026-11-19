@@ -966,7 +966,7 @@ impl Autopilot {
         }
         if let Some(run) = round.broken().next() {
             return Ok(ChecksStep::Stop(Outcome::NeedsHuman {
-                reason: NeedsHuman::CheckBroken { check: crate::checks::run_name(run).to_string(), why: run.output.clone() },
+                reason: NeedsHuman::CheckBroken { check: crate::checks::run_name(run).to_string(), why: crate::checks::broken_why(run) },
             }));
         }
         if round.clear() {

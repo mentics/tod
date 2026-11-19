@@ -198,7 +198,7 @@ fn settle_gate_unleased(fleet: &FleetStore, node: Uuid, branch_template: &str) -
     // their last run; a command that cannot run is an error, not a failure.
     let round = crate::checks::run_stale(fleet, node, &from)?;
     if let Some(run) = round.broken().next() {
-        anyhow::bail!("the check `{}` could not run: {}", crate::checks::run_name(run), run.output);
+        anyhow::bail!("the check `{}` could not run: {}", crate::checks::run_name(run), crate::checks::broken_why(run));
     }
     // Derived criteria may read GitHub: not under the projection lock, which
     // the UI thread reads through.

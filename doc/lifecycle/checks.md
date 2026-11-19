@@ -33,8 +33,11 @@ configures one.
   free MB when the check started (the script prints it ahead of the command; `run_command`
   strips that line wherever it is). The Fix agent is not sent it: the stop asks the user to
   lower the check's heap, scope it, or remove it (its first line is that decision, then why,
-  then the last lines of output). A stored memory kill is never reused for unchanged files:
-  the next run runs the check again.
+  then the last lines of output). A stored broken result of any kind (timeout, memory kill, could not start) is never reused
+  for unchanged files: the next look, a Resume or Check now included, runs the check again
+  (`checks::reusable`; gap 60, where a recorded timeout stopped the run again within seconds).
+  The stop says it is a fresh run and when it ended; the gate criterion says when it shows a
+  recorded result.
   **In a sandbox, the first kill is retried once** (`checks::run_command`,
   `free_sandbox_memory`): tod stops the dev servers the workspace boot started (found by
   program and arguments, not text anywhere in the line: `python manage.py runserver`,

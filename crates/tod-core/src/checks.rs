@@ -367,8 +367,33 @@ fn place_name(cwd: &Workdir) -> String {
     }
 }
 
-/// Whether a stored run is one killed for memory, which is never reused as
-/// the answer for unchanged files: the machine may have changed.
+/// Whether a stored run may stand as the answer for unchanged files. Only a
+/// verdict about the code can (passed, failed, skipped); a broken run (timeout,
+/// killed for memory, could not start) says nothing about the files, only about
+/// the machine at that moment, so the next look runs the check again.
+pub fn reusable(run: &CheckRun) -> bool {
+    run.verdict != Verdict::Broken
+}
+
+/// When a run finished, as a person reads it.
+pub fn ran_at_text(run: &CheckRun) -> String {
+    chrono::DateTime::from_timestamp_millis(run.ran_at)
+        .map(|t| t.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+        .unwrap_or_else(|| format!("{} ms since the epoch", run.ran_at))
+}
+
+/// Why a broken run stopped the node: its output, and (unless it was killed for
+/// memory, whose words are fixed) that it is a fresh run and when it ended.
+/// [`run_stale`] never returns a stored broken run, so this is always fresh.
+pub fn broken_why(run: &CheckRun) -> String {
+    if is_memory_kill(run) {
+        run.output.clone()
+    } else {
+        format!("{} (a fresh run, ended {}; nothing recorded is reused for a check that could not run)", run.output, ran_at_text(run))
+    }
+}
+
+/// Whether a stored run is one killed for memory.
 pub fn is_memory_kill(run: &CheckRun) -> bool {
     run.verdict == Verdict::Broken && run.output.starts_with(KILLED_FOR_MEMORY)
 }
@@ -665,7 +690,7 @@ pub fn run_stale(fleet: &FleetStore, node: Uuid, state: &str) -> Result<Round> {
         let assessment = assess(&tree, check)?;
         let latest = fleet.read(|conn| CheckRunRepo::new(conn).latest(node, key, &dir, &check.command))?;
         let run = match latest {
-            Some(run) if run.fingerprint == assessment.fingerprint && run.label == check.label && !is_memory_kill(&run) => run,
+            Some(run) if run.fingerprint == assessment.fingerprint && run.label == check.label && reusable(&run) => run,
             _ => {
                 let (verdict, output) = if assessment.applicable {
                     run_command(&cwd.join(&dir), check, &assessment.files)
@@ -740,7 +765,7 @@ pub fn gate_criteria(conn: &rusqlite::Connection, node: Uuid, state: &str, to: &
             Some(run) => match run.verdict {
                 Verdict::Passed => (OUTCOME_PASS, String::new()),
                 Verdict::Failed => (OUTCOME_FAIL, format!("failed\n{}", run.output)),
-                Verdict::Broken => (OUTCOME_FAIL, format!("could not run: {}", run.output)),
+                Verdict::Broken => (OUTCOME_FAIL, format!("could not run (the recorded result of the run that ended {}, not a new run): {}", ran_at_text(&run), run.output)),
                 // Nothing it is scoped to changed: not part of this gate.
                 Verdict::Skipped => continue,
             },
@@ -1024,6 +1049,24 @@ mod tests {
         assert!(!killed_for_memory(1, "JavaScript heap out of memory"));
         // The shell's "Killed" counts as the last line only.
         assert!(killed_for_memory(2, "build\n/bin/sh: 1: Killed\n"));
+    }
+
+    #[test]
+    fn a_broken_run_is_never_reused_but_a_verdict_is() {
+        let run = |verdict| CheckRun {
+            node_id: Uuid::nil(),
+            phase: "review".into(),
+            dir: String::new(),
+            command: "x".into(),
+            label: String::new(),
+            fingerprint: "f".into(),
+            verdict,
+            output: "the command did not finish in 10 minutes and was stopped".into(),
+            ran_at: 0,
+        };
+        assert!(!reusable(&run(Verdict::Broken)));
+        assert!(reusable(&run(Verdict::Passed)) && reusable(&run(Verdict::Failed)) && reusable(&run(Verdict::Skipped)));
+        assert!(broken_why(&run(Verdict::Broken)).contains("a fresh run, ended 1970-01-01 00:00:00 UTC"));
     }
 
     #[test]
