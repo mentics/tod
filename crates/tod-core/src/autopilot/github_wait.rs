@@ -176,6 +176,76 @@ pub fn github_look_failed(
     }
 }
 
+/// The wait that carries the failures of pushing a node's branch
+/// (`autopilot::local`): one per node, replaced by the push that succeeds.
+pub const PUSH_WAIT_SPEC: &str = "git:push";
+
+/// Pushing the node's branch at a step boundary failed with `error` (which
+/// names the repository: the checkout, or a submodule). Records it on the
+/// node's `git:push` wait, so it counts and shows (`tod_core::next_actor`),
+/// and says how the run ends:
+/// - a failure asking again may fix (network, GitHub down) → waiting, naming
+///   the error and the attempt, with the backoff of [`retry_delay_ms`];
+/// - anything else (rejected, authentication, a protected branch), or the
+///   last attempt → stopped failed with the exact error, which puts the node
+///   on the user's list.
+///
+/// The one place a failed push is handled; it is never only logged.
+pub fn branch_push_failed(fleet: &FleetStore, node: uuid::Uuid, error: &str) -> Result<Outcome> {
+    let now = chrono::Utc::now().timestamp_millis();
+    let existing = fleet
+        .read(|conn| WaitRepo::new(conn).list_pending_for_node(node))?
+        .into_iter()
+        .find(|w| w.match_spec == PUSH_WAIT_SPEC);
+    let (wait_id, attempt) = match existing {
+        Some(wait) => (wait.id, wait.attempt),
+        None => {
+            let made = fleet
+                .interview(
+                    ACTOR,
+                    InterviewCommand::RecordWait {
+                        node_id: node,
+                        wait: NewWait::event(PUSH_WAIT_SPEC, now + retry_delay_ms(0))
+                            .with_detail("pushing the branch to GitHub"),
+                    },
+                )
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let id = made["id"]
+                .as_str()
+                .and_then(|id| uuid::Uuid::parse_str(id).ok())
+                .ok_or_else(|| anyhow::anyhow!("the wait just recorded has no id"))?;
+            (id, 0)
+        }
+    };
+    let retry_due_at = tod_store::fleet::provision::is_transient_push_error(error).then(|| now + retry_delay_ms(attempt));
+    let result = fleet
+        .interview(
+            ACTOR,
+            InterviewCommand::WaitFailed { wait_id, error: error.to_string(), retry_due_at, spend_attempt: true },
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let exhausted = result["exhausted"].as_bool().unwrap_or(true);
+    match (exhausted, retry_due_at) {
+        (false, Some(due_at_ms)) => {
+            let attempt = result["attempt"].as_u64().unwrap_or(1);
+            let max = result["max_attempts"].as_u64().unwrap_or(0);
+            Ok(Outcome::Waiting {
+                what: format!("GitHub did not take the branch ({attempt} of {max}): {error}"),
+                due_at_ms,
+            })
+        }
+        _ => Ok(Outcome::Stopped {
+            reason: format!("{}the branch could not be pushed to GitHub: {error}", crate::autopilot::local::FAILED_PREFIX),
+        }),
+    }
+}
+
+/// A push of the node's branch succeeded (or had nothing to send): the
+/// failure recorded for an earlier one ends.
+pub fn branch_push_ok(fleet: &FleetStore, node: uuid::Uuid) -> Result<()> {
+    cancel_waits(fleet, node, |spec| spec == PUSH_WAIT_SPEC)
+}
+
 /// A look at GitHub failed where no run is going to handle it (the
 /// orchestrator's wake gate, for a node whose sandbox is asleep). Records the
 /// failure exactly as [`github_look_failed`] does, so it counts, shows
@@ -617,7 +687,7 @@ fn cancel_github_waits(fleet: &FleetStore, node: uuid::Uuid) -> Result<()> {
 }
 
 /// Cancels the node's pending waits whose spec `matches`.
-fn cancel_waits(fleet: &FleetStore, node: uuid::Uuid, matches: impl Fn(&str) -> bool) -> Result<()> {
+pub(super) fn cancel_waits(fleet: &FleetStore, node: uuid::Uuid, matches: impl Fn(&str) -> bool) -> Result<()> {
     let old = fleet.read(|conn| WaitRepo::new(conn).list_pending_for_node(node))?;
     // Agents write `github:pr 2810 checks`: match every spelling alike.
     for wait in old.iter().filter(|w| matches(&tod_store::waits::normalize_spec(&w.match_spec))) {

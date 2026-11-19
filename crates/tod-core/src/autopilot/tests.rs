@@ -22,6 +22,7 @@ use tod_store::outline::{Capability, OutlineMutation};
 use tod_store::settings::InterviewContextSettings;
 
 mod lost_work;
+mod push_failure;
 
 /// Plays every protocol's mock agent; each run finishes at once.
 struct FakeAgent {

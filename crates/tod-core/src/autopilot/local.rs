@@ -180,6 +180,7 @@ impl LocalRun {
                     last: None,
                     last_at: None,
                     waiting: false,
+                    push_retry: None,
                 };
                 let result = (|| -> Result<Outcome> {
                     crate::run_state::record(&fleet, node, crate::run_state::working("running on this machine"), WRITER)?;
@@ -194,10 +195,27 @@ impl LocalRun {
                     }
                     let outcome = pilot.run_with(&fleet, &mut SharedAgentAccess(&agent), &mut hook);
                     // Before the run stops for a wait, a request, or the end.
-                    push_branch(&fleet, node);
+                    // A failure is recorded on the node, never only logged; it
+                    // changes nothing about how this run ends (nothing is
+                    // left to block), and is shown as the node's own.
+                    let pushed = push_branch(&fleet, node);
                     // How it ended, as the node's run state: the one place
                     // `next_actor` reads why a run stopped.
                     let outcome = outcome?;
+                    pushed?;
+                    // A transient push failure at a step boundary stopped the
+                    // run only to hand it back to the runner: it ends as a
+                    // wait that the daemon resumes when it is due.
+                    let outcome = match (&outcome, hook.push_retry.take()) {
+                        (Outcome::Stopped { reason }, Some((what, due_at_ms))) if reason == PUSH_RETRY => {
+                            let waiting = Outcome::Waiting { what, due_at_ms };
+                            let mut state = AutopilotState::load(&data_root, node)?;
+                            state.outcome = Some(waiting.clone());
+                            state.save(&data_root, node)?;
+                            waiting
+                        }
+                        _ => outcome,
+                    };
                     if matches!(&outcome, Outcome::Stopped { reason } if reason == HANDOVER) {
                         // Not an ending: the saved run has no outcome, like a
                         // cut-off one, so the next daemon continues it, and the
@@ -343,6 +361,10 @@ struct Hook<'a, F: FnMut(LocalEvent)> {
     /// The run is waiting on something outside (`StepHook::waiting`), so
     /// reaching a step boundary does not show it as idle.
     waiting: bool,
+    /// A step boundary's push failed in a way asking again may fix: what to
+    /// say and when to try again. The run stops with [`PUSH_RETRY`] and ends
+    /// as this wait.
+    push_retry: Option<(String, i64)>,
 }
 
 impl<F: FnMut(LocalEvent)> Hook<'_, F> {
@@ -393,13 +415,37 @@ impl<F: FnMut(LocalEvent)> Hook<'_, F> {
     }
 }
 
+/// Why a run stopped to retry a push that failed for a reason asking again
+/// may fix; it ends as [`Outcome::Waiting`] (`Hook::push_retry`).
+const PUSH_RETRY: &str = "push-retry";
+
 /// Push the node's own branch, so finished work is on the remote and the next
-/// machine has it. A failure is logged, not fatal.
-fn push_branch(fleet: &FleetStore, node: Uuid) {
+/// machine has it. `Ok(None)` when it is there (or the node has no checkout of
+/// its own). A failure is recorded on the node (`branch_push_failed`: counted
+/// and shown by `next_actor`, with the repository and git's own words) and
+/// comes back as how the run must end: waiting to retry, for a failure asking
+/// again may fix, else stopped failed.
+///
+/// What blocks: every failure of an attempted push, because the work it
+/// leaves behind exists only on this machine, and the steps after it, Reset
+/// environment, Migrate and the sandbox delete all refuse or lose it. What
+/// does not: a push with nothing to send is never attempted, a node with no
+/// checkout of its own has none, and the push at the run's end, where nothing
+/// is left to block, is recorded without changing the outcome.
+pub(crate) fn push_branch(fleet: &FleetStore, node: Uuid) -> Result<Option<Outcome>> {
     match tod_store::fleet::provision::push_node_branch(fleet, &node.to_string()) {
-        Ok(Some(branch)) => tracing::debug!(%node, %branch, "pushed the branch"),
-        Ok(None) => {}
-        Err(err) => tracing::warn!(%node, "pushing the branch: {err:#}"),
+        Ok(pushed) => {
+            super::branch_push_ok(fleet, node)?;
+            if let Some(branch) = pushed {
+                tracing::debug!(%node, %branch, "pushed the branch");
+            }
+            Ok(None)
+        }
+        Err(err) => {
+            let error = format!("{err:#}");
+            tracing::warn!(%node, "pushing the branch: {error}");
+            super::branch_push_failed(fleet, node, &error).map(Some)
+        }
     }
 }
 
@@ -418,11 +464,20 @@ impl<F: FnMut(LocalEvent)> StepHook for Hook<'_, F> {
     }
 
     fn at(&mut self, fleet: &FleetStore, boundary: Boundary) -> Result<Option<String>> {
+        let mut blocked: Option<String> = None;
         if boundary == Boundary::Step {
             // Pushing can take seconds in a checkout with submodules: say so
             // rather than leave "deciding the next step" on screen.
             self.say("saving the branch to GitHub");
-            push_branch(fleet, self.node);
+            match push_branch(fleet, self.node)? {
+                None => {}
+                Some(Outcome::Waiting { what, due_at_ms }) => {
+                    self.push_retry = Some((what, due_at_ms));
+                    blocked = Some(PUSH_RETRY.to_string());
+                }
+                Some(Outcome::Stopped { reason }) => blocked = Some(reason),
+                Some(other) => anyhow::bail!("pushing the branch ended the run as {other:?}"),
+            }
             if !self.waiting {
                 // A group of skills run in its own session said so at the last
                 // step; the next one is the run at large again.
@@ -438,7 +493,9 @@ impl<F: FnMut(LocalEvent)> StepHook for Hook<'_, F> {
             anyhow::bail!("{error}");
         }
         Ok(match self.requested() {
-            Request::Run => None,
+            // A user's pause or stop wins over a failing push, which stays
+            // recorded on the node either way.
+            Request::Run => blocked,
             Request::Pause => Some(PAUSED.to_string()),
             Request::StopNow => Some(STOPPED.to_string()),
             Request::Handover | Request::HandoverNow => Some(HANDOVER.to_string()),

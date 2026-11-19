@@ -1852,6 +1852,50 @@ pub fn push_node_branch(fleet: &FleetStore, node_id: &str) -> Result<Option<Stri
     Ok(Some(branch))
 }
 
+/// Whether a failed push (or the look at the remote before it, in
+/// [`push_node_branch`]) failed in a way asking again may fix: the network,
+/// DNS, a timeout, a server error. Anything else (a rejected non-fast-forward
+/// with commits of ours on top, authentication, a protected branch or a
+/// declining hook, no origin) is the same on every attempt, so retrying it
+/// would only delay telling the person.
+pub fn is_transient_push_error(message: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "could not resolve host",
+        "temporary failure in name resolution",
+        "connection timed out",
+        "connection reset",
+        "connection refused",
+        "operation timed out",
+        "timed out",
+        "the remote end hung up unexpectedly",
+        "early eof",
+        "rpc failed",
+        "failed to connect",
+        "network is unreachable",
+        "ssl_error_syscall",
+        "http 500",
+        "http 502",
+        "http 503",
+        "http 504",
+        "error: 500",
+        "error: 502",
+        "error: 503",
+        "error: 504",
+        "service unavailable",
+        "bad gateway",
+        "gateway time-out",
+        "internal server error",
+        "another git process seems to be running",
+        "cannot lock ref",
+    ];
+    let lower = message.to_lowercase();
+    // A rejection is never transient, whatever else the text mentions.
+    if lower.contains("[rejected]") || lower.contains("non-fast-forward") || lower.contains("denied") {
+        return false;
+    }
+    MARKERS.iter().any(|m| lower.contains(m))
+}
+
 fn location_state_is_clean(dir: &Workdir) -> Result<bool> {
     let mut lines = dir.git(&["status", "--porcelain", "--ignore-submodules=all"])?.lines().count();
     lines += submodule_dirty_lines(dir)?.len();
@@ -1930,7 +1974,9 @@ fn push_branches(dir: &Workdir) -> Result<()> {
             continue;
         }
         if repo == *dir {
-            push_branch(&repo)?;
+            // Names the repository, as a submodule's failure does: a person
+            // reading "rejected" must know which repository refused.
+            push_branch(&repo).with_context(|| format!("repository {repo}"))?;
         } else if let Some(branch) = worktree::current_branch(&repo) {
             push_named_branch(&repo, &branch)
                 .with_context(|| format!("submodule {repo}"))?;
@@ -2814,6 +2860,18 @@ mod tests {
         git(&ui, &["update-ref", "-d", "refs/remotes/origin/task/x"]);
         let err = format!("{:#}", push_branches(&dir).unwrap_err());
         assert!(err.contains("submodule") && err.contains("task/x"), "{err}");
+    }
+
+    /// Gap 71: only a failure asking again may fix is retried; a refusal is
+    /// the same on every attempt and goes to the person at once.
+    #[test]
+    fn only_network_failures_are_transient_pushes() {
+        assert!(is_transient_push_error("fatal: unable to access 'https://github.com/o/r.git/': Could not resolve host: github.com"));
+        assert!(is_transient_push_error("error: RPC failed; HTTP 503 curl 22 The requested URL returned error: 503"));
+        assert!(!is_transient_push_error(" ! [rejected] task/x -> task/x (non-fast-forward)"));
+        assert!(!is_transient_push_error("remote: GH006: Protected branch update failed"));
+        assert!(!is_transient_push_error("fatal: Authentication failed for 'https://github.com/o/r.git/'"));
+        assert!(!is_transient_push_error("remote: Permission to o/r.git denied; unable to access, timed out waiting"));
     }
 
     /// Seen live (ENG-2287): commits that only a sandbox had went with the

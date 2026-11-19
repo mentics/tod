@@ -2,7 +2,7 @@
 
 use super::*;
 
-fn git_in(dir: &std::path::Path, args: &[&str]) {
+pub(super) fn git_in(dir: &std::path::Path, args: &[&str]) {
     let out = std::process::Command::new("git")
         .arg("-C")
         .arg(dir)
@@ -15,7 +15,7 @@ fn git_in(dir: &std::path::Path, args: &[&str]) {
 
 /// Makes the node's workspace a clone of a repository with one commit on
 /// `main`, on the node's branch with nothing of its own.
-fn workspace_is_a_clone(fx: &Fixture) -> PathBuf {
+pub(super) fn workspace_is_a_clone(fx: &Fixture) -> PathBuf {
     let origin = fx.root.join("origin.git");
     let seed = fx.root.join("seed");
     let workspace = fx.root.join("workspace");
