@@ -346,6 +346,10 @@ pub struct PrStatus {
     /// never replaced, as [`combine_checks`] reads it). Empty when none
     /// failed.
     pub failing_checks: Vec<String>,
+    /// For each of [`Self::failing_checks`] whose reason is known, `(name,
+    /// signature)` ([`failure_signature`]): the same failure on a later head
+    /// has the same signature. A check with none is not listed.
+    pub failing_signatures: Vec<(String, String)>,
     /// Some check is still running (a status `pending`, a run not completed),
     /// whatever else failed: `checks` says `failure` first.
     pub checks_running: bool,
@@ -367,6 +371,18 @@ pub struct PrStatus {
     /// The description. A review bot may keep its summary here, edited in
     /// place, rather than in a comment.
     pub body: Option<String>,
+}
+
+impl PrStatus {
+    /// The signature of failing check `check` ([`failure_signature`]); empty
+    /// when its reason is not known.
+    pub fn failure_signature_of(&self, check: &str) -> String {
+        self.failing_signatures
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(check))
+            .map(|(_, sig)| sig.clone())
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -717,6 +733,62 @@ impl Github {
         Err(GithubError::Api(format!("{owner}/{repo}@{sha}: more than 5000 check runs")))
     }
 
+    /// `(name, signature)` for each failing check that has one
+    /// ([`failure_signature`]): a GitHub Actions run names its failing step
+    /// (one more request per failing run), any run its output title and
+    /// summary, a commit status its description.
+    fn failing_signatures(
+        &self,
+        owner: &str,
+        repo: &str,
+        names: &[String],
+        statuses: &CombinedStatusRaw,
+        runs: &CheckRunsRaw,
+    ) -> Result<Vec<(String, String)>, GithubError> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        for s in &statuses.statuses {
+            let Some(name) = s.context.as_ref().filter(|n| names.contains(n)) else { continue };
+            if matches!(s.state.as_str(), "success" | "pending") || out.iter().any(|(n, _)| n == name) {
+                continue;
+            }
+            let sig = failure_signature(&s.state, "", "", s.description.as_deref().unwrap_or_default());
+            if !sig.is_empty() {
+                out.push((name.clone(), sig));
+            }
+        }
+        for run in &runs.check_runs {
+            let Some(name) = run.name.as_ref().filter(|n| names.contains(n)) else { continue };
+            let conclusion = run.conclusion.as_deref().unwrap_or_default();
+            if run.status != "completed" || matches!(conclusion, "success" | "neutral" | "skipped") {
+                continue;
+            }
+            if out.iter().any(|(n, _)| n == name) {
+                continue;
+            }
+            let mut step = String::new();
+            if run.app.as_ref().and_then(|a| a.slug.as_deref()) == Some("github-actions") && run.id != 0 {
+                let job: JobRaw = self.get_json(&format!("/repos/{owner}/{repo}/actions/jobs/{}", run.id))?;
+                step = job
+                    .steps
+                    .iter()
+                    .find(|s| s.conclusion.as_deref() == Some("failure"))
+                    .map(|s| s.name.clone())
+                    .unwrap_or_default();
+            }
+            let output = run.output.as_ref();
+            let sig = failure_signature(
+                conclusion,
+                &step,
+                output.and_then(|o| o.title.as_deref()).unwrap_or_default(),
+                output.and_then(|o| o.summary.as_deref()).unwrap_or_default(),
+            );
+            if !sig.is_empty() {
+                out.push((name.clone(), sig));
+            }
+        }
+        Ok(out)
+    }
+
     /// Fetch a pull request's live status: mergeable flag, mergeable state,
     /// combined check conclusion, and whether it has been merged.
     pub fn get_pr_status(&self, owner: &str, repo: &str, number: i64) -> Result<PrStatus, GithubError> {
@@ -725,6 +797,7 @@ impl Github {
         // says `pending` when there are none at all) and check runs (GitHub
         // Actions and apps), which the combined status leaves out.
         let mut failing_checks = Vec::new();
+        let mut failing_signatures = Vec::new();
         let mut checks_running = false;
         let checks = match &raw.head {
             Some(head) => {
@@ -734,6 +807,7 @@ impl Github {
                     .get_json::<CombinedStatusRaw>(&format!("/repos/{owner}/{repo}/commits/{}/status", head.sha))?;
                 let runs = self.get_check_runs(owner, repo, &head.sha)?;
                 failing_checks = failing_check_names(Some(&statuses), Some(&runs));
+                failing_signatures = self.failing_signatures(owner, repo, &failing_checks, &statuses, &runs)?;
                 checks_running = checks_running_in(Some(&statuses), Some(&runs));
                 combine_checks(Some(&statuses), Some(&runs))
             }
@@ -756,6 +830,7 @@ impl Github {
             merged: raw.merged.unwrap_or(false),
             checks,
             failing_checks,
+            failing_signatures,
             checks_running,
             head_sha: raw.head.as_ref().map(|h| h.sha.clone()),
             head_committed_at: None,
@@ -2116,6 +2191,8 @@ struct StatusRaw {
     #[serde(default)]
     context: Option<String>,
     state: String,
+    #[serde(default)]
+    description: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -2128,6 +2205,9 @@ struct CheckRunsRaw {
 
 #[derive(Debug, Deserialize)]
 struct CheckRunRaw {
+    /// For a GitHub Actions run this is the job's id.
+    #[serde(default)]
+    id: i64,
     status: String,
     conclusion: Option<String>,
     #[serde(default)]
@@ -2138,11 +2218,66 @@ struct CheckRunRaw {
     /// RFC 3339, so the strings order by time.
     #[serde(default)]
     started_at: Option<String>,
+    #[serde(default)]
+    output: Option<CheckOutputRaw>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CheckOutputRaw {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    summary: Option<String>,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 struct CheckAppRaw {
     id: i64,
+    #[serde(default)]
+    slug: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct JobRaw {
+    #[serde(default)]
+    steps: Vec<JobStepRaw>,
+}
+
+#[derive(Debug, Deserialize)]
+struct JobStepRaw {
+    name: String,
+    #[serde(default)]
+    conclusion: Option<String>,
+}
+
+/// A short, stable fingerprint of why a check fails, so that an answer about
+/// the failure can hold for later commits while it is the same failure: the
+/// conclusion, the failing step, and the check's own title and summary with
+/// what changes between runs (anything with a digit in it: commit ids,
+/// counts, durations, times; case; spacing) taken out. Empty when nothing
+/// but the name is known.
+pub fn failure_signature(conclusion: &str, step: &str, title: &str, summary: &str) -> String {
+    fn normal(text: &str) -> String {
+        text.chars()
+            .take(4000)
+            .map(|c| if c.is_alphanumeric() || matches!(c, '_' | '-' | '/' | '.') { c.to_ascii_lowercase() } else { ' ' })
+            .collect::<String>()
+            .split_whitespace()
+            .filter(|w| !w.chars().any(|c| c.is_ascii_digit()))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+    let (step, title, summary) = (normal(step), normal(title), normal(summary));
+    if step.is_empty() && title.is_empty() && summary.is_empty() {
+        return String::new();
+    }
+    let joined = format!("{}\u{1f}{step}\u{1f}{title}\u{1f}{summary}", conclusion.to_ascii_lowercase());
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in joined.bytes() {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
 }
 
 /// [`PrStatus::checks`] from the combined status and the check runs.

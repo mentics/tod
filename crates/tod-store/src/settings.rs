@@ -496,31 +496,57 @@ pub struct UnrelatedCheck {
     /// `owner/repo#number`.
     pub pr: String,
     pub check: String,
-    /// The head commit the standing was given for: it applies to that head
-    /// only, so a later push that breaks the check is judged again.
+    /// The head commit the standing was given for.
     pub head: String,
+    /// The failure the standing was given for (`github::failure_signature`),
+    /// empty when it was not known. A pending or carry-on standing holds for
+    /// every head while the check fails the same way; a fix-here one, and any
+    /// standing without a signature, holds for its head only.
+    pub signature: String,
     pub standing: UnrelatedStanding,
 }
 
 /// The standing a list of [`UnrelatedCheck`] holds for `check` of `pr` on the
-/// head `head` (names, repositories and commits compare without case). A
-/// standing given for another head does not count.
-pub fn unrelated_standing(list: &[UnrelatedCheck], pr: &str, check: &str, head: &str) -> Option<UnrelatedStanding> {
-    list.iter()
-        .find(|u| {
-            u.pr.eq_ignore_ascii_case(pr) && u.check.eq_ignore_ascii_case(check) && u.head.eq_ignore_ascii_case(head)
-        })
-        .map(|u| u.standing)
+/// head `head`, failing with `signature` (names, repositories and commits
+/// compare without case). One given for this head counts. One given for
+/// another head counts when it is a carry-on or a pending question about the
+/// same, known failure, and the user has not said to fix that failure here.
+pub fn unrelated_standing(
+    list: &[UnrelatedCheck],
+    pr: &str,
+    check: &str,
+    head: &str,
+    signature: &str,
+) -> Option<UnrelatedStanding> {
+    let same_check = |u: &&UnrelatedCheck| u.pr.eq_ignore_ascii_case(pr) && u.check.eq_ignore_ascii_case(check);
+    if let Some(u) = list.iter().filter(same_check).find(|u| u.head.eq_ignore_ascii_case(head)) {
+        return Some(u.standing);
+    }
+    if signature.is_empty() {
+        return None;
+    }
+    let same_failure: Vec<&UnrelatedCheck> =
+        list.iter().filter(same_check).filter(|u| u.signature == signature).collect();
+    if same_failure.iter().any(|u| u.standing == UnrelatedStanding::FixHere) {
+        None
+    } else if same_failure.iter().any(|u| u.standing == UnrelatedStanding::Waived) {
+        Some(UnrelatedStanding::Waived)
+    } else if same_failure.iter().any(|u| u.standing == UnrelatedStanding::Pending) {
+        Some(UnrelatedStanding::Pending)
+    } else {
+        None
+    }
 }
 
 /// Whether the user once said to carry on without `check` of `pr`, on a head
-/// other than `head`.
-pub fn waived_on_earlier_head(list: &[UnrelatedCheck], pr: &str, check: &str, head: &str) -> bool {
+/// other than `head`, for a failure with the same `signature` (both unknown counts as the same).
+pub fn waived_on_earlier_head(list: &[UnrelatedCheck], pr: &str, check: &str, head: &str, signature: &str) -> bool {
     list.iter().any(|u| {
         u.standing == UnrelatedStanding::Waived
             && u.pr.eq_ignore_ascii_case(pr)
             && u.check.eq_ignore_ascii_case(check)
             && !u.head.eq_ignore_ascii_case(head)
+            && u.signature == signature
     })
 }
 

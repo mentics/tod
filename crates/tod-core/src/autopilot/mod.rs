@@ -1990,14 +1990,25 @@ impl Autopilot {
                 }
                 // The agent judged an earlier commit: a push since may be the
                 // one that broke the check, so it is judged again.
-                Some(p) if !p.assessment.head_sha.as_deref().unwrap_or_default().eq_ignore_ascii_case(&head) => {
+                // ...unless it still fails the same way (same signature): the
+                // question stands, and so does its answer, for the new head.
+                Some(p)
+                    if !p.assessment.head_sha.as_deref().unwrap_or_default().eq_ignore_ascii_case(&head)
+                        && !same_failure(&decision, &check, &p.assessment) =>
+                {
                     format!("{pr} has a new head since the agent judged \"{check}\"")
                 }
                 Some(_) => {
                     // The agent said again, on this head, that the check is
                     // not the change's, and the user once said to carry on
                     // without it on this pull request: apply that, and say so.
-                    if tod_store::settings::waived_on_earlier_head(&settings.unrelated_checks, &pr, &check, &head) {
+                    if tod_store::settings::waived_on_earlier_head(
+                        &settings.unrelated_checks,
+                        &pr,
+                        &check,
+                        &head,
+                        &crate::check_unrelated::signature_of(&decision),
+                    ) {
                         tracing::info!(%node, %pr, %check, "carrying an earlier carry-on forward to the new head");
                         fleet
                             .interview(
@@ -2883,6 +2894,19 @@ fn short_waits(waits: Vec<crate::pr_readiness::Wait>) -> Vec<crate::pr_readiness
         }
     }
     short
+}
+
+/// Whether `check` still fails the way the check-unrelated question
+/// `decision` was raised about (both signatures known and equal).
+fn same_failure(decision: &tod_store::decisions::Decision, check: &str, assessment: &crate::pr_readiness::Assessment) -> bool {
+    let asked = crate::check_unrelated::signature_of(decision);
+    let now = assessment
+        .failing_signatures
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(check))
+        .map(|(_, s)| s.as_str())
+        .unwrap_or_default();
+    !asked.is_empty() && asked == now
 }
 
 /// Whether `question` names the pull request `number`: `#6680`,

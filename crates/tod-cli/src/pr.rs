@@ -696,7 +696,13 @@ fn checks(inv: &Invocation, rest: &[String]) -> anyhow::Result<String> {
         let mut failing = Vec::new();
         for check in &status.failing_checks {
             let head = status.head_sha.as_deref().unwrap_or_default();
-            let standing = tod_store::settings::unrelated_standing(&standings, &label, check, head);
+            let standing = tod_store::settings::unrelated_standing(
+                &standings,
+                &label,
+                check,
+                head,
+                &status.failure_signature_of(check),
+            );
             let words = match standing {
                 None => "failing",
                 Some(UnrelatedStanding::Pending) => "failing; you said it is not this change's, the user has been asked",
@@ -763,7 +769,8 @@ fn checks_unrelated(inv: &Invocation, rest: &[String]) -> anyhow::Result<String>
             }
         );
     };
-    match inv.client().read(|conn| cu::standing(conn, node, &label, name, &head))? {
+    let signature = status.failure_signature_of(name);
+    match inv.client().read(|conn| cu::standing(conn, node, &label, name, &head, &signature))? {
         Some(UnrelatedStanding::Pending) => {
             return Ok(format!("ok: the user has already been asked about \"{name}\" on {label}; end your turn"));
         }
@@ -775,7 +782,7 @@ fn checks_unrelated(inv: &Invocation, rest: &[String]) -> anyhow::Result<String>
         ),
         None => {}
     }
-    let claim = cu::Claim { pr: label.clone(), pr_url: pr.url.clone(), check: name.clone(), head, reason };
+    let claim = cu::Claim { pr: label.clone(), pr_url: pr.url.clone(), check: name.clone(), head, signature, reason };
     inv.client().interview(InterviewCommand::AskDecision {
         node_id: node,
         conversation_id: None,
@@ -784,7 +791,7 @@ fn checks_unrelated(inv: &Invocation, rest: &[String]) -> anyhow::Result<String>
     })?;
     Ok(format!(
         "ok: asked the user whether to fix \"{name}\" on {label} here or carry on without it; \
-         tod no longer sends you back for it on this commit (a later push that fails it is yours to judge again). End your turn (do not fix it in this pull request)."
+         tod no longer sends you back for it while it fails the same way, on this commit or a later one (a push that makes it fail differently is yours to judge again). End your turn (do not fix it in this pull request)."
     ))
 }
 

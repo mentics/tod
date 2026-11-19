@@ -301,6 +301,9 @@ pub struct Assessment {
     pub checks: Option<String>,
     /// The checks behind a failing `checks` ([`PrStatus::failing_checks`]).
     pub failing_checks: Vec<String>,
+    /// How each of them fails, where known ([`PrStatus::failing_signatures`]):
+    /// what lets an answer about a check hold for the next head.
+    pub failing_signatures: Vec<(String, String)>,
     /// A check is still running, whatever else failed.
     pub checks_running: bool,
     /// The head commit this was read at; a standing for a failing check
@@ -553,6 +556,7 @@ impl Assessment {
             behind_by: snapshot.status.behind_by,
             checks: snapshot.status.checks.clone(),
             failing_checks: snapshot.status.failing_checks.clone(),
+            failing_signatures: snapshot.status.failing_signatures.clone(),
             checks_running: snapshot.status.checks_running,
             head_sha: snapshot.status.head_sha.clone(),
             check_standings: Vec::new(),
@@ -589,15 +593,23 @@ impl Assessment {
 
     /// This assessment with the node's standings for `pr`'s failing checks
     /// ([`crate::check_unrelated`]): the ones in `list` for that pull request
-    /// and still failing, given for the head this was read at: a standing
-    /// for another head is not here, so a new head that fails the check is
-    /// work again.
+    /// and still failing: one given for this head, or a carry-on or pending
+    /// question about the same failure (same signature) on an earlier head.
+    /// A new head that fails the check differently is work again.
     pub fn with_unrelated(mut self, pr: &str, list: &[UnrelatedCheck]) -> Self {
         let head = self.head_sha.clone().unwrap_or_default();
         self.check_standings = self
             .failing_checks
             .iter()
-            .filter_map(|c| tod_store::settings::unrelated_standing(list, pr, c, &head).map(|s| (c.clone(), s)))
+            .filter_map(|c| {
+                let sig = self
+                    .failing_signatures
+                    .iter()
+                    .find(|(n, _)| n.eq_ignore_ascii_case(c))
+                    .map(|(_, s)| s.as_str())
+                    .unwrap_or_default();
+                tod_store::settings::unrelated_standing(list, pr, c, &head, sig).map(|s| (c.clone(), s))
+            })
             .collect();
         self
     }
@@ -2472,7 +2484,7 @@ Not safe.
     }
 
     fn standing_of(check: &str, standing: UnrelatedStanding) -> Vec<UnrelatedCheck> {
-        vec![UnrelatedCheck { pr: "acme/app#42".into(), check: check.into(), head: "abcdef1234567".into(), standing }]
+        vec![UnrelatedCheck { pr: "acme/app#42".into(), check: check.into(), head: "abcdef1234567".into(), signature: String::new(), standing }]
     }
 
     #[test]

@@ -584,13 +584,22 @@ request*.
 - A pending question whose check no longer fails, or whose pull request is
   merged or unlinked, is withdrawn with a note
   (`Autopilot::tend_unrelated_check_questions`).
-- A standing holds for the head it was given for, never a later one (the key is
-  check, pull request and head, in the carry-on option). On a new head that
-  still fails the check it is agent work for one look again, and a question
-  for an older head is withdrawn. If the agent records it unrelated again and
-  the user once said to carry on without that check on this pull request, the
-  autopilot applies that to the new head without asking (a timeline note says
-  so); the agent must re-attest per head, and nothing is carried unprompted.
+- A standing is keyed by check, pull request and **failure signature**
+  (`github::failure_signature`: the conclusion, the failing Actions step, and
+  the check's output title and summary with commit ids and numbers taken out;
+  carried in the carry-on option as `(<pr> @ <head> ~ <signature>)`). A
+  carry-on, or a question not yet answered, holds for every later head while
+  the check fails the same way (`settings::unrelated_standing`), so a push
+  neither re-asks nor withdraws it (seen ENG-2504, gap 48: the same lock-file
+  failure was asked five times, once per head). When the signature changes the
+  check is agent work again and a new question is raised. "Fix it here" and
+  any standing recorded without a signature hold for their head only: there a
+  new head that still fails is work for one look, a question for an older head
+  is withdrawn, and a carry-on is applied to the new head only when the agent
+  re-attests (a timeline note says so). Not done: telling that the same check
+  fails on the base's latest commit (one more check-runs request per look and
+  an automatic waiver the user did not give), or that it starts failing on a
+  file the change touches (only a different signature re-asks).
   Only this node's own pr conversation may record one.
 
 If the agent records nothing and changes nothing twice, the stop

@@ -175,6 +175,7 @@ mod tests {
                     merged: false,
                     checks: None,
                     failing_checks: Vec::new(),
+                    failing_signatures: Vec::new(),
                     checks_running: false,
                     head_sha: None,
                     head_committed_at: None,

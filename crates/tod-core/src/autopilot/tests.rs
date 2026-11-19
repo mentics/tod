@@ -2413,6 +2413,7 @@ fn a_pr_draft_wake_leaves_running_checks_to_the_babysitter() {
         merged: false,
         checks: Some("pending".into()),
         failing_checks: Vec::new(),
+        failing_signatures: Vec::new(),
         checks_running: false,
         head_sha: None,
         head_committed_at: None,
@@ -2456,6 +2457,7 @@ fn check_now_in_pr_draft_waits_for_the_draft_to_be_ready_and_reviewed() {
         merged: false,
         checks: None,
         failing_checks: Vec::new(),
+        failing_signatures: Vec::new(),
         checks_running: false,
         head_sha: None,
         head_committed_at: None,
@@ -2578,6 +2580,7 @@ fn check_now_in_pr_draft_sends_new_changes_requested_to_the_agent_even_on_a_draf
         merged: false,
         checks: None,
         failing_checks: Vec::new(),
+        failing_signatures: Vec::new(),
         checks_running: false,
         head_sha: None,
         head_committed_at: Some("2026-01-01T09:00:00Z".into()),
@@ -2624,6 +2627,7 @@ fn check_now_in_pr_draft_clears_a_leftover_review_wait_and_ignores_a_bot_reviewe
         merged: false,
         checks: None,
         failing_checks: Vec::new(),
+        failing_signatures: Vec::new(),
         checks_running: false,
         head_sha: None,
         head_committed_at: None,
@@ -4556,11 +4560,17 @@ struct FailingCheckFeed {
     head: std::sync::Mutex<String>,
     /// Every agent turn says the check is not the change's, not only the first.
     repeats: std::sync::atomic::AtomicBool,
+    /// How the check fails (`failure_signature`); empty is "not known".
+    signature: std::sync::Mutex<String>,
 }
 
 impl FailingCheckFeed {
     fn new_head(&self, head: &str) {
         *self.head.lock().unwrap() = head.to_string();
+    }
+
+    fn fails_as(&self, signature: &str) {
+        *self.signature.lock().unwrap() = signature.to_string();
     }
 }
 
@@ -4579,6 +4589,10 @@ impl crate::pr_readiness::PrFeed for FailingCheckFeed {
                 behind_by: Some(0),
                 checks: Some(if fixed { "success" } else { "failure" }.into()),
                 failing_checks: if fixed { Vec::new() } else { vec!["terraform".into()] },
+                failing_signatures: {
+                    let sig = self.signature.lock().unwrap().clone();
+                    if fixed || sig.is_empty() { Vec::new() } else { vec![("terraform".to_string(), sig)] }
+                },
                 head_sha: Some(self.head.lock().unwrap().clone()),
                 head_committed_at: Some("2020-01-01T00:00:00Z".into()),
                 open: true,
@@ -4614,6 +4628,7 @@ fn failing_check_node(says_unrelated: bool) -> (Fixture, Arc<FailingCheckFeed>, 
         fixed: std::sync::atomic::AtomicBool::new(false),
         head: std::sync::Mutex::new("abc1234".into()),
         repeats: std::sync::atomic::AtomicBool::new(false),
+        signature: std::sync::Mutex::new(String::new()),
     });
     crate::pr_readiness::set_feed_override(Some(feed.clone()));
     linked_to_prs(&fx, "pr_review", &["https://github.com/acme/app/pull/42"]);
@@ -4632,6 +4647,7 @@ fn failing_check_node(says_unrelated: bool) -> (Fixture, Arc<FailingCheckFeed>, 
                 pr_url: "https://github.com/acme/app/pull/42".into(),
                 check: "terraform".into(),
                 head: feed_seen.head.lock().unwrap().clone(),
+                signature: feed_seen.signature.lock().unwrap().clone(),
                 reason: "the lock file in infra/ fails the same way on main".into(),
             };
             fleet
@@ -4698,7 +4714,7 @@ fn carrying_on_without_the_check_leaves_the_pull_request_to_its_person() {
     assert_eq!(unrelated_decisions(&fx).len(), 1, "never asked again");
     let settings = crate::pr_readiness::settings_for_node(&fx.fleet, fx.node, &fx.root).unwrap();
     assert!(
-        crate::check_unrelated::all_waived(&settings, "acme/app#42", "abc1234", &["terraform".to_string()]),
+        crate::check_unrelated::all_waived(&settings, "acme/app#42", "abc1234", &["terraform".to_string()], &[]),
         "{settings:?}"
     );
 }
@@ -4802,6 +4818,79 @@ fn a_carry_on_is_carried_to_a_new_head_only_when_the_agent_says_so_again() {
     let before = agent.turns;
     run_babysitter(&fx, &mut agent);
     assert_eq!(agent.turns, before, "no more turns on this head");
+}
+
+/// Seen live (ENG-2504, gap 48): the same failing check (a provider checksum
+/// in a lock file, failing on main too) was asked about after every push,
+/// because an answer counted for one commit. An answer holds across heads
+/// while the check fails the same way.
+#[test]
+fn a_carry_on_holds_for_new_heads_while_the_check_fails_the_same_way() {
+    let (fx, feed, mut agent, _) = failing_check_node(true);
+    feed.fails_as("sig-a");
+    run_babysitter(&fx, &mut agent);
+    let d = unrelated_decisions(&fx).remove(0);
+    assert!(crate::check_unrelated::signature_of(&d) == "sig-a", "{:?}", d.options);
+    fx.fleet
+        .interview(ACTOR_USER, InterviewCommand::AnswerDecision { decision_id: d.id, option: Some(1), text: None })
+        .unwrap();
+    // Several pushes, none of which changes how the check fails.
+    for head in ["def5678", "0123abc", "fedcba9"] {
+        feed.new_head(head);
+        run_babysitter(&fx, &mut agent);
+        assert_eq!(agent.turns, 1, "no turn for a check already carried on without ({head})");
+        assert!(pending_requests(&fx).is_empty(), "the user is not asked again ({head})");
+        assert_eq!(unrelated_decisions(&fx).len(), 1, "no second question ({head})");
+    }
+    // The gate's mergeable criterion accepts the carry-on for the later head too.
+    assert_eq!(lifecycle::current_state(&fx.fleet, fx.node).unwrap(), "approved");
+    let settings = crate::pr_readiness::settings_for_node(&fx.fleet, fx.node, &fx.root).unwrap();
+    assert!(crate::check_unrelated::all_waived(
+        &settings,
+        "acme/app#42",
+        "fedcba9",
+        &["terraform".to_string()],
+        &[("terraform".to_string(), "sig-a".to_string())]
+    ));
+}
+
+/// ...and is asked again when the failure changes.
+#[test]
+fn a_carry_on_is_asked_again_when_the_check_starts_failing_differently() {
+    let (fx, feed, mut agent, _) = failing_check_node(true);
+    feed.fails_as("sig-a");
+    run_babysitter(&fx, &mut agent);
+    let d = unrelated_decisions(&fx).remove(0);
+    fx.fleet
+        .interview(ACTOR_USER, InterviewCommand::AnswerDecision { decision_id: d.id, option: Some(1), text: None })
+        .unwrap();
+    feed.new_head("def5678");
+    feed.fails_as("sig-b");
+    feed.repeats.store(true, std::sync::atomic::Ordering::SeqCst);
+    let outcome = run_babysitter(&fx, &mut agent);
+    assert!(agent.turns >= 2, "a different failure is work again");
+    assert!(
+        matches!(&outcome, Outcome::NeedsHuman { reason: NeedsHuman::Decision { pending: 1 } }),
+        "{outcome:?}"
+    );
+    let all = unrelated_decisions(&fx);
+    assert_eq!(all.len(), 2, "{all:?}");
+    assert!(all.iter().any(|d| crate::check_unrelated::signature_of(d) == "sig-b" && d.status == "pending"), "{all:?}");
+}
+
+/// A question the user has not answered survives a push that leaves the
+/// failure as it was: it is neither withdrawn nor asked a second time.
+#[test]
+fn a_pending_question_survives_a_new_head_with_the_same_failure() {
+    let (fx, feed, mut agent, _) = failing_check_node(true);
+    feed.fails_as("sig-a");
+    run_babysitter(&fx, &mut agent);
+    feed.new_head("def5678");
+    run_babysitter(&fx, &mut agent);
+    let all = unrelated_decisions(&fx);
+    assert_eq!(all.len(), 1, "{all:?}");
+    assert_eq!(all[0].status, "pending");
+    assert_eq!(agent.turns, 1);
 }
 
 /// A question raised for an earlier head is withdrawn when a new commit

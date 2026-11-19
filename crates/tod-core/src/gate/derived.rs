@@ -803,6 +803,7 @@ fn waived_checks_only(
         &crate::pr_readiness::pr_label(pr),
         status.head_sha.as_deref().unwrap_or_default(),
         &status.failing_checks,
+        &status.failing_signatures,
     ))
 }
 
@@ -1763,6 +1764,7 @@ mod readiness_tests {
             merged: false,
             checks: None,
             failing_checks: Vec::new(),
+            failing_signatures: Vec::new(),
             checks_running: false,
             head_sha: None,
             head_committed_at: None,
