@@ -91,7 +91,7 @@ COMMANDS:
     stats [<NODE>] [--section <NAME>] [--since <DURATION>]
 
 Read-only. One report over the store with a section per question: `cost`
-(per node and phase: sessions, agent turns, tool calls, wall time), `review`
+(per node and phase: sessions, agent turns, tool calls, wall time, and the tokens the agent reported: uncached input, cache reads, cache writes, output, and the share of the prompt read from the cache), `review`
 (rounds, findings, clean rounds, reopened findings, rejected/declined ratio),
 `pr-draft` (PR agent sessions, draft review rounds, threads posted, pushes, CI
 failures), `requests` (how many, how long they waited, answered with an offered
@@ -104,7 +104,7 @@ operation; a call that gave up also leaves a note on the node's activity) and
 else, and for how long; a state, so --since does not apply). <NODE> (a slug or UUID) narrows it to one node;
 --section to one section; --since (30m, 2h, 7d) to what happened in that
 window. Every section ends with `not available:` lines naming what tod does
-not keep (tokens, bot reviews, stop history, setup time), so a missing figure
+not keep (bot reviews, stop history, setup time), so a missing figure
 is never read as a zero. --json gives the same as JSON.
 Refused in an agent session (TOD_INTERVIEW_ACTOR set).
 ";

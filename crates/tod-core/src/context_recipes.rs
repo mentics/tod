@@ -129,10 +129,10 @@ pub const VISUAL_DESIGN: ContextRecipe = ContextRecipe {
     ],
     blocks: &[
         DynamicBlock::DataRoot,
-        DynamicBlock::PullRequests,
         DynamicBlock::Focus,
         DynamicBlock::AncestorContext,
         DynamicBlock::VisualDesign,
+        DynamicBlock::PullRequests,
     ],
 };
 
@@ -167,15 +167,15 @@ pub const IMPLEMENT_SESSION: ContextRecipe = ContextRecipe {
         DynamicBlock::Databases,
         DynamicBlock::WorkingDirectory,
         DynamicBlock::DataRoot,
-        DynamicBlock::PullRequests,
         DynamicBlock::Node,
-        DynamicBlock::Plan,
         DynamicBlock::NodeObligations {
             note: OWN_OBLIGATIONS_NOTE,
         },
         DynamicBlock::AncestorContext,
-        DynamicBlock::ObligationVerdicts,
         DynamicBlock::ConfiguredSkills,
+        DynamicBlock::Plan,
+        DynamicBlock::ObligationVerdicts,
+        DynamicBlock::PullRequests,
     ],
 };
 
@@ -232,14 +232,14 @@ pub const REVIEW_SESSION: ContextRecipe = ContextRecipe {
         DynamicBlock::Databases,
         DynamicBlock::WorkingDirectory,
         DynamicBlock::DataRoot,
-        DynamicBlock::PullRequests,
         DynamicBlock::Node,
         DynamicBlock::NodeObligations {
             note: OWN_OBLIGATIONS_NOTE,
         },
         DynamicBlock::AncestorContext,
-        DynamicBlock::ObligationVerdicts,
         DynamicBlock::ConfiguredSkills,
+        DynamicBlock::ObligationVerdicts,
+        DynamicBlock::PullRequests,
     ],
 };
 
@@ -318,15 +318,15 @@ pub const FIX_SESSION: ContextRecipe = ContextRecipe {
         DynamicBlock::Databases,
         DynamicBlock::WorkingDirectory,
         DynamicBlock::DataRoot,
-        DynamicBlock::PullRequests,
         DynamicBlock::Node,
-        DynamicBlock::ReviewFindings,
-        DynamicBlock::Plan,
         DynamicBlock::NodeObligations {
             note: OWN_OBLIGATIONS_NOTE,
         },
         DynamicBlock::AncestorContext,
         DynamicBlock::ConfiguredSkills,
+        DynamicBlock::Plan,
+        DynamicBlock::ReviewFindings,
+        DynamicBlock::PullRequests,
     ],
 };
 
@@ -357,7 +357,6 @@ pub const PHASE: ContextRecipe = ContextRecipe {
     blocks: &[
         DynamicBlock::Databases,
         DynamicBlock::DataRoot,
-        DynamicBlock::PullRequests,
         DynamicBlock::Node,
         DynamicBlock::NodeProcessFields,
         DynamicBlock::NodeObligations {
@@ -365,9 +364,10 @@ pub const PHASE: ContextRecipe = ContextRecipe {
                    not against the ancestor context below.",
         },
         DynamicBlock::AncestorContext,
+        DynamicBlock::ConfiguredSkills,
         DynamicBlock::Plan,
         DynamicBlock::WorkHistory,
-        DynamicBlock::ConfiguredSkills,
+        DynamicBlock::PullRequests,
     ],
 };
 
@@ -416,9 +416,9 @@ pub const FLEET_AUTONOMOUS: ContextRecipe = ContextRecipe {
     blocks: &[
         DynamicBlock::Databases,
         DynamicBlock::DataRoot,
-        DynamicBlock::PullRequests,
         DynamicBlock::Node,
         DynamicBlock::Workspace,
+        DynamicBlock::PullRequests,
     ],
 };
 
@@ -470,9 +470,9 @@ pub const CONVERSATION: ContextRecipe = ContextRecipe {
     blocks: &[
         DynamicBlock::Databases,
         DynamicBlock::DataRoot,
-        DynamicBlock::PullRequests,
         DynamicBlock::Focus,
         DynamicBlock::Environment,
+        DynamicBlock::PullRequests,
     ],
 };
 
@@ -500,9 +500,9 @@ pub const CHAT: ContextRecipe = ContextRecipe {
     blocks: &[
         DynamicBlock::Databases,
         DynamicBlock::DataRoot,
-        DynamicBlock::PullRequests,
         DynamicBlock::Focus,
         DynamicBlock::Environment,
+        DynamicBlock::PullRequests,
     ],
 };
 
@@ -526,13 +526,13 @@ pub const INCOMING_CHANGES: ContextRecipe = ContextRecipe {
     ],
     blocks: &[
         DynamicBlock::DataRoot,
-        DynamicBlock::PullRequests,
         DynamicBlock::Node,
-        DynamicBlock::IncomingChanges,
         DynamicBlock::NodeObligations {
             note: "This node's own, in full. Judge the incoming changes against these.",
         },
         DynamicBlock::Plan,
+        DynamicBlock::IncomingChanges,
+        DynamicBlock::PullRequests,
     ],
 };
 
@@ -873,6 +873,52 @@ missing"),
                 ancestors,
                 Some(idx + 1),
                 "{} must render AncestorContext directly after NodeObligations",
+                recipe.name
+            );
+        }
+    }
+
+    /// How long a block's text stays the same for sessions on a node, as a
+    /// rank: a lower one is identical for more sessions. Exhaustive on purpose,
+    /// so a new block must be placed.
+    fn stability(block: &DynamicBlock) -> u8 {
+        match block {
+            // The same for every session on this machine and node.
+            DynamicBlock::Databases | DynamicBlock::WorkingDirectory | DynamicBlock::DataRoot => 0,
+            // The same until the node is moved or retitled.
+            DynamicBlock::Node
+            | DynamicBlock::NodeProcessFields
+            | DynamicBlock::Focus
+            | DynamicBlock::Environment
+            | DynamicBlock::Workspace => 1,
+            // The same until the user edits them.
+            DynamicBlock::SelectedObligation { .. }
+            | DynamicBlock::NodeObligations { .. }
+            | DynamicBlock::AncestorContext => 2,
+            // The same for a phase until the configuration changes.
+            DynamicBlock::ConfiguredSkills => 3,
+            // Changes as the work goes on.
+            DynamicBlock::Plan => 4,
+            // Changes every round.
+            DynamicBlock::PullRequests
+            | DynamicBlock::ObligationVerdicts
+            | DynamicBlock::ReviewFindings
+            | DynamicBlock::WorkHistory
+            | DynamicBlock::IncomingChanges
+            | DynamicBlock::VisualDesign => 5,
+        }
+    }
+
+    /// The prompt cache holds a prefix only while it is byte-identical, so
+    /// every recipe orders its blocks from what is the same for every session
+    /// on a node to what changes each round (`doc/lifecycle/cache-measurement.md`).
+    #[test]
+    fn blocks_run_from_stable_to_volatile() {
+        for recipe in ALL_RECIPES {
+            let ranks: Vec<u8> = recipe.blocks.iter().map(stability).collect();
+            assert!(
+                ranks.windows(2).all(|w| w[0] <= w[1]),
+                "{}: blocks must run stable to volatile, got ranks {ranks:?}",
                 recipe.name
             );
         }

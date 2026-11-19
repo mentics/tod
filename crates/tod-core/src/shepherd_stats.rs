@@ -30,10 +30,11 @@
 //! written since it was introduced and may be trimmed, so every figure that
 //! comes from it is a count of what the journal holds (the sections say so).
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 use serde::Serialize;
 use std::collections::BTreeMap;
+use uuid::Uuid;
 
 /// What to look at: every node, or one slug, since a time.
 #[derive(Debug, Clone, Default)]
@@ -119,6 +120,21 @@ pub struct CostRow {
     pub tool_calls: u64,
     /// Time the sessions took, turn to turn, without idle gaps over 30 minutes (ms).
     pub wall_ms: i64,
+    /// What the agent reported spending (`tod_store::conversation_usage`),
+    /// for the turns that reported any: input not cached, cache reads, cache
+    /// writes and output tokens.
+    pub input_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub output_tokens: u64,
+}
+
+impl CostRow {
+    /// The share of the prompt tokens read from the cache, when any were counted.
+    pub fn cache_read_share(&self) -> Option<f64> {
+        let prompt = self.input_tokens + self.cache_read_tokens + self.cache_write_tokens;
+        (prompt > 0).then(|| self.cache_read_tokens as f64 / prompt as f64)
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -390,6 +406,14 @@ fn cost(conn: &Connection, f: &Filter) -> Result<Cost> {
             ..Default::default()
         });
         row.sessions += 1;
+        let usage = tod_store::conversation_usage::conversation_totals(
+            conn,
+            Uuid::from_slice(&id).context("a conversation id that is not a UUID")?,
+        )?;
+        row.input_tokens += usage.counts.input;
+        row.cache_read_tokens += usage.counts.cache_read;
+        row.cache_write_tokens += usage.counts.cache_write;
+        row.output_tokens += usage.counts.output;
         let stamps: Vec<i64> = stamp_stmt.query_map([&id], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
         let mut previous = created;
         for at in stamps {
@@ -419,12 +443,16 @@ fn cost(conn: &Connection, f: &Filter) -> Result<Cost> {
         t.agent_turns += r.agent_turns;
         t.tool_calls += r.tool_calls;
         t.wall_ms += r.wall_ms;
+        t.input_tokens += r.input_tokens;
+        t.cache_read_tokens += r.cache_read_tokens;
+        t.cache_write_tokens += r.cache_write_tokens;
+        t.output_tokens += r.output_tokens;
     }
     Ok(Cost {
         rows,
         by_phase: by_phase.into_values().collect(),
         unavailable: vec![
-            "tokens: the agent's token usage is not stored anywhere (only the turn text and its tool calls are)"
+            "tokens: counted per turn from when tod began recording them (`conversation_usage`), as the agent reported them; a session before that, or whose agent reports no usage, shows none (cache is the share of the prompt read from the prompt cache)"
                 .into(),
             "wall is the sum of the gaps from a session's start through its turns, leaving out any gap over 30 minutes (idle); it is time to a turn, not CPU or model time"
                 .into(),
@@ -828,6 +856,22 @@ fn ratio(r: Option<f64>) -> String {
     r.map(|r| format!("{:.0}%", r * 100.0)).unwrap_or_else(|| "n/a".into())
 }
 
+/// A row's tokens: `in <uncached> + <cache read> read + <cache write> write,
+/// <output> out, <share>% cached`, or `no tokens recorded`.
+fn tokens_text(r: &CostRow) -> String {
+    match r.cache_read_share() {
+        None if r.output_tokens == 0 => "no tokens recorded".to_string(),
+        share => format!(
+            "in {} + {} read + {} write, {} out, cached {}",
+            r.input_tokens,
+            r.cache_read_tokens,
+            r.cache_write_tokens,
+            r.output_tokens,
+            share.map_or("-".to_string(), |s| format!("{:.0}%", s * 100.0))
+        ),
+    }
+}
+
 fn notes(out: &mut String, unavailable: &[String]) {
     for u in unavailable {
         out.push_str(&format!("  not available: {u}\n"));
@@ -839,19 +883,19 @@ impl Stats {
     pub fn text(&self) -> String {
         let mut o = String::new();
         if let Some(c) = &self.cost {
-            o.push_str("COST per node and phase (sessions, agent turns, tool calls, wall)\n");
+            o.push_str("COST per node and phase (sessions, agent turns, tool calls, wall, tokens)\n");
             o.push_str("  by phase:\n");
             for r in &c.by_phase {
                 o.push_str(&format!(
-                    "    {:<28} {:>4} sessions {:>5} turns {:>6} tools {:>9}\n",
-                    r.phase, r.sessions, r.agent_turns, r.tool_calls, dur(r.wall_ms)
+                    "    {:<28} {:>4} sessions {:>5} turns {:>6} tools {:>9} {}\n",
+                    r.phase, r.sessions, r.agent_turns, r.tool_calls, dur(r.wall_ms), tokens_text(r)
                 ));
             }
             o.push_str("  by node:\n");
             for r in &c.rows {
                 o.push_str(&format!(
-                    "    {:<48} {:<22} {:>3} s {:>4} t {:>5} tools {:>8}\n",
-                    r.node, r.phase, r.sessions, r.agent_turns, r.tool_calls, dur(r.wall_ms)
+                    "    {:<48} {:<22} {:>3} s {:>4} t {:>5} tools {:>8} {}\n",
+                    r.node, r.phase, r.sessions, r.agent_turns, r.tool_calls, dur(r.wall_ms), tokens_text(r)
                 ));
             }
             notes(&mut o, &c.unavailable);

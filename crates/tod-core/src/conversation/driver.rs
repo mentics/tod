@@ -158,6 +158,9 @@ struct Run {
     sandbox: Option<String>,
     /// Where the agent runs, so its session log can be kept for a move.
     workdir: Workdir,
+    /// What the session had reported spending before this turn, so the
+    /// turn's own spending is the difference (`ConversationDriver::record_usage`).
+    usage_before: tod_agent::TokenCounts,
 }
 
 pub struct ConversationDriver {
@@ -680,6 +683,43 @@ impl ConversationDriver {
         events
     }
 
+    /// Records what the turn that just ended spent
+    /// (`tod_store::conversation_usage`): what the session reports now less
+    /// what it reported when the turn started, or the whole of it when it
+    /// reports less than before (a session that started over).
+    fn record_usage<A: AgentAccess + ?Sized>(
+        &self,
+        fleet: &FleetStore,
+        agent: &mut A,
+        run: &Run,
+        conversation: Uuid,
+    ) -> Result<()> {
+        let Some(now) = agent.with(|a| a.session_token_usage(&run.key)) else {
+            return Ok(());
+        };
+        let counts = usage_delta(&now.total, &run.usage_before);
+        if counts.is_empty() {
+            return Ok(());
+        }
+        let model = now
+            .model
+            .clone()
+            .or_else(|| now.agent_model.clone())
+            .or_else(|| self.launched.as_ref().map(|l| l.model.clone()));
+        let phase = crate::conversation::launch::phase_for(fleet, self.focus, self.protocol.kind());
+        fleet
+            .enqueue(tod_store::fleet::FleetMutation::RecordTurnUsage(
+                tod_store::conversation_usage::TurnUsage {
+                    conversation_id: conversation,
+                    at_ms: tod_store::outline::uuid_blob::now_ms(),
+                    phase,
+                    model,
+                    counts,
+                },
+            ))
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
     fn poll<A: AgentAccess + ?Sized>(
         &mut self,
         fleet: &FleetStore,
@@ -723,6 +763,12 @@ impl ConversationDriver {
         let id = self
             .conversation_id
             .context("a run without a conversation")?;
+        // The turn ended, well or not: either way it spent tokens.
+        if let Err(err) = self.record_usage(fleet, agent, &run, id) {
+            events.push(ConversationEvent::Notice(RunNotice::Error(format!(
+                "could not record the turn's token usage: {err:#}"
+            ))));
+        }
         let chars = agent
             .with(|a| a.session_context_chars(&run.key))
             .unwrap_or(run.chars_at_start);
@@ -1381,10 +1427,11 @@ impl ConversationDriver {
             env: turn_env,
             environment,
         };
-        let (chars_at_start, handle, chars_sent) = agent.with(|a| {
+        let (chars_at_start, handle, chars_sent, usage_before) = agent.with(|a| {
             let before = a.session_context_chars(&key).unwrap_or(0);
+            let usage_before = a.session_token_usage(&key).map(|u| u.total).unwrap_or_default();
             let handle = a.send_session_turn(turn);
-            (before, handle, a.session_context_chars(&key).unwrap_or(0))
+            (before, handle, a.session_context_chars(&key).unwrap_or(0), usage_before)
         });
         let handle = match handle {
             Ok(handle) => handle,
@@ -1410,6 +1457,7 @@ impl ConversationDriver {
             session_saved: false,
             sandbox,
             workdir,
+            usage_before,
         });
         self.start_lease(fleet);
         crate::journey::record(
@@ -1638,3 +1686,48 @@ mod test_hooks {
 
 #[cfg(test)]
 pub(crate) use test_hooks::set_cwd_error;
+
+/// What a session spent between two readings of its running total.
+fn usage_delta(now: &tod_agent::TokenCounts, before: &tod_agent::TokenCounts) -> tod_agent::TokenCounts {
+    let restarted = now.input < before.input
+        || now.output < before.output
+        || now.cache_read < before.cache_read
+        || now.cache_write < before.cache_write;
+    if restarted {
+        return now.clone();
+    }
+    tod_agent::TokenCounts {
+        requests: now.requests.saturating_sub(before.requests),
+        input: now.input - before.input,
+        output: now.output - before.output,
+        cache_read: now.cache_read - before.cache_read,
+        cache_write: now.cache_write - before.cache_write,
+        cache_write_5m: now.cache_write_5m.saturating_sub(before.cache_write_5m),
+        cache_write_1h: now.cache_write_1h.saturating_sub(before.cache_write_1h),
+        thinking: now.thinking.saturating_sub(before.thinking),
+        web_searches: now.web_searches.saturating_sub(before.web_searches),
+        web_fetches: now.web_fetches.saturating_sub(before.web_fetches),
+    }
+}
+
+#[cfg(test)]
+mod usage_delta_tests {
+    use super::*;
+    use tod_agent::TokenCounts;
+
+    fn counts(input: u64, read: u64, write: u64, output: u64) -> TokenCounts {
+        TokenCounts { input, cache_read: read, cache_write: write, output, ..Default::default() }
+    }
+
+    #[test]
+    fn a_turn_is_the_growth_of_the_running_total() {
+        let d = usage_delta(&counts(15, 900, 1100, 90), &counts(10, 0, 1000, 50));
+        assert_eq!((d.input, d.cache_read, d.cache_write, d.output), (5, 900, 100, 40));
+    }
+
+    #[test]
+    fn a_total_that_went_down_is_a_session_that_started_over() {
+        let d = usage_delta(&counts(3, 0, 500, 9), &counts(10, 0, 1000, 50));
+        assert_eq!((d.input, d.cache_write, d.output), (3, 500, 9));
+    }
+}
