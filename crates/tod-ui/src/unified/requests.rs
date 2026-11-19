@@ -201,7 +201,13 @@ fn edit_preview(decision: &Decision) -> Option<String> {
     if decision.edits.is_empty() {
         return None;
     }
-    let mut out = String::from("Answering edits the obligations as your own change (reversible in the change set):");
+    let mut out = if decision.conversation_id.is_some() {
+        String::from(
+            "Answering edits the obligations as your own change (listed in the asking conversation's change set, where it can be reversed):",
+        )
+    } else {
+        String::from("Answering edits the obligations as your own change:")
+    };
     for edit in &decision.edits {
         out.push_str(&format!(
             "\n\n**Option {}** changes obligation {}",

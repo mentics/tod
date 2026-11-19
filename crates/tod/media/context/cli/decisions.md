@@ -48,7 +48,8 @@ in full or as the 8-character prefix listings show.
   approach and an obligation names the approach it replaces (a check, a
   mechanism, a name, a number), put the obligation's new text on that option.
   The user sees the edit beside the option, and answering applies it as their
-  own edit (it shows in the change set and can be reversed), so you never ask
+  own edit (recorded in your conversation's change set, where it can be
+  reversed), so you never ask
   a second time to "update the obligations to match". Give the full new text
   of the obligation, and the edit to every obligation the option makes stale;
   an option that leaves them true carries none. The edits of the option the

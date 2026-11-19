@@ -160,7 +160,16 @@ fn answer_with_reopen(
     // The obligation edits the option carries are made with the answer
     // (`InterviewCommand::AnswerDecision`); one that no longer fits must fail
     // before the task is moved, so nothing is half done.
-    if decision.status == DECISION_PENDING {
+    if option.is_some_and(|o| !decision.edits_for(o).is_empty()) {
+        if decision.status == DECISION_WITHDRAWN {
+            bail!("decision {decision_id} was withdrawn");
+        }
+        if decision.status != DECISION_PENDING {
+            bail!(
+                "this request was already answered; a changed answer does not edit obligations, so this option's \
+                 edits are not made: edit them in the obligations panel if they are still wanted"
+            );
+        }
         fleet.read(|conn| DecisionRepo::new(conn).pending_edits(&decision, option))?;
     }
     let mut moved_to = None;
@@ -299,21 +308,49 @@ mod tests {
     }
 
     fn ask_with_edits(fx: &Fixture, edits: Vec<OptionEdit>) -> anyhow::Result<Uuid> {
+        ask_with_edits_in(fx, None, edits, Vec::new())
+    }
+
+    fn ask_with_edits_in(
+        fx: &Fixture,
+        conversation_id: Option<Uuid>,
+        edits: Vec<OptionEdit>,
+        moves: Vec<OptionMove>,
+    ) -> anyhow::Result<Uuid> {
         let value = fx.fleet.interview(
             ACTOR_USER,
             InterviewCommand::AskDecision {
                 node_id: fx.node,
-                conversation_id: None,
+                conversation_id,
                 protocol: Some("verify".into()),
                 decision: NewDecision {
                     question: "Which check tells a refresh from an edit?\n\nBackground.".into(),
                     options: vec!["Use last_synced_at".into(), "Use the in-memory comparison".into()],
                     edits,
+                    moves,
                     ..Default::default()
                 },
             },
         )?;
         Ok(Uuid::parse_str(value["id"].as_str().unwrap())?)
+    }
+
+    fn conversation(fx: &Fixture) -> Uuid {
+        let id = Uuid::new_v4();
+        fx.fleet
+            .interview(
+                ACTOR_USER,
+                InterviewCommand::CreateConversation {
+                    id,
+                    focus: tod_store::conversation::Focus::Node(fx.node),
+                    protocol: tod_store::conversation::ProtocolKind::Verification,
+                    platform: None,
+                    model: None,
+                    effort: None,
+                },
+            )
+            .unwrap();
+        id
     }
 
     fn edit(option: i64, obligation_id: Uuid, body: &str) -> OptionEdit {
@@ -372,6 +409,75 @@ mod tests {
             .unwrap();
         assert_eq!(recorded, 1, "the edit is in the change log as the user's");
         assert_eq!(pending(&fx), 0);
+    }
+
+
+    /// The edit is in the asking conversation's change set, and reversing it
+    /// there brings the old text back.
+    #[test]
+    fn an_answers_obligation_edit_is_in_the_asking_conversations_change_set_and_reverses() {
+        let fx = fixture();
+        let one = obligation(&fx, "Tell a refresh from an edit by last_synced_at");
+        crate::lifecycle::set_lifecycle(&fx.fleet, fx.node, "verifying").unwrap();
+        let conv = conversation(&fx);
+        let id = ask_with_edits_in(
+            &fx,
+            Some(conv),
+            vec![edit(2, one, "Tell a refresh from an edit by the in-memory comparison")],
+            Vec::new(),
+        )
+        .unwrap();
+
+        answer_decision(&fx.fleet, id, Some(2), None).unwrap();
+
+        assert_eq!(body_of(&fx, one), "Tell a refresh from an edit by the in-memory comparison");
+        let changes = fx
+            .fleet
+            .read(|conn| tod_store::conversation::net_changes(conn, conv))
+            .unwrap();
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        let actions = fx
+            .fleet
+            .read(|conn| tod_store::conversation::ConversationRepo::new(conn).actions(conv))
+            .unwrap();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].actor, tod_store::conversation::ActionActor::User);
+        fx.fleet
+            .interview(
+                ACTOR_USER,
+                InterviewCommand::ReverseConversationActions {
+                    conversation_id: conv,
+                    action_ids: vec![actions[0].id],
+                    include_dependents: true,
+                    force: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(body_of(&fx, one), "Tell a refresh from an edit by last_synced_at");
+    }
+
+    /// Every refusal comes before the node moves: a changed answer to an option
+    /// that both moves the node and edits an obligation moves nothing.
+    #[test]
+    fn a_changed_answer_to_an_option_with_a_move_and_an_edit_is_refused_before_the_node_moves() {
+        let fx = fixture();
+        in_review_with_verified_steps(&fx);
+        let one = obligation(&fx, "Old text");
+        let id = ask_with_edits_in(
+            &fx,
+            None,
+            vec![edit(2, one, "New text")],
+            vec![OptionMove { option: 2, to: "active".into(), asked_in: None }],
+        )
+        .unwrap();
+        answer_decision(&fx.fleet, id, Some(1), None).unwrap();
+        assert_eq!(current_state(&fx.fleet, fx.node).unwrap(), "review");
+
+        let err = answer_decision(&fx.fleet, id, Some(2), None).unwrap_err();
+
+        assert!(format!("{err:#}").contains("does not edit obligations"), "{err:#}");
+        assert_eq!(current_state(&fx.fleet, fx.node).unwrap(), "review", "the node did not move");
+        assert_eq!(body_of(&fx, one), "Old text");
     }
 
     #[test]

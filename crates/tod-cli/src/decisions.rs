@@ -45,7 +45,8 @@ must be before the node's current state and before pr_review.
 --edit-obligation makes option N change an obligation of the node to
 NEW_TEXT when the user picks it (an obligation may be given as its 8-character
 prefix; repeat the flag for more than one): the app edits it itself, as the
-user's own edit, so the change set shows it and it can be reversed.
+user's own edit, recorded in the asking conversation's change set, where it
+can be reversed.
 --blocks links a plan step of the node that this question holds up (one cause,
 one request): the user answers once, the step opens again, and the question and
 its steps show as one request. A question already answered on the node in the

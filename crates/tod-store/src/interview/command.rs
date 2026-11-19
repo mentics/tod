@@ -1097,9 +1097,34 @@ pub fn execute(
                              this option's edits are not made: edit them in the obligations panel if they are still wanted"
                         );
                     }
+                    // Recorded against the asking conversation as the user's
+                    // own action, so that conversation's change set lists the
+                    // edit and it can be reversed there. A decision with no
+                    // conversation (or one since deleted) has no change set:
+                    // the edit is then logged as the user's direct edit.
+                    let conversations = crate::conversation::ConversationRepo::new(conn);
+                    let asking = match found.conversation_id {
+                        Some(id) => conversations.get(id)?.map(|c| c.id),
+                        None => None,
+                    };
                     for (obligation_id, body) in decisions.pending_edits(&found, *option)? {
                         let mutation = OutlineMutation::UpdateObligationBody { obligation_id, body };
-                        crate::conversation::record_direct(conn, ACTOR_USER, &mutation, media_root)?;
+                        match asking {
+                            Some(conversation_id) => {
+                                let turn_seq = conversations.max_user_seq(conversation_id)?;
+                                crate::conversation::record_and_execute(
+                                    conn,
+                                    conversation_id,
+                                    crate::conversation::ActionActor::User,
+                                    turn_seq,
+                                    mutation,
+                                    media_root,
+                                )?;
+                            }
+                            None => {
+                                crate::conversation::record_direct(conn, ACTOR_USER, &mutation, media_root)?;
+                            }
+                        }
                     }
                 }
             }
