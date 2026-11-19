@@ -261,6 +261,37 @@ pub fn close_done_nodes(fleet: &FleetStore) -> Result<Vec<Uuid>> {
         .collect())
 }
 
+/// A run row that says the node waits on a request while the node has none
+/// pending (gap 67): answered, withdrawn, or synced from a machine that never
+/// saw it go. The row is the one record every runner shares, so the check is
+/// on it, not on any one runner's memory of its last outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleRequestWait {
+    pub node: Uuid,
+    /// When the row began (ms).
+    pub since: i64,
+}
+
+/// The nodes whose run row is a request wait with no request left to wait
+/// on (`attention`: pending decisions, handed-back steps, open findings).
+/// Their age (`now - since`) is the statistic that shows the fault sooner:
+/// the oldest such wait should always be about one daemon tick.
+pub fn stale_request_waits(fleet: &FleetStore) -> Result<Vec<StaleRequestWait>> {
+    fleet.read(|conn| {
+        let rows: Vec<RunState> = tod_store::run_state::list_waiting(conn)?
+            .into_iter()
+            .filter(|r| r.reason_kind == kind::REQUEST)
+            .collect();
+        let ids: Vec<Uuid> = rows.iter().map(|r| r.node_id).collect();
+        let asking = crate::attention::for_nodes(conn, &ids)?;
+        Ok(rows
+            .into_iter()
+            .filter(|r| asking.get(&r.node_id).is_none_or(|a| a.waiting_since.is_none()))
+            .map(|r| StaleRequestWait { node: r.node_id, since: r.since })
+            .collect())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

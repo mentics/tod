@@ -339,12 +339,57 @@ impl Runners {
     /// reconcile what is desired with what is happening.
     fn tick(&self) {
         self.start_due();
+        self.resume_stale_request_waits();
         if let Err(err) = self.reconcile() {
             tracing::error!("reconciling the runs failed: {err:#}");
         }
         // After `start_due` has seen each node waiting, so the next tick sees
         // its request gone and continues the run.
         self.recheck_requests();
+    }
+
+    /// A run row that says "waiting on a request" while none is pending
+    /// (gap 67) is stale whatever this daemon remembers of the run: it may
+    /// have been answered while the slot held no outcome, withdrawn by the
+    /// agent, or synced from another machine. Continue the run, which
+    /// rewrites the row. Reported with its age, so a wait that outlives a
+    /// tick is never silent. A run the user paused or stopped is theirs.
+    fn resume_stale_request_waits(&self) {
+        let stale = match tod_core::run_state::stale_request_waits(&self.inner.store) {
+            Ok(stale) => stale,
+            Err(err) => {
+                tracing::error!("could not look for request waits with no request: {err:#}");
+                return;
+            }
+        };
+        let now = now_ms();
+        for wait in stale {
+            let node = wait.node;
+            {
+                let slots = self.inner.slots.lock().expect("runner slots");
+                if let Some(slot) = slots.get(&node)
+                    && (slot.run.is_some() || slot.starting || matches!(slot.desired, Desired::Pause | Desired::Stop))
+                {
+                    continue;
+                }
+            }
+            match RunnerPlace::of(&self.inner.store, node) {
+                Ok(RunnerPlace::Local) => {}
+                // Not this daemon's run: its supervisor owns it.
+                Ok(RunnerPlace::Supervisor) => {
+                    tracing::error!(%node, age_ms = now - wait.since, "a run in a sandbox waits on a request that is gone; only its supervisor can continue it");
+                    continue;
+                }
+                Err(err) => {
+                    tracing::error!(%node, "could not tell where a stale request wait belongs: {err:#}");
+                    continue;
+                }
+            }
+            tracing::warn!(%node, age_ms = now - wait.since, "the run waits on a request that is gone; continuing");
+            if let Err(err) = self.start_auto(node) {
+                tracing::error!(%node, "could not continue a run whose request is gone: {err:#}");
+            }
+        }
     }
 
     fn start_due(&self) {
@@ -660,6 +705,16 @@ impl Runners {
         if let Err(err) = saved {
             // The slot still says it; only a restart would lose it.
             tracing::error!(%node, "could not save the failure of the run's start ({reason}): {err:#}");
+        }
+        // The run's row says the same, so an older "waiting on a request"
+        // never outlives the failed start (and is not retried every tick).
+        if let Err(err) = tod_core::run_state::record(
+            &self.inner.store,
+            node,
+            tod_core::run_state::runner_failed(&reason[FAILED_PREFIX.len()..]),
+            "local",
+        ) {
+            tracing::error!(%node, "could not record the failure of the run's start in its run state: {err:#}");
         }
         {
             let mut slots = self.inner.slots.lock().expect("runner slots");
@@ -1172,6 +1227,69 @@ mod tests {
             "{:?}",
             slot.outcome
         );
+    }
+
+    /// Gap 67: the run row said "waiting on 1 question(s)" for 27 hours after
+    /// the request was answered, because this daemon's slot held no outcome
+    /// for the node (restart, sync). The row alone is enough to continue it,
+    /// whether the request was answered or withdrawn.
+    #[test]
+    fn a_request_wait_row_with_no_request_pending_is_left_without_a_user_action() {
+        use tod_core::run_state::{kind, record};
+        use tod_store::interview::InterviewCommand;
+        use tod_store::run_state::{Draft, Phase};
+        for how in ["answered", "withdrawn"] {
+            let fx = fixture();
+            let store = &fx.runners.inner.store;
+            let stale = || tod_core::run_state::stale_request_waits(store).unwrap().iter().any(|w| w.node == fx.node);
+            record(
+                store,
+                fx.node,
+                Draft {
+                    phase: Phase::Waiting,
+                    reason_kind: kind::REQUEST.into(),
+                    reason_text: "the agent is waiting on 1 question(s) only you can answer".into(),
+                    resumable_by: tod_store::run_state::RESUMABLE_BY_YOU.into(),
+                },
+                "local",
+            )
+            .unwrap();
+            let asked = store
+                .interview(
+                    "agent",
+                    InterviewCommand::AskDecision {
+                        node_id: fx.node,
+                        conversation_id: None,
+                        protocol: None,
+                        decision: tod_store::decisions::NewDecision {
+                            question: "heap?".into(),
+                            options: vec!["1g".into(), "2g".into()],
+                            ..Default::default()
+                        },
+                    },
+                )
+                .unwrap();
+            store.reload_if_stale().unwrap();
+            assert!(!stale(), "a pending request is a real wait");
+            fx.runners.resume_stale_request_waits();
+            let row = store.read(|c| tod_store::run_state::get(c, fx.node)).unwrap().unwrap();
+            assert_eq!(row.reason_kind, kind::REQUEST, "left alone while pending");
+            let decision_id: Uuid = asked["id"].as_str().unwrap().parse().unwrap();
+            let command = if how == "answered" {
+                InterviewCommand::AnswerDecision { decision_id, option: Some(1), text: None }
+            } else {
+                InterviewCommand::WithdrawDecision { decision_id }
+            };
+            store.interview("user", command).unwrap();
+            store.reload_if_stale().unwrap();
+            assert!(stale(), "{how}: the row still says it waits");
+            fx.runners.resume_stale_request_waits();
+            // The run was started again (it fails here for want of media, and
+            // says so), so the row no longer says it waits on a request.
+            let row = store.read(|c| tod_store::run_state::get(c, fx.node)).unwrap().unwrap();
+            assert_ne!(row.reason_kind, kind::REQUEST, "{how}: {row:?}");
+            assert!(!stale(), "{how}");
+        }
     }
 
     #[test]
