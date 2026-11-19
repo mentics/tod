@@ -352,6 +352,10 @@ pub struct Facts<'a> {
     pub cloud: Option<&'a CloudBeat>,
     /// The node's cloud sandbox is gone.
     pub cloud_lost: Option<CloudLost>,
+    /// The node runs under a supervisor in a cloud sandbox (it has a cloud
+    /// row or a heartbeat). The local runner's own waits (`git:push`) are not
+    /// served by anything then, and are ignored rather than read as overdue.
+    pub supervised: bool,
     /// What the node's runner last said it was doing (`tod_store::run_state`),
     /// when it said anything: a supervisor or app built before the table
     /// writes none, and the heartbeat and saved run speak instead.
@@ -394,8 +398,10 @@ pub fn for_nodes(
     // Cloud nodes: a sandbox that is gone, and the answer to the latest stop
     // question (only for a node whose sandbox is there to be stopped).
     let mut lost: HashMap<Uuid, CloudLost> = HashMap::new();
+    let mut supervised: std::collections::HashSet<Uuid> = cloud.keys().copied().collect();
     let mut stop_answers: HashMap<Uuid, StopAnswer> = HashMap::new();
     for row in tod_store::cloud_nodes::list(conn)?.into_iter().filter(|r| node_ids.contains(&r.node_id)) {
+        supervised.insert(row.node_id);
         if let Some(since) = row.lost_at {
             lost.insert(row.node_id, CloudLost { since, deleted_by_user: inputs.deleted_sandboxes.contains(&row.node_id) });
         } else if let Some(latest) = crate::stop_questions::latest(conn, row.node_id)?
@@ -433,6 +439,7 @@ pub fn for_nodes(
             leases: leases.get(&node_id).map(Vec::as_slice).unwrap_or(&[]),
             cloud: cloud.get(&node_id),
             cloud_lost: lost.get(&node_id).copied(),
+            supervised: supervised.contains(&node_id),
             run_state: run_states.get(&node_id),
             stop_answer: stop_answers.get(&node_id),
             run: inputs.runs.get(&node_id).unwrap_or(&no_run),
@@ -789,7 +796,10 @@ fn actor_for(facts: &Facts<'_>) -> (NextActor, i64) {
         .iter()
         .filter(|w| {
             let ends = GiveUp::for_kind(&w.kind).is_some_and(GiveUp::ends_with_stay);
-            !(ends && w.stay.is_some_and(|stay| stay != facts.entered_at))
+            let moved_on = ends && w.stay.is_some_and(|stay| stay != facts.entered_at);
+            // The local runner's push wait: nothing in a sandbox serves it.
+            let local_only = facts.supervised && w.match_spec == crate::autopilot::PUSH_WAIT_SPEC;
+            !(moved_on || local_only)
         })
         .collect();
     // A look at the outside that failed as often as it may (or in a way
@@ -1067,6 +1077,7 @@ mod tests {
             leases: &c.leases,
             cloud: c.cloud.as_ref(),
             cloud_lost: c.cloud_lost,
+            supervised: c.cloud.is_some() || c.cloud_lost.is_some(),
             run_state: c.run_state.as_ref(),
             stop_answer: c.stop_answer.as_ref(),
             run: &c.run,
@@ -1631,6 +1642,23 @@ mod tests {
             panic!("not the user's")
         };
         assert!(reason.contains("a review") && reason.contains("nothing is looking"), "{reason}");
+    }
+
+    /// The local runner's `git:push` wait has no retrier in a sandbox: it is
+    /// ignored there, never read as overdue ("nothing is looking at it").
+    #[test]
+    fn the_local_push_wait_of_a_node_in_a_sandbox_is_ignored() {
+        let mut c = case("implementing");
+        c.waits = vec![wait(crate::autopilot::PUSH_WAIT_SPEC, NOW - 30 * 60_000, NOW - 31 * 60_000)];
+        // On this machine the same wait is overdue, and says so.
+        let NextActor::You { why: YouReason::Stopped { reason }, .. } = standing(&c).actor else {
+            panic!("an overdue push wait on this machine is the user's")
+        };
+        assert!(reason.contains("nothing is looking at it"), "{reason}");
+        // Under a supervisor nothing serves it, so it holds nothing.
+        c.cloud_lost = Some(CloudLost { since: NOW - 1, deleted_by_user: false });
+        let NextActor::You { why, .. } = standing(&c).actor else { panic!("not the user's") };
+        assert!(!matches!(&why, YouReason::Stopped { reason } if reason.contains("nothing is looking")), "{why:?}");
     }
 
     #[test]

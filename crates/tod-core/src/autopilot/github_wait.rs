@@ -180,18 +180,47 @@ pub fn github_look_failed(
 /// (`autopilot::local`): one per node, replaced by the push that succeeds.
 pub const PUSH_WAIT_SPEC: &str = "git:push";
 
-/// Pushing the node's branch at a step boundary failed with `error` (which
-/// names the repository: the checkout, or a submodule). Records it on the
-/// node's `git:push` wait, so it counts and shows (`tod_core::next_actor`),
-/// and says how the run ends:
-/// - a failure asking again may fix (network, GitHub down) → waiting, naming
-///   the error and the attempt, with the backoff of [`retry_delay_ms`];
-/// - anything else (rejected, authentication, a protected branch), or the
-///   last attempt → stopped failed with the exact error, which puts the node
-///   on the user's list.
+/// Who tries a failed push again. A `git:push` wait is the local runner's: it
+/// never outlives whatever will retry it (a wait nothing serves goes past due
+/// and reads as "You: nothing is looking at it").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushRetrier {
+    /// The run does: it stops at a step boundary and ends as a wait the
+    /// daemon resumes at the time given, or it ends as `Waiting` for another
+    /// reason the daemon resumes (the run-end push, see
+    /// `local::push_at_run_end`). The wait is due at the next try.
+    Run,
+    /// Nothing is scheduled: the run ends for a reason that does not resume by
+    /// itself (a request, a pause, a stop). The failure is a plain error on
+    /// the node, with its attempt counted, and the next push, when the run
+    /// goes on, clears or counts it. It is due far off, so it is never
+    /// overdue before then.
+    NextPush,
+}
+
+/// How long to wait before pushing again after the `attempt`th failure in a
+/// row: 60 s, doubling, so that the five attempts of
+/// [`tod_store::waits::DEFAULT_MAX_ATTEMPTS`] span 15 minutes (a GitHub or
+/// network outage of that length costs a node nothing).
+pub fn push_retry_delay_ms(attempt: u32) -> i64 {
+    (60_000i64 << attempt.min(4)).min(10 * 60 * 1000)
+}
+
+/// Due date of a [`PushRetrier::NextPush`] failure.
+const NEXT_PUSH_DUE_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+
+/// Pushing the node's branch failed with `error` (which names the repository:
+/// the checkout, or a submodule). Records it on the node's `git:push` wait,
+/// so it counts and shows (`tod_core::next_actor`), and says how the run ends:
+/// - a failure that is not known to be persistent
+///   (`provision::is_transient_push_error`, which is everything but a
+///   refusal) → waiting, naming the error and the attempt, with the backoff
+///   of [`push_retry_delay_ms`]; the last attempt is a failure;
+/// - a refusal, or the last attempt → stopped failed with the exact error,
+///   which puts the node on the user's list.
 ///
 /// The one place a failed push is handled; it is never only logged.
-pub fn branch_push_failed(fleet: &FleetStore, node: uuid::Uuid, error: &str) -> Result<Outcome> {
+pub fn branch_push_failed(fleet: &FleetStore, node: uuid::Uuid, error: &str, retrier: PushRetrier) -> Result<Outcome> {
     let now = chrono::Utc::now().timestamp_millis();
     let existing = fleet
         .read(|conn| WaitRepo::new(conn).list_pending_for_node(node))?
@@ -205,7 +234,7 @@ pub fn branch_push_failed(fleet: &FleetStore, node: uuid::Uuid, error: &str) -> 
                     ACTOR,
                     InterviewCommand::RecordWait {
                         node_id: node,
-                        wait: NewWait::event(PUSH_WAIT_SPEC, now + retry_delay_ms(0))
+                        wait: NewWait::event(PUSH_WAIT_SPEC, now + push_retry_delay_ms(0))
                             .with_detail("pushing the branch to GitHub"),
                     },
                 )
@@ -217,7 +246,10 @@ pub fn branch_push_failed(fleet: &FleetStore, node: uuid::Uuid, error: &str) -> 
             (id, 0)
         }
     };
-    let retry_due_at = tod_store::fleet::provision::is_transient_push_error(error).then(|| now + retry_delay_ms(attempt));
+    let retry_due_at = tod_store::fleet::provision::is_transient_push_error(error).then(|| match retrier {
+        PushRetrier::Run => now + push_retry_delay_ms(attempt),
+        PushRetrier::NextPush => now + NEXT_PUSH_DUE_MS,
+    });
     let result = fleet
         .interview(
             ACTOR,
@@ -225,17 +257,24 @@ pub fn branch_push_failed(fleet: &FleetStore, node: uuid::Uuid, error: &str) -> 
         )
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let exhausted = result["exhausted"].as_bool().unwrap_or(true);
+    let (attempt, max) = (result["attempt"].as_u64().unwrap_or(1), result["max_attempts"].as_u64().unwrap_or(0));
     match (exhausted, retry_due_at) {
-        (false, Some(due_at_ms)) => {
-            let attempt = result["attempt"].as_u64().unwrap_or(1);
-            let max = result["max_attempts"].as_u64().unwrap_or(0);
-            Ok(Outcome::Waiting {
-                what: format!("GitHub did not take the branch ({attempt} of {max}): {error}"),
-                due_at_ms,
-            })
-        }
-        _ => Ok(Outcome::Stopped {
+        (false, Some(_)) if retrier == PushRetrier::NextPush => Ok(Outcome::Stopped {
+            reason: format!("the branch could not be pushed to GitHub ({attempt} of {max}): {error}"),
+        }),
+        (false, Some(due_at_ms)) => Ok(Outcome::Waiting {
+            what: format!("GitHub did not take the branch ({attempt} of {max}): {error}"),
+            due_at_ms,
+        }),
+        // A refusal is the same on every try: no count to give.
+        (_, None) => Ok(Outcome::Stopped {
             reason: format!("{}the branch could not be pushed to GitHub: {error}", crate::autopilot::local::FAILED_PREFIX),
+        }),
+        _ => Ok(Outcome::Stopped {
+            reason: format!(
+                "{}the branch could not be pushed to GitHub (after {attempt} of {max} tries): {error}",
+                crate::autopilot::local::FAILED_PREFIX
+            ),
         }),
     }
 }

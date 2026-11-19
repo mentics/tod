@@ -25,7 +25,7 @@
 
 mod github_wait;
 pub use github_wait::{
-    GithubCheck, PUSH_WAIT_SPEC, branch_push_failed, branch_push_ok, check_github, check_now, github_look_failed, look_failed_next_look, read_wait_spec,
+    GithubCheck, PUSH_WAIT_SPEC, PushRetrier, branch_push_failed, push_retry_delay_ms, branch_push_ok, check_github, check_now, github_look_failed, look_failed_next_look, read_wait_spec,
     retry_delay_ms,
 };
 pub mod local;

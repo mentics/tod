@@ -4,6 +4,9 @@
 
 use super::lost_work::{git_in, workspace_is_a_clone};
 use super::*;
+use crate::autopilot::PushRetrier;
+use crate::autopilot::local::{Hook, LocalEvent, PAUSED, PUSH_RETRY, Request, push_at_run_end, push_retry_as_wait};
+use std::sync::atomic::{AtomicBool, AtomicU8};
 
 /// The node's worktree is the clone, so `push_node_branch` has a branch to push.
 fn node_works_in(fx: &Fixture, workspace: &std::path::Path) {
@@ -79,8 +82,199 @@ fn a_push_the_remote_refuses_stops_the_run_failed_with_git_s_words_and_the_repos
     assert!(push_waits(&fx).is_empty(), "a push that succeeds clears the failure");
 }
 
+/// The runner's hook, as `LocalRun` builds it.
+fn hook<'a>(fx: &Fixture, sink: &'a mut dyn FnMut(LocalEvent)) -> Hook<'a, &'a mut dyn FnMut(LocalEvent)> {
+    Hook::new(
+        fx.node,
+        fx.fleet.clone(),
+        Arc::new(AtomicU8::new(Request::Run as u8)),
+        Arc::new(AtomicBool::new(false)),
+        Box::leak(Box::new(sink)),
+    )
+}
+
+/// A checkout with a commit to push and a remote that can be made to fail
+/// the way the network does (`origin` pointing nowhere) and recover.
+struct Outage {
+    workspace: PathBuf,
+    origin: PathBuf,
+}
+
+impl Outage {
+    fn new(fx: &Fixture) -> Self {
+        let workspace = workspace_is_a_clone(fx);
+        node_works_in(fx, &workspace);
+        git_in(&workspace, &["commit", "-q", "--allow-empty", "-m", "the fix"]);
+        Self { workspace, origin: fx.root.join("origin.git") }
+    }
+    fn down(&self) {
+        git_in(&self.workspace, &["remote", "set-url", "origin", self.workspace.join("nowhere.git").to_str().unwrap()]);
+    }
+    fn up(&self) {
+        git_in(&self.workspace, &["remote", "set-url", "origin", self.origin.to_str().unwrap()]);
+    }
+}
+
+fn run_at_step(hook: &mut Hook<'_, impl FnMut(LocalEvent)>, fx: &Fixture) -> Option<String> {
+    use crate::autopilot::StepHook;
+    hook.at(&fx.fleet, Boundary::Step).unwrap()
+}
+
+fn log_of(dir: &std::path::Path, branch: &str) -> String {
+    let out = std::process::Command::new("git").arg("-C").arg(dir).args(["log", "--format=%s", branch]).output().unwrap();
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
 #[test]
-fn a_diverged_branch_names_the_repository_and_is_never_forced() {
+fn an_outage_within_the_budget_never_fails_the_node_and_counts_the_real_attempts() {
+    let fx = setup();
+    let outage = Outage::new(&fx);
+    outage.down();
+    let mut sink = |_: LocalEvent| {};
+    let mut hook = hook(&fx, &mut sink);
+    let max = tod_store::waits::DEFAULT_MAX_ATTEMPTS as usize;
+    // The longest outage that is still within budget: one attempt short of it.
+    for attempt in 1..max {
+        let stopped = run_at_step(&mut hook, &fx);
+        assert_eq!(stopped.as_deref(), Some(PUSH_RETRY), "attempt {attempt} waits, never fails");
+        // The run ends as the wait, the way `LocalRun` ends it.
+        let (what, due) = hook.push_retry.take().expect("what to say and when");
+        assert!(what.contains(&format!("({attempt} of {max})")), "{what}");
+        assert!(due > chrono::Utc::now().timestamp_millis());
+        let ended = push_retry_as_wait(
+            fx.fleet.paths().root(),
+            fx.node,
+            Outcome::Stopped { reason: PUSH_RETRY.into() },
+            Some((what, due)),
+        )
+        .unwrap();
+        assert!(matches!(ended, Outcome::Waiting { .. }), "{ended:?}");
+        let waits = push_waits(&fx);
+        assert_eq!((waits.len(), waits[0].attempt as usize), (1, attempt), "{waits:?}");
+        assert!(!waits[0].exhausted());
+        // The run that ended pushes nothing more at its end: this outage is
+        // one attempt, not two.
+        let after = push_at_run_end(&fx.fleet, fx.fleet.paths().root(), fx.node, ended.clone(), hook.push_failed).unwrap();
+        assert_eq!(after, ended);
+        assert_eq!(push_waits(&fx)[0].attempt as usize, attempt, "the run-end push did not count again");
+    }
+    // The network is back: the next boundary push clears it.
+    outage.up();
+    assert_eq!(run_at_step(&mut hook, &fx), None);
+    assert!(push_waits(&fx).is_empty(), "a push that succeeds clears the failure");
+    assert!(log_of(&outage.origin, "task/x").contains("the fix"), "the branch is on the remote");
+}
+
+#[test]
+fn an_outage_beyond_the_budget_ends_failed_with_the_last_error_and_the_count() {
+    let fx = setup();
+    let outage = Outage::new(&fx);
+    outage.down();
+    let mut sink = |_: LocalEvent| {};
+    let mut hook = hook(&fx, &mut sink);
+    let max = tod_store::waits::DEFAULT_MAX_ATTEMPTS as usize;
+    for _ in 1..max {
+        assert_eq!(run_at_step(&mut hook, &fx).as_deref(), Some(PUSH_RETRY));
+    }
+    let last = run_at_step(&mut hook, &fx).expect("the last attempt stops the run");
+    assert!(last.starts_with(crate::autopilot::local::FAILED_PREFIX), "{last}");
+    assert!(last.contains(&format!("after {max} of {max} tries")) && last.contains("nowhere.git"), "{last}");
+    assert!(push_waits(&fx)[0].exhausted());
+}
+
+#[test]
+fn the_run_end_push_after_a_failed_boundary_push_is_not_a_second_attempt() {
+    let fx = setup();
+    let outage = Outage::new(&fx);
+    outage.down();
+    let mut sink = |_: LocalEvent| {};
+    let mut boundary = hook(&fx, &mut sink);
+    assert_eq!(run_at_step(&mut boundary, &fx).as_deref(), Some(PUSH_RETRY));
+    assert!(boundary.push_failed);
+    let ended = Outcome::Stopped { reason: PUSH_RETRY.into() };
+    assert_eq!(push_at_run_end(&fx.fleet, fx.fleet.paths().root(), fx.node, ended.clone(), boundary.push_failed).unwrap(), ended);
+    assert_eq!(push_waits(&fx)[0].attempt, 1);
+    // A run whose boundary pushes were fine does push at its end, and counts it once.
+    let after = push_at_run_end(&fx.fleet, fx.fleet.paths().root(), fx.node, Outcome::Done, false).unwrap();
+    let Outcome::Waiting { what, .. } = &after else { panic!("{after:?}") };
+    assert!(what.contains("(2 of"), "the second real attempt: {what}");
+    assert_eq!(push_waits(&fx)[0].attempt, 2);
+}
+
+#[test]
+fn a_transient_run_end_failure_leaves_no_wait_nothing_retries() {
+    let fx = setup();
+    let outage = Outage::new(&fx);
+    outage.down();
+    let now = chrono::Utc::now().timestamp_millis();
+    // A run that ends for a reason that does not resume by itself.
+    let paused = Outcome::Stopped { reason: PAUSED.into() };
+    let after = push_at_run_end(&fx.fleet, fx.fleet.paths().root(), fx.node, paused.clone(), false).unwrap();
+    assert_eq!(after, paused, "the run's own end is not changed");
+    let waits = push_waits(&fx);
+    assert_eq!(waits.len(), 1, "{waits:?}");
+    assert!(waits[0].last_error.as_deref().is_some_and(|e| e.contains("nowhere.git")), "the error is on the node");
+    assert_eq!(waits[0].attempt, 1);
+    // Nothing is due soon, so it never goes past due as "nothing is looking at it".
+    assert!(waits[0].due_at > now + 24 * 60 * 60 * 1000, "{:?}", waits[0]);
+    assert!(waits[0].expired_by(now + 3 * 60 * 60 * 1000, false).is_none());
+    // When the run goes on, its next push clears it.
+    outage.up();
+    assert!(crate::autopilot::local::push_branch(&fx.fleet, fx.node).unwrap().is_none());
+    assert!(push_waits(&fx).is_empty());
+
+    // A run that ends waiting is resumed by the daemon: it ends as the wait
+    // on the push (the earlier time), which the daemon serves.
+    outage.down();
+    git_in(&outage.workspace, &["commit", "-q", "--allow-empty", "-m", "more"]);
+    let later = now + 3_600_000;
+    let waiting = Outcome::Waiting { what: "a review".into(), due_at_ms: later };
+    let after = push_at_run_end(&fx.fleet, fx.fleet.paths().root(), fx.node, waiting, false).unwrap();
+    let Outcome::Waiting { what, due_at_ms } = &after else { panic!("{after:?}") };
+    assert!(what.contains("GitHub did not take the branch") && *due_at_ms < later, "{what}");
+    let saved = crate::autopilot::AutopilotState::load(fx.fleet.paths().root(), fx.node).unwrap();
+    assert_eq!(saved.outcome, Some(after.clone()), "saved, so the daemon resumes the run");
+    assert!(push_waits(&fx)[0].due_at <= *due_at_ms + 1, "the wait is due when its retrier is");
+}
+
+#[test]
+fn a_remote_that_moved_between_the_look_and_the_push_is_refetched_and_decided_again() {
+    let fx = setup();
+    let workspace = workspace_is_a_clone(&fx);
+    node_works_in(&fx, &workspace);
+    git_in(&workspace, &["commit", "-q", "--allow-empty", "-m", "ours"]);
+    // Someone else takes our commit and adds one, in the instant between
+    // the fetch that decided "push" and the push itself.
+    let origin = fx.root.join("origin.git");
+    let other = fx.root.join("other");
+    git_in(&fx.root, &["clone", "-q", origin.to_str().unwrap(), other.to_str().unwrap()]);
+    let mark = fx.root.join("moved");
+    let script = format!(
+        "#!/bin/sh\n[ -e '{mark}' ] && exit 0\ntouch '{mark}'\nunset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE\ncd '{other}' || exit 1\n\
+         git fetch -q '{ws}' task/x || exit 1\ngit -c user.name=t -c user.email=t@t checkout -q -B task/x FETCH_HEAD || exit 1\n\
+         git -c user.name=t -c user.email=t@t commit -q --allow-empty -m theirs || exit 1\ngit push -q origin task/x || exit 1\n",
+        mark = mark.display(),
+        other = other.display(),
+        ws = workspace.display(),
+    );
+    let hook_path = workspace.join(".git/hooks/pre-push");
+    std::fs::write(&hook_path, script).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let mut sink = |_: LocalEvent| {};
+    let mut hook = hook(&fx, &mut sink);
+    assert_eq!(run_at_step(&mut hook, &fx), None, "the remote has our commit and more: nothing of ours to send, no failure");
+    assert!(mark.exists(), "the remote did move during the push");
+    assert!(push_waits(&fx).is_empty());
+    assert!(!hook.push_failed);
+    assert!(log_of(&origin, "task/x").starts_with("theirs"), "never forced");
+}
+
+#[test]
+fn a_diverged_branch_stops_the_run_failed_saying_how_to_resolve_it_and_is_never_forced() {
     let fx = setup();
     let workspace = workspace_is_a_clone(&fx);
     node_works_in(&fx, &workspace);
@@ -90,26 +284,44 @@ fn a_diverged_branch_names_the_repository_and_is_never_forced() {
     git_in(&fx.root, &["clone", "-q", "-b", "task/x", fx.root.join("origin.git").to_str().unwrap(), other.to_str().unwrap()]);
     git_in(&other, &["commit", "-q", "--allow-empty", "-m", "theirs"]);
     git_in(&other, &["push", "-q", "origin", "task/x"]);
-    git_in(&workspace, &["commit", "-q", "--allow-empty", "-m", "ours 2"]);
+    // The agent rebased on purpose: its history no longer has what was pushed.
+    git_in(&workspace, &["reset", "-q", "--hard", "HEAD~1"]);
+    git_in(&workspace, &["commit", "-q", "--allow-empty", "-m", "ours, rewritten"]);
     git_in(&workspace, &["update-ref", "-d", "refs/remotes/origin/task/x"]);
 
-    let outcome = crate::autopilot::local::push_branch(&fx.fleet, fx.node).unwrap().expect("refused");
-    let Outcome::Stopped { reason } = &outcome else { panic!("{outcome:?}") };
-    assert!(reason.starts_with(crate::autopilot::local::FAILED_PREFIX) && reason.contains("repository"), "{reason}");
-    assert!(reason.contains("rejected") || reason.contains("non-fast-forward"), "{reason}");
+    let mut sink = |_: LocalEvent| {};
+    let mut hook = hook(&fx, &mut sink);
+    let reason = run_at_step(&mut hook, &fx).expect("a divergence stops the run");
+    assert!(reason.starts_with(crate::autopilot::local::FAILED_PREFIX), "{reason}");
+    for needle in [
+        "repository",
+        "task/x has diverged from origin/task/x",
+        "1 commit(s) that origin does not, and origin has 2",
+        "git rebase origin/task/x",
+        "git merge origin/task/x",
+        "git log --oneline --left-right HEAD...origin/task/x",
+        "git push --force-with-lease origin HEAD:refs/heads/task/x",
+        "never force-pushes",
+    ] {
+        assert!(reason.contains(needle), "{needle}: {reason}");
+    }
+    assert!(hook.push_retry.is_none(), "a divergence is not retried");
+    let waits = push_waits(&fx);
+    assert!(waits[0].exhausted(), "{waits:?}");
+    assert!(log_of(&fx.root.join("origin.git"), "task/x").starts_with("theirs"), "never forced");
 }
 
 #[test]
 fn a_network_failure_waits_with_the_error_and_a_retry_count_and_gives_up_after_the_last() {
     let fx = setup();
     let error = "repository /w: push task/x: git push: fatal: unable to access 'https://github.com/o/r.git/': Could not resolve host: github.com";
-    let outcome = crate::autopilot::branch_push_failed(&fx.fleet, fx.node, error).unwrap();
+    let outcome = crate::autopilot::branch_push_failed(&fx.fleet, fx.node, error, PushRetrier::Run).unwrap();
     let Outcome::Waiting { what, due_at_ms } = &outcome else { panic!("{outcome:?}") };
     assert!(what.contains("1 of") && what.contains("Could not resolve host"), "{what}");
     assert!(*due_at_ms > chrono::Utc::now().timestamp_millis());
     let mut last = outcome;
     for _ in 0..30 {
-        last = crate::autopilot::branch_push_failed(&fx.fleet, fx.node, error).unwrap();
+        last = crate::autopilot::branch_push_failed(&fx.fleet, fx.node, error, PushRetrier::Run).unwrap();
         if !matches!(last, Outcome::Waiting { .. }) {
             break;
         }
@@ -117,6 +329,14 @@ fn a_network_failure_waits_with_the_error_and_a_retry_count_and_gives_up_after_t
     let Outcome::Stopped { reason } = &last else { panic!("retries are bounded: {last:?}") };
     assert!(reason.starts_with(crate::autopilot::local::FAILED_PREFIX) && reason.contains("Could not resolve host"), "{reason}");
     assert!(push_waits(&fx)[0].exhausted());
+}
+
+#[test]
+fn an_error_nobody_has_classified_is_retried_not_failed() {
+    let fx = setup();
+    let error = "repository /w: push task/x: git push: kex_exchange_identification: Connection closed by remote host";
+    let outcome = crate::autopilot::branch_push_failed(&fx.fleet, fx.node, error, PushRetrier::Run).unwrap();
+    assert!(matches!(outcome, Outcome::Waiting { .. }), "{outcome:?}");
 }
 
 #[test]

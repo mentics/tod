@@ -1754,6 +1754,13 @@ pub fn discard_location_changes(fleet: &FleetStore, node_id: &str) -> Result<()>
     Ok(())
 }
 
+/// Whether the repository in `dir` has an `origin` with a url. (`git remote`
+/// is not asked: a global `remote.origin.prune` makes it list `origin` for a
+/// repository that has none.)
+fn has_origin(dir: &Workdir) -> Result<bool> {
+    Ok(dir.git_output(&["config", "--get", "remote.origin.url"])?.status.success())
+}
+
 /// Push the branch checked out in `dir` to `origin`, setting it upstream.
 fn push_branch(dir: &Workdir) -> Result<()> {
     let branch = worktree::current_branch(dir)
@@ -1762,8 +1769,7 @@ fn push_branch(dir: &Workdir) -> Result<()> {
 }
 
 fn push_named_branch(dir: &Workdir, branch: &str) -> Result<()> {
-    let remote = dir.git(&["remote"])?;
-    if !remote.lines().any(|r| r.trim() == "origin") {
+    if !has_origin(dir)? {
         bail!("it has no origin remote to push {branch} to");
     }
     ensure_submodule_commits(dir)?;
@@ -1852,48 +1858,102 @@ pub fn push_node_branch(fleet: &FleetStore, node_id: &str) -> Result<Option<Stri
     Ok(Some(branch))
 }
 
+/// What a push error says when its branch and the remote's have each moved
+/// (`push_branches` writes it; [`is_transient_push_error`] reads it).
+const DIVERGED_MARKER: &str = "has diverged from origin/";
+
 /// Whether a failed push (or the look at the remote before it, in
-/// [`push_node_branch`]) failed in a way asking again may fix: the network,
-/// DNS, a timeout, a server error. Anything else (a rejected non-fast-forward
-/// with commits of ours on top, authentication, a protected branch or a
-/// declining hook, no origin) is the same on every attempt, so retrying it
-/// would only delay telling the person.
+/// [`push_node_branch`]) is worth asking again. **Persistent is the exception
+/// and is named; everything else is transient** and retried a bounded number
+/// of times (`autopilot::branch_push_failed`), because the person is told in
+/// the end either way and a false "failed" on a node that only met a network
+/// blip is the worse mistake (shepherd gap 71 review: about 30 nodes push 3
+/// submodules each, over ssh and https, through a dev container).
+///
+/// Persistent: what the same push meets every time: the server refusing us
+/// (authentication, permission, a protected branch or a declining hook, a
+/// repository that is not found), a branch whose history and the remote's have
+/// diverged (which [`push_branches`] decides *after* a fresh fetch, never from
+/// git's "rejected" alone: that is also what a remote that moved a moment ago
+/// says), and what tod itself refuses (no origin, a default branch, a detached
+/// HEAD, a submodule commit that exists nowhere).
 pub fn is_transient_push_error(message: &str) -> bool {
-    const MARKERS: &[&str] = &[
-        "could not resolve host",
-        "temporary failure in name resolution",
-        "connection timed out",
-        "connection reset",
-        "connection refused",
-        "operation timed out",
-        "timed out",
-        "the remote end hung up unexpectedly",
-        "early eof",
-        "rpc failed",
-        "failed to connect",
-        "network is unreachable",
-        "ssl_error_syscall",
-        "http 500",
-        "http 502",
-        "http 503",
-        "http 504",
-        "error: 500",
-        "error: 502",
-        "error: 503",
-        "error: 504",
-        "service unavailable",
-        "bad gateway",
-        "gateway time-out",
-        "internal server error",
-        "another git process seems to be running",
-        "cannot lock ref",
+    const PERSISTENT: &[&str] = &[
+        DIVERGED_MARKER,
+        // The server refusing this user or this branch.
+        "authentication failed",
+        "permission denied (publickey",
+        "host key verification failed",
+        "could not read username",
+        "could not read password",
+        "terminal prompts disabled",
+        "invalid username or password",
+        "password authentication was removed",
+        "repository not found",
+        "denied to ", // "Permission to o/r.git denied to <user>"
+        "protected branch",
+        "gh006",
+        "gh013",
+        "repository rule violations",
+        "hook declined",
+        "[remote rejected]",
+        "refusing to update checked out branch",
+        "returned error: 401",
+        // What tod itself refuses.
+        "has no origin remote",
+        "is a default branch",
+        "detached head",
+        "is not in its checkout or on its origin",
+        "not a git repository",
     ];
     let lower = message.to_lowercase();
-    // A rejection is never transient, whatever else the text mentions.
-    if lower.contains("[rejected]") || lower.contains("non-fast-forward") || lower.contains("denied") {
-        return false;
+    // The branch created on the remote by someone else a moment ago: a race
+    // ([`is_rejection`]), though the remote words it as a rejection.
+    if is_branch_race(&lower) {
+        return true;
     }
-    MARKERS.iter().any(|m| lower.contains(m))
+    // A 403 is a refusal, except GitHub's rate limits, which pass.
+    let refused_403 = lower.contains("returned error: 403") && !lower.contains("rate limit");
+    !(refused_403 || PERSISTENT.iter().any(|m| lower.contains(m)))
+}
+
+/// Whether a push error is git's "your branch is not what the remote has":
+/// the case [`push_branches`] re-decides from a fresh fetch.
+fn is_rejection(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    is_branch_race(&lower)
+        || ((lower.contains("[rejected]") || lower.contains("non-fast-forward") || lower.contains("fetch first"))
+            && !lower.contains("[remote rejected]"))
+}
+
+/// The remote branch was created between the look at it and the push.
+fn is_branch_race(lower: &str) -> bool {
+    lower.contains("reference already exists") || lower.contains("cannot lock ref")
+}
+
+/// `(ahead, behind)`: the commits of `repo`'s HEAD that `origin/<branch>`
+/// does not have, and the commits of `origin/<branch>` that HEAD does not.
+fn ahead_behind(repo: &Workdir, branch: &str) -> Result<(u64, u64)> {
+    let range = format!("HEAD...refs/remotes/origin/{branch}");
+    let out = repo.git(&["rev-list", "--left-right", "--count", &range])?;
+    let mut parts = out.split_whitespace().map(str::parse::<u64>);
+    match (parts.next(), parts.next()) {
+        (Some(Ok(ahead)), Some(Ok(behind))) => Ok((ahead, behind)),
+        _ => bail!("git rev-list --left-right --count printed `{}` in {repo}", out.trim()),
+    }
+}
+
+/// The error for a branch that has diverged from the remote's: never forced,
+/// and says what a person runs.
+fn diverged_error(label: &str, repo: &Workdir, branch: &str, ahead: u64, behind: u64) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{label}: {branch} {DIVERGED_MARKER}{branch}: it has {ahead} commit(s) that origin does not, and origin has {behind} \
+         that it does not. tod never force-pushes. To resolve it, in {repo}: `git log --oneline --left-right \
+         HEAD...origin/{branch}` shows both sides; `git rebase origin/{branch}` (or `git merge origin/{branch}`) puts the \
+         node's commits on top of origin's, and the node's next push then goes through. If the history was rewritten on \
+         purpose and origin's {behind} commit(s) are to go, `git push --force-with-lease origin \
+         HEAD:refs/heads/{branch}`. Then resume the node"
+    )
 }
 
 fn location_state_is_clean(dir: &Workdir) -> Result<bool> {
@@ -1941,7 +2001,7 @@ fn repo_needs_push(repo: &Workdir) -> Result<bool> {
     if tracking.as_deref().map(str::trim) == Some(head.trim()) {
         return Ok(false);
     }
-    if repo.git(&["remote"])?.lines().all(|r| r.trim() != "origin") {
+    if !has_origin(repo)? {
         // Nothing to compare with; the push says so.
         return Ok(true);
     }
@@ -1967,22 +2027,96 @@ fn repo_needs_push(repo: &Workdir) -> Result<bool> {
 /// submodules first.
 fn push_branches(dir: &Workdir) -> Result<()> {
     for repo in repos_deepest_first(dir)? {
+        if repo != *dir && submodule_has_no_work_to_push(dir, &repo)? {
+            continue;
+        }
         // A repository whose commits the remote already has is left alone: a
         // push of it is refused as "fetch first" when someone else has since
         // added to the branch, though there is nothing of ours to send.
         if !repo_needs_push(&repo)? {
             continue;
         }
-        if repo == *dir {
-            // Names the repository, as a submodule's failure does: a person
-            // reading "rejected" must know which repository refused.
-            push_branch(&repo).with_context(|| format!("repository {repo}"))?;
+        // Names the repository: a person reading "rejected" must know which
+        // repository refused.
+        let (label, branch) = if repo == *dir {
+            (format!("repository {repo}"), None)
         } else if let Some(branch) = worktree::current_branch(&repo) {
-            push_named_branch(&repo, &branch)
-                .with_context(|| format!("submodule {repo}"))?;
+            (format!("submodule {repo}"), Some(branch))
+        } else {
+            continue;
+        };
+        let push = || -> Result<()> {
+            match &branch {
+                None => push_branch(&repo),
+                Some(branch) => push_named_branch(&repo, branch),
+            }
+        };
+        let Err(first) = push() else { continue };
+        if !is_rejection(&format!("{first:#}")) {
+            return Err(first.context(label));
+        }
+        // The remote may have moved between the look in `repo_needs_push` and
+        // the push (another push, a merge): fetch again and decide again,
+        // once, before calling it a divergence.
+        let branch = match &branch {
+            Some(branch) => branch.clone(),
+            None => worktree::current_branch(&repo).context("its checkout is on a detached HEAD")?,
+        };
+        let heads_ref = format!("refs/heads/{branch}");
+        repo.git(&[
+            "fetch",
+            "--quiet",
+            "--no-recurse-submodules",
+            "origin",
+            &format!("+{heads_ref}:refs/remotes/origin/{branch}"),
+        ])
+        .with_context(|| format!("fetch {branch} from origin in {repo} after its push was rejected"))
+        .with_context(|| label.clone())?;
+        match ahead_behind(&repo, &branch)? {
+            // The remote has everything of ours (and more): nothing to send.
+            (0, _) => {}
+            (ahead, behind) if behind > 0 => return Err(diverged_error(&label, &repo, &branch, ahead, behind)),
+            // Ahead only: the remote went back, or moved and came back. Once more.
+            _ => push().map_err(|e| e.context(label))?,
         }
     }
     Ok(())
+}
+
+/// A submodule with no `origin` can be neither pushed nor fetched, so tod
+/// cannot save it. That is an error only when it holds something of the
+/// node's: HEAD beyond what the superproject's own upstream (the node's branch
+/// on origin, else the default branch) records for it. A submodule that is
+/// just a local dependency, at the commit the parent already records, has
+/// nothing to lose, and stopping the node for it would be a false stop that no
+/// retry can clear. (The supervisor makes the same distinction: it fails only
+/// for commits no remote has.) A submodule with an origin is never skipped
+/// here: `repo_needs_push` decides it.
+fn submodule_has_no_work_to_push(parent: &Workdir, sub: &Workdir) -> Result<bool> {
+    if has_origin(sub)? {
+        return Ok(false);
+    }
+    let rel = {
+        let (root, here) = (parent.path_text(), sub.path_text());
+        here.strip_prefix(root.trim_end_matches('/')).unwrap_or("").trim_matches('/').to_string()
+    };
+    let mut upstreams = Vec::new();
+    if let Some(branch) = worktree::current_branch(parent) {
+        upstreams.push(format!("refs/remotes/origin/{branch}"));
+    }
+    upstreams.push("refs/remotes/origin/HEAD".to_string());
+    let head = sub.git(&["rev-parse", "HEAD"])?;
+    for upstream in &upstreams {
+        let Ok(listed) = parent.git(&["ls-tree", upstream, "--", &rel]) else { continue };
+        let Some(recorded) = listed.split_whitespace().nth(2) else { continue };
+        let commit = format!("{recorded}^{{commit}}");
+        if sub.git(&["cat-file", "-e", &commit]).is_err() {
+            return Ok(false); // it holds something the upstream's record is not
+        }
+        let out = sub.git_output(&["merge-base", "--is-ancestor", head.trim(), recorded])?;
+        return Ok(out.status.code() == Some(0));
+    }
+    Ok(false)
 }
 
 /// Commits that no remote has, in one repository of a checkout.
@@ -2014,7 +2148,7 @@ pub fn unpushed_commits(dir: &Workdir) -> Result<Vec<Unpushed>> {
             let rel = here.strip_prefix(root.trim_end_matches('/')).unwrap_or("").trim_matches('/').to_string();
             if rel.is_empty() { ".".to_string() } else { rel }
         };
-        if repo.git(&["remote"])?.lines().all(|r| r.trim() != "origin") {
+        if !has_origin(&repo)? {
             bail!("{rel} has no origin remote, so its commits cannot be saved anywhere");
         }
         let counted = repo.git(&["rev-list", "--count", "HEAD", "--branches", "--not", "--remotes"])?;
@@ -2811,7 +2945,8 @@ mod tests {
         git(&work, &["update-ref", "-d", "refs/remotes/origin/task/x"]);
         assert!(needs_push(&dir).unwrap());
         let err = format!("{:#}", push_branches(&dir).unwrap_err());
-        assert!(err.contains("push task/x"), "{err}");
+        assert!(err.contains("has diverged from origin/task/x") && err.contains("git rebase origin/task/x"), "{err}");
+        assert!(err.contains("1 commit(s) that origin does not") && err.contains("force-with-lease"), "{err}");
         let err = format!("{:#}", ensure_work_pushed_in(&dir).unwrap_err());
         assert!(err.contains("ours 2") && err.contains("no remote has"), "{err}");
         assert!(!git(&remote, &["log", "--format=%s", "task/x"]).contains("ours 2"), "never force-pushed");
@@ -2862,16 +2997,78 @@ mod tests {
         assert!(err.contains("submodule") && err.contains("task/x"), "{err}");
     }
 
-    /// Gap 71: only a failure asking again may fix is retried; a refusal is
-    /// the same on every attempt and goes to the person at once.
+    /// Gap 71: a submodule with no `origin` at all, at the commit the
+    /// superproject's upstream records, has nothing of the node's to lose and
+    /// does not stop the push; one with a commit beyond that does, naming it.
     #[test]
-    fn only_network_failures_are_transient_pushes() {
-        assert!(is_transient_push_error("fatal: unable to access 'https://github.com/o/r.git/': Could not resolve host: github.com"));
-        assert!(is_transient_push_error("error: RPC failed; HTTP 503 curl 22 The requested URL returned error: 503"));
-        assert!(!is_transient_push_error(" ! [rejected] task/x -> task/x (non-fast-forward)"));
-        assert!(!is_transient_push_error("remote: GH006: Protected branch update failed"));
-        assert!(!is_transient_push_error("fatal: Authentication failed for 'https://github.com/o/r.git/'"));
-        assert!(!is_transient_push_error("remote: Permission to o/r.git denied; unable to access, timed out waiting"));
+    fn a_submodule_with_no_origin_stops_the_push_only_when_it_holds_work() {
+        let (tmp, _remote, work) = unpushed_fixture();
+        let sub_remote = tmp.path().join("sub.git");
+        let sub_seed = tmp.path().join("subseed");
+        std::fs::create_dir_all(&sub_remote).unwrap();
+        std::fs::create_dir_all(&sub_seed).unwrap();
+        git(&sub_remote, &["init", "-q", "--bare", "-b", "main"]);
+        git(&sub_seed, &["init", "-q", "-b", "main"]);
+        git(&sub_seed, &["config", "user.email", "t@example.com"]);
+        git(&sub_seed, &["config", "user.name", "t"]);
+        git(&sub_seed, &["commit", "-q", "--allow-empty", "-m", "sub base"]);
+        git(&sub_seed, &["remote", "add", "origin", &sub_remote.to_string_lossy()]);
+        git(&sub_seed, &["push", "-q", "origin", "main"]);
+        git(&work, &["-c", "protocol.file.allow=always", "submodule", "add", "-q", &sub_remote.to_string_lossy(), "ui"]);
+        git(&work, &["commit", "-q", "-m", "add ui"]);
+        let ui = work.join("ui");
+        git(&ui, &["config", "user.email", "t@example.com"]);
+        git(&ui, &["config", "user.name", "t"]);
+        git(&ui, &["checkout", "-q", "-b", "task/x"]);
+        let dir = Workdir::host(&work);
+        push_branches(&dir).unwrap();
+        git(&ui, &["remote", "remove", "origin"]);
+        // At the recorded commit: a local dependency, nothing to push or lose.
+        assert!(submodule_has_no_work_to_push(&dir, &Workdir::host(&ui)).unwrap());
+        push_branches(&dir).expect("a remote-less submodule with nothing of the node's is not an error");
+        // A commit of its own that nothing can save.
+        git(&ui, &["commit", "-q", "--allow-empty", "-m", "ui ours"]);
+        assert!(!submodule_has_no_work_to_push(&dir, &Workdir::host(&ui)).unwrap());
+        let err = format!("{:#}", push_branches(&dir).unwrap_err());
+        assert!(err.contains("submodule") && err.contains("no origin remote"), "{err}");
+        assert!(!is_transient_push_error(&err));
+    }
+
+    /// Gap 71: only what is known to be the same on every attempt is
+    /// persistent; every other failure is retried.
+    #[test]
+    fn only_known_refusals_are_persistent_pushes() {
+        for transient in [
+            "fatal: unable to access 'https://github.com/o/r.git/': Could not resolve host: github.com",
+            "error: RPC failed; HTTP 503 curl 22 The requested URL returned error: 503",
+            "kex_exchange_identification: Connection closed by remote host\nfatal: Could not read from remote repository.",
+            "Connection closed by 140.82.112.4 port 22",
+            "error: unexpected disconnect while reading sideband packet",
+            "fatal: the remote end hung up unexpectedly\nBroken pipe",
+            "error: RPC failed; HTTP 429 curl 22 The requested URL returned error: 429",
+            "error: RPC failed; curl 92 HTTP/2 stream 5 was not closed cleanly: INTERNAL_ERROR (err 2)",
+            "fatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights",
+            "The requested URL returned error: 403 secondary rate limit",
+            // A refusal marker word does not outvote a network failure.
+            "remote: Permission to o/r.git ... unable to access, timed out waiting for the access list",
+            " ! [rejected] task/x -> task/x (fetch first)",
+            "something git has never said",
+        ] {
+            assert!(is_transient_push_error(transient), "{transient}");
+        }
+        for persistent in [
+            "fatal: Authentication failed for 'https://github.com/o/r.git/'",
+            "git@github.com: Permission denied (publickey).\nfatal: Could not read from remote repository.",
+            "remote: Permission to o/r.git denied to someone.",
+            "remote: GH006: Protected branch update failed",
+            " ! [remote rejected] task/x -> task/x (pre-receive hook declined)",
+            "The requested URL returned error: 403",
+            "repository x: it has no origin remote to push task/x to",
+            "main is a default branch; a node pushes only its own",
+            "submodule /w/ui: task/x has diverged from origin/task/x: it has 2 commit(s)",
+        ] {
+            assert!(!is_transient_push_error(persistent), "{persistent}");
+        }
     }
 
     /// Seen live (ENG-2287): commits that only a sandbox had went with the
