@@ -11,9 +11,20 @@
 //! normal path. `tod-cli stats --section git-retries` reads it; a call that
 //! gave up, with a node known, also leaves a note on the node's activity.
 //!
-//! The shell scripts' own retry (`tod_sandbox::git_retry::FETCH_RETRY_SH`:
-//! the quick branch script, the sandbox checkout, the golden refresh) runs
-//! where Rust cannot wrap it and is not counted here.
+//! Counted, all through `tod_sandbox::git_retry::report`: `retry_network_git`
+//! (fetch, clone, ls-remote, pull, submodule update), the sandbox checkout's
+//! authentication retry (`tod_sandbox::node::checkout_with_auth_retry`,
+//! class `auth`), the stale-registration prune and retry of `git worktree add`
+//! (class `stale_worktree`), and `fetch_origin`'s second try of a fetch that
+//! failed for no transient reason (class `other`).
+//!
+//! Not counted here: the shell scripts' own retry
+//! (`tod_sandbox::git_retry::FETCH_RETRY_SH`: the quick branch script, the
+//! sandbox checkout, the golden refresh), which runs where Rust cannot wrap
+//! it; and the autopilot's retry of a failed push (`github_wait`), which is
+//! already counted where it lives: each attempt, its error and the attempts
+//! left are on the node's push wait (`tod_store::waits`), a record of its
+//! own, and a push is not a call `retry_network_git` retries.
 //!
 //! Machine-local, append-only, not synced, and not in `journey_changes`: it
 //! is operational telemetry about this machine's network and repositories, not
@@ -29,8 +40,7 @@ pub const TABLE: &str = "git_retries";
 
 pub const OUTCOME_RECOVERED: &str = "recovered";
 pub const OUTCOME_GAVE_UP: &str = "gave_up";
-pub const CLASS_LOCK_RACE: &str = "lock_race";
-pub const CLASS_NETWORK: &str = "network";
+pub use tod_sandbox::git_retry::{CLASS_AUTH, CLASS_LOCK_RACE, CLASS_NETWORK, CLASS_OTHER, CLASS_STALE_WORKTREE};
 
 /// The title of the note a call that gave up leaves on the node's activity.
 pub const GAVE_UP_TITLE: &str = "Git gave up retrying";
@@ -69,6 +79,19 @@ pub struct GitRetry {
 }
 
 impl GitRetry {
+    /// From what a retry loop reported (`tod_sandbox::git_retry`).
+    pub fn from_retried(r: tod_sandbox::git_retry::Retried) -> Self {
+        Self::new(
+            r.node.as_deref().and_then(|n| Uuid::parse_str(n).ok()),
+            &r.workdir,
+            &r.op,
+            &r.class,
+            r.retries,
+            r.recovered,
+            &r.error,
+        )
+    }
+
     pub fn new(node_id: Option<Uuid>, workdir: &str, op: &str, class: &str, retries: u32, recovered: bool, error: &str) -> Self {
         Self {
             id: Uuid::new_v4(),
@@ -81,6 +104,25 @@ impl GitRetry {
             error: error.trim().chars().take(400).collect(),
             at: now_ms(),
         }
+    }
+}
+
+type FailureHook = std::sync::Arc<dyn Fn(&GitRetry, &str) + Send + Sync>;
+static FAILURE_HOOK: std::sync::RwLock<Option<FailureHook>> = std::sync::RwLock::new(None);
+
+/// Installs what is done, besides counting and logging, with a retry that
+/// could not be recorded (the store puts a problem on the node).
+pub fn set_failure_hook(hook: FailureHook) {
+    *FAILURE_HOOK.write().unwrap_or_else(|p| p.into_inner()) = Some(hook);
+}
+
+/// A retry could not be recorded (queued, written, or its note left): counted
+/// (`tod_sandbox::git_retry::record_failures`), logged, and shown on its node.
+/// Never an error to the git call it describes.
+pub fn record_failed(retry: &GitRetry, why: &str) {
+    tod_sandbox::git_retry::count_failure(&format!("git {} in {}", retry.op, retry.workdir), why);
+    if let Some(hook) = FAILURE_HOOK.read().unwrap_or_else(|p| p.into_inner()).clone() {
+        hook(retry, why);
     }
 }
 
@@ -109,27 +151,36 @@ impl<'a> GitRetryRepo<'a> {
                 r.at
             ],
         )?;
-        // A call that gave up is also a note on the node's activity (a node
-        // deleted since has none to leave it on).
+        // A call that gave up is also a note on the node's activity. The row
+        // above stands whether or not the note can be left: a note that fails
+        // is counted, logged and shown on the node, not an error that would
+        // roll the row back.
         if r.outcome == OUTCOME_GAVE_UP
             && let Some(node) = r.node_id
+            && let Err(e) = self.leave_note(r, node)
         {
-            let exists: i64 =
-                self.conn.query_row("SELECT COUNT(*) FROM nodes WHERE id = ?1", [uuid_to_blob(node)], |row| row.get(0))?;
-            if exists > 0 {
-                let lifecycle: String = self
-                    .conn
-                    .query_row("SELECT state FROM node_lifecycle WHERE node_id = ?1", [uuid_to_blob(node)], |row| row.get(0))
-                    .unwrap_or_default();
-                let detail = format!(
-                    "git {} in {} failed ({}) and still failed after {} retries: {}",
-                    r.op, r.workdir, r.class, r.retries, r.error
-                );
-                let entry = crate::node_timeline::TimelineEntry::new(node, crate::node_timeline::KIND_NOTE, &lifecycle, GAVE_UP_TITLE, true, detail);
-                crate::node_timeline::TimelineRepo::new(self.conn).record(&entry)?;
-            }
+            record_failed(r, &format!("its note on the node's activity could not be left: {e:#}"));
         }
         Ok(())
+    }
+
+    fn leave_note(&self, r: &GitRetry, node: Uuid) -> Result<()> {
+        // A node deleted since has no activity to leave it on.
+        let exists: i64 =
+            self.conn.query_row("SELECT COUNT(*) FROM nodes WHERE id = ?1", [uuid_to_blob(node)], |row| row.get(0))?;
+        if exists == 0 {
+            return Ok(());
+        }
+        let lifecycle: String = self
+            .conn
+            .query_row("SELECT state FROM node_lifecycle WHERE node_id = ?1", [uuid_to_blob(node)], |row| row.get(0))
+            .unwrap_or_default();
+        let detail = format!(
+            "git {} in {} failed ({}) and still failed after {} retries: {}",
+            r.op, r.workdir, r.class, r.retries, r.error
+        );
+        let entry = crate::node_timeline::TimelineEntry::new(node, crate::node_timeline::KIND_NOTE, &lifecycle, GAVE_UP_TITLE, true, detail);
+        crate::node_timeline::TimelineRepo::new(self.conn).record(&entry)
     }
 
     pub fn list_for_node(&self, node: Uuid) -> Result<Vec<GitRetry>> {
@@ -216,6 +267,56 @@ mod tests {
             })
             .unwrap();
         assert_eq!(n, 1);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_note_that_cannot_be_left_does_not_lose_the_row_and_is_not_dropped() {
+        let dir = tod_test_util::scratch_dir(format!("tod-git-retries-note-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = schema::open_writer_connection(&dir.join("tod.db")).unwrap();
+        let node = Uuid::new_v4();
+        NodeRepo::new(&conn).create_with_id(node, "alpha", "alpha").unwrap();
+        conn.execute_batch("DROP TABLE node_timeline").unwrap();
+        let before = tod_sandbox::git_retry::record_failures();
+        GitRetryRepo::new(&conn)
+            .record(&GitRetry::new(Some(node), "/r", "fetch", CLASS_NETWORK, 3, false, "early EOF"))
+            .expect("the row is kept; the note's failure is reported, not returned");
+        assert_eq!(GitRetryRepo::new(&conn).list_for_node(node).unwrap().len(), 1);
+        assert!(tod_sandbox::git_retry::record_failures() > before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_write_the_writer_fails_is_counted_and_put_on_the_node() {
+        let dir = tod_test_util::scratch_dir(format!("tod-git-retries-write-{}", Uuid::new_v4()));
+        let store = crate::fleet::FleetStore::open_without_reload(&dir).unwrap();
+        let node = Uuid::new_v4();
+        let db = dir.join("tod.db");
+        let side = rusqlite::Connection::open(&db).unwrap();
+        side.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+        NodeRepo::new(&side).create_with_id(node, "alpha", "alpha").unwrap();
+        // The queue accepts the record; the write then fails.
+        side.execute_batch("DROP TABLE git_retries").unwrap();
+        let before = tod_sandbox::git_retry::record_failures();
+        let _scope = tod_sandbox::git_retry::scope_node(Some(node.to_string()));
+        tod_sandbox::git_retry::report("/r/lost-write", "fetch", CLASS_NETWORK, 2, true, "");
+        // The debounced write runs on its own, two seconds on.
+        let mut problem = false;
+        for _ in 0..100 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let n: i64 = side
+                .query_row("SELECT COUNT(*) FROM node_problems WHERE kind = 'git_retry_record'", [], |r| r.get(0))
+                .unwrap_or(0);
+            if n > 0 {
+                problem = true;
+                break;
+            }
+        }
+        assert!(problem, "the failed write is put on the node as a problem");
+        assert!(tod_sandbox::git_retry::record_failures() > before, "and counted");
+        drop(side);
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
     }

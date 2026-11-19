@@ -400,6 +400,7 @@ impl StepHook for Hook<'_> {
         if self.push_branch && boundary != Boundary::Wait {
             // A failure stops the run with the repositories named: work that
             // cannot reach the remote is not something to carry on past.
+            let _retries = tod_store::fleet::workdir::scope_retries_to_node(&self.node.to_string());
             git::push_branch(self.workspace).context("pushing the node's branch at a turn or step boundary")?;
         }
         if fresh_marker(self.state_dir)
@@ -940,6 +941,7 @@ pub fn wake(config: Config) -> Result<Woke> {
     let ended = beating.finish(stopped, &state);
     let pushed = replica.lock().unwrap_or_else(|e| e.into_inner()).push();
     let branch_pushed = if config.push_branch {
+        let _retries = tod_store::fleet::workdir::scope_retries_to_node(&config.node.to_string());
         git::push_branch(&config.workspace).context("pushing the node's branch when the run ended")
     } else {
         Ok(())

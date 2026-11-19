@@ -915,7 +915,7 @@ pub fn checkout(
 ) -> Result<()> {
     progress(&format!("checking out {branch}…"));
     let script = format!("sh -c {} 2>&1", shell_quote(&checkout_script(repo_url, branch, identity, allow_clone)));
-    checkout_with_auth_retry(&mut || bx.run(url, &script, 600), &mut |d| std::thread::sleep(d), branch, progress)
+    checkout_with_auth_retry(&mut || bx.run(url, &script, 600), &mut |d| std::thread::sleep(d), url, branch, progress)
 }
 
 /// Starts the relay (killing a running one, so it runs the binary installed)
@@ -947,6 +947,7 @@ fn is_auth_failure(output: &str) -> bool {
 fn checkout_with_auth_retry(
     run: &mut dyn FnMut() -> Result<crate::blaxel::ProcessResult>,
     sleep: &mut dyn FnMut(std::time::Duration),
+    site: &str,
     branch: &str,
     progress: &mut dyn FnMut(&str),
 ) -> Result<()> {
@@ -954,6 +955,9 @@ fn checkout_with_auth_retry(
     loop {
         let res = run()?;
         if res.exit_code == 0 {
+            if attempt > 0 {
+                crate::git_retry::report(site, "checkout", crate::git_retry::CLASS_AUTH, attempt, true, "");
+            }
             return Ok(());
         }
         // git's own message is the last lines; a long ref listing before it
@@ -969,6 +973,9 @@ fn checkout_with_auth_retry(
             ));
             sleep(CHECKOUT_AUTH_RETRY_WAIT);
             continue;
+        }
+        if attempt > 0 {
+            crate::git_retry::report(site, "checkout", crate::git_retry::CLASS_AUTH, attempt, false, &tail);
         }
         bail!("checking out {branch} failed (exit {}): {}", res.exit_code, tail);
     }
@@ -1284,7 +1291,7 @@ mod tests {
         let auth = "fatal: could not read Username for 'https://github.com'";
         let mut replies = vec![result(128, auth), result(0, "")].into_iter();
         let mut slept = 0;
-        checkout_with_auth_retry(&mut || Ok(replies.next().unwrap()), &mut |_| slept += 1, "b", &mut |_| {}).unwrap();
+        checkout_with_auth_retry(&mut || Ok(replies.next().unwrap()), &mut |_| slept += 1, "u", "b", &mut |_| {}).unwrap();
         assert_eq!(slept, 1);
 
         let mut calls = 0;
@@ -1294,6 +1301,7 @@ mod tests {
                 Ok(result(128, auth))
             },
             &mut |_| {},
+            "u",
             "b",
             &mut |_| {},
         )
@@ -1308,6 +1316,7 @@ mod tests {
                 Ok(result(1, "fatal: not our ref"))
             },
             &mut |_| {},
+            "u",
             "b",
             &mut |_| {},
         )

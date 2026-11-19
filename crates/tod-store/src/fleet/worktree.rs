@@ -180,7 +180,14 @@ pub fn fetch_origin(repo: &Workdir) -> Result<()> {
             if crate::fleet::workdir::is_transient_fetch_failure(&format!("{first:#}")) {
                 return Err(first);
             }
-            fetch().map_err(|_| first)
+            // Counted: this second try is a retry too (`crate::git_retries`).
+            let second = fetch();
+            let (recovered, said) = match &second {
+                Ok(_) => (true, String::new()),
+                Err(_) => (false, format!("{first:#}")),
+            };
+            tod_sandbox::git_retry::report(&repo.to_string(), "fetch", tod_sandbox::git_retry::CLASS_OTHER, 1, recovered, &said);
+            second.map_err(|_| first)
         })
         .with_context(|| {
             format!("fetch {REMOTE} in {repo}, so the node's new branch starts from the latest")
@@ -652,10 +659,18 @@ pub fn branch_submodules_from_origin(worktree: &Workdir, branch: &str) -> Result
         return Ok(Vec::new());
     }
     let dirs = submodule_dirs(worktree)?;
+    // A thread-local does not reach spawned threads: each re-enters it.
+    let retry_node = crate::fleet::workdir::current_retry_node();
     let results: Vec<Result<()>> = std::thread::scope(|scope| {
         let handles: Vec<_> = dirs
             .iter()
-            .map(|dir| scope.spawn(move || sync_branch_with_origin(dir, branch)))
+            .map(|dir| {
+                let retry_node = retry_node.clone();
+                scope.spawn(move || {
+                    let _retries = tod_sandbox::git_retry::scope_node(retry_node);
+                    sync_branch_with_origin(dir, branch)
+                })
+            })
             .collect();
         handles
             .into_iter()
@@ -682,11 +697,14 @@ pub fn branch_submodules(worktree: &Workdir, branch: &str) -> Result<Vec<String>
     // is a round trip, so they are switched side by side, not one after
     // another (the warnings stay in the submodules' order).
     let dirs = submodule_dirs(worktree)?;
+    let retry_node = crate::fleet::workdir::current_retry_node();
     let results: Vec<Result<()>> = std::thread::scope(|scope| {
         let handles: Vec<_> = dirs
             .iter()
             .map(|dir| {
+                let retry_node = retry_node.clone();
                 scope.spawn(move || {
+                    let _retries = tod_sandbox::git_retry::scope_node(retry_node);
                     switch_to_branch(dir, branch, None).and_then(|created_at_head| {
                         if created_at_head {
                             let head = run_git(dir, &["rev-parse", "HEAD"])?;
@@ -1525,7 +1543,18 @@ fn retry_after_pruning_stale_worktree<T>(
                 "stale worktree registration in {repo}; pruning and retrying: {message}"
             );
             prune_worktrees_recursive(repo, stale_worktree_path(&message).as_deref());
-            f()
+            let second = f();
+            // Counted: the prune and retry is a git retry (`crate::git_retries`).
+            let said = second.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default();
+            tod_sandbox::git_retry::report(
+                &repo.to_string(),
+                "worktree add",
+                tod_sandbox::git_retry::CLASS_STALE_WORKTREE,
+                1,
+                second.is_ok(),
+                &said,
+            );
+            second
         }
         other => other,
     }
@@ -1991,6 +2020,29 @@ mod tests {
         assert!(branch_submodules_from_origin(&top, "task/none").unwrap().is_empty());
         assert_eq!(git_in(&top.join("a"), &["rev-parse", "HEAD"]), pinned);
         assert_eq!(current_branch(&top.join("a")).as_deref(), Some("task/none"));
+    }
+
+    /// The retry count's node is a thread-local, which a spawned thread does
+    /// not inherit: the per-submodule threads re-enter it, so a submodule's
+    /// retried fetch is counted against the node (shepherd gap 49, rework).
+    #[test]
+    fn a_submodule_fetch_retried_on_a_spawned_thread_is_counted_against_the_node() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        tod_sandbox::git_retry::set_sink(std::sync::Arc::new(move |r| {
+            sink.lock().unwrap().push(r);
+            Ok(())
+        }));
+        let top = repo_with_submodules();
+        git_in(&top.join("a"), &["remote", "set-url", "origin", "https://tod-no-such-host.invalid/r.git"]);
+        let node = uuid::Uuid::new_v4();
+        let _scope = crate::fleet::workdir::scope_retries_to_node(&node.to_string());
+        assert!(branch_submodules_from_origin(&top, "task/x").is_err());
+        let seen = seen.lock().unwrap();
+        let mine: Vec<_> = seen.iter().filter(|r| r.node.as_deref() == Some(&node.to_string()[..])).collect();
+        assert_eq!(mine.len(), 1, "the submodule's fetch is counted against the node, not against none: {seen:?}");
+        assert_eq!((mine[0].op.as_str(), mine[0].recovered), ("fetch", false));
+        assert!(mine[0].workdir.ends_with('a') || mine[0].workdir.contains("/a"), "{}", mine[0].workdir);
     }
 
     #[test]

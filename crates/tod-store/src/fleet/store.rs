@@ -68,33 +68,35 @@ impl Drop for FleetStore {
 }
 
 /// Counts the git calls this process retries through `writer`
-/// (`crate::git_retries`). Queueing never blocks the git call. When a record
-/// cannot be queued the git call is left alone, as its outcome stands on its
-/// own; the failure is returned to `workdir` (counted and logged) and, when
-/// the retry was for a node, put on that node as a problem its views show.
+/// (`crate::git_retries`). Queueing never blocks the git call. A record that
+/// cannot be queued, or that the writer later fails to write
+/// (`crate::git_retries::record_failed`), leaves the git call alone, whose
+/// outcome stands on its own; it is counted, logged, and put on the node as a
+/// problem its views show.
 fn install_git_retry_sink(writer: &FleetWriter) {
     let queue = writer.queue_handle();
-    crate::fleet::workdir::set_retry_sink(Arc::new(move |retry| {
-        let node = retry.node_id;
-        let what = format!("git {} in {}", retry.op, retry.workdir);
-        match queue(FleetMutation::RecordGitRetry(Box::new(retry))) {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                if let Some(node) = node {
-                    let message = format!("tod could not count the retries of {what}: {e}");
-                    // Best effort: the error is returned either way.
-                    let _ = queue(FleetMutation::RecordNodeProblem {
-                        problem: crate::node_problems::NodeProblem::new(
-                            node,
-                            crate::node_problems::KIND_GIT_RETRY_RECORD,
-                            message,
-                            crate::outline::uuid_blob::now_ms(),
-                        ),
-                    });
-                }
-                Err(anyhow::anyhow!("{e}"))
-            }
+    let problem_queue = queue.clone();
+    crate::git_retries::set_failure_hook(Arc::new(move |retry, why| {
+        let Some(node) = retry.node_id else { return };
+        let message = format!("tod could not count the retries of git {} in {}: {why}", retry.op, retry.workdir);
+        // The one write that is allowed to fail unreported: it is the report
+        // of a failed write, which `record_failed` has already counted and
+        // logged, and the same queue that failed may fail again.
+        let _ = problem_queue(FleetMutation::RecordNodeProblem {
+            problem: crate::node_problems::NodeProblem::new(
+                node,
+                crate::node_problems::KIND_GIT_RETRY_RECORD,
+                message,
+                crate::outline::uuid_blob::now_ms(),
+            ),
+        });
+    }));
+    tod_sandbox::git_retry::set_sink(Arc::new(move |retried| {
+        let retry = crate::git_retries::GitRetry::from_retried(retried);
+        if let Err(e) = queue(FleetMutation::RecordGitRetry(Box::new(retry.clone()))) {
+            crate::git_retries::record_failed(&retry, &format!("it could not be queued: {e}"));
         }
+        Ok(())
     }));
 }
 

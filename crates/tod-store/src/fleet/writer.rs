@@ -1109,7 +1109,28 @@ async fn writer_loop(
     }
 }
 
+/// [`flush_batch_inner`], and when the write fails, every git retry record in
+/// the batch is reported lost (`crate::git_retries::record_failed`): the
+/// debounced write has no caller to return the error to.
 fn flush_batch(
+    conn: &Arc<Mutex<Connection>>,
+    media_root: &Path,
+    batch: &[FleetMutation],
+    actor: &str,
+    command_log: &Arc<Mutex<CommandLog>>,
+) -> Result<()> {
+    let result = flush_batch_inner(conn, media_root, batch, actor, command_log);
+    if let Err(err) = &result {
+        for mutation in batch {
+            if let FleetMutation::RecordGitRetry(retry) = mutation {
+                crate::git_retries::record_failed(retry, &format!("the write failed: {err:#}"));
+            }
+        }
+    }
+    result
+}
+
+fn flush_batch_inner(
     conn: &Arc<Mutex<Connection>>,
     media_root: &Path,
     batch: &[FleetMutation],

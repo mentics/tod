@@ -8,7 +8,7 @@ use anyhow::{Result, bail};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use crate::git_retries::{CLASS_LOCK_RACE, CLASS_NETWORK, GitRetry};
+use tod_sandbox::git_retry::{CLASS_LOCK_RACE, CLASS_NETWORK};
 use tod_agent::devcontainer::ContainerExec;
 
 /// Put before the arguments of every git tod runs in a dev container: turns
@@ -156,59 +156,28 @@ fn op_name(args: &[&str]) -> String {
     if is_submodule_update(args) { "submodule update".into() } else { git_subcommand(args).unwrap_or("git").to_string() }
 }
 
-/// Where a retried git call is counted: a function given the record, installed
-/// once per store ([`set_retry_sink`]). It returns the error when it could not
-/// record it.
-pub type RetrySink = std::sync::Arc<dyn Fn(GitRetry) -> Result<()> + Send + Sync>;
+/// Installs the sink retried calls are counted through (see
+/// [`tod_sandbox::git_retry`], the one core every Rust retry loop reports to).
+pub use tod_sandbox::git_retry::{
+    NodeScope as RetryNodeScope, current_node as current_retry_node, record_failures as retry_record_failures,
+    scope_node,
+};
 
-static RETRY_SINK: std::sync::RwLock<Option<RetrySink>> = std::sync::RwLock::new(None);
-static RETRY_RECORD_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Installs the sink retried git calls are counted through (the store that
-/// owns this process's database does it when it opens). The latest wins.
-pub fn set_retry_sink(sink: RetrySink) {
-    *RETRY_SINK.write().unwrap_or_else(|p| p.into_inner()) = Some(sink);
-}
-
-/// How many retries this process failed to record (each was also logged as an
-/// error).
-pub fn retry_record_failures() -> u64 {
-    RETRY_RECORD_FAILURES.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-thread_local! {
-    static RETRY_NODE: std::cell::RefCell<Option<uuid::Uuid>> = const { std::cell::RefCell::new(None) };
-}
-
-/// While alive, git calls this thread retries are counted against a node.
-pub struct RetryNodeScope(Option<uuid::Uuid>);
-
-impl Drop for RetryNodeScope {
-    fn drop(&mut self) {
-        RETRY_NODE.with(|n| *n.borrow_mut() = self.0.take());
-    }
-}
-
-/// Counts the git retries this thread makes until the guard drops against
-/// `node_id` (a node id string; one that is not a UUID counts against none).
+/// Counts this thread's git retries against `node_id` (a node id string; one
+/// that is not a UUID counts against none) until the guard drops.
 pub fn scope_retries_to_node(node_id: &str) -> RetryNodeScope {
-    let node = uuid::Uuid::parse_str(node_id).ok();
-    RetryNodeScope(RETRY_NODE.with(|n| n.replace(node)))
+    scope_node(uuid::Uuid::parse_str(node_id).ok().map(|id| id.to_string()))
 }
 
 fn report_retry(workdir: &str, args: &[&str], class: &str, retries: u32, last: &Output) {
-    let Some(sink) = RETRY_SINK.read().unwrap_or_else(|p| p.into_inner()).clone() else {
-        return;
-    };
-    let node = RETRY_NODE.with(|n| *n.borrow());
-    let op = op_name(args);
-    let record = GitRetry::new(node, workdir, &op, class, retries, last.status.success(), &String::from_utf8_lossy(&last.stderr));
-    if let Err(e) = sink(record) {
-        // Never fails the git call (which may have recovered); the failure is
-        // counted and logged, and the sink itself puts it on the node.
-        RETRY_RECORD_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        tracing::error!("could not record the retry of git {op} in {workdir}: {e:#}");
-    }
+    tod_sandbox::git_retry::report(
+        workdir,
+        &op_name(args),
+        class,
+        retries,
+        last.status.success(),
+        &String::from_utf8_lossy(&last.stderr),
+    );
 }
 
 /// Removes what a `git submodule update` cut off mid-clone leaves behind, so
@@ -619,10 +588,10 @@ mod retry_tests {
     }
 
     /// Collects what `report_retry` hands the sink, the sink being process-wide.
-    fn collecting_sink() -> std::sync::Arc<std::sync::Mutex<Vec<GitRetry>>> {
+    fn collecting_sink() -> std::sync::Arc<std::sync::Mutex<Vec<tod_sandbox::git_retry::Retried>>> {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = seen.clone();
-        set_retry_sink(std::sync::Arc::new(move |r| {
+        tod_sandbox::git_retry::set_sink(std::sync::Arc::new(move |r| {
             sink.lock().unwrap().push(r);
             Ok(())
         }));
@@ -656,23 +625,23 @@ mod retry_tests {
         let mine = |w: &str| seen.iter().filter(|r| r.workdir == w).cloned().collect::<Vec<_>>();
         let [ok] = mine("/r/counted-recovers").try_into().unwrap();
         assert_eq!(
-            (ok.node_id, ok.op.as_str(), ok.class.as_str(), ok.retries, ok.outcome.as_str()),
-            (Some(node), "fetch", "lock_race", 2, "recovered")
+            (ok.node.clone(), ok.op.as_str(), ok.class.as_str(), ok.retries, ok.recovered),
+            (Some(node.to_string()), "fetch", "lock_race", 2, true)
         );
         let [bad] = mine("/r/counted-gives-up").try_into().unwrap();
         assert_eq!(
-            (bad.op.as_str(), bad.class.as_str(), bad.retries, bad.outcome.as_str()),
-            ("submodule update", "network", 3, "gave_up")
+            (bad.op.as_str(), bad.class.as_str(), bad.retries, bad.recovered),
+            ("submodule update", "network", 3, false)
         );
         assert!(bad.error.contains("early EOF"));
         assert!(mine("/r/counted-none").is_empty(), "{seen:?}");
         let [un] = mine("/r/counted-unscoped").try_into().unwrap();
-        assert_eq!((un.node_id, un.op.as_str()), (None, "pull"));
+        assert_eq!((un.node, un.op.as_str()), (None, "pull"));
     }
 
     #[test]
     fn a_sink_that_cannot_record_never_changes_the_git_result() {
-        set_retry_sink(std::sync::Arc::new(|_| anyhow::bail!("writer closed")));
+        tod_sandbox::git_retry::set_sink(std::sync::Arc::new(|_| anyhow::bail!("writer closed")));
         let before = retry_record_failures();
         let mut calls = 0;
         let r = retry_ref_lock_race_in("/r/unrecordable", &["fetch"], &[Duration::ZERO; 3], || {

@@ -561,6 +561,7 @@ pub fn release_parked_worktree(
     settings: &TodSettings,
     node_id: &str,
 ) -> Result<Release> {
+    let _retries = crate::fleet::workdir::scope_retries_to_node(node_id);
     let lock = node_lock(node_id);
     let _held = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     // Everything below is read under the lock, so a launch that resolved this
@@ -1667,8 +1668,11 @@ fn make_sandbox_once(
         // is still taking effect.
         let mut warnings = Vec::new();
         let (dir_path, quick) = if fork_from.is_some() {
+            // A thread-local does not reach spawned threads: each re-enters it.
+            let retry_node = crate::fleet::workdir::current_retry_node();
             let (probed, checked, checked_said, beside) = std::thread::scope(|scope| {
                 let beside = scope.spawn(|| -> Result<(String, worktree::QuickBranch, bool)> {
+                    let _retries = tod_sandbox::git_retry::scope_node(retry_node.clone());
                     let dir = find_sandbox_checkout(&name)?;
                     let at = Workdir::sandbox(&name, &dir);
                     // Whether the node has saved work on the remote
@@ -1677,13 +1681,17 @@ fn make_sandbox_once(
                     // list, neither of which the checkout changes, so it
                     // is asked meanwhile, and the answer used afterwards.
                     let (quick, none_saved) = std::thread::scope(|inner| {
-                        let saved = inner.spawn(|| crate::fleet::node_checkpoint::nothing_saved_in_sandbox(&at, node_id));
+                        let saved = inner.spawn(|| {
+                            let _retries = tod_sandbox::git_retry::scope_node(retry_node.clone());
+                            crate::fleet::node_checkpoint::nothing_saved_in_sandbox(&at, node_id)
+                        });
                         let quick = worktree::branch_submodules_quickly(&at, branch);
                         (quick, saved.join().unwrap_or(false))
                     });
                     Ok((dir, quick?, none_saved))
                 });
                 let checkout = scope.spawn(|| {
+                    let _retries = tod_sandbox::git_retry::scope_node(retry_node.clone());
                     let mut said = Vec::new();
                     let checked = node::checkout(&bx, &url, &repo.url, branch, &identity, false, &mut |m: &str| said.push(m.to_string()));
                     (checked, said)
@@ -2190,6 +2198,7 @@ fn ensure_submodule_commits(repo: &Workdir) -> Result<()> {
 /// checked out there is not its branch). Refuses a default branch. Runs git
 /// and the network: never on the UI thread.
 pub fn push_node_branch(fleet: &FleetStore, node_id: &str) -> Result<Option<String>> {
+    let _retries = crate::fleet::workdir::scope_retries_to_node(node_id);
     // Under the node's lock, so a release ([`release_parked_worktree`]) cannot
     // give the worktree back mid-push; one that came first has removed the
     // location, which is then nothing to push, not a failure.
