@@ -812,22 +812,14 @@ impl Github {
                 continue;
             }
             seen.push(name.clone());
-            let description = s.description.as_deref().unwrap_or_default();
-            let sig = if says_how_it_failed(description, name) {
-                failure_signature(&s.state, "", description)
-            } else {
-                String::new()
-            };
+            // A status description alone says that it failed, not how: it
+            // would match every failure of the check, so it is never evidence.
             record(
                 name,
-                if sig.is_empty() {
-                    Err(format!(
-                        "an answer about it holds for one head only: the commit status says only \"{}\", which would match every failure",
-                        description.trim()
-                    ))
-                } else {
-                    Ok(sig)
-                },
+                Err(format!(
+                    "an answer about it holds for one head only: a commit status gives only a short description (\"{}\"), not the failure",
+                    s.description.as_deref().unwrap_or_default().trim()
+                )),
             );
         }
         for run in &runs.check_runs {
@@ -844,6 +836,22 @@ impl Github {
             record(name, result);
         }
         Ok((sigs, notes))
+    }
+
+    /// Every annotation of a check run, all pages; more than 1,000 is an
+    /// error (a signature of some of them could miss the one that differs).
+    fn get_annotations(&self, owner: &str, repo: &str, id: i64) -> Result<Vec<AnnotationRaw>, GithubError> {
+        let mut all = Vec::new();
+        for page in 1..=10 {
+            let got: Vec<AnnotationRaw> =
+                self.get_json(&format!("/repos/{owner}/{repo}/check-runs/{id}/annotations?per_page=100&page={page}"))?;
+            let n = got.len();
+            all.extend(got);
+            if n < 100 {
+                return Ok(all);
+            }
+        }
+        Err(GithubError::Api(format!("more than 1000 annotations on check run {id}")))
     }
 
     /// One failed check run's signature, or why it has none; cached by run.
@@ -880,14 +888,7 @@ impl Github {
         let step = job.as_ref().and_then(|j| j.steps.iter().find(|s| step_failed(s)));
         let mut evidence = String::new();
         if run.id != 0 {
-            let annotations = soft(
-                "the annotations",
-                self.get_json::<Vec<AnnotationRaw>>(&format!(
-                    "/repos/{owner}/{repo}/check-runs/{}/annotations?per_page=50",
-                    run.id
-                )),
-                &mut reasons,
-            )?;
+            let annotations = soft("the annotations", self.get_annotations(owner, repo, run.id), &mut reasons)?;
             evidence = annotations.map(|a| annotation_evidence(&a, actions)).unwrap_or_default();
         }
         if evidence.is_empty() && actions {
@@ -903,16 +904,13 @@ impl Github {
             }
         }
         if evidence.is_empty() && !actions {
-            let output = run.output.as_ref();
-            let text = format!(
-                "{} {}",
-                output.and_then(|o| o.title.as_deref()).unwrap_or_default(),
-                output.and_then(|o| o.summary.as_deref()).unwrap_or_default()
-            );
-            if says_how_it_failed(&text, run.name.as_deref().unwrap_or_default()) {
-                evidence = text;
+            // Only the output's detailed body is a failure text; its title and
+            // summary are short and would match every failure of the check.
+            let text = run.output.as_ref().and_then(|o| o.text.as_deref()).unwrap_or_default();
+            if text.trim().is_empty() {
+                reasons.push("its output has no detailed text and no annotations, only a title and summary".to_string());
             } else {
-                reasons.push(format!("its output says only \"{}\", which would match every failure", text.trim()));
+                evidence = text.to_string();
             }
         }
         let sig = failure_signature(conclusion, step.map(|s| s.name.as_str()).unwrap_or_default(), &evidence);
@@ -2371,10 +2369,9 @@ struct CheckRunRaw {
 
 #[derive(Debug, Default, Deserialize)]
 struct CheckOutputRaw {
+    /// The detailed body of the output, where an app puts the failure.
     #[serde(default)]
-    title: Option<String>,
-    #[serde(default)]
-    summary: Option<String>,
+    text: Option<String>,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -2412,6 +2409,8 @@ struct AnnotationRaw {
     title: Option<String>,
     #[serde(default)]
     message: Option<String>,
+    #[serde(default)]
+    raw_details: Option<String>,
 }
 
 /// The most of a job's log read; a longer one has no signature.
@@ -2430,10 +2429,10 @@ fn generic_failure_text(text: &str) -> bool {
         || t.contains("exited with code")
 }
 
-/// The failure text in a check run's annotations: each one's level, path and
-/// message (never its line, which moves between commits), without the generic
-/// exit-code one. A GitHub Actions run counts only failure-level ones (its
-/// warnings are about the workflow, not the failure). Empty when there is none.
+/// The failure text in a check run's annotations: each one's level, path,
+/// title, message and details (never its line, which moves between commits),
+/// all of them, without the generic exit-code ones. A GitHub Actions run
+/// counts only failure-level ones. Empty when there is none.
 fn annotation_evidence(annotations: &[AnnotationRaw], actions: bool) -> String {
     annotations
         .iter()
@@ -2442,14 +2441,14 @@ fn annotation_evidence(annotations: &[AnnotationRaw], actions: bool) -> String {
             if actions { level == "failure" } else { level != "notice" }
         })
         .filter(|a| !generic_failure_text(a.message.as_deref().unwrap_or_default()))
-        .take(20)
         .map(|a| {
             format!(
-                "{} {} {} {}",
+                "{} {} {} {} {}",
                 a.annotation_level.as_deref().unwrap_or_default(),
                 a.path.as_deref().unwrap_or_default(),
                 a.title.as_deref().unwrap_or_default(),
-                a.message.as_deref().unwrap_or_default()
+                a.message.as_deref().unwrap_or_default().replace('\n', " "),
+                a.raw_details.as_deref().unwrap_or_default().replace('\n', " ")
             )
         })
         .collect::<Vec<_>>()
@@ -2458,9 +2457,10 @@ fn annotation_evidence(annotations: &[AnnotationRaw], actions: bool) -> String {
 
 /// The lines of a job's log that say how `step` failed: the step's own
 /// section (lines stamped between its start and end; when the step's times
-/// are not known, only the log's `##[error]` lines), the lines of it that
-/// name an error (bounded to the first 10 and last 50), else its last 10 lines. Empty when the section
-/// holds nothing but the generic exit-code line.
+/// are not known, only the log's `##[error]` lines), and in it every line that
+/// is an `##[error]` or names an error, in full; when there is none, its last
+/// 10 lines. Empty when the section holds nothing but generic lines, or more
+/// than 20,000 error lines (too many to tell apart: no signature).
 fn failing_step_log(log: &str, step: &JobStepRaw) -> String {
     let parse = |t: &Option<String>| t.as_deref().and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok());
     let window = match (parse(&step.started_at), parse(&step.completed_at)) {
@@ -2488,9 +2488,10 @@ fn failing_step_log(log: &str, step: &JobStepRaw) -> String {
             section.push(text);
         }
     }
-    const KEYWORDS: [&str; 14] = [
+    const KEYWORDS: [&str; 26] = [
         "error", "fail", "panic", "exception", "fatal", "denied", "mismatch", "invalid", "cannot", "unable", "not found",
-        "unexpected", "syntax", "refused",
+        "unexpected", "syntax", "refused", "expected", "assert", "abort", "missing", "no such", "undefined", "unresolved",
+        "conflict", "timeout", "timed out", "must ", "required",
     ];
     let content = |l: &str| -> Option<String> {
         let l = l.trim();
@@ -2505,28 +2506,24 @@ fn failing_step_log(log: &str, step: &JobStepRaw) -> String {
     } else {
         section
             .iter()
-            .filter_map(|l| content(l))
-            .filter(|l| {
+            .filter(|l| l.trim().starts_with("##[error]") || {
                 let low = l.to_ascii_lowercase();
                 KEYWORDS.iter().any(|k| low.contains(k))
             })
+            .filter_map(|l| content(l))
             .collect()
     };
-    let chosen: Vec<String> = if !flagged.is_empty() {
-        // All of them when there are few; else the first 10 and the last 50,
-        // so what ends the output (usually the real error) is never cut off.
-        if flagged.len() > 60 {
-            flagged[..10].iter().chain(flagged[flagged.len() - 50..].iter()).cloned().collect()
-        } else {
-            flagged
-        }
+    let chosen: Vec<String> = if flagged.len() > 20_000 {
+        Vec::new()
+    } else if !flagged.is_empty() {
+        flagged
     } else if window.is_some() {
         let all: Vec<String> = section.iter().filter_map(|l| content(l)).collect();
         all[all.len().saturating_sub(10)..].to_vec()
     } else {
         Vec::new()
     };
-    chosen.into_iter().map(|l| l.chars().take(300).collect::<String>()).collect::<Vec<_>>().join("\n")
+    chosen.join("\n")
 }
 
 type CachedSignature = (Result<String, String>, Option<std::time::Instant>);
@@ -2562,18 +2559,21 @@ fn signature_cache_put(key: String, result: Result<String, String>) {
 /// A short, stable fingerprint of why a check fails, so that an answer about
 /// the failure can hold for later commits while it is the same failure: the
 /// conclusion, the failing step, and the failure text itself (`evidence`:
-/// annotations, the error lines of the failing step's log, or a commit
-/// status's description), with what changes between runs taken out: ANSI
-/// colors, timestamps, ids, hashes, counts, durations and versions (any word
-/// with a digit in it), long hex or encoded strings, temporary paths, case and
-/// spacing. Empty when `evidence` says nothing: the step's name alone never
-/// makes one, since a new failure in the same step would then read as the old.
+/// annotations or the error lines of the failing step's log), normalized by
+/// [`normalize_failure_text`]. The rule: a false waiver is a blocker and an
+/// extra question is not, so everything is kept except precisely-recognized
+/// volatile tokens. Empty when `evidence` says nothing, or is over 8 MB (never
+/// truncated): the step's name alone never makes a signature, and an empty one
+/// keeps the answer with its commit.
 pub fn failure_signature(conclusion: &str, step: &str, evidence: &str) -> String {
+    if evidence.len() > 8 * 1024 * 1024 {
+        return String::new();
+    }
     let evidence = normalize_failure_text(evidence);
     if evidence.is_empty() {
         return String::new();
     }
-    let joined = format!("{}\u{1f}{}\u{1f}{evidence}", conclusion.to_ascii_lowercase(), normalize_failure_text(step));
+    let joined = format!("{}\u{1f}{step}\u{1f}{evidence}", conclusion.to_ascii_lowercase());
     let mut hash: u64 = 0xcbf29ce484222325;
     for b in joined.bytes() {
         hash ^= u64::from(b);
@@ -2582,48 +2582,127 @@ pub fn failure_signature(conclusion: &str, step: &str, evidence: &str) -> String
     format!("{hash:016x}")
 }
 
-/// Whether `w` (a whitespace-separated word, edge punctuation removed) is
-/// something that changes from run to run: a timestamp, UUID, duration,
-/// version, long hex or encoded string, memory address or temporary path.
-fn volatile_word(w: &str) -> bool {
-    let low = w.to_ascii_lowercase();
-    let digits = low.chars().any(|c| c.is_ascii_digit());
-    let temp = low.contains("/tmp/") || low.starts_with("/tmp") || low.contains("_temp") || low.contains("/var/folders");
-    let timestamp = low.starts_with(|c: char| c.is_ascii_digit())
-        && low.chars().all(|c| c.is_ascii_digit() || matches!(c, ':' | '-' | 't' | 'z' | '.' | '+'))
-        && (low.contains(':') || (low.contains('-') && low.len() >= 8));
-    let uuid = low.len() == 36
-        && low.char_indices().all(|(i, c)| if matches!(i, 8 | 13 | 18 | 23) { c == '-' } else { c.is_ascii_hexdigit() });
-    let duration = ["ms", "\u{b5}s", "us", "ns", "sec", "secs", "seconds", "min", "s", "m", "h"].iter().any(|u| {
-        low.strip_suffix(u).is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit() || c == '.') && n.chars().any(|c| c.is_ascii_digit()))
-    });
-    let version = {
-        let v = low.strip_prefix('v').unwrap_or(&low);
-        let parts: Vec<&str> = v.split('.').collect();
-        parts.len() >= 3 && parts.iter().all(|p| p.starts_with(|c: char| c.is_ascii_digit()))
-            || (low.starts_with('v') && parts.len() == 2 && parts.iter().all(|p| p.starts_with(|c: char| c.is_ascii_digit())))
-    };
-    let hex = (low.len() >= 7 && digits && low.chars().all(|c| c.is_ascii_hexdigit())) || (low.len() >= 12 && low.chars().all(|c| c.is_ascii_hexdigit()));
-    let address = low.starts_with("0x") && low.len() >= 6;
-    let big_number = low.len() >= 5 && low.chars().all(|c| c.is_ascii_digit());
-    temp || timestamp || uuid || duration || version || hex || address || big_number
+fn is_hex_run(s: &str) -> bool {
+    s.len() >= 12 && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-/// [`failure_signature`]'s normal form of a failure text, line by line: the
-/// words that say what failed (error codes, HTTP statuses, test names, small
-/// numbers stay), without the volatile ones ([`volatile_word`]), a source
-/// position's line and column, ANSI escapes, case and spacing. Repeated lines
-/// count once. A text longer than 12,000 characters keeps its first 3,000 and
-/// last 9,000, so the line that ends the output still tells errors apart.
+fn is_uuid(s: &str) -> bool {
+    s.len() == 36 && s.char_indices().all(|(i, c)| if matches!(i, 8 | 13 | 18 | 23) { c == '-' } else { c.is_ascii_hexdigit() })
+}
+
+/// `2026-11-18`, `2026-11-18T20:14:45.123Z`, `2026-11-18T20:14:45+00:00`.
+fn is_iso_timestamp(s: &str) -> bool {
+    let b = s.as_bytes();
+    s.len() >= 10
+        && b[..4].iter().all(u8::is_ascii_digit)
+        && b[4] == b'-'
+        && b[5..7].iter().all(u8::is_ascii_digit)
+        && b[7] == b'-'
+        && b[8..10].iter().all(u8::is_ascii_digit)
+        && (s.len() == 10 || (matches!(b[10], b'T' | b't') && s[11..].chars().all(|c| c.is_ascii_digit() || matches!(c, ':' | '.' | 'Z' | 'z' | '+' | '-'))))
+}
+
+/// `20:14:45`, `20:14:45.123Z`, `20:14`.
+fn is_clock_time(s: &str) -> bool {
+    let b = s.as_bytes();
+    s.len() >= 5
+        && b[..2].iter().all(u8::is_ascii_digit)
+        && b[2] == b':'
+        && b[3..5].iter().all(u8::is_ascii_digit)
+        && s[5..].chars().all(|c| c.is_ascii_digit() || matches!(c, ':' | '.' | 'Z' | 'z'))
+}
+
+/// One whitespace-separated word of a failure text without its volatile
+/// parts, or `None` when it is only volatile: a timestamp, a UUID, a hash (a
+/// hex run of 12 or more, or a lock file's `h1:`/`zh:` digest), a
+/// `/tmp`, `_temp` or `/var/folders` directory (only that segment), a GitHub
+/// run, job or check id in a URL, and the line and column after a file name.
+fn scrub_word(word: &str) -> Option<String> {
+    let edge = |c: char| matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | '"' | '\'' | '`');
+    let core = word.trim_matches(edge);
+    let core_t = core.trim_end_matches([':', '.']);
+    if core_t.is_empty() {
+        return Some(word.to_string());
+    }
+    let low = core_t.to_ascii_lowercase();
+    if is_iso_timestamp(core_t) || is_clock_time(core_t) || is_uuid(core_t) || is_hex_run(core_t) || low.starts_with("h1:") || low.starts_with("zh:") {
+        return None;
+    }
+    // `file.tf:12:5` is `file.tf`.
+    let mut path = core;
+    for _ in 0..2 {
+        match path.rsplit_once(':') {
+            Some((head, tail))
+                if (head.contains('.') || head.contains('/')) && !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) =>
+            {
+                path = head
+            }
+            _ => break,
+        }
+    }
+    const ID_KEYS: [&str; 9] = ["runs", "jobs", "job", "check-runs", "check_runs", "attempts", "suites", "check-suites", "check_suites"];
+    let segments: Vec<&str> = path.split('/').collect();
+    let mut kept: Vec<String> = Vec::new();
+    let mut skip = 0usize;
+    let mut skip_if_digit = false;
+    for (i, seg) in segments.iter().enumerate() {
+        if skip > 0 {
+            skip -= 1;
+            continue;
+        }
+        if skip_if_digit {
+            skip_if_digit = false;
+            if seg.chars().any(|c| c.is_ascii_digit()) {
+                continue;
+            }
+        }
+        if matches!(*seg, "_temp" | "tmp") {
+            skip_if_digit = true;
+            continue;
+        }
+        if *seg == "folders" && kept.last().is_some_and(|k| k == "var") {
+            kept.push((*seg).to_string());
+            skip = 3;
+            continue;
+        }
+        if i > 0 && !seg.is_empty() && seg.chars().all(|c| c.is_ascii_digit()) && ID_KEYS.contains(&segments[i - 1].to_ascii_lowercase().as_str()) {
+            continue;
+        }
+        // A digest or uuid after `:`, `=` or `@` inside a segment.
+        let mut out = String::new();
+        let mut piece = String::new();
+        for c in seg.chars() {
+            if matches!(c, ':' | '=' | '@') {
+                if !(is_hex_run(&piece) || is_uuid(&piece)) {
+                    out.push_str(&piece);
+                }
+                out.push(c);
+                piece.clear();
+            } else {
+                piece.push(c);
+            }
+        }
+        if !(is_hex_run(&piece) || is_uuid(&piece)) {
+            out.push_str(&piece);
+        }
+        kept.push(out);
+    }
+    let rebuilt = kept.join("/");
+    if rebuilt.is_empty() {
+        return None;
+    }
+    let lead = &word[..word.len() - word.trim_start_matches(edge).len()];
+    Some(format!("{lead}{rebuilt}"))
+}
+
+/// [`failure_signature`]'s normal form of a failure text: per line, ANSI
+/// escapes and volatile tokens ([`scrub_word`]) removed and whitespace made
+/// single, nothing else changed (case, long paths, numbers, versions and
+/// durations all stay); then the sorted, de-duplicated set of lines, so the
+/// order and repeats of lines do not matter.
 fn normalize_failure_text(text: &str) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    let bounded: String = if chars.len() > 12_000 {
-        chars[..3_000].iter().chain(['\n'].iter()).chain(chars[chars.len() - 9_000..].iter()).collect()
-    } else {
-        text.to_string()
-    };
-    let mut out: Vec<String> = Vec::new();
-    for line in bounded.lines() {
+    let mut lines = std::collections::BTreeSet::new();
+    for line in text.lines() {
         // ANSI escapes: `ESC [ ... letter`.
         let mut plain = String::new();
         let mut it = line.chars();
@@ -2638,63 +2717,12 @@ fn normalize_failure_text(text: &str) -> String {
                 plain.push(c);
             }
         }
-        let words: Vec<String> = plain
-            .split_whitespace()
-            .map(|w| w.trim_matches(|c: char| matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | ':' | '"' | '\'' | '`' | '.')))
-            .filter(|w| !w.is_empty() && !volatile_word(w))
-            .flat_map(|w| {
-                // `file.tf:12:5` is `file.tf`: positions move between commits.
-                let mut w = w;
-                for _ in 0..2 {
-                    match w.rsplit_once(':') {
-                        Some((head, tail)) if !head.is_empty() && !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) => w = head,
-                        _ => break,
-                    }
-                }
-                w.chars()
-                    .map(|c| if c.is_alphanumeric() || matches!(c, '_' | '-' | '/' | '.') { c.to_ascii_lowercase() } else { ' ' })
-                    .collect::<String>()
-                    .split_whitespace()
-                    .map(|p| p.trim_matches(|c| matches!(c, '.' | '-' | '/')).to_string())
-                    .filter(|p| {
-                        // An encoded blob (a hash, a token): one long alphanumeric
-                        // run with digits in it; a test name has separators.
-                        let blob = p.len() >= 16
-                            && p.chars().all(|c| c.is_ascii_alphanumeric())
-                            && p.chars().any(|c| c.is_ascii_digit())
-                            && p.chars().any(|c| c.is_ascii_alphabetic());
-                        !p.is_empty() && !volatile_word(p) && !blob && p.len() < 40
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect();
+        let words: Vec<String> = plain.split_whitespace().filter_map(scrub_word).collect();
         if !words.is_empty() {
-            let line = words.join(" ");
-            if !out.contains(&line) {
-                out.push(line);
-            }
+            lines.insert(words.join(" "));
         }
     }
-    out.join("\n")
-}
-
-/// Whether `text` (a commit status's description, or a check run's output
-/// title and summary) says more than that the check failed: at least three
-/// words that are not the check's own name or a generic one ("build failed",
-/// "your tests failed"). Anything less would match every failure of the check.
-fn says_how_it_failed(text: &str, check: &str) -> bool {
-    const GENERIC: [&str; 40] = [
-        "build", "tests", "test", "failed", "failure", "failures", "failing", "check", "checks", "your", "the", "has", "have",
-        "error", "errors", "run", "job", "step", "completed", "with", "passed", "not", "did", "was", "is", "a", "an", "ci",
-        "pipeline", "status", "problem", "problems", "something", "went", "wrong", "see", "details", "click", "here", "and",
-    ];
-    let name = normalize_failure_text(check);
-    let name_words: Vec<&str> = name.split_whitespace().collect();
-    normalize_failure_text(text)
-        .split_whitespace()
-        .filter(|w| !name_words.contains(w) && !GENERIC.contains(w))
-        .count()
-        >= 3
+    lines.into_iter().collect::<Vec<_>>().join("\n")
 }
 
 /// [`PrStatus::checks`] from the combined status and the check runs.
@@ -3496,25 +3524,30 @@ mod tests {
         assert_eq!(failing_check_names(None, Some(&n)), vec!["(unnamed check)".to_string()]);
     }
 
-    const CLOUDFLARE_ERR_A: &str = "\u{1b}[31;1mError:\u{1b}[0m Failed to install provider cloudflare/cloudflare 4.52.0: the current package for registry.terraform.io/cloudflare/cloudflare doesn't match any of the checksums previously recorded in the dependency lock file (h1:Zc8dQ5m7vK2PjRtq0ZxYw1oN3aBcDeFgHiJk=) in /home/runner/work/_temp/9f3a1c7e/.terraform.lock.hcl after 12.4s";
-    const CLOUDFLARE_ERR_B: &str = "Error: Failed to install provider cloudflare/cloudflare 4.53.1: the current package for registry.terraform.io/cloudflare/cloudflare doesn't match any of the checksums previously recorded in the dependency lock file (h1:QqQqQqQqQqQqQqQqQq77Zz=) in /home/runner/work/_temp/0b2e55d1/.terraform.lock.hcl after 3.1s";
+    // The same error on two runs: only the digest, the temporary directory
+    // and (in the log) the timestamps differ.
+    const CLOUDFLARE_ERR_A: &str = "\u{1b}[31;1mError:\u{1b}[0m Failed to install provider cloudflare/cloudflare 4.52.0: the current package for registry.terraform.io/cloudflare/cloudflare doesn't match any of the checksums previously recorded in the dependency lock file (h1:Zc8dQ5m7vK2PjRtq0ZxYw1oN3aBcDeFgHiJk=) in /home/runner/work/_temp/9f3a1c7e/.terraform.lock.hcl";
+    const CLOUDFLARE_ERR_B: &str = "Error: Failed to install provider cloudflare/cloudflare 4.52.0: the current package for registry.terraform.io/cloudflare/cloudflare doesn't match any of the checksums previously recorded in the dependency lock file (h1:QqQqQqQqQqQqQqQqQq77Zz=) in /home/runner/work/_temp/0b2e55d1/.terraform.lock.hcl";
 
     #[test]
-    fn a_signature_ignores_what_changes_between_runs_and_keeps_the_error() {
+    fn a_signature_ignores_only_what_is_precisely_volatile() {
         let sig = |text: &str| failure_signature("failure", "Terraform validate", text);
-        // The same checksum error across heads, with other timestamps, ids,
-        // hashes, temp paths, versions and durations.
         let a = format!("2026-11-18T20:14:45.1234567Z {CLOUDFLARE_ERR_A}");
         let b = format!("2026-11-19T03:02:11.7654321Z {CLOUDFLARE_ERR_B}");
         assert!(!sig(&a).is_empty());
         assert_eq!(sig(&a), sig(&b));
-        assert_eq!(sig(&a), sig(&a.to_ascii_uppercase()), "case does not matter");
-        // A different error in the same step is a different failure.
-        let syntax = "2026-11-19T03:02:11Z Error: Argument or block definition required: syntax error in modules/aws/main.tf";
-        assert_ne!(sig(&a), sig(syntax));
-        // The step name alone never makes a signature.
+        // Positions, UUIDs, hashes, run ids in URLs, /var/folders and clock times.
+        assert_eq!(sig("error at main.tf:12:5"), sig("error at main.tf:99:1"));
+        assert_eq!(
+            sig("id 3f2b8c1e-0a4d-4b7e-9c1d-5e6f7a8b9c0d at 12:30:01 sha 0123456789abcdef0123 see https://github.com/o/r/actions/runs/111/job/222"),
+            sig("id 11111111-2222-3333-4444-555555555555 at 01:02:03 sha fedcba9876543210fedc see https://github.com/o/r/actions/runs/333/job/444")
+        );
+        assert_eq!(sig("wrote /var/folders/ab/cdef12/T/out.txt"), sig("wrote /var/folders/zz/yyyy99/T/out.txt"));
+        // Line order and repeats do not matter.
+        assert_eq!(sig("first failure\nsecond failure"), sig("second failure\nfirst failure\nsecond failure"));
+        // The step name alone never makes one.
         assert_eq!(failure_signature("failure", "Terraform validate", ""), "");
-        assert_eq!(failure_signature("failure", "Terraform validate", "  12:30:01  2026-11-19T03:02:11Z  4821000  450ms  v1.2.3 \n"), "");
+        assert_eq!(failure_signature("failure", "Terraform validate", "  12:30:01  2026-11-19T03:02:11Z  0123456789abcdef0123 \n"), "");
         // Another conclusion or step is another failure.
         assert_ne!(sig(&a), failure_signature("timed_out", "Terraform validate", &a));
         assert_ne!(sig(&a), failure_signature("failure", "Terraform plan", &a));
@@ -3523,39 +3556,88 @@ mod tests {
     #[test]
     fn different_failures_do_not_share_a_signature() {
         let sig = |t: &str| failure_signature("failure", "Test", t);
+        let deep = |dir: &str| format!("error: cannot find module in /home/runner/work/app/app/packages/{dir}/src/components/widgets/forms/inputs/index.ts");
         for (a, b) in [
             ("request returned error: 404", "request returned error: 500"),
             ("Expected 3 got 4", "Expected 5 got 6"),
+            ("expected 12345 got 12346", "expected 54321 got 54322"),
             ("FAILED tests/test_login_v2", "FAILED tests/test_login_v3"),
             ("error[E0425]: cannot find value `x`", "error[E0599]: cannot find value `x`"),
+            ("requires node 18.0.0", "requires node 20.0.0"),
+            ("timeout after 5m", "timeout after 30m"),
+            ("Error: Argument required in main.tf", "Error: Argument required in other.tf"),
         ] {
             assert_ne!(sig(a), sig(b), "{a} / {b}");
         }
-        // Positions and the volatile are still ignored.
-        assert_eq!(sig("error at main.tf:12:5 after 450ms in v1.2.3"), sig("error at main.tf:99:1 after 3.1s in v2.0.0"));
-        assert_eq!(
-            sig("id 3f2b8c1e-0a4d-4b7e-9c1d-5e6f7a8b9c0d failed at 12:30:01 addr 0x7ffd1234"),
-            sig("id 11111111-2222-3333-4444-555555555555 failed at 01:02:03 addr 0x7ffe9999")
-        );
+        assert_ne!(sig(&deep("alpha-service-with-a-long-name")), sig(&deep("beta-service-with-a-long-name")));
+        // Case is kept too.
+        assert_ne!(sig("Error: Foo"), sig("Error: foo"));
     }
 
     #[test]
-    fn a_generic_description_is_no_evidence() {
-        for text in ["Build failed", "Your tests failed", "Kasm offline validation and tests", "Kasm offline validation and tests failed"] {
-            assert!(!says_how_it_failed(text, "Kasm offline validation and tests"), "{text}");
-        }
-        assert!(says_how_it_failed("3 of 40 checks failed: lint error in src/main.rs", "ci"));
-        // Through get_pr_status: a commit status with only "Build failed" has a note, no signature.
-        let statuses = r#"{"state":"failure","total_count":1,"statuses":[{"context":"ci/build","state":"failure","description":"Build failed"}]}"#;
+    fn annotations_are_all_used_and_their_order_does_not_matter() {
+        let ann = |m: String| AnnotationRaw {
+            path: Some("src/lib.rs".into()),
+            annotation_level: Some("failure".into()),
+            title: None,
+            message: Some(m),
+            raw_details: None,
+        };
+        let many = |last: &str| -> Vec<AnnotationRaw> {
+            (0..30).map(|i| ann(format!("error number {i}: bad thing"))).chain([ann(last.to_string())]).collect()
+        };
+        let sig = |a: &[AnnotationRaw]| failure_signature("failure", "Build", &annotation_evidence(a, true));
+        // More than 20, a new one last: another failure.
+        assert_ne!(sig(&many("error: a new problem")), sig(&many("error: another new problem")));
+        let mut reversed = many("error: a new problem");
+        let forward = sig(&reversed);
+        reversed.reverse();
+        assert_eq!(forward, sig(&reversed));
+        // Paged: 100 on the first page, the rest on the second.
+        let page = |n: usize, last: &str| -> &'static str {
+            let items: Vec<String> = (0..n)
+                .map(|i| {
+                    let m = if i == n - 1 { last.to_string() } else { format!("error number {i}") };
+                    format!(r#"{{"path":"a.rs","annotation_level":"failure","message":"{m}"}}"#)
+                })
+                .collect();
+            leaked(format!("[{}]", items.join(",")))
+        };
+        let paged = |last: &'static str| {
+            let first = leaked(format!("[{}]", (0..100).map(|i| format!(r#"{{"path":"a.rs","annotation_level":"failure","message":"error number {i}"}}"#)).collect::<Vec<_>>().join(",")));
+            let (status, requests) = status_with(vec![
+                ("200 OK", leaked(actions_run_json(9400 + last.len() as i64))),
+                ("200 OK", job_json()),
+                ("200 OK", first),
+                ("200 OK", page(5, last)),
+            ]);
+            assert_eq!(requests, 6);
+            status.failure_signature_of("Kasm offline validation and tests")
+        };
+        let one = paged("error: late one");
+        assert!(!one.is_empty());
+        assert_ne!(one, paged("error: late two!"));
+    }
+
+    #[test]
+    fn a_status_or_title_alone_is_never_evidence() {
+        let statuses = r#"{"state":"failure","total_count":1,"statuses":[{"context":"ci/build","state":"failure","description":"The build failed due to errors in tests"}]}"#;
         let (url, handle) = serve_canned(vec![("200 OK", PR_JSON), ("200 OK", statuses), ("200 OK", r#"{"total_count":0,"check_runs":[]}"#)]);
         let status = client(&url, &[]).get_pr_status("o", "r", 1).unwrap();
         handle.join().unwrap();
         assert!(status.failing_signatures.is_empty());
-        assert!(status.signature_notes[0].1.contains("Build failed"), "{:?}", status.signature_notes);
-        // A check run whose output only repeats its name: the same.
-        let run = r#"{"total_count":1,"check_runs":[{"id":0,"name":"lint","status":"completed","conclusion":"failure","app":{"id":1,"slug":"other"},"output":{"title":"lint","summary":"Your checks failed"}}]}"#;
-        let (status, _) = status_with(vec![("200 OK", run)]);
+        assert!(status.signature_notes[0].1.contains("one head only"), "{:?}", status.signature_notes);
+        // A non-Actions check run with a long title and summary but no body or annotations: a note.
+        let run = |id: i64, extra: &str| {
+            leaked(format!(
+                r#"{{"total_count":1,"check_runs":[{{"id":{id},"name":"lint","status":"completed","conclusion":"failure","app":{{"id":1,"slug":"other"}},"output":{{"title":"Lint found a lot of problems in many files","summary":"Several rule violations were found","text":{extra}}}}}]}}"#
+            ))
+        };
+        let (status, _) = status_with(vec![("200 OK", run(9500, "null")), ("200 OK", "[]")]);
         assert!(status.failing_signatures.is_empty() && status.signature_notes.len() == 1);
+        // With a detailed body it has a signature.
+        let (status, _) = status_with(vec![("200 OK", run(9501, r#""src/a.rs: unused variable x""#)), ("200 OK", "[]")]);
+        assert!(!status.failure_signature_of("lint").is_empty());
     }
 
     #[test]
@@ -3565,6 +3647,7 @@ mod tests {
             annotation_level: Some("failure".into()),
             title: None,
             message: Some(m.into()),
+            raw_details: None,
         };
         assert_eq!(annotation_evidence(&[a("The process '/usr/bin/git' failed with exit code 128")], true), "");
         assert_eq!(annotation_evidence(&[a("Command failed with exit code 2"), a("Process completed with exit code 1.")], true), "");
