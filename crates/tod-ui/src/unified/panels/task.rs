@@ -93,6 +93,10 @@ pub(crate) struct TaskHeader {
     /// The latest review's coverage in one line (lenses covered, saturation
     /// pass owed), or why it could not be read; `None` when never reviewed.
     pub coverage_label: Option<String>,
+    /// What every session of the node has cost so far at list prices
+    /// (`Cost $12.34`; a `+` when some turns could not be priced); `None`
+    /// until a turn has reported tokens. The Activity lists it per step.
+    pub cost_label: Option<String>,
     /// The node's guidance selection and what the user may add.
     pub guidance: crate::unified::panels::guidance::GuidanceView,
 }
@@ -173,6 +177,10 @@ fn load(fleet: &FleetStore, node_id: Uuid) -> TaskHeader {
     {
         Ok(latest) => latest.map(|latest| latest.summary_label()),
         Err(err) => Some(format!("Coverage could not be read: {err:#}")),
+    };
+    header.cost_label = match fleet.read(|conn| tod_store::conversation_usage::node_cost(conn, node_id)) {
+        Ok(spent) => spent.label().map(|label| format!("Cost {label}")),
+        Err(err) => Some(format!("Cost could not be read: {err:#}")),
     };
     header.guidance = crate::unified::panels::guidance::GuidanceView::load(fleet, node_id);
     header
@@ -639,6 +647,10 @@ impl TaskPanel {
             .child(plan)
             .children(findings)
             .children(coverage)
+            // The node's total, as the Activity breaks it down by step.
+            .children(self.header.cost_label.clone().map(|label| {
+                self.artifact_link("unified-task-cost", label, PanelKind::Watch(node_id), cx)
+            }))
             // Only a current count: none while unknown or recomputing.
             .children(self.changes.state.label().map(|label| {
                 self.artifact_link("unified-task-changes", label, PanelKind::Changes(node_id), cx)

@@ -181,6 +181,106 @@ pub fn node_turns(conn: &Connection, node: Uuid) -> Result<Vec<(String, TurnUsag
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
+/// What turns cost at list prices (`tod_agent::price`): the money, and how
+/// many of the turns could not be priced because their model is unknown (so
+/// the money is a floor).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Spent {
+    pub turns: u64,
+    pub unpriced_turns: u64,
+    pub micros: u64,
+}
+
+impl Spent {
+    pub fn add_turn(&mut self, micros: Option<u64>) {
+        self.turns += 1;
+        match micros {
+            Some(m) => self.micros += m,
+            None => self.unpriced_turns += 1,
+        }
+    }
+
+    pub fn add(&mut self, other: &Self) {
+        self.turns += other.turns;
+        self.unpriced_turns += other.unpriced_turns;
+        self.micros += other.micros;
+    }
+
+    /// Nothing was recorded (no turn reported tokens).
+    pub fn is_empty(&self) -> bool {
+        self.turns == 0
+    }
+
+    /// `$1.23`, `$1.23+` when some turns could not be priced, `unpriced`
+    /// when none could; `None` when nothing was recorded.
+    pub fn label(&self) -> Option<String> {
+        if self.is_empty() {
+            None
+        } else if self.unpriced_turns == self.turns {
+            Some("unpriced".to_string())
+        } else {
+            let plus = if self.unpriced_turns > 0 { "+" } else { "" };
+            Some(format!("{}{plus}", tod_agent::format_usd(self.micros)))
+        }
+    }
+}
+
+/// `SELECT model, sums` grouped by model: pricing is linear in the counts, so
+/// a group priced as one is the sum of its turns priced one by one.
+fn spent_by_model(conn: &Connection, where_clause: &str, arg: Vec<u8>) -> Result<Spent> {
+    let sql = format!(
+        "SELECT u.model, {SUMS} FROM conversation_usage u
+         JOIN conversations c ON c.id = u.conversation_id
+         WHERE {where_clause} GROUP BY u.model"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![arg], |r| Ok((r.get::<_, Option<String>>(0)?, totals_from(r, 1)?)))?;
+    let mut spent = Spent::default();
+    for row in rows {
+        let (model, totals) = row?;
+        let micros = tod_agent::price(&totals.counts, model.as_deref()).map(|c| c.micros);
+        match micros {
+            Some(m) => {
+                spent.turns += totals.turns;
+                spent.micros += m;
+            }
+            None => {
+                spent.turns += totals.turns;
+                spent.unpriced_turns += totals.turns;
+            }
+        }
+    }
+    Ok(spent)
+}
+
+/// What everything focused on `node` cost, every phase together.
+pub fn node_cost(conn: &Connection, node: Uuid) -> Result<Spent> {
+    spent_by_model(conn, "COALESCE(c.focus_node_id, c.focus_id) = ?1", uuid_to_blob(node))
+}
+
+/// What one conversation cost.
+pub fn conversation_cost(conn: &Connection, conversation: Uuid) -> Result<Spent> {
+    spent_by_model(conn, "c.id = ?1", uuid_to_blob(conversation))
+}
+
+/// Each turn of a conversation that reported tokens: when it was recorded
+/// and what it cost (`None`: its model is unknown), oldest first.
+pub fn conversation_turn_costs(conn: &Connection, conversation: Uuid) -> Result<Vec<(i64, Option<u64>)>> {
+    let mut stmt = conn.prepare(
+        "SELECT u.at_ms, u.model, u.requests, u.input, u.cache_read, u.cache_write, u.output
+         FROM conversation_usage u WHERE u.conversation_id = ?1 ORDER BY u.id",
+    )?;
+    let rows = stmt.query_map(params![uuid_to_blob(conversation)], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?, counts_from(r, 2)?))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (at, model, counts) = row?;
+        out.push((at, tod_agent::price(&counts, model.as_deref()).map(|c| c.micros)));
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,5 +354,31 @@ mod tests {
         assert_eq!(totals, UsageTotals::default());
         assert_eq!(totals.cache_read_share(), None);
         assert!(phase_totals(&conn, node).unwrap().is_empty());
+    }
+    #[test]
+    fn cost_is_priced_per_model_and_a_node_totals_its_conversations() {
+        let conn = conn();
+        let node = Uuid::new_v4();
+        let (a, b) = (conversation(&conn, node, "implementation"), conversation(&conn, node, "review"));
+        let mut t = turn(a, Some("implement"), 1_000_000, 0, 0, 100_000);
+        t.model = Some("claude-sonnet-5-5".into()); // $2 in, $10 out
+        record(&conn, &t).unwrap();
+        let mut t = turn(b, Some("review"), 1_000_000, 0, 0, 0);
+        t.model = Some("opus".into()); // $4 in
+        record(&conn, &t).unwrap();
+        // A model nobody priced.
+        let mut t = turn(b, Some("review"), 5, 0, 0, 5);
+        t.model = Some("mystery".into());
+        record(&conn, &t).unwrap();
+
+        let a_cost = conversation_cost(&conn, a).unwrap();
+        assert_eq!((a_cost.micros, a_cost.unpriced_turns), (3_000_000, 0));
+        assert_eq!(a_cost.label().as_deref(), Some("$3.00"));
+        let all = node_cost(&conn, node).unwrap();
+        assert_eq!((all.turns, all.micros, all.unpriced_turns), (3, 7_000_000, 1));
+        assert_eq!(all.label().as_deref(), Some("$7.00+"));
+        let turns = conversation_turn_costs(&conn, b).unwrap();
+        assert_eq!(turns.iter().map(|t| t.1).collect::<Vec<_>>(), vec![Some(4_000_000), None]);
+        assert_eq!(node_cost(&conn, Uuid::new_v4()).unwrap().label(), None);
     }
 }

@@ -126,7 +126,7 @@ pub struct TranscriptPanel {
 const WATCH_THROTTLE: std::time::Duration = std::time::Duration::from_millis(60);
 
 /// How wide the list of the node's conversations is, beside the transcript.
-const RUNS_WIDTH: f32 = 210.0;
+const RUNS_WIDTH: f32 = 270.0;
 
 /// The phase a session worked in: the state it was started for, else the one
 /// its kind belongs to.
@@ -450,18 +450,21 @@ impl TranscriptPanel {
             let found = cx
                 .background_executor()
                 .spawn(async move {
-                    let (conversations, entries, turn_times) = fleet.read(|conn| {
+                    let (conversations, entries, turn_times, turn_costs) = fleet.read(|conn| {
                         let repo = ConversationRepo::new(conn);
                         let mut conversations = repo.conversations_for_focus(Focus::Node(node))?;
                         conversations.retain(|c| !matches!(c.protocol, ProtocolKind::Outline | ProtocolKind::Chat));
                         let mut turn_times = Vec::with_capacity(conversations.len());
+                        let mut turn_costs = Vec::with_capacity(conversations.len());
                         for c in &conversations {
                             turn_times.push(repo.turn_times(c.id)?);
+                            turn_costs.push(tod_store::conversation_usage::conversation_turn_costs(conn, c.id)?);
                         }
                         anyhow::Ok((
                             conversations,
                             tod_store::node_timeline::TimelineRepo::new(conn).list(node)?,
                             turn_times,
+                            turn_costs,
                         ))
                     })?;
                     let current = tod_core::lifecycle::current_state(&fleet, node).unwrap_or_default();
@@ -485,6 +488,7 @@ impl TranscriptPanel {
                             c.updated_at,
                             &turn_times[ix],
                             &others,
+                            &turn_costs[ix],
                         ));
                     }
                     items.extend(timeline::entry_items(&entries));
@@ -633,6 +637,9 @@ impl TranscriptPanel {
                             .child(label.clone())
                             .record_text(label)
                     })
+                    .children(group.cost().label().map(|cost| {
+                        style::text_dense_muted(div()).flex_shrink_0().pr_2().child(cost.clone()).record_text(cost)
+                    }))
                     .child({
                         let count = group.items.len().to_string();
                         style::text_dense_muted(div())
@@ -672,6 +679,9 @@ impl TranscriptPanel {
                             cx.listener(move |this, _: &MouseDownEvent, _, cx| this.choose(Some(id), cx)),
                         )
                         .child(label.child(format!("{}{}", if live { "\u{25cf} " } else { "" }, item.label)))
+                        .children(item.cost.label().map(|cost| {
+                            style::text_dense_muted(div()).flex_shrink_0().pr_2().child(cost.clone()).record_text(cost)
+                        }))
                         .child(style::text_dense_muted(div()).flex_shrink_0().child(format_time(item.at))),
                 );
             }

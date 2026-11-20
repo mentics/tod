@@ -127,6 +127,8 @@ pub struct CostRow {
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
     pub output_tokens: u64,
+    /// The same turns at list prices (`tod_agent::price`).
+    pub cost: tod_store::conversation_usage::Spent,
 }
 
 impl CostRow {
@@ -414,6 +416,10 @@ fn cost(conn: &Connection, f: &Filter) -> Result<Cost> {
         row.cache_read_tokens += usage.counts.cache_read;
         row.cache_write_tokens += usage.counts.cache_write;
         row.output_tokens += usage.counts.output;
+        row.cost.add(&tod_store::conversation_usage::conversation_cost(
+            conn,
+            Uuid::from_slice(&id).context("a conversation id that is not a UUID")?,
+        )?);
         let stamps: Vec<i64> = stamp_stmt.query_map([&id], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
         let mut previous = created;
         for at in stamps {
@@ -447,12 +453,13 @@ fn cost(conn: &Connection, f: &Filter) -> Result<Cost> {
         t.cache_read_tokens += r.cache_read_tokens;
         t.cache_write_tokens += r.cache_write_tokens;
         t.output_tokens += r.output_tokens;
+        t.cost.add(&r.cost);
     }
     Ok(Cost {
         rows,
         by_phase: by_phase.into_values().collect(),
         unavailable: vec![
-            "tokens: counted per turn from when tod began recording them (`conversation_usage`), as the agent reported them; a session before that, or whose agent reports no usage, shows none (cache is the share of the prompt read from the prompt cache)"
+            "tokens: counted per turn from when tod began recording them (`conversation_usage`), as the agent reported them; a session before that, or whose agent reports no usage, shows none (cache is the share of the prompt read from the prompt cache). The dollar figure is those tokens at Anthropic list prices (`tod_agent::price`; cache writes at the five-minute rate; `+` means some turns ran a model with no known price)"
                 .into(),
             "wall is the sum of the gaps from a session's start through its turns, leaving out any gap over 30 minutes (idle); it is time to a turn, not CPU or model time"
                 .into(),
@@ -862,7 +869,8 @@ fn tokens_text(r: &CostRow) -> String {
     match r.cache_read_share() {
         None if r.output_tokens == 0 => "no tokens recorded".to_string(),
         share => format!(
-            "in {} + {} read + {} write, {} out, cached {}",
+            "{} · in {} + {} read + {} write, {} out, cached {}",
+            r.cost.label().unwrap_or_else(|| "-".into()),
             r.input_tokens,
             r.cache_read_tokens,
             r.cache_write_tokens,

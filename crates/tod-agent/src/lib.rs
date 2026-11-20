@@ -21,6 +21,7 @@ mod routing;
 pub mod run_state;
 pub mod sandbox;
 mod transcript;
+mod pricing;
 mod usage;
 pub mod util;
 
@@ -51,6 +52,7 @@ pub use transcript::{
     FormatProblem, Transcript, TranscriptRead, TranscriptTurn, read_transcript,
     transcript_fingerprint,
 };
+pub use pricing::{Rates, format_usd, price, rates_for};
 pub use usage::{Cost, TokenCounts, TokenUsage};
 
 use std::sync::{Arc, Mutex};

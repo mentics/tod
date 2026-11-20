@@ -8,6 +8,7 @@
 //! the state that change left; with no change recorded (a node older than the
 //! timeline), everything is in the node's current state.
 
+use tod_store::conversation_usage::Spent;
 use tod_store::node_timeline::{KIND_CHECKS, KIND_GATE, KIND_NOTE, KIND_PHASE, KIND_SEND_BACK, TimelineEntry};
 use uuid::Uuid;
 
@@ -43,6 +44,10 @@ pub struct Item {
     /// Set when the row shows only part of a session: the turns between two
     /// cuts (see [`cut_pieces`]).
     pub piece: Option<Piece>,
+    /// What a session spent (a piece: the turns it shows), at list prices;
+    /// empty for anything that is not a session and for a session whose
+    /// agent reported no tokens.
+    pub cost: Spent,
 }
 
 impl Item {
@@ -131,9 +136,18 @@ pub fn session_items(
     updated_at: i64,
     turns: &[(i64, i64)],
     others: &[i64],
+    costs: &[(i64, Option<u64>)],
 ) -> Vec<Item> {
     let spans = cut_pieces(turns, others);
+    let whole_cost = {
+        let mut spent = Spent::default();
+        for &(_, micros) in costs {
+            spent.add_turn(micros);
+        }
+        spent
+    };
     let whole = |piece| Item {
+        cost: whole_cost,
         id,
         kind: ItemKind::Session,
         label: label.to_string(),
@@ -152,7 +166,14 @@ pub fn session_items(
         .enumerate()
         .map(|(ix, s)| {
             let last = ix + 1 == of;
+            let mut cost = Spent::default();
+            for &(at, micros) in costs {
+                if piece_of(&spans, turns, at) == ix {
+                    cost.add_turn(micros);
+                }
+            }
             Item {
+                cost,
                 id: piece_id(id, s.from_seq),
                 kind: ItemKind::Session,
                 label: format!("{label} \u{b7} part {}", ix + 1),
@@ -164,6 +185,16 @@ pub fn session_items(
             }
         })
         .collect()
+}
+
+/// Which span (by index) a turn's recorded usage belongs to. The usage is
+/// recorded as the turn ends, a moment before the agent's reply is stored as
+/// the turn's row, so it belongs to the first row stored at or after it (a
+/// second of slack for the clocks); after every row it is the last span's.
+fn piece_of(spans: &[Span], turns: &[(i64, i64)], usage_at: i64) -> usize {
+    let seq = turns.iter().find(|&&(_, at)| at >= usage_at - 1000).or(turns.last()).map(|t| t.0);
+    seq.and_then(|seq| spans.iter().position(|s| s.from_seq <= seq && seq <= s.to_seq))
+        .unwrap_or(spans.len().saturating_sub(1))
 }
 
 /// A stay in a phase and what happened in it.
@@ -179,6 +210,15 @@ pub struct Group {
 }
 
 impl Group {
+    /// What the stay's sessions spent.
+    pub fn cost(&self) -> Spent {
+        let mut spent = Spent::default();
+        for item in &self.items {
+            spent.add(&item.cost);
+        }
+        spent
+    }
+
     /// `Active`, `Active (user)`: the phase and, when the user chose it, who.
     pub fn title(&self) -> String {
         let name = tod_store::settings::lifecycle_display_name(&self.phase);
@@ -214,6 +254,7 @@ pub fn entry_items(timeline: &[TimelineEntry]) -> Vec<Item> {
                 failed: e.failed,
                 phase: Some(e.phase.clone()),
                 piece: None,
+                cost: Spent::default(),
             })
         })
         .collect()
@@ -277,7 +318,7 @@ mod tests {
     use super::*;
 
     fn session(at: i64) -> Item {
-        Item { id: Uuid::new_v4(), kind: ItemKind::Session, label: "s".into(), at, started: at, failed: false, phase: None, piece: None }
+        Item { id: Uuid::new_v4(), kind: ItemKind::Session, label: "s".into(), at, started: at, failed: false, phase: None, piece: None, cost: Spent::default() }
     }
 
     fn change(node: Uuid, at: i64, from: &str, to: &str, by_user: bool) -> TimelineEntry {
@@ -369,7 +410,7 @@ mod tests {
     fn pieces_are_rows_placed_at_their_own_time_among_the_other_items() {
         let id = Uuid::new_v4();
         let turns = [(1, 10), (2, 11), (3, 50), (4, 51)];
-        let mut items = session_items(id, "Pull request", None, 10, 60, &turns, &[30]);
+        let mut items = session_items(id, "Pull request", None, 10, 60, &turns, &[30], &[]);
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].label, "Pull request \u{b7} part 1");
         assert_ne!(items[0].id, id);
@@ -385,14 +426,40 @@ mod tests {
     }
 
     #[test]
+    fn a_session_row_shows_what_its_turns_cost_and_a_piece_only_its_own() {
+        let id = Uuid::new_v4();
+        // Turn rows (ms) at 100k, 110k | 500k, 510k; usage is recorded just
+        // before each agent reply's row, and one turn's model was unpriced.
+        let turns = [(1, 100_000), (2, 110_000), (3, 500_000), (4, 510_000)];
+        let costs = [
+            (99_990, Some(1_000_000)),
+            (109_990, Some(2_000_000)),
+            (499_990, Some(4_000_000)),
+            (509_990, None),
+        ];
+        let items = session_items(id, "PR", None, 10, 600_000, &turns, &[300_000], &costs);
+        assert_eq!(items.len(), 2);
+        assert_eq!((items[0].cost.turns, items[0].cost.micros), (2, 3_000_000));
+        assert_eq!((items[1].cost.turns, items[1].cost.micros, items[1].cost.unpriced_turns), (2, 4_000_000, 1));
+        assert_eq!(items[1].cost.label().as_deref(), Some("$4.00+"));
+        // Uncut: the whole of it.
+        let whole = session_items(id, "PR", None, 10, 600_000, &turns, &[], &costs);
+        assert_eq!((whole[0].cost.turns, whole[0].cost.micros), (4, 7_000_000));
+        let groups = build_groups(items, &[], "pr_draft");
+        assert_eq!(groups[0].cost().micros, 7_000_000);
+        // No usage recorded (an older session): nothing shown.
+        assert_eq!(session_items(id, "x", None, 1, 600_000, &turns, &[], &[])[0].cost.label(), None);
+    }
+
+    #[test]
     fn an_uncut_session_stays_one_row_with_its_own_id() {
         let id = Uuid::new_v4();
-        let items = session_items(id, "Implement", None, 1, 20, &[(1, 5), (2, 6)], &[]);
+        let items = session_items(id, "Implement", None, 1, 20, &[(1, 5), (2, 6)], &[], &[]);
         assert_eq!(items.len(), 1);
         assert_eq!((items[0].id, items[0].at, items[0].started), (id, 20, 1));
         assert!(items[0].piece.is_none());
         // No turns loaded: still one row, ordered by last update.
-        assert_eq!(session_items(id, "x", None, 1, 20, &[], &[5]).len(), 1);
+        assert_eq!(session_items(id, "x", None, 1, 20, &[], &[5], &[]).len(), 1);
     }
 
     #[test]
