@@ -315,6 +315,10 @@ pub struct Assessment {
     /// A failing check that could not be compared with the base branch, and why
     /// ([`PrStatus::base_notes`]): no proof either way, shown rather than hidden.
     pub base_notes: Vec<(String, String)>,
+    /// The failing checks whose jobs failed for the infrastructure's reasons
+    /// ([`PrStatus::infra_failures`]): tod reruns them, no agent turn
+    /// (`Autopilot::rerun_infra_failures`).
+    pub infra_failures: Vec<tod_store::github::InfraFailure>,
     /// A check is still running, whatever else failed.
     pub checks_running: bool,
     /// The head commit this was read at; a standing for a failing check
@@ -580,6 +584,7 @@ impl Assessment {
             signature_notes: snapshot.status.signature_notes.clone(),
             base_failures: snapshot.status.base_failures.clone(),
             base_notes: snapshot.status.base_notes.clone(),
+            infra_failures: snapshot.status.infra_failures.clone(),
             checks_running: snapshot.status.checks_running,
             head_sha: snapshot.status.head_sha.clone(),
             check_standings: Vec::new(),
@@ -2791,6 +2796,11 @@ pub trait PrFeed: Send + Sync {
     fn branches_without_pr(&self, _pr: &tod_store::github::NodePr, _prefix: &str) -> Result<Vec<String>, String> {
         Ok(Vec::new())
     }
+    /// Rerun one failed GitHub Actions job by its id, as the "Re-run job"
+    /// button does: tod's answer to an infrastructure failure, with no agent.
+    fn rerun_job(&self, _pr: &tod_store::github::NodePr, _job_id: i64) -> Result<(), String> {
+        Err("this feed does not rerun jobs".to_string())
+    }
     /// Post a top-level comment on the pull request (the ask for a bot's
     /// review, `PrReviewBotSettings::ask`).
     fn post_comment(&self, _pr: &tod_store::github::NodePr, _body: &str) -> Result<(), String> {
@@ -2863,6 +2873,10 @@ impl PrFeed for GithubFeed {
 
     fn threads(&self, pr: &tod_store::github::NodePr) -> Result<Vec<tod_store::github::ReviewThread>, String> {
         self.0.list_review_threads(&pr.owner, &pr.repo, pr.pr_number).map_err(|err| err.to_string())
+    }
+
+    fn rerun_job(&self, pr: &tod_store::github::NodePr, job_id: i64) -> Result<(), String> {
+        self.0.rerun_job(&pr.owner, &pr.repo, job_id).map_err(|err| err.to_string())
     }
 
     fn update_branch(&self, pr: &tod_store::github::NodePr) -> Result<(), String> {

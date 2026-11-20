@@ -23,6 +23,17 @@
 //!   told the user decided so, and may not say again that it is not the
 //!   change's.
 //!
+//! **Checked, not asked** (`doc/requests/design.md` 4.2.2). A failure the base
+//! branch has too ([`tod_store::github::BaseFailure`]) is waived by tod itself
+//! ([`settle_confirmed`]): the request is recorded and answered by tod
+//! (`decided_by = tod`), with the comparison as its rationale, and the check
+//! is noted in the node's Activity and offered as a suggestion
+//! ([`file_pre_existing_suggestion`]). An agent's `pr checks unrelated` claim
+//! is put through the same comparison: a confirmed one is waived, an
+//! unconfirmed one is refused back to the agent as work, with no request to
+//! the user. Only a check two quiet agent turns left standing
+//! ([`Raised::QuietTurns`]) still asks the user (until triage takes it).
+//!
 //! A pending question whose check no longer fails (re-run green, fixed by a
 //! push) is withdrawn by the autopilot.
 
@@ -248,6 +259,63 @@ pub fn all_waived(
             tod_store::settings::unrelated_standing(&settings.unrelated_checks, pr, c, head, sig)
                 == Some(UnrelatedStanding::Waived)
         })
+}
+
+/// Record `claim` as a request and answer it at once as tod, "carry on
+/// without", with `rationale` saying what was compared: the same standing as
+/// the user's answer holds ([`standing`]), and the Answers drawer shows that
+/// tod decided and why. Used for a failure the comparison with the base branch
+/// confirmed ([`Raised::BaseBranch`]).
+pub fn settle_confirmed(
+    fleet: &tod_store::fleet::FleetStore,
+    node: Uuid,
+    claim: &Claim,
+    rationale: &str,
+) -> anyhow::Result<()> {
+    use tod_store::interview::InterviewCommand;
+    let made = fleet
+        .interview(
+            "autopilot",
+            InterviewCommand::AskDecision {
+                node_id: node,
+                conversation_id: None,
+                protocol: Some(PROTOCOL.to_string()),
+                decision: new_decision(claim),
+            },
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let id = made
+        .get("id")
+        .and_then(|v| v.as_str())
+        .and_then(|v| Uuid::parse_str(v).ok())
+        .ok_or_else(|| anyhow::anyhow!("the recorded request has no id"))?;
+    fleet
+        .interview(
+            "autopilot",
+            InterviewCommand::SettleDecision { decision_id: id, option: 1, text: None, rationale: rationale.to_string() },
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(())
+}
+
+/// File the suggestion that follows a waived pre-existing failure: "Open a
+/// ticket: check X fails on main". For now it only writes the node's Activity
+/// note; the suggestion store does not exist yet.
+pub fn file_pre_existing_suggestion(
+    fleet: &tod_store::fleet::FleetStore,
+    node: Uuid,
+    phase: &str,
+    pr: &str,
+    found: &tod_store::github::BaseFailure,
+) -> anyhow::Result<()> {
+    use tod_store::node_timeline::{KIND_NOTE, TimelineEntry};
+    // step 4 wires this to tod_store::suggestions
+    let title = format!("Suggestion: open a ticket: check \"{}\" fails on {}", found.check, found.base_branch);
+    let detail = format!("{pr}: {}", found.describe());
+    let entry = TimelineEntry::new(node, KIND_NOTE, phase, title, false, detail);
+    fleet.enqueue(tod_store::fleet::FleetMutation::RecordTimeline(Box::new(entry)))?;
+    fleet.writer().flush()?;
+    Ok(())
 }
 
 /// The pending check-unrelated decisions of `node`, with their key.

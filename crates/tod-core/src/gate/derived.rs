@@ -1993,6 +1993,7 @@ mod readiness_tests {
             failing_evidence: Vec::new(),
             base_failures: Vec::new(),
             base_notes: Vec::new(),
+            infra_failures: Vec::new(),
             checks_running: false,
             head_sha: None,
             head_committed_at: None,

@@ -155,6 +155,11 @@ pr_readiness:
     - name: greptile
       min_score: 4
       rerun_after_minutes: 10
+      on_silence: proceed      # or `ask`: the request below (default: proceed)
+  max_infra_reruns: 2          # reruns of a job the infrastructure lost, per check and head
+  check_fixes:                 # CI checks tod fixes itself (see "Mechanical failures")
+    - check: lint
+      fix: cargo fmt --all
 ```
 
 Only selecting and tuning built-in bots is supported at first. Arbitrary
@@ -442,6 +447,19 @@ its own words. Now:
    Options: `Proceed without {bot}` and `Keep waiting`. At most one is
    pending or answered per bot per node; "Keep waiting" holds the question
    back for six hours.
+
+   **By default nobody is asked** (`on_silence`, per bot in
+   `pr_readiness.bots[]`, default `proceed`; schema v106). Once the bot is
+   asked `max_asks` times and is still silent, tod itself goes on without it:
+   it records the same decision, answered at once **by tod**
+   (`InterviewCommand::SettleDecision`, `decision_answers.decided_by = 'tod'`,
+   no `conversation_id`, and a `rationale` saying what was tried: the asks, when
+   the last was, the bot's last activity), and the standing in item 4 applies
+   unchanged. The task panel's Answered drawer shows it as "decided by tod"
+   with the rationale. `on_silence: ask` keeps today's request, with the
+   fixed wording above. A silent bot is never settled by a decision tod did not
+   make: `SettleDecision` is refused to agent sessions and to every protocol
+   but `bot_silence` and `check_unrelated`.
 4. **Proceed without** is a standing answer on the node: the bot is left out
    of `pr_readiness::settings_for_node`, which the babysitter, the gate's
    criteria (`pr-approved.review-current`, `.review-score`, `pr-pr_review`)
@@ -648,11 +666,62 @@ request*.
   any standing recorded without a signature hold for their head only: there a
   new head that still fails is work for one look, a question for an older head
   is withdrawn, and a carry-on is applied to the new head only when the agent
-  re-attests (a timeline note says so). Not done: telling that the same check
-  fails on the base's latest commit (one more check-runs request per look and
-  an automatic waiver the user did not give), or that it starts failing on a
-  file the change touches (only a different signature re-asks).
+  re-attests (a timeline note says so). Not done: telling that it starts failing on a
+  file the change touches (only a different signature re-asks). The base
+  branch's latest run is compared by tod itself (below).
   Only this node's own pr conversation may record one.
+
+**Pre-existing failures are waived by tod, not asked about** (schema v106,
+`doc/requests/design.md` 4.2.2). `PrStatus::base_failures` compares each failing
+check with the base branch's latest run of the same check (same failure
+signature). When it matches, tod itself records the `check_unrelated` decision
+answered **by tod** (option 1, *carry on without*, `decided_by = 'tod'`, the
+comparison as rationale: `Autopilot::waive_base_failures`), notes it in the
+node's Activity, and files a suggestion for a ticket (`check_unrelated::file_pre_existing_suggestion`:
+for now an Activity note, step 4 wires it to `tod_store::suggestions`). Gate
+and babysit then treat the check as not the change's, exactly as for a
+user's carry-on.
+
+The agent's claim (`tod-cli pr checks unrelated`) no longer raises a request
+to the user: the verb runs the same comparison. A confirmed claim is waived by
+tod on its next read, and says so. An unconfirmed one is refused back to the
+agent as work, naming the comparison's outcome (or why none could be made),
+with no request: the agent fixes the failure or gives better evidence. The
+user is still asked in one case: two quiet turns on a failing check
+(`Raised::QuietTurns`, triage's to take over later).
+
+### Mechanical failures
+
+Two failures of a CI check are not the change's and not an agent's to fix, and
+tod handles them before any agent turn (`Autopilot::rerun_infra_failures`,
+`run_ci_fixers`, in `babysit` after the base comparison):
+
+- **Infrastructure** (`github::infra_kind`): a job that was cancelled, timed
+  out, or lost its runner ("The runner has received a shutdown signal", "lost
+  communication with the server", "runner ... offline"). tod asks GitHub to
+  run the job again (`PrFeed::rerun_job`, `POST /actions/jobs/{id}/rerun`; no
+  agent turn), at most `max_infra_reruns` (default 2) per check and head, only
+  while no check is running (GitHub reruns a finished run only), and notes
+  each rerun in the Activity. A check that passes after a rerun is noted as a
+  **flake** of that check (`Flake: ...`). Reruns spent, or refused by GitHub
+  (noted, counted), leave the failure to the agent as any other. Kept in the
+  run state (`AutopilotState::infra_reruns`).
+- **A configured fix** (`pr_readiness.check_fixes`, `check` and `fix`): on a
+  failing check with an entry, tod runs the fix in the node's checkout
+  (`tod_core::fixer`), commits the result as its own mechanical commit,
+  pushes it, and reads the pull request again: if the check then passes there
+  was no agent turn and no round of review. Only when the checkout is at the
+  pull request's head and no change awaits review; at most 2 attempts per
+  check and pull request (`AutopilotState::ci_fix_attempts`); a fix that fails or
+  changes nothing is noted and the check is the agent's as before. A CI fix
+  reruns every check of the pull request, not only the fixed one (GitHub
+  decides that). tod's own checks have the same in `lifecycle_config`
+  (`doc/lifecycle/checks.md`, "Fix").
+- **No review of a mechanical head.** The push is recorded as
+  `tod_store::pr_pushes::VERDICT_MECHANICAL` (schema v106): not unreviewed
+  (`tod_core::pr_pushes`), and a review that covered the head before it covers
+  it (`PrPushRepo::only_mechanical_since`, read by `pr_draft_review::owed`).
+  A head with any other push after the reviewed one is compared as before.
 
 If the agent records nothing and changes nothing twice, the stop
 (`NeedsHuman::PrStuck`) names what is outstanding on which pull request

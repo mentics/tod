@@ -77,10 +77,12 @@ you did not, and why. If you cannot decide a thread, ask the user with
 decision stands for any you called unrelated. `checks unrelated` says a failing
 check is not caused by this change: --reason is your evidence (the file or log
 line, and where else the check fails: the base branch, other branches). tod
-then takes that check off your list and asks the user once whether to fix it in
-this pull request or carry on without it; end your turn after it. It refuses a
-check that is not failing, one already asked about, and one the user decided to
-fix in this pull request.
+checks the claim itself by comparing the check with the base branch's latest
+run: when the same failure is there, tod waives the check for this pull request
+by itself (nobody is asked) and takes it off your list; end your turn after it.
+When the comparison cannot confirm the claim it is refused as an error and the
+failure is your work. It also refuses a check that is not failing and one the
+user decided to fix in this pull request.
 `mergeable` records that the PR is ready for the `pr → approved` gate to
 check (checks green, reviews satisfied) — it does not itself approve
 anything. `blocked` records that you cannot make further progress without the
@@ -749,9 +751,12 @@ fn checks_unrelated(inv: &Invocation, rest: &[String]) -> anyhow::Result<String>
     }
     let pr = pick_pr(linked(inv, node)?.prs, &args, node)?;
     let label = tod_core::pr_readiness::pr_label(&pr);
+    // The claim is checked, not forwarded: the snapshot compares each failing
+    // check with the base branch.
     let status = github(inv)?
-        .get_pr_status(&pr.owner, &pr.repo, pr.pr_number)
-        .map_err(|err| gh_err(inv, &format!("GitHub ({})", pr.url), err))?;
+        .get_pr_snapshot(&pr.owner, &pr.repo, pr.pr_number)
+        .map_err(|err| gh_err(inv, &format!("GitHub ({})", pr.url), err))?
+        .status;
     let Some(head) = status.head_sha.clone().filter(|h| !h.is_empty()) else {
         anyhow::bail!("GitHub did not name {label}'s head commit: try again (the answer is for one head)");
     };
@@ -778,17 +783,24 @@ fn checks_unrelated(inv: &Invocation, rest: &[String]) -> anyhow::Result<String>
         ),
         None => {}
     }
-    let claim = cu::Claim { pr: label.clone(), pr_url: pr.url.clone(), check: name.clone(), head, signature, reason, raised: cu::Raised::Agent };
-    inv.client().interview(InterviewCommand::AskDecision {
-        node_id: node,
-        conversation_id: None,
-        protocol: Some(cu::PROTOCOL.to_string()),
-        decision: cu::new_decision(&claim),
-    })?;
-    Ok(format!(
-        "ok: asked the user whether to fix \"{name}\" on {label} here or carry on without it; \
-         tod no longer sends you back for it while it fails the same way, on this commit or a later one (a push that makes it fail differently is yours to judge again). End your turn (do not fix it in this pull request)."
-    ))
+    // Confirmed: the same failure is on the base branch. tod itself waives the
+    // check when the babysitter next reads the pull request (recording the
+    // request as answered by tod, with this comparison as the rationale).
+    if let Some(found) = status.base_failures.iter().find(|b| b.check.eq_ignore_ascii_case(name)) {
+        return Ok(format!(
+            "ok: tod compared \"{name}\" on {label} with the base branch and confirmed the claim ({}). \
+             tod waives the check for this pull request itself and no longer sends you back for it while it fails the same way; nobody is asked. End your turn (do not fix it in this pull request).",
+            found.describe()
+        ));
+    }
+    let why = match status.base_notes.iter().find(|(c, _)| c.eq_ignore_ascii_case(name)) {
+        Some((_, why)) => format!("it could not compare them: {why}"),
+        None => "the base branch's latest run of the check does not fail the same way (it passes, has no run, or fails differently)".to_string(),
+    };
+    anyhow::bail!(
+        "tod compared \"{name}\" on {label} with the base branch and could not confirm that it is not this change's: {why}. \
+         The claim is refused and nobody is asked: treat the failure as your work and fix it (read its log; if it is the infrastructure's, tod reruns such jobs itself). Your evidence was: {reason}"
+    )
 }
 
 #[cfg(test)]

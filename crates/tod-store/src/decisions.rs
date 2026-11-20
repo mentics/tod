@@ -263,6 +263,21 @@ pub struct DecisionAnswer {
     /// `user`, or the agent role that answered on the user's behalf.
     pub actor: String,
     pub answered_at: i64,
+    /// Who decided: [`DECIDED_BY_USER`], [`DECIDED_BY_TRIAGE`] or
+    /// [`DECIDED_BY_TOD`] (schema v106).
+    pub decided_by: String,
+    /// The triage session whose transcript is the evidence for the answer.
+    pub conversation_id: Option<Uuid>,
+    /// For an answer not made by the user: how it was decided, in a line or
+    /// two (what tod tried, or what triage found).
+    pub rationale: Option<String>,
+}
+
+impl DecisionAnswer {
+    /// The answer was made by tod or triage, not by the user.
+    pub fn is_automatic(&self) -> bool {
+        self.decided_by != DECIDED_BY_USER
+    }
 }
 
 /// A decision with its full answer history, oldest first.
@@ -312,6 +327,19 @@ pub struct NewDecision {
     #[serde(default)]
     pub brief: Brief,
 }
+
+/// `decision_answers.decided_by`: the user picked an option or settled it in
+/// a chat.
+pub const DECIDED_BY_USER: &str = "user";
+/// Triage answered without the user.
+pub const DECIDED_BY_TRIAGE: &str = "triage";
+/// tod answered mechanically (a bot that stayed silent, a failure the base
+/// branch has too), with the rationale saying what was tried.
+pub const DECIDED_BY_TOD: &str = "tod";
+
+/// Protocols whose requests tod settles itself, mechanically
+/// ([`DecisionRepo::answer_settled`]): nothing else may be answered as tod.
+pub const SETTLEABLE_PROTOCOLS: &[&str] = &["bot_silence", "check_unrelated"];
 
 /// The actor of an answer the app recorded, not the user or an agent. Such an
 /// answer is never shown to an agent as the user's, and never counts against
@@ -435,7 +463,35 @@ pub fn add_new_evidence(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-const ANSWER_COLUMNS: &str = "id, decision_id, option_index, text, actor, answered_at";
+const ANSWER_COLUMNS: &str =
+    "id, decision_id, option_index, text, actor, answered_at, decided_by, conversation_id, rationale";
+
+/// `decision_answers.decided_by`, `.conversation_id` and `.rationale`
+/// (schema v106: who decided, the triage session behind it, and how); a no-op
+/// when the columns are already there. Synced (sync copies the columns both
+/// sides have); the table is journaled already.
+pub fn add_answer_columns(conn: &Connection) -> Result<()> {
+    let has = |name: &str| -> Result<bool> {
+        Ok(conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('decision_answers') WHERE name = ?1",
+            params![name],
+            |row| row.get(0),
+        )?)
+    };
+    if !has("decided_by")? {
+        conn.execute_batch(
+            "ALTER TABLE decision_answers ADD COLUMN decided_by TEXT NOT NULL DEFAULT 'user'
+                 CHECK (decided_by IN ('user','triage','tod'));",
+        )?;
+    }
+    if !has("conversation_id")? {
+        conn.execute_batch("ALTER TABLE decision_answers ADD COLUMN conversation_id BLOB;")?;
+    }
+    if !has("rationale")? {
+        conn.execute_batch("ALTER TABLE decision_answers ADD COLUMN rationale TEXT;")?;
+    }
+    Ok(())
+}
 
 /// What a request is about, for telling whether the node has asked it before.
 struct Cause<'a> {
@@ -877,6 +933,43 @@ impl<'a> DecisionRepo<'a> {
         text: Option<&str>,
         actor: &str,
     ) -> Result<DecisionAnswer> {
+        self.answer_by(decision_id, option, text, actor, DECIDED_BY_USER, None, None)
+    }
+
+    /// Record tod's own answer to a request of one of the
+    /// [`SETTLEABLE_PROTOCOLS`]: `decided_by = tod`, with the `rationale` saying
+    /// what was tried. Anything else is refused: tod never answers what is
+    /// the user's to decide.
+    pub fn answer_settled(
+        &self,
+        decision_id: Uuid,
+        option: i64,
+        text: Option<&str>,
+        rationale: &str,
+    ) -> Result<DecisionAnswer> {
+        let decision = self
+            .get(decision_id)?
+            .with_context(|| format!("decision {decision_id} not found"))?;
+        if !decision.protocol.as_deref().is_some_and(|p| SETTLEABLE_PROTOCOLS.contains(&p)) {
+            bail!("tod does not answer a {} request itself: it is the user's to decide", decision.protocol.as_deref().unwrap_or("this"));
+        }
+        if rationale.trim().is_empty() {
+            bail!("an answer by tod needs a rationale saying what was tried");
+        }
+        self.answer_by(decision_id, Some(option), text, SETTLED_BY, DECIDED_BY_TOD, None, Some(rationale.trim()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn answer_by(
+        &self,
+        decision_id: Uuid,
+        option: Option<i64>,
+        text: Option<&str>,
+        actor: &str,
+        decided_by: &str,
+        conversation_id: Option<Uuid>,
+        rationale: Option<&str>,
+    ) -> Result<DecisionAnswer> {
         let decision = self
             .get(decision_id)?
             .with_context(|| format!("decision {decision_id} not found"))?;
@@ -894,9 +987,19 @@ impl<'a> DecisionRepo<'a> {
         }
         let now = now_ms();
         self.conn.execute(
-            "INSERT INTO decision_answers (decision_id, option_index, text, actor, answered_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![uuid_to_blob(decision_id), option, text, actor, now],
+            "INSERT INTO decision_answers
+                 (decision_id, option_index, text, actor, answered_at, decided_by, conversation_id, rationale)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                uuid_to_blob(decision_id),
+                option,
+                text,
+                actor,
+                now,
+                decided_by,
+                conversation_id.map(uuid_to_blob),
+                rationale
+            ],
         )?;
         if decision.status == DECISION_PENDING {
             self.conn.execute(
@@ -1221,6 +1324,13 @@ fn map_answer(row: &rusqlite::Row<'_>) -> rusqlite::Result<DecisionAnswer> {
         text: row.get(3)?,
         actor: row.get(4)?,
         answered_at: row.get(5)?,
+        decided_by: row.get(6)?,
+        conversation_id: row
+            .get::<_, Option<Vec<u8>>>(7)?
+            .as_deref()
+            .map(blob_to_uuid_sql)
+            .transpose()?,
+        rationale: row.get(8)?,
     })
 }
 
@@ -1263,6 +1373,30 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn tod_settles_only_what_it_may_and_says_why() {
+        let fx = setup();
+        let repo = DecisionRepo::new(&fx.conn);
+        let silent = repo
+            .create(fx.node, None, Some("bot_silence"), &decision("Proceed without the bot?", &["Proceed", "Wait"]))
+            .unwrap();
+        assert!(repo.answer_settled(silent.id, 1, None, "  ").is_err(), "a rationale is required");
+        let answer = repo.answer_settled(silent.id, 1, None, "asked 2 times, no review").unwrap();
+        assert_eq!(answer.decided_by, DECIDED_BY_TOD);
+        assert_eq!(answer.actor, "tod");
+        assert_eq!(answer.rationale.as_deref(), Some("asked 2 times, no review"));
+        let back = repo.get_with_answers(silent.id).unwrap().unwrap();
+        assert_eq!(back.answers[0].decided_by, DECIDED_BY_TOD);
+
+        let users = repo
+            .create(fx.node, None, Some("implement"), &decision("Per line?", &["yes", "no"]))
+            .unwrap();
+        assert!(repo.answer_settled(users.id, 1, None, "because").is_err(), "a user's decision is never tod's");
+        let by_user = repo.answer(users.id, Some(1), None, "user").unwrap();
+        assert_eq!(by_user.decided_by, DECIDED_BY_USER);
+        assert!(by_user.rationale.is_none());
     }
 
     #[test]

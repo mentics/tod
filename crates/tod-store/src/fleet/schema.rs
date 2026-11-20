@@ -703,6 +703,17 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         crate::review::add_reviewer_columns(conn)?;
         conn.pragma_update(None, "user_version", 105)?;
     }
+    if version < 106 {
+        // Requests tod settles itself (step 1 of `doc/requests/design.md`):
+        // who decided an answer, the triage session behind it and how
+        // (`crate::decisions::add_answer_columns`), and the `mechanical`
+        // verdict a fixer's commit is recorded with
+        // (`crate::pr_pushes::ensure_mechanical`; the triggers are remade
+        // below). Both tables are synced and journaled already.
+        crate::decisions::add_answer_columns(conn)?;
+        crate::pr_pushes::ensure_mechanical(conn)?;
+        conn.pragma_update(None, "user_version", 106)?;
+    }
     if version < 107 {
         // The structured fields of an access, broken or capability request
         // and the signature of its error (`crate::decisions::Brief`). Synced
@@ -761,6 +772,7 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     crate::decisions::add_new_evidence(conn)?;
     crate::decisions::add_option_edits(conn)?;
     crate::decisions::add_brief(conn)?;
+    crate::decisions::add_answer_columns(conn)?;
     crate::review::add_pr_columns(conn)?;
     crate::review::add_root_cause_column(conn)?;
     crate::review::add_reviewer_columns(conn)?;
@@ -820,7 +832,7 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     // schema version (`crate::git_retries`).
     conn.execute_batch(crate::git_retries::CREATE_TABLE)?;
     // Pull request heads and whether tod's review cleared them (v102).
-    conn.execute_batch(crate::pr_pushes::CREATE_TABLE)?;
+    crate::pr_pushes::ensure_mechanical(conn)?;
     conn.execute_batch(&crate::journey_changes::pr_pushes_triggers_sql())?;
     crate::sync::install(conn)?;
     // Idempotent and cheap — keeps the gate criteria catalog's wording in

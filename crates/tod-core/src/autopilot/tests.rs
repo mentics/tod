@@ -2594,6 +2594,7 @@ fn a_pr_draft_wake_leaves_running_checks_to_the_babysitter() {
         failing_evidence: Vec::new(),
         base_failures: Vec::new(),
         base_notes: Vec::new(),
+        infra_failures: Vec::new(),
         checks_running: false,
         head_sha: None,
         head_committed_at: None,
@@ -2645,6 +2646,7 @@ fn check_now_in_pr_draft_waits_for_the_draft_to_be_ready_and_reviewed() {
         failing_evidence: Vec::new(),
         base_failures: Vec::new(),
         base_notes: Vec::new(),
+        infra_failures: Vec::new(),
         checks_running: false,
         head_sha: None,
         head_committed_at: None,
@@ -2778,6 +2780,7 @@ fn check_now_in_pr_draft_sends_new_changes_requested_to_the_agent_even_on_a_draf
         failing_evidence: Vec::new(),
         base_failures: Vec::new(),
         base_notes: Vec::new(),
+        infra_failures: Vec::new(),
         checks_running: false,
         head_sha: None,
         head_committed_at: Some("2026-01-01T09:00:00Z".into()),
@@ -2832,6 +2835,7 @@ fn check_now_in_pr_draft_clears_a_leftover_review_wait_and_ignores_a_bot_reviewe
         failing_evidence: Vec::new(),
         base_failures: Vec::new(),
         base_notes: Vec::new(),
+        infra_failures: Vec::new(),
         checks_running: false,
         head_sha: None,
         head_committed_at: None,
@@ -4595,7 +4599,7 @@ fn a_silent_bot_is_asked_a_bounded_number_of_times_by_tod_then_the_user_is_asked
     let feed = BotFeed::new("2020-01-01T00:00:00Z", None);
     let (fx, mut agent) = bot_node(
         feed.clone(),
-        "      rerun_after_minutes: 0\n      ask: \"@greptileai please review\"\n      ask_every_minutes: 0\n      max_asks: 3\n",
+        "      rerun_after_minutes: 0\n      ask: \"@greptileai please review\"\n      ask_every_minutes: 0\n      max_asks: 3\n      on_silence: ask\n",
     );
     let run = |agent: &mut FakeAgent| {
         autopilot(&fx, Budget::default())
@@ -4675,7 +4679,37 @@ fn a_parked_run_withdraws_the_silence_question_when_the_bot_comes() {
 }
 
 const SILENT_BOT: &str =
+    "      rerun_after_minutes: 0\n      ask: \"@greptileai please review\"\n      ask_every_minutes: 0\n      max_asks: 3\n      on_silence: ask\n";
+
+/// The same bot with the default: nobody is asked, tod goes on without it.
+const SILENT_BOT_DEFAULT: &str =
     "      rerun_after_minutes: 0\n      ask: \"@greptileai please review\"\n      ask_every_minutes: 0\n      max_asks: 3\n";
+
+/// Design 4.4: once `max_asks` are spent, tod proceeds without the bot by
+/// itself, and the decision records that tod made it, and why.
+#[test]
+fn a_silent_bot_is_gone_on_without_by_tod_with_no_request_to_the_user() {
+    let feed = BotFeed::new("2020-01-01T00:00:00Z", None);
+    let (fx, mut agent) = bot_node(feed.clone(), SILENT_BOT_DEFAULT);
+    let outcome = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO).run(&fx.fleet, &mut agent).unwrap();
+    assert!(!matches!(outcome, Outcome::NeedsHuman { .. }), "{outcome:?}");
+    assert_eq!(*feed.posted.lock().unwrap(), vec!["@greptileai please review"; 3]);
+    assert_eq!(agent.turns, 0);
+    assert!(pending_requests(&fx).is_empty(), "nobody is asked");
+    let decisions = bot_decisions(&fx);
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0].status, "answered");
+    let answers = fx.fleet.read(|conn| Ok(DecisionRepo::new(conn).get_with_answers(decisions[0].id)?.map(|d| d.answers).unwrap_or_default())).unwrap();
+    assert_eq!(answers.len(), 1, "{answers:?}");
+    assert_eq!(answers[0].decided_by, tod_store::decisions::DECIDED_BY_TOD);
+    assert_eq!(answers[0].actor, tod_store::decisions::SETTLED_BY);
+    assert_eq!(answers[0].option, Some(1));
+    let why = answers[0].rationale.clone().unwrap_or_default();
+    assert!(why.contains("greptile") && why.contains("3"), "{why}");
+    // The same standing as the user's "Proceed without": the bot is out.
+    let settings = crate::pr_readiness::settings_for_node(&fx.fleet, fx.node, &fx.root).unwrap();
+    assert!(settings.bots.is_empty(), "{settings:?}");
+}
 
 fn pending_requests(fx: &Fixture) -> Vec<tod_store::decisions::Decision> {
     fx.fleet.read(|conn| Ok(DecisionRepo::new(conn).list_pending_for_node(fx.node)?)).unwrap()
@@ -5099,6 +5133,13 @@ struct FailingCheckFeed {
     base_note: std::sync::Mutex<Option<String>>,
     /// Further failing checks that are the change's own (no standing).
     own_failing: std::sync::Mutex<Vec<String>>,
+    /// `terraform` failed for the infrastructure's reasons (`PrStatus::infra_failures`).
+    infra: std::sync::Mutex<Option<tod_store::github::InfraFailure>>,
+    /// What rerunning a job does: `Some(true)` passes the check, `Some(false)`
+    /// leaves it failing, `None` is refused by GitHub.
+    rerun_result: std::sync::Mutex<Option<bool>>,
+    /// The job ids tod asked to rerun.
+    reruns: std::sync::Mutex<Vec<i64>>,
 }
 
 impl FailingCheckFeed {
@@ -5149,12 +5190,26 @@ impl crate::pr_readiness::PrFeed for FailingCheckFeed {
                 base_ref: Some("main".into()),
                 base_failures: if fixed { Vec::new() } else { self.base_failure.lock().unwrap().iter().cloned().collect() },
                 base_notes: if fixed { Vec::new() } else { self.base_note.lock().unwrap().iter().map(|w| ("terraform".to_string(), w.clone())).collect() },
+                infra_failures: if fixed { Vec::new() } else { self.infra.lock().unwrap().iter().cloned().collect() },
                 ..Default::default()
             },
             threads: Vec::new(),
             comments: Vec::new(),
             reviews: vec![],
         })
+    }
+
+    fn rerun_job(&self, _: &tod_store::github::NodePr, job_id: i64) -> Result<(), String> {
+        match *self.rerun_result.lock().unwrap() {
+            None => Err("Resource not accessible by integration".to_string()),
+            Some(passes) => {
+                self.reruns.lock().unwrap().push(job_id);
+                if passes {
+                    self.fixed.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                Ok(())
+            }
+        }
     }
 }
 
@@ -5183,6 +5238,9 @@ fn failing_check_node(says_unrelated: bool) -> (Fixture, Arc<FailingCheckFeed>, 
         base_failure: std::sync::Mutex::new(None),
         base_note: std::sync::Mutex::new(None),
         own_failing: std::sync::Mutex::new(Vec::new()),
+        infra: std::sync::Mutex::new(None),
+        rerun_result: std::sync::Mutex::new(None),
+        reruns: std::sync::Mutex::new(Vec::new()),
     });
     crate::pr_readiness::set_feed_override(Some(feed.clone()));
     linked_to_prs(&fx, "pr_review", &["https://github.com/acme/app/pull/42"]);
@@ -5382,12 +5440,12 @@ fn base_proof_for_terraform(proof: tod_store::github::BaseProof) -> tod_store::g
     }
 }
 
-/// Gap 73 (ENG-2504, ENG-2157): a check the base branch fails too, with the
-/// agent never claiming it, used to send the agent back twice for nothing and
-/// stop the run `pr_stuck`. Now tod asks the user once, with its proof, and the
-/// agent is never sent for it.
+/// Design 4.2.2 (ENG-2504, ENG-2157): a check the base branch fails too is not
+/// the change's. tod compares it with the base's latest run and waives it by
+/// itself, noting it in the Activity; no request, no agent turn, and the run is
+/// never stopped `pr_stuck` for it.
 #[test]
-fn a_check_the_base_fails_too_is_asked_once_and_never_stops_the_run_stuck() {
+fn a_check_the_base_fails_too_is_waived_by_tod_with_no_request_and_never_stops_the_run_stuck() {
     for proof in [
         tod_store::github::BaseProof::SameCheck,
         tod_store::github::BaseProof::SameErrors { paths: vec!["/w/inventory/ocr.py".into()] },
@@ -5399,50 +5457,66 @@ fn a_check_the_base_fails_too_is_asked_once_and_never_stops_the_run_stuck() {
         let mut pilot = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO);
         pilot.state.loops.pr_unchanged = 1;
         let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
-        assert!(
-            matches!(&outcome, Outcome::NeedsHuman { reason: NeedsHuman::Decision { pending: 1 } }),
-            "{outcome:?}"
-        );
+        assert!(matches!(outcome, Outcome::Waiting { .. }), "{outcome:?}");
         assert_eq!(agent.turns, 0, "the agent was not sent for a failure the base has");
-        assert_eq!(pilot.state().loops.pr_unchanged, 1);
         assert_eq!(pilot.state().loops.pr_rounds, 0, "not a round of fixing");
+        assert!(pending_requests(&fx).is_empty(), "the user is not asked");
         let decisions = unrelated_decisions(&fx);
         assert_eq!(decisions.len(), 1);
-        let q = &decisions[0].question;
-        assert!(q.contains("acme/app#42") && q.contains("terraform") && q.contains("on the base branch"), "{q}");
-        assert!(q.contains("main @ 9e05268") || q.contains("fails on main @ 9e05268"), "{q}");
-        // Asked again and again: still one request, still no turn.
+        assert_eq!(decisions[0].status, "answered");
+        let answers = fx.fleet.read(|conn| Ok(DecisionRepo::new(conn).get_with_answers(decisions[0].id)?.map(|d| d.answers).unwrap_or_default())).unwrap();
+        assert_eq!(answers.len(), 1, "{answers:?}");
+        assert_eq!(answers[0].decided_by, tod_store::decisions::DECIDED_BY_TOD);
+        assert_eq!(answers[0].option, Some(1));
+        let why = answers[0].rationale.clone().unwrap_or_default();
+        assert!(why.contains("terraform") && why.contains("main"), "{why}");
+        // The Activity says so, and carries the suggestion note step 4 will file.
+        let notes = fx.fleet.read(|conn| Ok(tod_store::node_timeline::TimelineRepo::new(conn).list(fx.node)?)).unwrap();
+        assert!(notes.iter().any(|e| e.title.contains("waived by tod")), "{notes:?}");
+        assert!(notes.iter().any(|e| e.title.starts_with("Suggestion: open a ticket")), "{notes:?}");
+        // Read again and again: still one decision, still no turn.
         for _ in 0..3 {
             let outcome = run_babysitter(&fx, &mut agent);
-            assert!(matches!(&outcome, Outcome::NeedsHuman { reason: NeedsHuman::Decision { pending: 1 } }), "{outcome:?}");
+            assert!(matches!(outcome, Outcome::Waiting { .. }), "{outcome:?}");
         }
-        assert_eq!(agent.turns, 0);
-        assert_eq!(unrelated_decisions(&fx).len(), 1);
-        // Carrying on moves the node on, still with no turn.
-        fx.fleet
-            .interview(ACTOR_USER, InterviewCommand::AnswerDecision { decision_id: decisions[0].id, option: Some(1), text: None })
-            .unwrap();
-        let outcome = run_babysitter(&fx, &mut agent);
-        assert!(matches!(outcome, Outcome::Waiting { .. }), "{outcome:?}");
         assert_eq!(agent.turns, 0);
         assert_eq!(unrelated_decisions(&fx).len(), 1, "never asked again");
     }
 }
 
-/// The user's "fix it in this pull request" is the one thing that sends the
-/// agent for a check the base fails too.
+fn lost_runner() -> tod_store::github::InfraFailure {
+    tod_store::github::InfraFailure { check: "terraform".into(), job_id: 777, kind: "runner lost".into() }
+}
+
+/// Design 4.2.1: a job the infrastructure lost is run again by tod, with no
+/// agent turn; passing on the rerun is recorded as a flake of that check.
 #[test]
-fn a_base_failure_the_user_says_to_fix_here_is_work_again() {
+fn a_job_the_infrastructure_lost_is_rerun_by_tod_and_a_pass_is_noted_as_a_flake() {
     let (fx, feed, mut agent, _) = failing_check_node(false);
-    feed.fails_as("0123456789abcdef");
-    *feed.base_failure.lock().unwrap() = Some(base_proof_for_terraform(tod_store::github::BaseProof::SameCheck));
-    run_babysitter(&fx, &mut agent);
-    let d = unrelated_decisions(&fx).remove(0);
-    fx.fleet
-        .interview(ACTOR_USER, InterviewCommand::AnswerDecision { decision_id: d.id, option: Some(2), text: None })
-        .unwrap();
-    run_babysitter(&fx, &mut agent);
-    assert!(agent.turns >= 1, "the user said to fix it here");
+    *feed.infra.lock().unwrap() = Some(lost_runner());
+    *feed.rerun_result.lock().unwrap() = Some(true);
+    let outcome = run_babysitter(&fx, &mut agent);
+    assert!(matches!(outcome, Outcome::Waiting { .. }), "{outcome:?}");
+    assert_eq!(agent.turns, 0, "no agent turn for the infrastructure's failure");
+    assert_eq!(*feed.reruns.lock().unwrap(), vec![777]);
+    let notes = fx.fleet.read(|conn| Ok(tod_store::node_timeline::TimelineRepo::new(conn).list(fx.node)?)).unwrap();
+    assert!(notes.iter().any(|e| e.title.starts_with("Reran \"terraform\"")), "{notes:?}");
+    assert!(notes.iter().any(|e| e.title.starts_with("Flake: \"terraform\"")), "{notes:?}");
+    assert!(pending_requests(&fx).is_empty());
+}
+
+/// A rerun GitHub refuses is counted, noted and bounded by `max_infra_reruns`,
+/// and the failure is then the agent's like any other.
+#[test]
+fn a_refused_rerun_is_counted_and_the_failure_then_goes_to_the_agent() {
+    let (fx, feed, mut agent, _) = failing_check_node(false);
+    *feed.infra.lock().unwrap() = Some(lost_runner());
+    let outcome = run_babysitter(&fx, &mut agent);
+    assert!(feed.reruns.lock().unwrap().is_empty());
+    assert!(agent.turns >= 1, "the failure is the agent's once the reruns are spent: {outcome:?}");
+    let notes = fx.fleet.read(|conn| Ok(tod_store::node_timeline::TimelineRepo::new(conn).list(fx.node)?)).unwrap();
+    let refused = notes.iter().filter(|e| e.title.starts_with("Could not rerun")).count();
+    assert_eq!(refused, 2, "the default max_infra_reruns is 2: {notes:?}");
 }
 
 /// A deploy must not withdraw the agent's claim that a check is not the

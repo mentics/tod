@@ -227,6 +227,37 @@ fn default_ask_every_minutes() -> u64 {
     30
 }
 
+fn default_max_infra_reruns() -> u32 {
+    2
+}
+
+/// What tod does when a review bot stays silent after every ask
+/// (`PrReviewBotSettings::on_silence`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnSilence {
+    /// Go on without the bot, with nobody asked: the answer is recorded as
+    /// tod's own (`decided_by = tod`) with what was tried
+    /// (`tod_core::bot_silence`).
+    #[default]
+    Proceed,
+    /// Ask the user whether to go on without it or keep waiting.
+    Ask,
+}
+
+/// A command that fixes a failing CI check mechanically (a formatter, a lint
+/// autofix), run by tod in the node's Files directory, committed as tod's
+/// own mechanical commit and pushed by tod, after which only that check is
+/// read again (`doc/lifecycle/pr-readiness.md`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CiCheckFix {
+    /// The CI check's name, as GitHub shows it.
+    pub check: String,
+    /// The command, run through the shell.
+    pub fix: String,
+}
+
 fn default_max_asks() -> u32 {
     3
 }
@@ -272,6 +303,11 @@ pub struct PrReviewBotSettings {
     /// called silent: `max_asks` asks made, the last `ask_every_minutes` ago.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub silent_after_minutes: Option<u64>,
+    /// What happens when the bot is silent and there is no `fallback`: tod
+    /// goes on without it by itself (`proceed`, the default), or asks the user
+    /// (`ask`).
+    #[serde(default)]
+    pub on_silence: OnSilence,
     /// What replaces a silent bot, with no question to the user, for the head
     /// it stayed silent on. Unset, the user is asked once
     /// (`tod_core::bot_silence`).
@@ -377,6 +413,7 @@ impl PrReviewBotSettings {
             ask_every_minutes: default_ask_every_minutes(),
             max_asks: default_max_asks(),
             silent_after_minutes: None,
+            on_silence: OnSilence::default(),
             fallback: None,
             exhausted_pattern: None,
             reviews_drafts: None,
@@ -447,6 +484,15 @@ pub struct PrReadinessSettings {
     /// person's review.
     #[serde(default)]
     pub review_schedule: ReviewSchedule,
+    /// Reruns tod makes, through GitHub and with no agent turn, of one CI job
+    /// that failed for the infrastructure's reasons (cancelled, timed out, its
+    /// runner lost), per check and head. A job that then passes is recorded as
+    /// a flake of that check.
+    #[serde(default = "default_max_infra_reruns")]
+    pub max_infra_reruns: u32,
+    /// CI checks with a command that fixes them mechanically.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub check_fixes: Vec<CiCheckFix>,
     /// The ask comments (lowercase) of bots a node was told to go on without
     /// and so are no longer in `bots`: comments holding them are still tod's
     /// own asks, never feedback. Never saved.
@@ -613,6 +659,8 @@ impl Default for PrReadinessSettings {
             max_thread_rounds: default_max_thread_rounds(),
             max_rounds: default_max_rounds(),
             review_schedule: ReviewSchedule::default(),
+            max_infra_reruns: default_max_infra_reruns(),
+            check_fixes: Vec::new(),
             waived_asks: Vec::new(),
             own_review: OwnReviewState::default(),
             draft_blind: Vec::new(),
@@ -1617,6 +1665,8 @@ mod tests {
                 bots: vec![PrReviewBotSettings::new("greptile", 4, 10)],
                 max_thread_rounds: 3,
                 max_rounds: 4,
+                max_infra_reruns: 3,
+                check_fixes: vec![CiCheckFix { check: "lint".into(), fix: "cargo fmt".into() }],
                 review_schedule: ReviewSchedule { start_hour: 9, ..ReviewSchedule::default() },
                 waived_asks: Vec::new(),
                 own_review: OwnReviewState::default(),

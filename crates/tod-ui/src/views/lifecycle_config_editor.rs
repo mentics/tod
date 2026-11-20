@@ -82,6 +82,7 @@ struct CheckRow {
     changed: Entity<InputState>,
     pattern: Entity<InputState>,
     setup: Entity<InputState>,
+    fix: Entity<InputState>,
 }
 
 /// The label a phase is shown under.
@@ -309,6 +310,7 @@ impl LifecycleConfigEditor {
             changed: input("only if changed (default: run in)", &check.changed, cx),
             pattern: input("files (e.g. *.py)", &check.pattern, cx),
             setup: input("setup, once per worktree (e.g. install dependencies)", &check.setup, cx),
+            fix: input("fix, run when it fails; tod commits the result (e.g. cargo fmt)", &check.fix, cx),
         }
     }
 
@@ -578,6 +580,7 @@ impl LifecycleConfigEditor {
                     changed: scope[1].clone().unwrap_or_default(),
                     pattern: scope[2].clone().unwrap_or_default(),
                     setup: field(&row.setup).unwrap_or_default(),
+                    fix: field(&row.fix).unwrap_or_default(),
                 }),
                 (label, None) => {
                     self.error = Some(format!("the check `{}` has no command", label.unwrap_or_default()));
@@ -857,6 +860,7 @@ impl LifecycleConfigEditor {
                             .child(div().flex_1().child(Input::new(&row.pattern))),
                     )
                     .child(div().w_full().child(Input::new(&row.setup)))
+                    .child(div().w_full().child(Input::new(&row.fix)))
             }))
             .child(
                 h_flex().child(

@@ -481,6 +481,14 @@ pub const PR_HOUSEKEEPING_GAP: Duration = Duration::from_secs(30 * 60);
 /// live: two or three agent sessions per merge, all night.
 const PR_HOUSEKEEPING_LIMIT: u32 = 8;
 
+/// How long after asking GitHub to rerun a CI job the failure it still shows is
+/// taken to be the old one (`Autopilot::rerun_infra_failures`).
+const INFRA_RERUN_SETTLE_MS: i64 = 120_000;
+
+/// How often tod's configured fixer runs for one failing CI check of a pull
+/// request (`Autopilot::run_ci_fixers`).
+const CI_FIX_ATTEMPTS: u32 = 2;
+
 /// How many times one run reviews a head pushed without tod's review at once
 /// (`crate::pr_pushes::review_owed_now`) before leaving it to the usual
 /// review once nothing but a person is left.
@@ -498,6 +506,17 @@ enum BranchUpdate {
     /// A branch was updated on GitHub: look at the pull requests again.
     Updated,
     /// The run stops (GitHub failed, or the user stopped it).
+    Stop(Outcome),
+}
+
+/// What `Autopilot::bot_waiting` did.
+enum BotStep {
+    /// Nothing more: park, or poll.
+    Go,
+    /// tod went on without a silent bot by itself (decided by tod): read the
+    /// pull request again with the bot out of the settings.
+    Reread,
+    /// The run stops (GitHub failed).
     Stop(Outcome),
 }
 
@@ -1596,7 +1615,23 @@ impl Autopilot {
             // out): the user is asked once, here, so a pull request that has
             // nothing else to do never reads as clear with a red check, and no
             // turn is spent on it.
-            if self.ask_about_base_failures(fleet, &live, phase_key)? {
+            if self.waive_base_failures(fleet, &live, phase_key)? {
+                continue;
+            }
+            // What a tool can do about a failing check comes before any agent
+            // turn (`doc/requests/design.md` 4.2): a job the infrastructure
+            // lost is run again, and a check with a configured fixer is
+            // fixed, committed and pushed by tod itself.
+            if self.rerun_infra_failures(fleet, feed.as_ref(), &live, &settings, phase_key)? {
+                // Give GitHub a moment to show the rerun before the next read.
+                let settle = self.pr_poll.min(Duration::from_secs(20));
+                if let Some(reason) = self.sleep_watching(fleet, hook, settle)? {
+                    hook.waiting(None, None);
+                    return Ok(Some(Outcome::Stopped { reason }));
+                }
+                continue;
+            }
+            if self.run_ci_fixers(fleet, &live, &settings, phase_key)? {
                 continue;
             }
             match self.update_branches(fleet, hook, feed.as_ref(), &live, before_review)? {
@@ -1894,9 +1929,13 @@ impl Autopilot {
                     }
                     // A bot that has not come: tod asks it, a bounded number of
                     // times, and when it stays silent asks the user once.
-                    if let Some(outcome) = self.bot_waiting(fleet, feed.as_ref(), &live, &mut asked)? {
-                        hook.waiting(None, None);
-                        return Ok(Some(outcome));
+                    match self.bot_waiting(fleet, feed.as_ref(), &live, &mut asked)? {
+                        BotStep::Go => {}
+                        BotStep::Reread => continue,
+                        BotStep::Stop(outcome) => {
+                            hook.waiting(None, None);
+                            return Ok(Some(outcome));
+                        }
                     }
                     // Every bot still waited on is silent and its question to
                     // the user is pending: park the run on the bot's review (a
@@ -1952,8 +1991,11 @@ impl Autopilot {
         feed: &dyn crate::pr_readiness::PrFeed,
         live: &[crate::pr_readiness::LivePr],
         asked: &mut std::collections::HashSet<String>,
-    ) -> Result<Option<Outcome>> {
+    ) -> Result<BotStep> {
         use crate::bot_silence::{self, Tried};
+        // A silent bot tod went on without by itself this look: the pull
+        // request is read again with it out of the settings.
+        let mut settled = false;
         let node = self.node;
         let now = chrono::Utc::now();
         let mut silent: Vec<Tried> = Vec::new();
@@ -1970,6 +2012,7 @@ impl Autopilot {
                             last_ask_at: None,
                             last_activity_at: None,
                             exhausted: false,
+                            auto_proceed: true,
                         });
                         silent.len() - 1
                     }
@@ -1980,11 +2023,19 @@ impl Autopilot {
                 tried.last_ask_at = tried.last_ask_at.max(report.last_ask_at);
                 tried.last_activity_at = tried.last_activity_at.max(report.reviewed_at);
                 tried.exhausted |= report.exhausted;
+                // One bot that asks the user keeps the request for the bot.
+                tried.auto_proceed &= report.settings.on_silence == tod_store::OnSilence::Proceed;
             }
         }
         for tried in silent {
             let standing = fleet.read(|conn| bot_silence::standing(conn, node, &tried.bot))?;
             if !bot_silence::should_ask(standing, now) {
+                continue;
+            }
+            if tried.auto_proceed {
+                tracing::info!(%node, bot = %tried.bot, asks = tried.asks, "a review bot stayed silent: going on without it (decided by tod)");
+                bot_silence::settle_without(fleet, node, &tried)?;
+                settled = true;
                 continue;
             }
             tracing::info!(%node, bot = %tried.bot, asks = tried.asks, "a review bot stayed silent: asking the user");
@@ -2004,6 +2055,9 @@ impl Autopilot {
             // ([`Self::park_for_silent_bots`]); a review withdraws the question
             // ([`Self::tend_silence_questions`]).
         }
+        if settled {
+            return Ok(BotStep::Reread);
+        }
         for p in live {
             for ask in p.assessment.asks_due() {
                 let key = format!(
@@ -2018,12 +2072,12 @@ impl Autopilot {
                 }
                 tracing::info!(%node, bot = %ask.bot, pr = %p.pr.url, asks = ask.asks, "asking a review bot for a review");
                 if let Err(err) = feed.post_comment(&p.pr, &ask.text) {
-                    return Ok(Some(github_wait::github_look_failed(fleet, node, false, &err)?));
+                    return Ok(BotStep::Stop(github_wait::github_look_failed(fleet, node, false, &err)?));
                 }
                 crate::pr_readiness::forget_snapshot(&p.pr);
             }
         }
-        Ok(None)
+        Ok(BotStep::Go)
     }
 
     /// Records, once per bot, pull request and head, that a bot was given up
@@ -2192,14 +2246,16 @@ impl Autopilot {
         Ok((None, open))
     }
 
-    /// Raises the one check-unrelated request ([`crate::check_unrelated`]) for
-    /// each failing check that has a proof of failing on the base branch too
-    /// ([`tod_store::github::BaseFailure`]) and no standing yet on this head:
-    /// tod's own claim, with its proof, in place of the agent's (the agent
-    /// would otherwise be sent to fix what main fails, take two turns that
-    /// change nothing and stop the run `pr_stuck`). Returns whether any was
-    /// raised; the loop then stops on it at the top, like any pending request.
-    fn ask_about_base_failures(&self, fleet: &FleetStore, live: &[crate::pr_readiness::LivePr], phase: &str) -> Result<bool> {
+    /// Waives, itself, each failing check that has a proof of failing on the
+    /// base branch too ([`tod_store::github::BaseFailure`]) and no standing yet
+    /// on this head (`doc/requests/design.md` 4.2.2): the request is recorded
+    /// and answered by tod with the comparison as its rationale
+    /// ([`crate::check_unrelated::settle_confirmed`]), noted on the node's
+    /// Activity, and offered as a suggestion. Nobody is asked: the agent would
+    /// otherwise be sent to fix what main fails, take two turns that change
+    /// nothing and stop the run `pr_stuck`. Returns whether any was waived;
+    /// the loop then reads the pull request again with the standing applied.
+    fn waive_base_failures(&self, fleet: &FleetStore, live: &[crate::pr_readiness::LivePr], phase: &str) -> Result<bool> {
         use crate::check_unrelated as cu;
         use tod_store::node_timeline::{KIND_NOTE, TimelineEntry};
         let node = self.node;
@@ -2234,26 +2290,228 @@ impl Autopilot {
                     asked = true;
                     continue;
                 }
-                tracing::info!(%node, pr = %label, check = %found.check, "a failing check is also failing on the base: asking the user once");
-                fleet
-                    .interview(
-                        "autopilot",
-                        InterviewCommand::AskDecision {
-                            node_id: node,
-                            conversation_id: None,
-                            protocol: Some(cu::PROTOCOL.to_string()),
-                            decision: cu::new_decision(&claim),
-                        },
-                    )
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-                let title = format!("\"{}\" on {label} also fails on {}: the agent is not sent for it", found.check, found.base_branch);
-                let entry = TimelineEntry::new(node, KIND_NOTE, phase, title, false, found.describe());
+                tracing::info!(%node, pr = %label, check = %found.check, "a failing check is also failing on the base: waiving it (decided by tod)");
+                let rationale = format!(
+                    "tod compared \"{}\" with {}'s latest run and the same failure is there, so this change did not cause it: {}. Waived for {label} at {}.",
+                    found.check,
+                    found.base_branch,
+                    found.describe(),
+                    head.chars().take(7).collect::<String>(),
+                );
+                cu::settle_confirmed(fleet, node, &claim, &rationale)?;
+                let title = format!("\"{}\" on {label} also fails on {}: waived by tod, the agent is not sent for it", found.check, found.base_branch);
+                let entry = TimelineEntry::new(node, KIND_NOTE, phase, title, false, rationale);
                 fleet.enqueue(tod_store::fleet::FleetMutation::RecordTimeline(Box::new(entry)))?;
                 fleet.writer().flush()?;
+                cu::file_pre_existing_suggestion(fleet, node, phase, &label, found)?;
                 asked = true;
             }
         }
         Ok(asked)
+    }
+
+    /// A CI job that was cancelled, timed out or lost its runner is the
+    /// infrastructure's failure, not the change's: tod asks GitHub to run it
+    /// again (no agent turn), at most `settings.max_infra_reruns` times per
+    /// check and head. A check that passes after a rerun is noted in the
+    /// Activity as a flake. Returns whether it acted or is waiting for a rerun
+    /// it asked for (the loop then reads the pull request again). A rerun
+    /// GitHub refuses is noted, counted, and left to the agent as work.
+    fn rerun_infra_failures(
+        &mut self,
+        fleet: &FleetStore,
+        feed: &dyn crate::pr_readiness::PrFeed,
+        live: &[crate::pr_readiness::LivePr],
+        settings: &tod_store::PrReadinessSettings,
+        phase: &str,
+    ) -> Result<bool> {
+        use tod_store::node_timeline::{KIND_NOTE, TimelineEntry};
+        let node = self.node;
+        let mut acted = false;
+        for p in live {
+            let a = &p.assessment;
+            let Some(head) = a.head_sha.clone() else { continue };
+            if a.merged || head.is_empty() {
+                continue;
+            }
+            let label = crate::pr_readiness::pr_label(&p.pr);
+            // A check that failed for infrastructure, was rerun, and now passes.
+            let mut flaked = Vec::new();
+            for r in self.state.infra_reruns.iter_mut().filter(|r| r.pr == label && r.head == head && !r.flaked && r.count > 0) {
+                let failing = a.failing_checks.iter().any(|c| c.eq_ignore_ascii_case(&r.check));
+                if failing || a.checks_running {
+                    continue;
+                }
+                r.flaked = true;
+                flaked.push((r.check.clone(), r.count));
+            }
+            for (check, count) in flaked {
+                let title = format!("Flake: \"{check}\" on {label} passed on rerun");
+                let detail = format!(
+                    "The check \"{check}\" failed for the infrastructure's reasons at {} and passed when tod ran it again ({count} rerun{}). Recorded as a flake of that check.",
+                    head.chars().take(7).collect::<String>(),
+                    if count == 1 { "" } else { "s" },
+                );
+                fleet.enqueue(tod_store::fleet::FleetMutation::RecordTimeline(Box::new(TimelineEntry::new(node, KIND_NOTE, phase, title, false, detail))))?;
+                fleet.writer().flush()?;
+                self.save()?;
+            }
+            if a.checks_running || a.infra_failures.is_empty() {
+                continue;
+            }
+            for found in &a.infra_failures {
+                if !a.failing_checks.iter().any(|c| c.eq_ignore_ascii_case(&found.check)) {
+                    continue;
+                }
+                let now = state::now_ms();
+                let at = match self.state.infra_reruns.iter().position(|r| r.pr == label && r.head == head && r.check == found.check) {
+                    Some(at) => at,
+                    None => {
+                        self.state.infra_reruns.push(state::InfraRerun {
+                            pr: label.clone(),
+                            head: head.clone(),
+                            check: found.check.clone(),
+                            count: 0,
+                            at_ms: 0,
+                            flaked: false,
+                        });
+                        let over = self.state.infra_reruns.len().saturating_sub(state::MECHANICAL_KEPT);
+                        self.state.infra_reruns.drain(..over);
+                        self.state.infra_reruns.len() - 1
+                    }
+                };
+                let (count, last) = (self.state.infra_reruns[at].count, self.state.infra_reruns[at].at_ms);
+                if count > 0 && now - last < INFRA_RERUN_SETTLE_MS {
+                    // GitHub has not shown the rerun yet: not a failure to hand on.
+                    acted = true;
+                    continue;
+                }
+                if count >= settings.max_infra_reruns {
+                    continue;
+                }
+                let what = format!("\"{}\" on {label} ({})", found.check, found.kind);
+                match feed.rerun_job(&p.pr, found.job_id) {
+                    Ok(()) => {
+                        self.state.infra_reruns[at].count += 1;
+                        self.state.infra_reruns[at].at_ms = now;
+                        self.save()?;
+                        let title = format!("Reran {what}: tod asked GitHub to run the job again ({} of {})", count + 1, settings.max_infra_reruns);
+                        let detail = format!(
+                            "The job failed for the infrastructure's reasons ({}), not the change's, so no agent is sent for it.",
+                            found.kind
+                        );
+                        fleet.enqueue(tod_store::fleet::FleetMutation::RecordTimeline(Box::new(TimelineEntry::new(node, KIND_NOTE, phase, title, false, detail))))?;
+                        fleet.writer().flush()?;
+                        crate::pr_readiness::forget_snapshot(&p.pr);
+                        acted = true;
+                    }
+                    Err(err) => {
+                        // Counted, so a refusal never repeats without end; the
+                        // failure is the agent's work once the count is spent.
+                        self.state.infra_reruns[at].count += 1;
+                        self.state.infra_reruns[at].at_ms = 0;
+                        self.save()?;
+                        let title = format!("Could not rerun {what}");
+                        let entry = TimelineEntry::new(node, KIND_NOTE, phase, title, true, format!("GitHub refused the rerun: {err}"));
+                        fleet.enqueue(tod_store::fleet::FleetMutation::RecordTimeline(Box::new(entry)))?;
+                        fleet.writer().flush()?;
+                    }
+                }
+            }
+        }
+        Ok(acted)
+    }
+
+    /// A failing CI check with a configured fixer (`pr_readiness.check_fixes`)
+    /// is fixed by tod: the fixer runs in the node's checkout, what it changed
+    /// is committed as tod's own mechanical commit, pushed, and recorded as a
+    /// mechanical head (no review of it is owed). No agent turn, and no round
+    /// of review. At most [`CI_FIX_ATTEMPTS`] times per check of a pull
+    /// request; a fixer that fails or changes nothing hands the check to the
+    /// agent, with a note saying what it did. Returns whether a fix was pushed
+    /// (the loop reads the pull request again).
+    fn run_ci_fixers(
+        &mut self,
+        fleet: &FleetStore,
+        live: &[crate::pr_readiness::LivePr],
+        settings: &tod_store::PrReadinessSettings,
+        phase: &str,
+    ) -> Result<bool> {
+        use tod_store::node_timeline::{KIND_NOTE, TimelineEntry};
+        if settings.check_fixes.is_empty() || self.state.pr_change.is_some() {
+            return Ok(false);
+        }
+        let node = self.node;
+        let mut pushed = false;
+        for p in live {
+            let a = &p.assessment;
+            let Some(head) = a.head_sha.clone() else { continue };
+            if a.merged || head.is_empty() || a.checks_running {
+                continue;
+            }
+            let label = crate::pr_readiness::pr_label(&p.pr);
+            for check in a.checks_to_fix() {
+                let Some(fix) = settings.check_fixes.iter().find(|f| f.check.eq_ignore_ascii_case(&check)) else { continue };
+                if a.infra_failures.iter().any(|i| i.check.eq_ignore_ascii_case(&check)) {
+                    continue;
+                }
+                let tried = self
+                    .state
+                    .ci_fix_attempts
+                    .iter()
+                    .find(|t| t.pr == label && t.check.eq_ignore_ascii_case(&check))
+                    .map_or(0, |t| t.count);
+                if tried >= CI_FIX_ATTEMPTS {
+                    continue;
+                }
+                let Some(cwd) = tod_store::fleet::provision::launch_cwd_if_made(fleet, &node.to_string())? else { continue };
+                let dir = crate::pr_draft_review::repo_dir(&cwd, &p.pr.owner, &p.pr.repo)?;
+                // Only on the pull request's own head: a fix on top of commits
+                // nobody pushed would push them unreviewed.
+                let local = dir.git(&["rev-parse", "HEAD"])?;
+                if local != head {
+                    continue;
+                }
+                match self.state.ci_fix_attempts.iter_mut().find(|t| t.pr == label && t.check.eq_ignore_ascii_case(&check)) {
+                    Some(t) => t.count += 1,
+                    None => {
+                        self.state.ci_fix_attempts.push(state::CiFixAttempt { pr: label.clone(), check: check.clone(), count: 1 });
+                        let over = self.state.ci_fix_attempts.len().saturating_sub(state::MECHANICAL_KEPT);
+                        self.state.ci_fix_attempts.drain(..over);
+                    }
+                }
+                self.save()?;
+                let outcome = crate::fixer::run_fix(&dir, &check, &fix.fix)?;
+                let (title, detail, failed) = match &outcome {
+                    crate::fixer::FixOutcome::Committed { head: new } => (
+                        format!("Fixed \"{check}\" on {label} with its configured fix: committed {} and pushed", new.chars().take(7).collect::<String>()),
+                        format!("tod ran `{}`, committed what it changed as its own mechanical commit and pushed it; no agent turn and no review is owed for it.", fix.fix),
+                        false,
+                    ),
+                    crate::fixer::FixOutcome::NoChange => (
+                        format!("The configured fix for \"{check}\" on {label} changed nothing"),
+                        format!("tod ran `{}` and it changed no file, so the failure is the agent's to look at.", fix.fix),
+                        true,
+                    ),
+                    crate::fixer::FixOutcome::ChangedUncommitted => (
+                        format!("The configured fix for \"{check}\" on {label} left its change uncommitted"),
+                        format!("tod ran `{}`, but the checkout had uncommitted work that is not the fixer's, so nothing was committed.", fix.fix),
+                        true,
+                    ),
+                    crate::fixer::FixOutcome::Failed(why) => (format!("The configured fix for \"{check}\" on {label} failed"), why.clone(), true),
+                };
+                fleet.enqueue(tod_store::fleet::FleetMutation::RecordTimeline(Box::new(TimelineEntry::new(node, KIND_NOTE, phase, title, failed, detail))))?;
+                fleet.writer().flush()?;
+                let crate::fixer::FixOutcome::Committed { head: new } = outcome else { continue };
+                // A head tod pushes is its own, whatever GitHub shows next.
+                self.remember_tod_push(new.clone())?;
+                tod_store::fleet::provision::push_node_branch(fleet, &node.to_string())?;
+                crate::pr_pushes::record_mechanical(fleet, node, &p.pr, Some(head.clone()), &new, phase)?;
+                crate::pr_readiness::forget_snapshot(&p.pr);
+                pushed = true;
+            }
+        }
+        Ok(pushed)
     }
 
     /// Two agent turns in a row changed nothing while checks failed and the

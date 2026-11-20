@@ -46,12 +46,15 @@ same check fails on the base branch or on other branches. Then:
 - Record it: `pr checks unrelated <check> --reason <evidence>`. The evidence
   is what the user reads: the file or log line that fails, why the change
   cannot have caused it, and where else it fails (another branch, the base).
-  The app then asks the user once whether to fix it in this pull request or
-  carry on without it, and stops sending you back for that check meanwhile.
-  End your turn after recording it; do not ask the user about it yourself
-  (`decisions ask`), and do not work around it.
-- If the user's answer is to fix it in this pull request, you are told so in
-  your next turn: fix it then, whoever caused it.
+  The app checks the claim itself against the base branch's latest run of
+  the check. When the same failure is there it waives the check for this
+  pull request (nobody is asked) and stops sending you back for it; end your
+  turn after recording it, do not ask the user about it yourself
+  (`decisions ask`), and do not work around it. When the comparison does not
+  confirm the claim, the command is refused: it is yours to fix, whatever
+  you believe caused it.
+- If you are told the user decided to fix it in this pull request, fix it
+  then, whoever caused it.
 - A check this change did cause is yours to fix as any other feedback.
 
 ## Where the code is

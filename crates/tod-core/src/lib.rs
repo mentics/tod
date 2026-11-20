@@ -87,6 +87,7 @@ pub mod process;
 pub mod process_bundle;
 pub mod orchestrator_github;
 pub mod checks;
+pub mod fixer;
 pub mod pr_readiness;
 pub mod release_watch;
 pub mod request_brief;

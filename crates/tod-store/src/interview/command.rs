@@ -258,6 +258,18 @@ pub enum InterviewCommand {
         #[serde(default)]
         text: Option<String>,
     },
+    /// tod's own answer to a request it can settle mechanically (a bot that
+    /// stayed silent after every ask, a failure the base branch has too):
+    /// recorded `decided_by = tod` with the rationale saying what was tried
+    /// (`DecisionRepo::answer_settled`, which refuses any other request). Not
+    /// offered by `tod-cli`, and refused to an agent session.
+    SettleDecision {
+        decision_id: Uuid,
+        option: i64,
+        #[serde(default)]
+        text: Option<String>,
+        rationale: String,
+    },
     /// Mark the node's `state` phase ready for evaluation (`crate::phase`).
     /// Who it is from comes from the actor, as for the two below.
     PhaseReady { node_id: Uuid, state: String },
@@ -1210,6 +1222,23 @@ pub fn execute(
                 *option,
                 text.as_deref(),
                 author,
+            )?;
+            Ok(json!({ "id": answer.id }))
+        }
+        InterviewCommand::SettleDecision {
+            decision_id,
+            option,
+            text,
+            rationale,
+        } => {
+            if agent.is_some() {
+                bail!("only tod settles a request itself: an agent session may not");
+            }
+            let answer = crate::decisions::DecisionRepo::new(conn).answer_settled(
+                *decision_id,
+                *option,
+                text.as_deref(),
+                rationale,
             )?;
             Ok(json!({ "id": answer.id }))
         }
