@@ -9,11 +9,13 @@
 //! a second store writer beside the daemon). Refused in an agent session,
 //! and into `pr_review` or beyond.
 //!
-//! `send-back` is the agent's: a phase agent, evaluator, verification, review
-//! or fix session sends its own node back to the phase that got it wrong
-//! (`tod_store::send_back`, the same store move), with the conversation as
-//! the sender. A send-back the loop guard refuses stops the run for the user
-//! and fails here with why.
+//! `send-back` is the agent's: a phase agent, evaluator, implementation (to
+//! dispute an obligation), verification, review or fix session sends its own
+//! node back to the phase that got it wrong (`tod_store::send_back`, the same
+//! store move), with the conversation as the sender. A send-back the loop
+//! guard refuses stops the run for the user and fails here with why.
+//! `resolve-dispute` is the receiving phase agent's answer to a send-back that
+//! disputed an obligation.
 
 use crate::Invocation;
 use crate::args::Args;
@@ -30,6 +32,7 @@ tod-cli lifecycle — move a node's lifecycle state
 COMMANDS:
     set <NODE> <STATE> --reason <TEXT>
     send-back --to <STATE> --reason <TEXT> [--evidence <KIND>:<ID>]... [--obligation <ID>]...
+    resolve-dispute --as <fixed|upheld|passed-up> --note <TEXT> [--send-back <ID>]
 
 `set` moves the node to <STATE> at once, bypassing the gates, exactly as the
 task panel's state chip does: a move back clears what certified the states
@@ -42,12 +45,23 @@ and choosing a reviewer are the user's step.
 
 `send-back` sends the session's own node back to an earlier state, before
 `pr_review`, with the reason and evidence that phase starts from. Only a
-phase agent, an evaluator, or a verification, review or fix session may use
-it. At `active` or earlier the implementation steps and verified verdicts
-reopen; to `verifying`, only the verdicts of the --obligation(s) named, and
-at least one is required. The same move again on unchanged obligations, plan
-and design, or a third send-back to the same state since the user last acted,
-is refused and stops the run for the user.
+phase agent, an evaluator, or an implementation, verification, review or fix
+session may use it. At `active` or earlier the implementation steps and
+verified verdicts reopen; to `verifying`, only the verdicts of the
+--obligation(s) named, and at least one is required. With --obligation and a
+target other than `verifying` it is a dispute of those obligations, which
+must be agent-written and go to the phase that wrote them (`design` for a
+design obligation, `proposed` for a requirement); an implementation session
+may send back only that way. The same move again on unchanged obligations,
+plan and design, or a third send-back to the same state since the user last
+acted, is refused and stops the run for the user.
+
+`resolve-dispute` is how the phase agent a dispute was sent to settles it:
+`fixed` (a disputed obligation was changed or removed; refused if none was),
+`upheld` (it stands; the note says how it is meant) or `passed-up` (design
+only: the dispute goes on to `proposed` with the chain). --note is required.
+The phase cannot be recorded ready or certified by an agent while a dispute
+sent to it is open.
 ";
 
 pub fn run(inv: Invocation) -> anyhow::Result<String> {
@@ -60,6 +74,7 @@ pub fn run(inv: Invocation) -> anyhow::Result<String> {
     match command.as_str() {
         "set" => set(&inv, &args, |name| std::env::var(name).ok()),
         "send-back" => send_back(&inv, &args, |name| std::env::var(name).ok()),
+        "resolve-dispute" => resolve_dispute(&inv, &args, |name| std::env::var(name).ok()),
         other => anyhow::bail!("unknown command `{other}`\n\n{}", USAGE.trim_end()),
     }
 }
@@ -107,6 +122,42 @@ fn send_back(inv: &Invocation, args: &Args, env: impl Fn(&str) -> Option<String>
         to,
         to
     ))
+}
+
+/// The receiving phase agent settles the dispute sent to its state.
+fn resolve_dispute(inv: &Invocation, args: &Args, env: impl Fn(&str) -> Option<String>) -> anyhow::Result<String> {
+    let set = |name: &str| env(name).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    let Some(raw) = set(IMPLEMENT_CONVERSATION_ENV) else {
+        anyhow::bail!("not in an agent session: only the phase agent a dispute was sent to settles it");
+    };
+    let conversation_id = Uuid::parse_str(&raw)
+        .map_err(|_| anyhow::anyhow!("{IMPLEMENT_CONVERSATION_ENV} is not a UUID (`{raw}`)"))?;
+    let kind = args.require("--as")?.trim().replace('-', "_");
+    let note = args.require("--note")?.trim().to_string();
+    let send_back = args
+        .get("--send-back")
+        .map(|raw| Uuid::parse_str(raw.trim()).map_err(|_| anyhow::anyhow!("--send-back is not a UUID (`{raw}`)")))
+        .transpose()?;
+    let client = InterviewClient::new(&inv.data_root, set(ACTOR_ENV).unwrap_or_else(|| ACTOR_AGENT.to_string()));
+    let result = client.interview(InterviewCommand::ResolveDispute(tod_store::send_back::Resolution {
+        conversation_id,
+        send_back,
+        kind: kind.clone(),
+        note,
+    }))?;
+    if result["outcome"] == tod_store::send_back::OUTCOME_STOPPED {
+        anyhow::bail!(
+            "not passed up: {}. The run stops here for the user; end your turn",
+            result["why"].as_str().unwrap_or("the loop guard refused it")
+        );
+    }
+    if inv.json {
+        return Ok(serde_json::to_string(&result)?);
+    }
+    if result["outcome"] == tod_store::send_back::OUTCOME_MOVED {
+        return Ok("ok passed up to proposed; end your turn, that phase takes it from here".to_string());
+    }
+    Ok(format!("ok dispute {kind}"))
 }
 
 /// `env` is the process environment, passed in so a test can play an agent.
@@ -267,7 +318,7 @@ mod tests {
         let id = conversation(&root, node, tod_store::conversation::ProtocolKind::Implementation);
         let (i, a) = inv(&root, &["--to", "design", "--reason", "x"]);
         let err = send_back(&i, &a, session(id)).unwrap_err();
-        assert!(err.to_string().contains("only a phase agent"), "{err}");
+        assert!(err.to_string().contains("only to dispute an obligation"), "{err}");
         assert_eq!(state(&root, node), "active");
     }
 

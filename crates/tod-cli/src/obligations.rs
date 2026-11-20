@@ -47,6 +47,13 @@ Every obligation is live: verification must show it in the running work.
 a refactor, a rename), so a unit test or reading the code verifies it; `--live`
 clears the mark. Only the design phase agent and the user may set or clear it.
 
+Every obligation shows who stands behind it: none for an agent's own, `(user)`
+for one the user wrote or edited, `(approved)` for one the user confirmed.
+You never change or remove a user or approved obligation. You may change an
+agent's own only in the phase that wrote it (a requirement through `proposed`,
+a design obligation through `design`); later, send the node back with
+`lifecycle send-back --obligation` to dispute it.
+
 Inside an interview, an agent's `add` always writes its own session's phase —
 `--phase` there only matters when running `add` outside an interview.
 ";
@@ -212,6 +219,7 @@ fn list(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
                     "phase": r.phase,
                     "acts_in": r.acts_in,
                     "code_only": r.code_only,
+                    "authority": r.authority,
                     "inherited_from": source,
                 });
                 if let Some(item) = item.as_object_mut() {
@@ -235,7 +243,12 @@ fn list(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
                 .as_deref()
                 .map(|s| format!(" ({s})"))
                 .unwrap_or_default();
-            let acts = format!("{}{}", acts_in_note(&o.acts_in), code_only_note(o.code_only.as_deref()));
+            let acts = format!(
+                "{}{}{}",
+                acts_in_note(&o.acts_in),
+                code_only_note(o.code_only.as_deref()),
+                authority_note(&o.authority)
+            );
             let from = source
                 .as_deref()
                 .map(|s| format!(" [from \"{s}\"]"))
@@ -261,6 +274,16 @@ fn acts_in_note(acts_in: &str) -> String {
         String::new()
     } else {
         format!(" acts-in={acts_in}")
+    }
+}
+
+/// ` (user)` or ` (approved)` when the user stands behind the obligation: an
+/// agent does not change or remove it (`tod_store::conversation::settled`).
+fn authority_note(authority: &str) -> String {
+    if authority == tod_store::outline::repos::obligations::AUTHORITY_AGENT {
+        String::new()
+    } else {
+        format!(" ({authority})")
     }
 }
 
@@ -312,6 +335,7 @@ fn show(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
             "phase": row.phase,
             "acts_in": row.acts_in,
             "code_only": row.code_only,
+            "authority": row.authority,
         });
         return Ok(value.to_string());
     }
@@ -321,12 +345,13 @@ fn show(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
         .map(|s| format!(" ({s})"))
         .unwrap_or_default();
     Ok(format!(
-        "[{}] {}/{}{}{}{section} on node {}\n{}",
+        "[{}] {}/{}{}{}{}{section} on node {}\n{}",
         short_id(row.id),
         row.phase,
         row.kind,
         acts_in_note(&row.acts_in),
         code_only_note(row.code_only.as_deref()),
+        authority_note(&row.authority),
         row.node_id,
         row.body
     ))

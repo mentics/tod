@@ -805,6 +805,12 @@ impl Autopilot {
                 }
                 ChecksStep::Stop(outcome) => return Ok(outcome),
             }
+            // A phase the node comes forward to, whose suspended certificate
+            // still covers what it covers now, gets it back with no agent.
+            fleet.interview(
+                "autopilot",
+                InterviewCommand::RestoreCertificate { node_id: self.node },
+            )?;
             let mut pending = fleet
                 .read(|conn| Ok(DecisionRepo::new(conn).list_pending_for_node(self.node)?))?
                 .len();

@@ -211,10 +211,23 @@ work around with fixtures never needs the user. When something does:
 - When the user answers one — settles a conflict, picks an option, supplies
   access — the app sets the step back to `in_progress` and tells you the
   answer. Act on it; where the answer changes what an obligation says, the
-  user changes the obligation (the app refuses yours past `planning`). Do not
+  user changes the obligation (the app refuses yours once the phase that wrote
+  it is done, and always for one the user wrote or approved). Do not
   ask for that afterwards: when you ask the question, put each option's new
   obligation text on the option (see the decisions commands), and answering
   makes the edit.
+
+## When an obligation is wrong
+
+An obligation you cannot build because it is wrong or unclear is not yours to
+reword, and not the user's to be asked about when an earlier phase wrote it:
+send the task back to that phase with `lifecycle send-back` (see the
+`lifecycle` commands), naming the obligation, with what shows it wrong. A
+design obligation goes to `design`, a requirement to `proposed`; a user's or
+approved obligation cannot be disputed, so ask the user about it as below.
+That phase's agent fixes it, upholds it with a clarification, or passes it up,
+and the task comes forward again to you. A dispute is for an obligation,
+never for a step that is merely hard; end your turn after sending it.
 
 ## Asking the user
 

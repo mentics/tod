@@ -1,6 +1,16 @@
-//! Obligations are the user's. Once a node is past `planning`, an agent may
-//! not create, edit, move, or delete one of its obligations on its own: it
-//! asks the user (`tod-cli decisions ask`), and the user makes the change.
+//! Who may change an obligation, and when (`doc/requests/design.md` 10.2).
+//! No agent changes or removes an obligation the user stands behind
+//! (`authority` `user` or `approved`), in any state: it asks
+//! (`tod-cli decisions ask`, proposing the change with `--edit-obligation`) and
+//! the user makes it. An obligation of an agent's own may be changed by an
+//! agent only until the phase that wrote it is done: through `proposed` for a
+//! requirement, through `design` for a design obligation
+//! ([`last_open_state`]). From `planning` on none may, and the refusal says
+//! to send the node back with a dispute (`tod-cli lifecycle send-back
+//! --obligation`, `crate::send_back`) so the phase that wrote it settles it.
+//!
+//! The design phase agent may also set where an obligation of its own node acts
+//! (`acts_in`) in `design`, requirements included ([`design_may_retag`]).
 //!
 //! Checked where every outline write is recorded ([`super::record_and_execute`]
 //! for a conversation's agent, [`super::record_direct`] for every other
@@ -23,6 +33,7 @@ use super::repo::ConversationRepo;
 use super::types::{EntitySnapshot, ProtocolKind};
 use crate::interview::InterviewRepo;
 use crate::outline::OutlineMutation;
+use crate::outline::repos::obligations::AUTHORITY_AGENT;
 use crate::outline::repos::{NodeRepo, ObligationRepo, PlanStepRepo};
 use crate::verification::VerdictRepo;
 use crate::outline::{ACTS_IN_MERGED, ACTS_IN_RELEASED};
@@ -30,10 +41,6 @@ use crate::settings::VALID_LIFECYCLE_STATES;
 use anyhow::{Result, bail};
 use rusqlite::Connection;
 use uuid::Uuid;
-
-/// The last lifecycle state in which an agent may change a node's
-/// obligations by itself.
-pub const LAST_OPEN_STATE: &str = "planning";
 
 /// Whether a conversation of this kind is one the user directs turn by turn.
 pub fn user_directed(protocol: ProtocolKind) -> bool {
@@ -68,7 +75,31 @@ pub fn check_conversation_agent(
             Retag::NotARetag => {}
         }
     }
+    if conversation.protocol == ProtocolKind::Phase && design_may_retag(conn, &conversation, mutation)? {
+        return Ok(());
+    }
     check_agent(conn, mutation)
+}
+
+/// Whether `mutation` is the design phase agent setting where one of its own
+/// node's agent-written obligations is acted on (`acts_in`) while the node is
+/// in `design`. That is design's call for a requirement too (a requirement
+/// that only a later phase can show true acts there), and it leaves the text,
+/// which is the requirements phase's, as it was.
+fn design_may_retag(
+    conn: &Connection,
+    conversation: &super::types::Conversation,
+    mutation: &OutlineMutation,
+) -> Result<bool> {
+    let OutlineMutation::UpdateObligationActsIn { obligation_id, .. } = mutation else {
+        return Ok(false);
+    };
+    let Some(obligation) = ObligationRepo::new(conn).get(*obligation_id)? else {
+        return Ok(false);
+    };
+    Ok(!obligation.user_owned()
+        && conversation.focus == super::types::Focus::Node(obligation.node_id)
+        && NodeRepo::new(conn).get_lifecycle(obligation.node_id)?.as_deref() == Some("design"))
 }
 
 /// What [`verify_may_retag`] decided.
@@ -260,60 +291,139 @@ fn check_agent_noting(
     mutation: &OutlineMutation,
     retag_note: Option<&str>,
 ) -> Result<()> {
-    for node_id in obligation_nodes(conn, mutation)? {
-        let Some(state) = NodeRepo::new(conn).get_lifecycle(node_id)? else {
+    if let OutlineMutation::SetObligationAuthority { .. } = mutation {
+        bail!(
+            "refused: who stands behind an obligation is the user's to say: an agent never sets \
+            it. To have the user approve an obligation, ask with `tod-cli decisions ask \
+            --option <TEXT> --affirm-obligation <N>:<ID>`."
+        );
+    }
+    for touch in touches(conn, mutation)? {
+        let nodes = NodeRepo::new(conn);
+        let Some(state) = nodes.get_lifecycle(touch.node_id)? else {
             continue;
         };
-        if !past_planning(&state)? {
+        let name = nodes
+            .get(touch.node_id)?
+            .map(|n| n.slug)
+            .unwrap_or_else(|| touch.node_id.to_string());
+        if touch.authority != AUTHORITY_AGENT {
+            let what = match &touch.id {
+                Some(id) => format!("obligation {}", crate::interview::short_id(*id)),
+                None => "this obligation".to_string(),
+            };
+            bail!(
+                "refused: {what} of node {name} is the user's ({}): the user's obligations are \
+                changed or removed by the user alone, in any state. If it looks wrong, ask with \
+                `tod-cli decisions ask --node {} <QUESTION>`, proposing the change with \
+                `--edit-obligation <N>:<ID>=<TEXT>`.{}",
+                touch.authority,
+                touch.node_id,
+                retag_suffix(retag_note)
+            );
+        }
+        let through = last_open_state(&touch.phase);
+        let (Some(at), Some(open)) = (rank(&state), rank(through)) else {
+            bail!("node {name} is in unknown lifecycle state `{state}`");
+        };
+        if at <= open {
             continue;
         }
-        let name = NodeRepo::new(conn)
-            .get(node_id)?
-            .map(|n| n.slug)
-            .unwrap_or_else(|| node_id.to_string());
+        let (target, whose) = match crate::send_back::dispute_target(&touch.phase) {
+            Some("design") => ("design", "design"),
+            _ => ("proposed", "requirements"),
+        };
+        let wrong_phase_hint = if touch.creates && state == "design" {
+            " (An obligation created in `design` is a design obligation: pass `--phase design`.)"
+        } else {
+            ""
+        };
+        let how = if rank(&state).zip(rank(target)).is_some_and(|(s, t)| s > t) {
+            format!(
+                "If it is wrong or unclear, send the node back to `{target}` to dispute it: \
+                `tod-cli lifecycle send-back --to {target} --obligation <ID> --reason <WHY>`; the \
+                phase that wrote it settles it. If it needs the user, ask with \
+                `tod-cli decisions ask --node {} <QUESTION>`.",
+                touch.node_id
+            )
+        } else {
+            String::new()
+        };
         bail!(
-            "refused: node {name} is in `{state}`, past {LAST_OPEN_STATE}, and the obligations \
-            of a node past {LAST_OPEN_STATE} change only with the user's approval. Ask the \
-            user with `tod-cli decisions ask --node {node_id} <QUESTION>`, quoting the change \
-            you propose (the obligation's id, its current text and the text you propose) and \
-            why; if they approve, they make the change themselves.{}",
-            match retag_note {
-                Some(why) => format!(
-                    " (The verification agent's own move to a later phase did not apply: {why}. \
-                    Do not ask the user to make that move unless that is fixed.)"
-                ),
-                None => String::new(),
-            }
+            "refused: node {name} is in `{state}`, and the {whose} obligations of a node change \
+            only through `{through}` at the latest: an agent past it does not edit them. {how}{wrong_phase_hint}{}",
+            retag_suffix(retag_note)
         );
     }
     Ok(())
 }
 
-/// Whether `state` comes after `planning` in the lifecycle.
-fn past_planning(state: &str) -> Result<bool> {
-    let rank = |s: &str| VALID_LIFECYCLE_STATES.iter().position(|v| *v == s);
-    let Some(open) = rank(LAST_OPEN_STATE) else {
-        bail!("`{LAST_OPEN_STATE}` is not a lifecycle state");
-    };
-    let Some(at) = rank(state) else {
-        bail!("node is in unknown lifecycle state `{state}`");
-    };
-    Ok(at > open)
+fn retag_suffix(retag_note: Option<&str>) -> String {
+    match retag_note {
+        Some(why) => format!(
+            " (The verification agent's own move to a later phase did not apply: {why}. \
+            Do not ask the user to make that move unless that is fixed.)"
+        ),
+        None => String::new(),
+    }
 }
 
-/// The nodes whose obligations `mutation` changes: the obligation's own node
-/// and, for a move, the node it goes to. Empty for anything that is not an
-/// obligation change, and for attaching a visual-design mockup, which does
-/// not change what the obligation says.
-fn obligation_nodes(conn: &Connection, mutation: &OutlineMutation) -> Result<Vec<Uuid>> {
+fn rank(state: &str) -> Option<usize> {
+    VALID_LIFECYCLE_STATES.iter().position(|v| *v == state)
+}
+
+/// The last lifecycle state in which an agent may change an agent's
+/// obligation of this `phase` (`doc/requests/design.md` 10.2): `design` for
+/// a design obligation, `proposed` for a requirement (or one with no phase).
+pub fn last_open_state(phase: &str) -> &'static str {
+    if phase == "design" { "design" } else { "proposed" }
+}
+
+/// One obligation a mutation changes: its node, id (`None` when it is being
+/// created), the phase it belongs to, and who stands behind it.
+struct Touch {
+    node_id: Uuid,
+    id: Option<Uuid>,
+    phase: String,
+    authority: String,
+    creates: bool,
+}
+
+/// The obligations `mutation` changes, existing and new, for each node they
+/// sit on (a move or a placement touches the node it leaves and the one it
+/// goes to). Empty for anything that is not an obligation change, and for
+/// attaching a visual-design mockup, which does not change what the
+/// obligation says.
+fn touches(conn: &Connection, mutation: &OutlineMutation) -> Result<Vec<Touch>> {
     use OutlineMutation as M;
-    let owner = |id: Uuid| -> Result<Option<Uuid>> {
-        Ok(ObligationRepo::new(conn).get(id)?.map(|o| o.node_id))
+    let existing = |id: Uuid| -> Result<Option<Touch>> {
+        Ok(ObligationRepo::new(conn).get(id)?.map(|o| Touch {
+            node_id: o.node_id,
+            id: Some(o.id),
+            phase: o.phase.clone(),
+            authority: o.authority.clone(),
+            creates: false,
+        }))
     };
-    let mut nodes = Vec::new();
+    let mut out = Vec::new();
     match mutation {
-        M::CreateObligation { node_id, .. } | M::RenameObligationSection { node_id, .. } => {
-            nodes.push(*node_id);
+        M::CreateObligation { node_id, phase, .. } => out.push(Touch {
+            node_id: *node_id,
+            id: None,
+            phase: phase.clone(),
+            authority: AUTHORITY_AGENT.to_string(),
+            creates: true,
+        }),
+        M::RenameObligationSection { node_id, .. } => {
+            // A section holds obligations of any phase: the earlier phase
+            // governs, so it is refused once the requirements are closed.
+            out.push(Touch {
+                node_id: *node_id,
+                id: None,
+                phase: "requirements".to_string(),
+                authority: AUTHORITY_AGENT.to_string(),
+                creates: false,
+            });
         }
         M::UpdateObligationBody { obligation_id, .. }
         | M::UpdateObligationSection { obligation_id, .. }
@@ -322,7 +432,7 @@ fn obligation_nodes(conn: &Connection, mutation: &OutlineMutation) -> Result<Vec
         | M::UpdateObligationCodeOnly { obligation_id, .. }
         | M::DeleteObligation { obligation_id }
         | M::ReorderObligation { obligation_id, .. } => {
-            nodes.extend(owner(*obligation_id)?);
+            out.extend(existing(*obligation_id)?);
         }
         M::MoveObligation {
             obligation_id,
@@ -333,28 +443,57 @@ fn obligation_nodes(conn: &Connection, mutation: &OutlineMutation) -> Result<Vec
             node_id,
             ..
         } => {
-            nodes.extend(owner(*obligation_id)?);
-            nodes.push(*node_id);
+            let own = existing(*obligation_id)?;
+            if let Some(own) = own {
+                let target = (own.node_id != *node_id).then(|| Touch {
+                    node_id: *node_id,
+                    id: own.id,
+                    phase: own.phase.clone(),
+                    authority: own.authority.clone(),
+                    creates: false,
+                });
+                out.push(own);
+                out.extend(target);
+            }
         }
         M::RestoreObligation { rev } => {
             if let Some(snapshot) = InterviewRepo::new(conn).obligation_snapshot(*rev)? {
-                nodes.extend(owner(snapshot.obligation_id)?);
-                nodes.push(snapshot.node_id);
+                match existing(snapshot.obligation_id)? {
+                    Some(own) => out.push(own),
+                    None => out.push(Touch {
+                        node_id: snapshot.node_id,
+                        id: Some(snapshot.obligation_id),
+                        phase: snapshot.prior.phase.clone(),
+                        authority: AUTHORITY_AGENT.to_string(),
+                        creates: true,
+                    }),
+                }
             }
         }
         M::RestoreObligationRow {
             obligation_id,
             snapshot,
         } => {
-            nodes.extend(owner(*obligation_id)?);
-            if let EntitySnapshot::Obligation { node_id, .. } = snapshot {
-                nodes.push(*node_id);
+            out.extend(existing(*obligation_id)?);
+            if let EntitySnapshot::Obligation {
+                node_id,
+                phase,
+                authority,
+                ..
+            } = snapshot
+            {
+                out.push(Touch {
+                    node_id: *node_id,
+                    id: Some(*obligation_id),
+                    phase: phase.clone(),
+                    authority: authority.clone(),
+                    creates: true,
+                });
             }
         }
         _ => {}
     }
-    nodes.dedup();
-    Ok(nodes)
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -477,8 +616,8 @@ mod tests {
     fn assert_refused(state: &str, err: anyhow::Error) {
         let message = format!("{err:#}");
         assert!(
-            message.contains(&format!("node n is in `{state}`, past planning"))
-                && message.contains("change only with the user's approval")
+            message.contains(&format!("node n is in `{state}`"))
+                && message.contains("tod-cli lifecycle send-back --to ")
                 && message.contains("tod-cli decisions ask"),
             "{message}"
         );
@@ -504,7 +643,7 @@ mod tests {
     /// node's obligations too.
     #[test]
     fn an_agent_may_not_move_an_obligation_onto_a_node_past_planning() {
-        let fx = setup("design");
+        let fx = setup("proposed");
         NodeRepo::new(&fx.conn).set_lifecycle(fx.other, "review").unwrap();
         let err = outline(
             &fx,
@@ -527,24 +666,158 @@ mod tests {
         assert!(ObligationRepo::new(&fx.conn).get(fx.obligation).unwrap().is_none());
     }
 
+    /// An agent's requirement is open to agents through `proposed` only: the
+    /// phase that wrote it.
     #[test]
-    fn an_agent_may_change_obligations_up_to_planning() {
-        for state in ["proposed", "design", "planning"] {
+    fn an_agent_may_change_a_requirement_only_in_proposed() {
+        let fx = setup("proposed");
+        let phase = conversation(&fx, ProtocolKind::Phase);
+        outline(&fx, &phase, edit(&fx)).unwrap();
+        assert_eq!(body(&fx), "Export as JSON");
+        outline(
+            &fx,
+            ACTOR_AGENT,
+            OutlineMutation::UpdateObligationBody {
+                obligation_id: fx.obligation,
+                body: "Export as YAML".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(body(&fx), "Export as YAML");
+        for state in ["design", "planning"] {
             let fx = setup(state);
             let phase = conversation(&fx, ProtocolKind::Phase);
-            outline(&fx, &phase, edit(&fx)).unwrap();
-            assert_eq!(body(&fx), "Export as JSON");
-            outline(
-                &fx,
-                ACTOR_AGENT,
-                OutlineMutation::UpdateObligationBody {
-                    obligation_id: fx.obligation,
-                    body: "Export as YAML".into(),
-                },
-            )
-            .unwrap();
-            assert_eq!(body(&fx), "Export as YAML");
+            let err = outline(&fx, &phase, edit(&fx)).unwrap_err();
+            assert_refused(state, err);
+            assert_eq!(body(&fx), "Export as CSV");
         }
+    }
+
+    /// A design obligation stays open through `design`, and closes with
+    /// `planning`, where the refusal says to dispute it with a send-back to
+    /// `design`.
+    #[test]
+    fn an_agent_may_change_a_design_obligation_through_design() {
+        for (state, open) in [("proposed", true), ("design", true), ("planning", false), ("active", false)] {
+            let fx = setup(state);
+            let design = Uuid::new_v4();
+            ObligationRepo::new(&fx.conn)
+                .insert_at(design, fx.node, "requirement", 1, None, "Use a queue", "design")
+                .unwrap();
+            let phase = conversation(&fx, ProtocolKind::Phase);
+            let result = outline(
+                &fx,
+                &phase,
+                OutlineMutation::UpdateObligationBody {
+                    obligation_id: design,
+                    body: "Use a stack".into(),
+                },
+            );
+            if open {
+                result.unwrap();
+            } else {
+                let message = format!("{:#}", result.unwrap_err());
+                assert!(
+                    message.contains("send-back --to design --obligation"),
+                    "{message}"
+                );
+            }
+        }
+    }
+
+    /// The user's and approved obligations are changed by the user alone, in
+    /// any state, and an agent never sets authority.
+    #[test]
+    fn an_agent_never_changes_a_user_or_approved_obligation() {
+        for authority in ["user", "approved"] {
+            for state in ["proposed", "design"] {
+                let fx = setup(state);
+                ObligationRepo::new(&fx.conn).update_authority(fx.obligation, authority).unwrap();
+                let phase = conversation(&fx, ProtocolKind::Phase);
+                for actor in [phase.as_str(), ACTOR_AGENT] {
+                    for mutation in [
+                        edit(&fx),
+                        OutlineMutation::DeleteObligation {
+                            obligation_id: fx.obligation,
+                        },
+                    ] {
+                        let message = format!("{:#}", outline(&fx, actor, mutation).unwrap_err());
+                        assert!(
+                            message.contains(&format!("is the user's ({authority})"))
+                                && message.contains("--edit-obligation"),
+                            "{message}"
+                        );
+                    }
+                }
+                assert_eq!(body(&fx), "Export as CSV");
+            }
+        }
+    }
+
+    #[test]
+    fn an_agent_may_not_set_authority_and_the_user_may() {
+        let fx = setup("proposed");
+        let set = OutlineMutation::SetObligationAuthority {
+            obligation_id: fx.obligation,
+            authority: "approved".into(),
+        };
+        let phase = conversation(&fx, ProtocolKind::Phase);
+        let message = format!("{:#}", outline(&fx, &phase, set.clone()).unwrap_err());
+        assert!(message.contains("never sets it"), "{message}");
+        outline(&fx, ACTOR_USER, set).unwrap();
+        let authority = ObligationRepo::new(&fx.conn).get(fx.obligation).unwrap().unwrap().authority;
+        assert_eq!(authority, "approved");
+    }
+
+    /// Where an obligation acts is design's to set in `design`, for a
+    /// requirement too, unless the user stands behind it.
+    #[test]
+    fn the_design_agent_may_retag_a_requirement_in_design() {
+        let fx = setup("design");
+        let phase = conversation(&fx, ProtocolKind::Phase);
+        outline(&fx, &phase, retag(&fx, "released")).unwrap();
+        assert_eq!(acts_in(&fx), "released");
+        // Its text is still the requirements phase's.
+        assert!(outline(&fx, &phase, edit(&fx)).is_err());
+        let fx = setup("design");
+        ObligationRepo::new(&fx.conn).update_authority(fx.obligation, "user").unwrap();
+        let phase = conversation(&fx, ProtocolKind::Phase);
+        assert!(outline(&fx, &phase, retag(&fx, "released")).is_err());
+        let fx = setup("planning");
+        let phase = conversation(&fx, ProtocolKind::Phase);
+        assert!(outline(&fx, &phase, retag(&fx, "released")).is_err());
+    }
+
+    /// What the user writes or edits is theirs, whoever's it was before.
+    #[test]
+    fn what_the_user_creates_or_edits_becomes_theirs() {
+        let fx = setup("proposed");
+        let authority = |id| ObligationRepo::new(&fx.conn).get(id).unwrap().unwrap().authority;
+        assert_eq!(authority(fx.obligation), "agent");
+        outline(&fx, ACTOR_USER, edit(&fx)).unwrap();
+        assert_eq!(authority(fx.obligation), "user");
+        outline(
+            &fx,
+            ACTOR_USER,
+            OutlineMutation::CreateObligation {
+                obligation_id: None,
+                node_id: fx.node,
+                kind: "requirement".into(),
+                after_id: None,
+                before: false,
+                section: None,
+                body: "Mine".into(),
+                phase: "requirements".into(),
+            },
+        )
+        .unwrap();
+        let mine = ObligationRepo::new(&fx.conn)
+            .list_for_node(fx.node)
+            .unwrap()
+            .into_iter()
+            .find(|o| o.body == "Mine")
+            .unwrap();
+        assert_eq!(mine.authority, "user");
     }
 
     /// In a freeform conversation the user directs each change as it is made.

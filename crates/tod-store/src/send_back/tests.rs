@@ -57,7 +57,7 @@ fn return_to(fx: &Fx, from: &str) {
 #[test]
 fn only_the_judging_sessions_may_send_back() {
     let fx = setup("review");
-    for protocol in [ProtocolKind::Implementation, ProtocolKind::Outline, ProtocolKind::Pr] {
+    for protocol in [ProtocolKind::Outline, ProtocolKind::Pr] {
         let id = conversation(&fx, protocol);
         let err = send(&fx, ACTOR_AGENT, request(id, "active", "wrong")).unwrap_err();
         assert!(err.to_string().contains("only a phase agent"), "{protocol:?}: {err}");
@@ -198,7 +198,7 @@ fn the_target_phase_opening_and_the_activity_carry_the_send_back() {
     send(&fx, ACTOR_AGENT, asked).unwrap();
 
     let opening = render_for_opening(&fx.conn, fx.node).unwrap();
-    assert!(opening.contains("## Sent back"), "{opening}");
+    assert!(opening.contains("## Dispute"), "{opening}");
     assert!(opening.contains("review session sent this task back from `review` to `design`"), "{opening}");
     assert!(opening.contains("the approach is wrong"), "{opening}");
     assert!(opening.contains(&finding.to_string()), "{opening}");
@@ -217,6 +217,16 @@ fn the_target_phase_opening_and_the_activity_carry_the_send_back() {
 }
 
 #[test]
+fn a_send_back_that_names_no_obligation_is_not_a_dispute() {
+    let fx = setup("review");
+    let review = conversation(&fx, ProtocolKind::Review);
+    send(&fx, ACTOR_AGENT, request(review, "design", "the approach is wrong")).unwrap();
+    let opening = render_for_opening(&fx.conn, fx.node).unwrap();
+    assert!(opening.contains("## Sent back") && !opening.contains("## Dispute"), "{opening}");
+    assert!(open_dispute_into(&fx.conn, fx.node, "design").unwrap().is_none());
+}
+
+#[test]
 fn the_row_is_journaled() {
     let fx = setup("review");
     let review = conversation(&fx, ProtocolKind::Review);
@@ -226,4 +236,190 @@ fn the_row_is_journaled() {
         .query_row("SELECT COUNT(*) FROM journey_changes WHERE tbl = 'node_send_backs'", [], |r| r.get(0))
         .unwrap();
     assert_eq!(journaled, 1);
+}
+
+// ── Disputes ────────────────────────────────────────────────────────────
+
+fn requirement(fx: &Fx, index: usize, body: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    ObligationRepo::new(&fx.conn)
+        .insert_at(id, fx.node, "requirement", index, None, body, "requirements")
+        .unwrap();
+    id
+}
+
+fn dispute(conversation_id: Uuid, to: &str, obligation: Uuid) -> Request {
+    let mut asked = request(conversation_id, to, "this obligation cannot be met: it names a field that does not exist");
+    asked.obligations = vec![obligation];
+    asked
+}
+
+fn resolution(conversation_id: Uuid, kind: &str, note: &str) -> Resolution {
+    Resolution { conversation_id, send_back: None, kind: kind.into(), note: note.into() }
+}
+
+fn resolve_as(fx: &Fx, actor: &str, resolution: Resolution) -> Result<Value> {
+    crate::interview::execute(&fx.conn, Path::new("."), actor, &InterviewCommand::ResolveDispute(resolution))
+}
+
+#[test]
+fn an_implementation_session_may_send_back_only_to_dispute() {
+    let fx = setup("active");
+    let design = obligation(&fx, 0, "Use the supplier id");
+    let req = requirement(&fx, 1, "Show the price");
+    let implement = conversation(&fx, ProtocolKind::Implementation);
+
+    // A plain send-back is not an implementation session's.
+    let err = send(&fx, ACTOR_AGENT, request(implement, "design", "wrong")).unwrap_err();
+    assert!(err.to_string().contains("only to dispute an obligation"), "{err}");
+    // A design obligation is disputed to design, a requirement to proposed.
+    let err = send(&fx, ACTOR_AGENT, dispute(implement, "proposed", design)).unwrap_err();
+    assert!(err.to_string().contains("goes to `design`"), "{err}");
+    let err = send(&fx, ACTOR_AGENT, dispute(implement, "design", req)).unwrap_err();
+    assert!(err.to_string().contains("goes to `proposed`"), "{err}");
+    assert_eq!(state(&fx), "active");
+
+    let out = send(&fx, ACTOR_AGENT, dispute(implement, "design", design)).unwrap();
+    assert_eq!(out["outcome"], OUTCOME_MOVED, "{out}");
+    assert_eq!(state(&fx), "design");
+    let row = SendBackRepo::new(&fx.conn).list_for_node(fx.node).unwrap().remove(0);
+    assert!(row.is_open_dispute());
+    assert_eq!(row.protocol, "implementation");
+}
+
+#[test]
+fn a_users_obligation_cannot_be_disputed() {
+    let fx = setup("active");
+    let design = obligation(&fx, 0, "Use the supplier id");
+    ObligationRepo::new(&fx.conn).update_authority(design, "approved").unwrap();
+    let implement = conversation(&fx, ProtocolKind::Implementation);
+    let err = send(&fx, ACTOR_AGENT, dispute(implement, "design", design)).unwrap_err();
+    let message = err.to_string();
+    assert!(message.contains("is the user's (approved)") && message.contains("decisions ask"), "{message}");
+    assert_eq!(state(&fx), "active");
+}
+
+#[test]
+fn the_phase_must_settle_a_dispute_before_it_certifies() {
+    let fx = setup("active");
+    let design = obligation(&fx, 0, "Use the supplier id");
+    let implement = conversation(&fx, ProtocolKind::Implementation);
+    send(&fx, ACTOR_AGENT, dispute(implement, "design", design)).unwrap();
+    let opening = render_for_opening(&fx.conn, fx.node).unwrap();
+    assert!(opening.contains("## Dispute") && opening.contains("Use the supplier id"), "{opening}");
+    assert!(opening.contains("implementation session"), "{opening}");
+
+    let phase = conversation(&fx, ProtocolKind::Phase);
+    let repo = crate::phase::PhaseRepo::new(&fx.conn);
+    let err = repo
+        .record(fx.node, "design", crate::phase::PHASE_READY, Some(phase), crate::phase::CERTIFIER_SELF, "")
+        .unwrap_err();
+    assert!(err.to_string().contains("dispute") && err.to_string().contains("resolve-dispute"), "{err}");
+    // The user may mark the phase done.
+    repo.record(fx.node, "design", crate::phase::PHASE_CERTIFY, None, crate::phase::CERTIFIER_USER, "")
+        .unwrap();
+
+    // Only the receiving state's phase agent settles it.
+    let err = resolve_as(&fx, ACTOR_AGENT, resolution(implement, "upheld", "it stands")).unwrap_err();
+    assert!(err.to_string().contains("phase agent"), "{err}");
+    let err = resolve_as(&fx, ACTOR_AGENT, resolution(phase, "upheld", " ")).unwrap_err();
+    assert!(err.to_string().contains("needs a note"), "{err}");
+    let err = resolve_as(&fx, ACTOR_AGENT, resolution(phase, "maybe", "x")).unwrap_err();
+    assert!(err.to_string().contains("not a resolution"), "{err}");
+
+    // `fixed` needs a change to a disputed obligation.
+    let err = resolve_as(&fx, ACTOR_AGENT, resolution(phase, "fixed", "done")).unwrap_err();
+    assert!(err.to_string().contains("was changed or removed"), "{err}");
+    std::thread::sleep(std::time::Duration::from_millis(3));
+    ObligationRepo::new(&fx.conn).update_body(design, "Use the supplier part number").unwrap();
+    let out = resolve_as(&fx, ACTOR_AGENT, resolution(phase, "fixed", "now names the part number")).unwrap();
+    assert_eq!(out["outcome"], RESOLUTION_FIXED, "{out}");
+    assert!(open_dispute_into(&fx.conn, fx.node, "design").unwrap().is_none());
+    let row = SendBackRepo::new(&fx.conn).list_for_node(fx.node).unwrap().remove(0);
+    assert_eq!((row.resolution_kind.as_str(), row.resolution.as_str()), ("fixed", "now names the part number"));
+    // Nothing left to settle: a second resolution is refused.
+    let err = resolve_as(&fx, ACTOR_AGENT, resolution(phase, "upheld", "again")).unwrap_err();
+    assert!(err.to_string().contains("no dispute is open"), "{err}");
+    let entries = TimelineRepo::new(&fx.conn).list(fx.node).unwrap();
+    assert!(entries.iter().any(|e| e.kind == KIND_SEND_BACK && e.title.contains("Dispute fixed")));
+}
+
+#[test]
+fn an_upheld_dispute_is_shown_to_the_disputing_phase_when_the_node_comes_forward() {
+    let fx = setup("active");
+    let design = obligation(&fx, 0, "Use the supplier id");
+    let implement = conversation(&fx, ProtocolKind::Implementation);
+    send(&fx, ACTOR_AGENT, dispute(implement, "design", design)).unwrap();
+    let phase = conversation(&fx, ProtocolKind::Phase);
+    resolve_as(&fx, ACTOR_AGENT, resolution(phase, "upheld", "the supplier id is the org-wide key; see the ticket"))
+        .unwrap();
+
+    // Forward again through planning to the disputing phase.
+    return_to(&fx, "planning");
+    assert_eq!(render_for_opening(&fx.conn, fx.node).unwrap(), "");
+    return_to(&fx, "active");
+    let opening = render_for_opening(&fx.conn, fx.node).unwrap();
+    assert!(opening.contains("## Dispute settled"), "{opening}");
+    assert!(opening.contains("upheld") && opening.contains("org-wide key"), "{opening}");
+    assert!(opening.contains("cannot be met"), "{opening}");
+}
+
+#[test]
+fn a_dispute_passed_up_carries_the_chain_and_is_settled_by_the_phase_above() {
+    let fx = setup("active");
+    let design = obligation(&fx, 0, "Use the supplier id");
+    let implement = conversation(&fx, ProtocolKind::Implementation);
+    send(&fx, ACTOR_AGENT, dispute(implement, "design", design)).unwrap();
+    let design_agent = conversation(&fx, ProtocolKind::Phase);
+
+    // Only design passes up.
+    let out = resolve_as(
+        &fx,
+        ACTOR_AGENT,
+        resolution(design_agent, "passed_up", "the ticket itself names the supplier id"),
+    )
+    .unwrap();
+    assert_eq!(out["outcome"], OUTCOME_MOVED, "{out}");
+    assert_eq!(state(&fx), "proposed");
+    let rows = SendBackRepo::new(&fx.conn).list_for_node(fx.node).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].resolution_kind, "passed_up");
+    assert_eq!(rows[1].parent_id, Some(rows[0].id));
+    assert_eq!((rows[1].from_state.as_str(), rows[1].to_state.as_str()), ("design", "proposed"));
+    assert!(rows[1].is_open_dispute());
+
+    // Proposed sees the whole chain.
+    let opening = render_for_opening(&fx.conn, fx.node).unwrap();
+    assert!(opening.contains("## Dispute"), "{opening}");
+    assert!(opening.contains("from `active` to `design`") && opening.contains("from `design` to `proposed`"), "{opening}");
+    assert!(opening.contains("the ticket itself names the supplier id"), "{opening}");
+
+    // `proposed` cannot pass it further up; it upholds it, and the original is settled too.
+    let proposed_agent = conversation(&fx, ProtocolKind::Phase);
+    let err = resolve_as(&fx, ACTOR_AGENT, resolution(proposed_agent, "passed_up", "x")).unwrap_err();
+    assert!(err.to_string().contains("only the design phase passes"), "{err}");
+    resolve_as(&fx, ACTOR_AGENT, resolution(proposed_agent, "upheld", "the ticket does say it")).unwrap();
+    let rows = SendBackRepo::new(&fx.conn).list_for_node(fx.node).unwrap();
+    assert_eq!(rows[1].resolution_kind, "upheld");
+    assert_eq!(rows[0].resolution_kind, "upheld");
+    assert!(rows[0].resolution.contains("Settled in proposed") && rows[0].resolution.contains("the ticket does say it"));
+}
+
+#[test]
+fn resolving_a_dispute_is_journaled() {
+    let fx = setup("active");
+    let design = obligation(&fx, 0, "Use the supplier id");
+    let implement = conversation(&fx, ProtocolKind::Implementation);
+    send(&fx, ACTOR_AGENT, dispute(implement, "design", design)).unwrap();
+    let phase = conversation(&fx, ProtocolKind::Phase);
+    resolve_as(&fx, ACTOR_AGENT, resolution(phase, "upheld", "it stands")).unwrap();
+    let updates: i64 = fx
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM journey_changes WHERE tbl = 'node_send_backs' AND op = 'update'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(updates, 1);
 }

@@ -354,7 +354,7 @@ mod tests {
     }
 
     fn edit(option: i64, obligation_id: Uuid, body: &str) -> OptionEdit {
-        OptionEdit { option, obligation_id, body: body.into(), was: None }
+        OptionEdit { option, obligation_id, body: body.into(), was: None, affirm: false }
     }
 
     /// Gap 65: a decision whose answer changes the approach carries the
@@ -409,6 +409,52 @@ mod tests {
             .unwrap();
         assert_eq!(recorded, 1, "the edit is in the change log as the user's");
         assert_eq!(pending(&fx), 0);
+    }
+
+    /// An option that affirms an obligation approves it as it stands, as the
+    /// user: its authority becomes `approved` and its text is untouched, and
+    /// an agent still cannot change it afterwards.
+    #[test]
+    fn answering_an_option_that_affirms_an_obligation_approves_it() {
+        let fx = fixture();
+        let one = obligation(&fx, "Export as CSV");
+        crate::lifecycle::set_lifecycle(&fx.fleet, fx.node, "verifying").unwrap();
+        let authority = |fx: &Fixture| {
+            fx.fleet
+                .read(|conn| {
+                    Ok(conn.query_row(
+                        "SELECT authority FROM node_obligations WHERE id = ?1",
+                        [tod_store::outline::uuid_blob::uuid_to_blob(one)],
+                        |r| r.get::<_, String>(0),
+                    )?)
+                })
+                .unwrap()
+        };
+        // The fixture writes as the user; make it an agent's obligation.
+        let conn = rusqlite::Connection::open(fx.fleet.paths().db()).unwrap();
+        conn.execute(
+            "UPDATE node_obligations SET authority = 'agent' WHERE id = ?1",
+            [tod_store::outline::uuid_blob::uuid_to_blob(one)],
+        )
+        .unwrap();
+        drop(conn);
+        assert_eq!(authority(&fx), "agent");
+        let id = ask_with_edits(
+            &fx,
+            vec![OptionEdit { option: 1, obligation_id: one, body: String::new(), was: None, affirm: true }],
+        )
+        .unwrap();
+        answer_decision(&fx.fleet, id, Some(1), None).unwrap();
+        assert_eq!(authority(&fx), "approved");
+        assert_eq!(body_of(&fx, one), "Export as CSV");
+        let agent = fx.fleet.interview(
+            "verifier-actor",
+            InterviewCommand::Outline {
+                mutation: OutlineMutation::UpdateObligationBody { obligation_id: one, body: "agent".into() },
+                target: None,
+            },
+        );
+        assert!(agent.is_err());
     }
 
 

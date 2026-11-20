@@ -31,6 +31,18 @@ pub const OBLIGATION_ACTS_IN: [&str; 5] = [
     ACTS_IN_RELEASED,
 ];
 
+/// Who stands behind an obligation (`node_obligations.authority`,
+/// `doc/requests/design.md` section 10). The default, `agent`: an agent wrote
+/// it, and the phase that wrote it (or an earlier one) may still change it.
+pub const AUTHORITY_AGENT: &str = "agent";
+/// The user created or edited it: no agent may change or remove it.
+pub const AUTHORITY_USER: &str = "user";
+/// The user said it is correct (an answer that affirms it, or Approve in the
+/// obligations panel): protected exactly as a `user` one.
+pub const AUTHORITY_APPROVED: &str = "approved";
+/// The values `authority` may take.
+pub const OBLIGATION_AUTHORITIES: [&str; 3] = [AUTHORITY_AGENT, AUTHORITY_USER, AUTHORITY_APPROVED];
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ObligationCounts {
     pub requirements: usize,
@@ -59,6 +71,9 @@ pub struct NodeObligation {
     /// means it is live: verification must exercise it against the running
     /// work. Set only by the design phase agent or the user.
     pub code_only: Option<String>,
+    /// Who stands behind it: [`AUTHORITY_AGENT`], [`AUTHORITY_USER`] or
+    /// [`AUTHORITY_APPROVED`].
+    pub authority: String,
 }
 
 pub struct ObligationRepo<'a> {
@@ -66,12 +81,34 @@ pub struct ObligationRepo<'a> {
 }
 
 impl NodeObligation {
+    /// Whether the user stands behind it (`user` or `approved`): no agent may
+    /// change or remove it.
+    pub fn user_owned(&self) -> bool {
+        self.authority != AUTHORITY_AGENT
+    }
+
     /// Whether plan steps deliver this obligation, so the planning trace
     /// gate needs one for it. A `design` obligation is carried out by the
     /// design work and a `verifying` one only needs checking.
     pub fn needs_plan_step(&self) -> bool {
         self.acts_in != ACTS_IN_DESIGN && self.acts_in != ACTS_IN_VERIFYING
     }
+}
+
+/// `node_obligations.authority` (schema v108). Idempotent.
+pub fn add_authority(conn: &Connection) -> Result<()> {
+    let has: bool = conn.query_row(
+        "SELECT COUNT(*) > 0 FROM pragma_table_info('node_obligations') WHERE name = 'authority'",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has {
+        conn.execute_batch(
+            "ALTER TABLE node_obligations ADD COLUMN authority TEXT NOT NULL DEFAULT 'agent'
+                 CHECK (authority IN ('agent', 'user', 'approved'));",
+        )?;
+    }
+    Ok(())
 }
 
 impl<'a> ObligationRepo<'a> {
@@ -82,8 +119,8 @@ impl<'a> ObligationRepo<'a> {
     pub fn insert(&self, row: &NodeObligation) -> Result<()> {
         let now = now_ms();
         self.conn.execute(
-            "INSERT INTO node_obligations (id, node_id, kind, ordinal, section, body, phase, acts_in, visual_design_path, code_only, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
+            "INSERT INTO node_obligations (id, node_id, kind, ordinal, section, body, phase, acts_in, visual_design_path, code_only, authority, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?12, ?11, ?11)",
             params![
                 uuid_to_blob(row.id),
                 uuid_to_blob(row.node_id),
@@ -95,7 +132,8 @@ impl<'a> ObligationRepo<'a> {
                 row.acts_in,
                 row.visual_design_path,
                 row.code_only,
-                now
+                now,
+                row.authority
             ],
         )?;
         Ok(())
@@ -103,7 +141,7 @@ impl<'a> ObligationRepo<'a> {
 
     pub fn get(&self, id: Uuid) -> Result<Option<NodeObligation>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, node_id, kind, ordinal, section, body, phase, acts_in, visual_design_path, code_only FROM node_obligations WHERE id = ?1",
+            "SELECT id, node_id, kind, ordinal, section, body, phase, acts_in, visual_design_path, code_only, authority FROM node_obligations WHERE id = ?1",
         )?;
         let row = stmt
             .query_row(params![uuid_to_blob(id)], map_obligation)
@@ -113,7 +151,7 @@ impl<'a> ObligationRepo<'a> {
 
     pub fn list_for_node(&self, node_id: Uuid) -> Result<Vec<NodeObligation>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, node_id, kind, ordinal, section, body, phase, acts_in, visual_design_path, code_only FROM node_obligations
+            "SELECT id, node_id, kind, ordinal, section, body, phase, acts_in, visual_design_path, code_only, authority FROM node_obligations
              WHERE node_id = ?1 ORDER BY kind, ordinal",
         )?;
         let rows = stmt
@@ -126,7 +164,7 @@ impl<'a> ObligationRepo<'a> {
     /// kind and ordinal. Backs the project-wide `tod-cli obligations list`.
     pub fn list_all(&self) -> Result<Vec<NodeObligation>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, node_id, kind, ordinal, section, body, phase, acts_in, visual_design_path, code_only FROM node_obligations
+            "SELECT id, node_id, kind, ordinal, section, body, phase, acts_in, visual_design_path, code_only, authority FROM node_obligations
              ORDER BY node_id, kind, ordinal",
         )?;
         let rows = stmt
@@ -213,6 +251,25 @@ impl<'a> ObligationRepo<'a> {
         Ok(())
     }
 
+    /// Set who stands behind the obligation (see [`AUTHORITY_AGENT`]). The
+    /// wording is unchanged, so no verdict reopens.
+    pub fn update_authority(&self, id: Uuid, authority: &str) -> Result<()> {
+        if !OBLIGATION_AUTHORITIES.contains(&authority) {
+            anyhow::bail!(
+                "`{authority}` is not an obligation authority (expected one of {})",
+                OBLIGATION_AUTHORITIES.join(", ")
+            );
+        }
+        let n = self.conn.execute(
+            "UPDATE node_obligations SET authority = ?1, updated_at = ?2 WHERE id = ?3",
+            params![authority, now_ms(), uuid_to_blob(id)],
+        )?;
+        if n == 0 {
+            anyhow::bail!("obligation not found");
+        }
+        Ok(())
+    }
+
     /// Set (or clear, with `None`) the associated visual-design mockup path.
     /// Overwrites any previous value — an obligation has at most one.
     pub fn update_visual_design_path(&self, id: Uuid, path: Option<&str>) -> Result<()> {
@@ -263,6 +320,7 @@ impl<'a> ObligationRepo<'a> {
             acts_in: ACTS_IN_ACTIVE.to_string(),
             visual_design_path: None,
             code_only: None,
+            authority: AUTHORITY_AGENT.to_string(),
         })?;
         ids.insert(index, id);
         self.write_ordinals(node_id, kind, &ids)?;
@@ -322,6 +380,7 @@ impl<'a> ObligationRepo<'a> {
             acts_in: row.acts_in,
             visual_design_path: row.visual_design_path,
             code_only: row.code_only,
+            authority: row.authority,
         })?;
         Ok(())
     }
@@ -423,5 +482,6 @@ fn map_obligation(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeObligation> {
         acts_in: row.get(7)?,
         visual_design_path: row.get(8)?,
         code_only: row.get(9)?,
+        authority: row.get(10)?,
     })
 }

@@ -711,6 +711,16 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         crate::decisions::add_brief(conn)?;
         conn.pragma_update(None, "user_version", 107)?;
     }
+    if version < 108 {
+        // Requests design step 3 (`doc/requests/design.md` section 10):
+        // who stands behind each obligation (`node_obligations.authority`),
+        // and a send-back's resolution and the dispute it passes up
+        // (`crate::send_back::add_dispute_columns`). Synced (sync copies the
+        // columns both sides have); both tables are journaled already.
+        crate::outline::repos::obligations::add_authority(conn)?;
+        crate::send_back::add_dispute_columns(conn)?;
+        conn.pragma_update(None, "user_version", 108)?;
+    }
     if version < 109 {
         // Suggestions: out-of-scope work filed on a node without blocking it
         // (`crate::suggestions`): synced, journaled.
@@ -787,6 +797,8 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     crate::phase::ensure_table(conn)?;
     conn.execute_batch(&crate::journey_changes::phase_events_triggers_sql())?;
     conn.execute_batch(crate::send_back::CREATE_TABLE)?;
+    crate::send_back::add_dispute_columns(conn)?;
+    crate::outline::repos::obligations::add_authority(conn)?;
     conn.execute_batch(&crate::journey_changes::send_backs_triggers_sql())?;
     conn.execute_batch(crate::guidance::CREATE_TABLE)?;
     conn.execute_batch(&crate::journey_changes::guidance_triggers_sql())?;

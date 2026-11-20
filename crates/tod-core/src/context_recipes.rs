@@ -161,6 +161,7 @@ pub const IMPLEMENT_SESSION: ContextRecipe = ContextRecipe {
         "cli/environment",
         "cli/decisions",
         "cli/suggest",
+        "cli/lifecycle",
         "cli/wait",
         "surface/implement",
     ],

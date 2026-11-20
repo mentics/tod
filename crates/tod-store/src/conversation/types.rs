@@ -206,6 +206,10 @@ pub enum EntitySnapshot {
         /// taken before the marker.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         code_only: Option<String>,
+        /// Who stands behind it (`agent`, `user`, `approved`); `agent` in
+        /// snapshots taken before authority existed.
+        #[serde(default = "default_authority")]
+        authority: String,
     },
     PlanStep {
         node_id: Uuid,
@@ -714,6 +718,10 @@ where
 
 fn default_plan_step_phase() -> String {
     crate::outline::repos::plan_steps::PHASE_ACTIVE.to_string()
+}
+
+fn default_authority() -> String {
+    crate::outline::repos::obligations::AUTHORITY_AGENT.to_string()
 }
 
 fn default_acts_in() -> String {

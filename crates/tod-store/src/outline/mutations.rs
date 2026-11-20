@@ -201,6 +201,13 @@ pub enum OutlineMutation {
         obligation_id: Uuid,
         code_only: Option<String>,
     },
+    /// Set who stands behind an obligation (`user`, `approved`, or `agent`):
+    /// the user's "Approve" and an answer that affirms it. Never an agent's
+    /// (`conversation::settled`).
+    SetObligationAuthority {
+        obligation_id: Uuid,
+        authority: String,
+    },
     /// Bulk-rename every obligation in `node_id`/`kind` whose section is
     /// `old_section` (`None` meaning the implicit "no section" bucket) to
     /// `new_section`.
@@ -498,6 +505,7 @@ impl OutlineMutation {
                 | OutlineMutation::UpdateObligationPhase { .. }
                 | OutlineMutation::UpdateObligationActsIn { .. }
                 | OutlineMutation::UpdateObligationCodeOnly { .. }
+                | OutlineMutation::SetObligationAuthority { .. }
                 | OutlineMutation::RenameObligationSection { .. }
                 | OutlineMutation::DeleteObligation { .. }
                 | OutlineMutation::RestoreObligation { .. }
@@ -783,6 +791,12 @@ impl OutlineMutation {
                     }
                 };
                 ObligationRepo::new(conn).update_code_only(*obligation_id, reason)?;
+            }
+            OutlineMutation::SetObligationAuthority {
+                obligation_id,
+                authority,
+            } => {
+                ObligationRepo::new(conn).update_authority(*obligation_id, authority)?;
             }
             OutlineMutation::RenameObligationSection {
                 node_id,
@@ -1257,6 +1271,7 @@ fn restore_obligation_row(
         ordinal,
         visual_design_path,
         code_only,
+        authority,
     } = snapshot
     else {
         anyhow::bail!("not an obligation snapshot");
@@ -1286,6 +1301,9 @@ fn restore_obligation_row(
     }
     if code_only.is_some() {
         repo.update_code_only(id, code_only.as_deref())?;
+    }
+    if authority != crate::outline::repos::obligations::AUTHORITY_AGENT {
+        repo.update_authority(id, authority)?;
     }
     Ok(())
 }

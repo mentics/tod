@@ -50,7 +50,7 @@ May spawn subagents across code areas when separation is clear; parent merges re
 When child tasks are added or scope evolves:
 
 - Ensure new work conforms to this task's obligations (report conflicts; do not silently override).
-- Propose clarifications to the obligations through the `decisions` noun; the user makes the change. Past `planning` the app refuses an agent's obligation changes.
+- Propose clarifications to the obligations through the `decisions` noun; the user makes the change. The app refuses an agent's change to an obligation once the phase that wrote it is done, and always to one the user wrote or approved. When an obligation is wrong or unclear, do not work around it and do not ask the user to reword it: send the task back to the phase that wrote it with the `lifecycle` noun's send-back, naming the obligation (a dispute), and end your turn.
 
 ### Child-task decomposition (optional)
 

@@ -28,7 +28,7 @@ Inside a conversation --node defaults to the node it is about, and asks are
 filed under that conversation and its protocol.
 
 COMMANDS:
-    ask   [--node <UUID>] <QUESTION> [--option <TEXT> (repeatable)] [--evidence <KIND>:<ID> (repeatable)] [--reason <KIND>] [--moves-to <N>:<STATE> (repeatable)] [--edit-obligation <N>:<OBLIGATION_ID>=<NEW_TEXT> (repeatable)] [--blocks <STEP_ID> (repeatable)] [--new-evidence <TEXT>] [--need <TEXT>] [--command <TEXT>] [--error <TEXT>] [--tried <TEXT> (repeatable)] [--after <TEXT>]
+    ask   [--node <UUID>] <QUESTION> [--option <TEXT> (repeatable)] [--evidence <KIND>:<ID> (repeatable)] [--reason <KIND>] [--moves-to <N>:<STATE> (repeatable)] [--edit-obligation <N>:<OBLIGATION_ID>=<NEW_TEXT> (repeatable)] [--affirm-obligation <N>:<OBLIGATION_ID> (repeatable)] [--blocks <STEP_ID> (repeatable)] [--new-evidence <TEXT>] [--need <TEXT>] [--command <TEXT>] [--error <TEXT>] [--tried <TEXT> (repeatable)] [--after <TEXT>]
     list  [--node <UUID>] [--all]
     show  <ID>
 
@@ -47,6 +47,10 @@ NEW_TEXT when the user picks it (an obligation may be given as its 8-character
 prefix; repeat the flag for more than one): the app edits it itself, as the
 user's own edit, recorded in the asking conversation's change set, where it
 can be reversed.
+--affirm-obligation makes option N approve an obligation of the node as it
+stands: picking it makes the obligation the user's (`approved`), so no agent
+changes or removes it afterwards. It is for an obligation the user should
+confirm, not for one whose text must change (that is --edit-obligation).
 --blocks links a plan step of the node that this question holds up (one cause,
 one request): the user answers once, the step opens again, and the question and
 its steps show as one request. A request whose cause is already pending or
@@ -212,7 +216,21 @@ fn parse_edit(inv: &Invocation, raw: &str) -> anyhow::Result<OptionEdit> {
         .parse()
         .map_err(|_| anyhow::anyhow!("--edit-obligation `{raw}`: `{option}` is not an option number"))?;
     let obligation_id = inv.client().read(|conn| InterviewRepo::new(conn).resolve_obligation_id(id.trim()))?;
-    Ok(OptionEdit { option, obligation_id, body: body.to_string(), was: None })
+    Ok(OptionEdit { option, obligation_id, body: body.to_string(), was: None, affirm: false })
+}
+
+/// `--affirm-obligation <N>:<OBLIGATION_ID>`: option N (1-based) approves
+/// that obligation as it stands when picked.
+fn parse_affirm(inv: &Invocation, raw: &str) -> anyhow::Result<OptionEdit> {
+    let (option, id) = raw
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("--affirm-obligation must be `<option number>:<obligation id>` (got `{raw}`)"))?;
+    let option: i64 = option
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("--affirm-obligation `{raw}`: `{option}` is not an option number"))?;
+    let obligation_id = inv.client().read(|conn| InterviewRepo::new(conn).resolve_obligation_id(id.trim()))?;
+    Ok(OptionEdit { option, obligation_id, body: String::new(), was: None, affirm: true })
 }
 
 /// `--moves-to <N>:<STATE>`: option N (1-based) sends the node back to STATE.
@@ -303,11 +321,14 @@ fn ask(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
         .iter()
         .map(|raw| parse_move(raw))
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let edits = args
+    let mut edits = args
         .get_all("--edit-obligation")
         .iter()
         .map(|raw| parse_edit(inv, raw))
         .collect::<anyhow::Result<Vec<_>>>()?;
+    for raw in args.get_all("--affirm-obligation") {
+        edits.push(parse_affirm(inv, raw)?);
+    }
     let mut blocks = Vec::new();
     for raw in args.get_all("--blocks") {
         for id in raw.split(',').map(str::trim).filter(|id| !id.is_empty()) {
