@@ -160,6 +160,15 @@ pub enum InterviewCommand {
         conversation_id: Uuid,
         group: usize,
     },
+    /// Record which of a review round's reviewers a review conversation is
+    /// and, for the risk reviewer, the main reviewer's conversation of its
+    /// round (`crate::review::round`).
+    SetConversationReviewer {
+        conversation_id: Uuid,
+        reviewer: crate::review::Reviewer,
+        #[serde(default)]
+        round: Option<Uuid>,
+    },
     /// Append a transcript entry; returns its `seq`.
     AppendConversationTurn {
         conversation_id: Uuid,
@@ -1018,6 +1027,10 @@ pub fn execute(
         }
         InterviewCommand::SetConversationSkillGroup { conversation_id, group } => {
             crate::conversation::ConversationRepo::new(conn).set_skill_group(*conversation_id, *group)?;
+            Ok(json!({}))
+        }
+        InterviewCommand::SetConversationReviewer { conversation_id, reviewer, round } => {
+            crate::conversation::ConversationRepo::new(conn).set_reviewer(*conversation_id, *reviewer, *round)?;
             Ok(json!({}))
         }
         InterviewCommand::AppendConversationTurn {

@@ -86,12 +86,13 @@ repository may exist on this machine — never change into them or build them.
 
 ## The app's own code review
 
-In `pr_draft`, when the task's lifecycle config includes the review steps,
-every change you make for the pull request is reviewed before it is pushed:
-you commit and stop, the app runs its own code review and fix sessions on
-the branch until a review records nothing that stands, and then sends you a
-turn to push and answer the threads. A head that reaches the pull request
-without that review (pushed from outside it) is reviewed there instead, and
+In `pr_draft` and `pr_review`, when the task's lifecycle config includes the
+review steps, every change you make for the pull request is reviewed before
+it is pushed: you commit and stop, the app runs its own code review and fix
+sessions on the branch until a review records nothing that stands, and then
+sends you a turn to push and answer the threads. In `pr_draft`, a head that
+reaches the pull request without that review (pushed from outside it) is
+reviewed there instead, and
 what the review finds is posted on the pull request as review threads, each
 naming a finding id. Answer those threads like any other; answering one
 answers its finding too. A finding whose file the change does not touch is

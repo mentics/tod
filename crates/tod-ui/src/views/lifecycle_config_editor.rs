@@ -94,6 +94,7 @@ fn phase_label(phase: &str) -> &'static str {
         "verify" => "Verify",
         "verify_evaluate" => "Verify: evidence evaluator",
         "review" => "Review (finds problems)",
+        "review_risk" => "Review: risk reviewer",
         "fix" => "Fix (resolves the review's findings)",
         "pr" => "Pull request",
         "pr_draft" => "Pull request draft",
@@ -110,8 +111,14 @@ fn phase_label(phase: &str) -> &'static str {
 fn phase_blurb(phase: &str) -> Option<&'static str> {
     match phase {
         "review" => Some(
-            "For the agent that reviews the change and records findings. Optional: leave it empty \
-             and the review still runs; add project-specific things to look for.",
+            "For the main reviewer, which reviews the change through every lens and records \
+             findings. Optional: leave it empty and the review still runs; add project-specific \
+             things to look for.",
+        ),
+        "review_risk" => Some(
+            "For the risk reviewer, which runs beside the main reviewer in every round and looks \
+             only at data, external systems, persisted results, interactions, reach and data \
+             writes. Left unset, it uses Review's skills, model and effort.",
         ),
         "fix" => Some(
             "For the separate agent that fixes what the review found, then is reviewed again. \

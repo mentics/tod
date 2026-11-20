@@ -54,15 +54,29 @@ pub const HEADS_KEY: &str = "pr_heads";
 /// Who the app's own writes here are attributed to.
 const ACTOR: &str = "autopilot";
 
-/// Whether `pr_draft` includes the review steps for `node`.
+/// The states with the pull request open in which, with the review steps on,
+/// a change the pull request's agent makes is reviewed before it is pushed:
+/// `pr_draft`, and `pr_review` too, so a head pushed after a person's review
+/// was still reviewed by tod first.
+pub const STATES: [&str; 2] = [STATE, "pr_review"];
+
+/// Whether a review run in lifecycle state `state` is one of these: on the
+/// pull request's local head, by `surface/review-on-pr`.
+pub fn reviews_on_pr(state: &str) -> bool {
+    STATES.contains(&state)
+}
+
+/// Whether `pr_draft` (and so `pr_review`) includes the review steps for
+/// `node`.
 pub fn enabled(conn: &Connection, node: Uuid) -> Result<bool> {
     Ok(tod_store::lifecycle_config::resolve_pr_draft_review(conn, node)?.enabled)
 }
 
-/// A review conversation run in `pr_draft` in the node's current stay there.
+/// A review conversation run with the pull request open ([`STATES`]), in the
+/// node's current stay when `since` says when it began.
 fn is_own(conversation: &Conversation, since: Option<i64>) -> bool {
     conversation.protocol == ProtocolKind::Review
-        && conversation.from_state.as_deref() == Some(STATE)
+        && conversation.from_state.as_deref().is_some_and(reviews_on_pr)
         && since.is_none_or(|since| conversation.created_at >= since)
 }
 
@@ -95,16 +109,15 @@ pub fn unconverged_rounds_since(conn: &Connection, node: Uuid, since_ms: Option<
     let mut reviews: Vec<Conversation> = repo
         .conversations_for_focus(Focus::Node(node))?
         .into_iter()
-        .filter(|c| c.skill_group == 0 && is_own(c, since) && since_ms.is_none_or(|ms| c.created_at >= ms))
+        .filter(|c| c.skill_group == 0 && !c.is_risk_reviewer() && is_own(c, since) && since_ms.is_none_or(|ms| c.created_at >= ms))
         .collect();
     reviews.sort_by_key(|c| c.created_at);
     let findings = own_findings(conn, node)?;
     let mut count = 0;
     let mut next_start = i64::MAX;
     for review in reviews.iter().rev() {
-        let done = repo
-            .latest_report(review.id)?
-            .is_some_and(|r| crate::conversation::review::is_done_report(&r));
+        // Both reviewers of the round finished (`tod_store::review::round`).
+        let done = tod_store::review::round::done(conn, review.id)?;
         let stands = findings
             .iter()
             .filter(|f| f.created_at >= review.created_at && f.created_at < next_start)
@@ -179,8 +192,12 @@ pub fn heads_report(heads: &BTreeMap<String, String>) -> Value {
 }
 
 /// The heads the review `conversation` recorded reviewing; `None` until the
-/// app recorded them (or when the review is not finished).
+/// app recorded them (or when the review round, both of its reviewers, is not
+/// finished).
 pub fn reviewed_heads(conn: &Connection, conversation: Uuid) -> Result<Option<BTreeMap<String, String>>> {
+    if !tod_store::review::round::done(conn, conversation)? {
+        return Ok(None);
+    }
     let report = ConversationRepo::new(conn).latest_report(conversation)?;
     Ok(report
         .filter(crate::conversation::review::is_done_report)
@@ -412,7 +429,7 @@ pub fn reviews_since(conn: &Connection, node: Uuid, since_ms: i64) -> Result<Vec
     let mut out: Vec<Conversation> = ConversationRepo::new(conn)
         .conversations_for_focus(Focus::Node(node))?
         .into_iter()
-        .filter(|c| c.skill_group == 0 && is_own(c, stay) && c.created_at >= since_ms)
+        .filter(|c| c.skill_group == 0 && !c.is_risk_reviewer() && is_own(c, stay) && c.created_at >= since_ms)
         .collect();
     out.sort_by_key(|c| c.created_at);
     Ok(out)
@@ -438,10 +455,7 @@ pub fn change_step(conn: &Connection, node: Uuid, since_ms: i64) -> Result<Chang
     let Some(latest) = reviews_since(conn, node, since_ms)?.pop() else {
         return Ok(ChangeStep::Review);
     };
-    let done = ConversationRepo::new(conn)
-        .latest_report(latest.id)?
-        .is_some_and(|r| crate::conversation::review::is_done_report(&r));
-    if !done {
+    if !tod_store::review::round::done(conn, latest.id)? {
         return Ok(ChangeStep::Review);
     }
     let findings = own_findings(conn, node)?;
@@ -484,9 +498,10 @@ pub fn cleared(conn: &Connection, node: Uuid, heads: &BTreeMap<String, String>) 
 /// steps are off or no review has finished clean. What a review bot's ask and
 /// fallback wait for (`tod_store::OwnReviewState`).
 ///
-/// In `pr_review` (`in_review`), where no review runs, it is the heads the
-/// review that cleared the `pr_draft` gate covered (the latest own review of
-/// any stay), so a head pushed there is not cleared.
+/// In `pr_review` (`in_review`) it is the heads the latest own review of any
+/// stay covered: the one that cleared the `pr_draft` gate, or one run in
+/// `pr_review` on a change the agent made there before pushing it. A head
+/// pushed there without such a review is not cleared.
 pub fn cleared_shas(conn: &Connection, node: Uuid, in_review: bool) -> Result<Vec<String>> {
     if !enabled(conn, node)? {
         return Ok(Vec::new());
@@ -949,6 +964,7 @@ mod tests {
             pr_thread: None,
             pr_posted_at: None,
             root_cause: None,
+            reviewer: None,
         }
     }
 

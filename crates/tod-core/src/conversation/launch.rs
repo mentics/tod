@@ -14,6 +14,7 @@ use tod_agent::agent_launch::{coerce_effort, coerce_model};
 use tod_store::conversation::{Focus, ProtocolKind};
 use tod_store::fleet::FleetStore;
 use tod_store::lifecycle_config;
+use tod_store::review::Reviewer;
 use tod_store::{AgentRole, TodSettings};
 
 /// Which settings a conversation of `kind` follows where the node's Agent
@@ -39,8 +40,15 @@ pub fn role_for(kind: ProtocolKind) -> AgentRole {
 /// for the implementation, verification, review and fix protocols; the
 /// node's lifecycle state for a phase agent, an evaluator, and the PR
 /// agent (`pr`, `pr_draft`, `pr_review`). `None` for every other kind, and
-/// for a node whose state has no phase.
-pub fn phase_for(fleet: &FleetStore, focus: Focus, kind: ProtocolKind) -> Option<String> {
+/// for a node whose state has no phase. A review round's risk reviewer
+/// (`reviewer`) works under `review_risk`, which falls back to `review`
+/// (`lifecycle_config::fallback`).
+pub fn phase_for(
+    fleet: &FleetStore,
+    focus: Focus,
+    kind: ProtocolKind,
+    reviewer: Option<Reviewer>,
+) -> Option<String> {
     let state = || {
         let node = focus.node_id()?;
         fleet.get_node(&node.to_string()).ok()?.map(|n| n.lifecycle)
@@ -48,7 +56,10 @@ pub fn phase_for(fleet: &FleetStore, focus: Focus, kind: ProtocolKind) -> Option
     let phase = match kind {
         ProtocolKind::Implementation => "implement".to_string(),
         ProtocolKind::Verification => "verify".to_string(),
-        ProtocolKind::Review => "review".to_string(),
+        ProtocolKind::Review => match reviewer {
+            Some(Reviewer::Risk) => lifecycle_config::REVIEW_RISK.to_string(),
+            _ => lifecycle_config::REVIEW.to_string(),
+        },
         ProtocolKind::Fix => "fix".to_string(),
         ProtocolKind::Pr => match state()?.as_str() {
             "pr_draft" => "pr_draft".to_string(),
@@ -126,23 +137,37 @@ pub fn resolve(
     focus: Focus,
     kind: ProtocolKind,
 ) -> AgentLaunchOptions {
-    let phase = phase_for(fleet, focus, kind);
+    resolve_reviewer(fleet, settings, focus, kind, None)
+}
+
+/// [`resolve`] for a review round's `reviewer` (the risk reviewer has a key
+/// of its own).
+pub fn resolve_reviewer(
+    fleet: &FleetStore,
+    settings: &TodSettings,
+    focus: Focus,
+    kind: ProtocolKind,
+    reviewer: Option<Reviewer>,
+) -> AgentLaunchOptions {
+    let phase = phase_for(fleet, focus, kind, reviewer);
     for_focus(fleet, focus, phase.as_deref(), settings.launch_options_for(role_for(kind)))
 }
 
-/// [`resolve`] with the settings read from `settings_path`; the defaults
-/// (logged) when they cannot be read. A launch uses [`try_resolve_from`].
+/// [`resolve_reviewer`] with the settings read from `settings_path`; the
+/// defaults (logged) when they cannot be read. A launch uses
+/// [`try_resolve_from`].
 pub fn resolve_from(
     fleet: &FleetStore,
     settings_path: &Path,
     focus: Focus,
     kind: ProtocolKind,
+    reviewer: Option<Reviewer>,
 ) -> AgentLaunchOptions {
     let settings = TodSettings::load_from_path(settings_path).unwrap_or_else(|err| {
         tracing::warn!("reading settings for the agent's launch: {err:#}");
         TodSettings::default()
     });
-    resolve(fleet, &settings, focus, kind)
+    resolve_reviewer(fleet, &settings, focus, kind, reviewer)
 }
 
 /// [`resolve_from`] that fails when the settings or the node's Agent
@@ -152,10 +177,11 @@ pub fn try_resolve_from(
     settings_path: &Path,
     focus: Focus,
     kind: ProtocolKind,
+    reviewer: Option<Reviewer>,
 ) -> anyhow::Result<AgentLaunchOptions> {
     let settings = TodSettings::load_from_path(settings_path)
         .map_err(|err| err.context("reading the settings for the agent's launch"))?;
-    let phase = phase_for(fleet, focus, kind);
+    let phase = phase_for(fleet, focus, kind, reviewer);
     try_for_focus(fleet, focus, phase.as_deref(), settings.launch_options_for(role_for(kind)))
 }
 
@@ -308,11 +334,11 @@ mod tests {
         tod_store::outline::repos::NodeRepo::new(&conn).set_lifecycle(node, "verifying").unwrap();
         store.reload_if_stale().ok();
         assert_eq!(
-            phase_for(&store, Focus::Node(node), ProtocolKind::Evaluate).as_deref(),
+            phase_for(&store, Focus::Node(node), ProtocolKind::Evaluate, None).as_deref(),
             Some(VERIFY_EVALUATE)
         );
         assert_eq!(
-            phase_for(&store, Focus::Node(node), ProtocolKind::Verification).as_deref(),
+            phase_for(&store, Focus::Node(node), ProtocolKind::Verification, None).as_deref(),
             Some("verify")
         );
         let set = |agents: Agents| {
@@ -348,6 +374,49 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(skills.skills, ["drive-the-app"]);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A review round's risk reviewer runs under `review_risk`, taking
+    /// `review`'s settings for whatever its own leaves unset; the main
+    /// reviewer runs under `review`.
+    #[test]
+    fn the_risk_reviewer_has_its_own_key_that_falls_back_to_review() {
+        use tod_store::lifecycle_config::{Agents, PhaseAgent, REVIEW_RISK};
+        let (root, store, node) = store_with_node();
+        store
+            .enqueue_outline(OutlineMutation::EnableCapabilities {
+                node_id: node,
+                capabilities: vec![Capability::LifecycleConfig, Capability::Lifecycle],
+            })
+            .unwrap();
+        store.writer().flush().unwrap();
+        store.reload_if_stale().ok();
+        let focus = Focus::Node(node);
+        assert_eq!(
+            phase_for(&store, focus, ProtocolKind::Review, Some(Reviewer::Risk)).as_deref(),
+            Some(REVIEW_RISK)
+        );
+        assert_eq!(phase_for(&store, focus, ProtocolKind::Review, Some(Reviewer::Main)).as_deref(), Some("review"));
+        assert_eq!(phase_for(&store, focus, ProtocolKind::Review, None).as_deref(), Some("review"));
+        let set = |agents: Agents| {
+            store.enqueue_outline(OutlineMutation::SetNodeLifecycleAgents { node_id: node, agents }).unwrap();
+            store.writer().flush().unwrap();
+            store.reload_if_stale().ok();
+        };
+        let risk = || resolve_reviewer(&store, &settings(), focus, ProtocolKind::Review, Some(Reviewer::Risk));
+        set([("review".to_string(), PhaseAgent { model: Some("sonnet".into()), effort: Some("high".into()) })].into());
+        let launch = risk();
+        assert_eq!((launch.model.as_str(), launch.effort.as_str()), ("sonnet", "high"));
+        set([
+            ("review".to_string(), PhaseAgent { model: Some("sonnet".into()), effort: Some("high".into()) }),
+            (REVIEW_RISK.to_string(), PhaseAgent { model: Some("opus".into()), effort: None }),
+        ]
+        .into());
+        let launch = risk();
+        assert_eq!((launch.model.as_str(), launch.effort.as_str()), ("opus", "high"));
+        assert_eq!(resolve(&store, &settings(), focus, ProtocolKind::Review).model, "sonnet");
         drop(store);
         let _ = std::fs::remove_dir_all(&root);
     }

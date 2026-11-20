@@ -177,6 +177,9 @@ pub struct ConversationDriver {
     progress_before: Option<String>,
     /// `None` until the first send creates the row.
     conversation_id: Option<Uuid>,
+    /// For a review conversation, which of the round's reviewers the row is
+    /// created for, and (for the risk reviewer) the round's main conversation.
+    reviewer: Option<(tod_store::review::Reviewer, Option<Uuid>)>,
     /// The group of the phase's skills the row is created for.
     skill_group: usize,
     run: Option<Run>,
@@ -215,6 +218,7 @@ impl ConversationDriver {
             progress_before: None,
             conversation_id: None,
             skill_group: 0,
+            reviewer: None,
             run: None,
             session_tokens: None,
             reported_stale: ReportedStale::new(),
@@ -235,6 +239,18 @@ impl ConversationDriver {
     pub fn with_skill_group(mut self, group: usize) -> Self {
         self.skill_group = group;
         self
+    }
+
+    /// Be `reviewer` of a review round (find-it-first 6h); the risk reviewer
+    /// names `round`, the main reviewer's conversation it runs beside.
+    pub fn with_reviewer(mut self, reviewer: tod_store::review::Reviewer, round: Option<Uuid>) -> Self {
+        self.reviewer = Some((reviewer, round));
+        self
+    }
+
+    /// Which of a review round's reviewers this conversation is.
+    pub fn reviewer(&self) -> Option<tod_store::review::Reviewer> {
+        self.reviewer.map(|(r, _)| r)
     }
 
     /// Take the lease for the turn that just started. A failure to record it
@@ -271,6 +287,7 @@ impl ConversationDriver {
         let mut driver = Self::new(config, conversation.focus, conversation.protocol);
         driver.conversation_id = Some(conversation_id);
         driver.skill_group = conversation.skill_group;
+        driver.reviewer = conversation.reviewer.map(|r| (r, conversation.review_round));
         Ok(driver)
     }
 
@@ -385,9 +402,9 @@ impl ConversationDriver {
     fn try_launch_options(&self, fleet: &FleetStore) -> Result<AgentLaunchOptions> {
         let kind = self.protocol.kind();
         match &self.config.settings_path {
-            Some(path) => crate::conversation::launch::try_resolve_from(fleet, path, self.focus, kind),
+            Some(path) => crate::conversation::launch::try_resolve_from(fleet, path, self.focus, kind, self.reviewer()),
             None => {
-                let phase = crate::conversation::launch::phase_for(fleet, self.focus, kind);
+                let phase = crate::conversation::launch::phase_for(fleet, self.focus, kind, self.reviewer());
                 crate::conversation::launch::try_for_focus(fleet, self.focus, phase.as_deref(), self.config.launch.clone())
             }
         }
@@ -400,9 +417,9 @@ impl ConversationDriver {
     pub fn launch_options(&self, fleet: &FleetStore) -> AgentLaunchOptions {
         let kind = self.protocol.kind();
         match &self.config.settings_path {
-            Some(path) => crate::conversation::launch::resolve_from(fleet, path, self.focus, kind),
+            Some(path) => crate::conversation::launch::resolve_from(fleet, path, self.focus, kind, self.reviewer()),
             None => {
-                let phase = crate::conversation::launch::phase_for(fleet, self.focus, kind);
+                let phase = crate::conversation::launch::phase_for(fleet, self.focus, kind, self.reviewer());
                 crate::conversation::launch::for_focus(fleet, self.focus, phase.as_deref(), self.config.launch.clone())
             }
         }
@@ -588,12 +605,17 @@ impl ConversationDriver {
                     self.protocol.opening(&self.env(fleet, id))?,
                     text,
                 )?;
-                // Kept so the user can read what the agent was given.
+                // Kept so the user can read what the agent was given, with
+                // what `start` puts at its very end (a reviewer's assignment).
+                let shown = match self.protocol.opening_tail(&self.env(fleet, id))? {
+                    Some(tail) => format!("{context}\n\n{tail}"),
+                    None => context.clone(),
+                };
                 fleet.interview(
                     ACTOR_USER,
                     InterviewCommand::SetConversationOpeningContext {
                         conversation_id: id,
-                        context: context.clone(),
+                        context: shown,
                     },
                 )?;
                 self.session_tokens = Some(0);
@@ -706,7 +728,7 @@ impl ConversationDriver {
             .clone()
             .or_else(|| now.agent_model.clone())
             .or_else(|| self.launched.as_ref().map(|l| l.model.clone()));
-        let phase = crate::conversation::launch::phase_for(fleet, self.focus, self.protocol.kind());
+        let phase = crate::conversation::launch::phase_for(fleet, self.focus, self.protocol.kind(), self.reviewer());
         fleet
             .enqueue(tod_store::fleet::FleetMutation::RecordTurnUsage(
                 tod_store::conversation_usage::TurnUsage {
@@ -1158,6 +1180,12 @@ impl ConversationDriver {
                 },
             )?;
         }
+        if let Some((reviewer, round)) = self.reviewer {
+            fleet.interview(
+                ACTOR_USER,
+                InterviewCommand::SetConversationReviewer { conversation_id: id, reviewer, round },
+            )?;
+        }
         self.conversation_id = Some(id);
         Ok(id)
     }
@@ -1400,6 +1428,19 @@ impl ConversationDriver {
                 context.map(crate::dynamic::for_remote_agent)
             }
         };
+        // Last of all, what the protocol puts at the very end of a fresh
+        // session's context (a reviewer's assignment), so everything before
+        // it can be a prefix two sessions share.
+        let context = match context {
+            Some(mut context) => {
+                if let Some(tail) = self.protocol.opening_tail(&self.env(fleet, id))? {
+                    context.push_str("\n\n");
+                    context.push_str(&tail);
+                }
+                Some(context)
+            }
+            None => None,
+        };
         // An agent inside a dev container or sandbox is started from the
         // data root here.
         let workdir = cwd.clone();
@@ -1548,10 +1589,15 @@ impl ConversationDriver {
         let focus = fleet.read(|conn| focus_selection(conn, self.focus))?;
         // A later group of the phase's skills is a session of its own, told
         // apart in the agent's session picker too.
-        let surface = match self.skill_group {
+        let mut surface = match self.skill_group {
             0 => self.protocol.surface().to_string(),
             group => format!("{} skills {}", self.protocol.surface(), group + 1),
         };
+        // A review round's risk reviewer is a session of its own beside the
+        // main one.
+        if self.reviewer() == Some(tod_store::review::Reviewer::Risk) {
+            surface.push_str(" (risk)");
+        }
         Ok(session_name(Some(&surface), &focus.title, chrono::Local::now()))
     }
 

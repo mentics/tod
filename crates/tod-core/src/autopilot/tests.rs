@@ -43,6 +43,12 @@ struct FakeAgent {
     /// Every review turn records a new finding and finishes: a reviewer that
     /// never comes back clean.
     review_never_clean: bool,
+    /// The root cause every `review_never_clean` finding names (`None`: none).
+    review_root_cause: Option<String>,
+    /// With `review_never_clean`, each review records one more finding than
+    /// the one before (the first records one).
+    review_growing: bool,
+    review_played: std::sync::atomic::AtomicUsize,
     /// The next this-many review turns fail (the agent died) before doing anything.
     review_fails: std::sync::atomic::AtomicUsize,
     /// Every fix turn first writes this file (its path and content): the
@@ -71,6 +77,9 @@ impl FakeAgent {
             verify_rounds: std::sync::atomic::AtomicUsize::new(0),
             phase_churn: false,
             review_never_clean: false,
+            review_root_cause: None,
+            review_growing: false,
+            review_played: std::sync::atomic::AtomicUsize::new(0),
             review_fails: std::sync::atomic::AtomicUsize::new(0),
             fix_writes: None,
             log: Default::default(),
@@ -175,9 +184,9 @@ impl FakeAgent {
                 let protocol = self.fleet.read(|conn| {
                     Ok(tod_store::conversation::ConversationRepo::new(conn)
                         .get(conversation.parse()?)?
-                        .map(|c| c.protocol))
+                        .map(|c| (c.protocol, c.is_risk_reviewer())))
                 })?;
-                if protocol == Some(tod_store::conversation::ProtocolKind::Review) {
+                if protocol == Some((tod_store::conversation::ProtocolKind::Review, false)) {
                     self.review_fails.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                     anyhow::bail!("ACP error -32603: Internal error: The Claude Agent process exited unexpectedly");
                 }
@@ -186,22 +195,30 @@ impl FakeAgent {
                 let protocol = self.fleet.read(|conn| {
                     Ok(tod_store::conversation::ConversationRepo::new(conn)
                         .get(conversation.parse()?)?
-                        .map(|c| c.protocol))
+                        .map(|c| (c.protocol, c.is_risk_reviewer())))
                 })?;
-                if protocol == Some(tod_store::conversation::ProtocolKind::Review) {
+                if protocol == Some((tod_store::conversation::ProtocolKind::Review, false)) {
                     use crate::conversation::mock::Access;
-                    user.interview(InterviewCommand::AddReviewFinding {
-                        node_id: node.parse()?,
-                        conversation_id: Some(conversation.parse()?),
-                        finding: tod_store::review::NewFinding {
-                            severity: "medium".into(),
-                            file: Some("src/lib.rs".into()),
-                            line: Some(1),
-                            summary: "Another defect.".into(),
-                            detail: None,
-                            root_cause: None,
-                        },
-                    })?;
+                    let round = self.review_played.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    let count = if self.review_growing { round } else { 1 };
+                    for n in 0..count {
+                        user.interview(InterviewCommand::AddReviewFinding {
+                            node_id: node.parse()?,
+                            conversation_id: Some(conversation.parse()?),
+                            finding: tod_store::review::NewFinding {
+                                severity: "medium".into(),
+                                file: Some("src/lib.rs".into()),
+                                line: Some(1),
+                                summary: if self.review_growing {
+                                    format!("Another defect, {round}.{n}.")
+                                } else {
+                                    "Another defect.".into()
+                                },
+                                detail: None,
+                                root_cause: self.review_root_cause.clone(),
+                            },
+                        })?;
+                    }
                     user.interview(InterviewCommand::RecordConversationReport {
                         conversation_id: conversation.parse()?,
                         body: crate::conversation::review::done_report(),
@@ -837,6 +854,7 @@ fn a_restart_reopens_the_conversation_in_progress() {
         lifecycle: "active".into(),
         conversation_id: id,
         skill_group: 0,
+        partner: None,
     });
     state.save(&fx.root, fx.node).unwrap();
 
@@ -874,6 +892,7 @@ fn a_requested_fresh_session_starts_a_new_conversation_instead_of_reopening() {
         lifecycle: "active".into(),
         conversation_id: id,
         skill_group: 0,
+        partner: None,
     });
     state.save(&fx.root, fx.node).unwrap();
     AutopilotState::request_fresh_session(&fx.root, fx.node).unwrap();
@@ -901,7 +920,7 @@ fn a_local_runner_consumes_request_rows_and_starts_a_new_session_for_one() {
     driver.send(&fx.fleet, &mut agent, "Implement the plan.").unwrap();
     let id = driver.conversation_id().unwrap();
     let mut state = AutopilotState::fresh();
-    state.current = Some(CurrentStep { protocol: "implementation".into(), lifecycle: "active".into(), conversation_id: id, skill_group: 0 });
+    state.current = Some(CurrentStep { protocol: "implementation".into(), lifecycle: "active".into(), conversation_id: id, skill_group: 0, partner: None });
     state.save(&fx.root, fx.node).unwrap();
     for kind in [tod_store::node_requests::KIND_FRESH_SESSION, tod_store::node_requests::KIND_CHECK_NOW] {
         fx.fleet
@@ -1522,7 +1541,8 @@ fn openings(fx: &Fixture, kind: ProtocolKind) -> Vec<(usize, String)> {
             let mut found = Vec::new();
             for summary in repo.list_for_focus(Focus::Node(fx.node))? {
                 let conversation = summary.conversation;
-                if conversation.protocol == kind {
+                // A review round counts once: its main reviewer's conversation.
+                if conversation.protocol == kind && !conversation.is_risk_reviewer() {
                     found.push((
                         repo.skill_group(conversation.id)?,
                         repo.opening_context(conversation.id)?.unwrap_or_default(),
@@ -5774,4 +5794,133 @@ fn a_branch_only_behind_is_updated_on_github_without_the_agent() {
             assert_eq!(notes, ["Updated acme/app#42 with its base branch"]);
         }
     }
+}
+
+/// find-it-first 6h: every review round is two fresh sessions at once, the
+/// main reviewer (the round's lead) and the risk reviewer, recording into
+/// the node's one findings list; their openings are the same up to each
+/// one's assignment. `--agent mock` plays both.
+#[test]
+fn every_review_round_runs_a_main_and_a_risk_reviewer_with_one_shared_opening() {
+    use tod_store::review::Reviewer;
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut pilot = autopilot(&fx, Budget::default());
+    let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
+    assert_eq!(outcome, Outcome::Done);
+    let steps: Vec<&str> = pilot.state().steps.iter().map(|s| s.step.as_str()).filter(|s| s.starts_with("review")).collect();
+    // The mock finds one thing in the first round and nothing in the second.
+    assert_eq!(steps.iter().filter(|s| **s == "review").count(), 2, "{steps:?}");
+    assert_eq!(steps.iter().filter(|s| **s == "review (risk reviewer)").count(), 2, "{steps:?}");
+    let reviews: Vec<_> = fx
+        .fleet
+        .read(|conn| Ok(ConversationRepo::new(conn).conversations_for_focus(Focus::Node(fx.node))?))
+        .unwrap()
+        .into_iter()
+        .filter(|c| c.protocol == ProtocolKind::Review)
+        .collect();
+    let mains: Vec<_> = reviews.iter().filter(|c| c.reviewer == Some(Reviewer::Main)).collect();
+    let risks: Vec<_> = reviews.iter().filter(|c| c.reviewer == Some(Reviewer::Risk)).collect();
+    assert_eq!((mains.len(), risks.len(), reviews.len()), (2, 2, 4), "{reviews:#?}");
+    for main in &mains {
+        let partner: Vec<_> = risks.iter().filter(|r| r.review_round == Some(main.id)).collect();
+        assert_eq!(partner.len(), 1, "each round has one risk reviewer");
+        assert!(fx.fleet.read(|conn| tod_store::review::round::done(conn, main.id)).unwrap());
+        // The same opening up to the assignment, byte for byte.
+        let opening = |id| fx.fleet.read(|conn| ConversationRepo::new(conn).opening_context(id)).unwrap().unwrap();
+        let (main_opening, risk_opening) = (opening(main.id), opening(partner[0].id));
+        let (main_shared, main_assignment) = main_opening.split_once("# Your assignment").expect("the main reviewer's assignment");
+        let (risk_shared, risk_assignment) = risk_opening.split_once("# Your assignment").expect("the risk reviewer's assignment");
+        assert_eq!(main_shared, risk_shared, "the shared opening differs");
+        assert_ne!(main_assignment, risk_assignment);
+        assert!(risk_assignment.contains("(`data-writes`)"), "{risk_assignment}");
+    }
+    // One findings list, each finding naming the reviewer that recorded it.
+    let findings = fx.fleet.read(|conn| Ok(tod_store::review::ReviewRepo::new(conn).list_for_node(fx.node)?)).unwrap();
+    assert!(!findings.is_empty());
+    assert!(findings.iter().all(|f| f.reviewer.is_some()), "{findings:#?}");
+}
+
+/// Item 9: findings that share a root cause across three review rounds send
+/// the task back to design, as the autopilot, with the findings as reason and
+/// evidence, instead of a fourth round.
+#[test]
+fn a_root_cause_that_comes_back_in_three_rounds_sends_the_task_to_design() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    let mut agent = FakeAgent::new(&fx.fleet);
+    agent.review_never_clean = true;
+    agent.review_root_cause = Some("The cache is trusted after a write".into());
+    let mut pilot = autopilot(&fx, Budget::default());
+    let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
+    let rows = fx
+        .fleet
+        .read(|conn| Ok(tod_store::send_back::SendBackRepo::new(conn).list_for_node(fx.node)?))
+        .unwrap();
+    let first = rows.first().unwrap_or_else(|| panic!("no send-back: {outcome:?}"));
+    assert_eq!((first.from_state.as_str(), first.to_state.as_str()), ("review", "design"), "{outcome:?}");
+    assert!(first.moved(), "{first:?}");
+    assert!(first.reason.contains("root cause \"The cache is trusted after a write\" across 3 review rounds"), "{}", first.reason);
+    assert_eq!(first.evidence.len(), 3, "the three rounds' findings");
+    assert!(first.evidence.iter().all(|e| e.kind == "finding"));
+    // Three rounds, then design: no fourth review in that stay.
+    let reviews_before: Vec<_> = pilot
+        .state()
+        .steps
+        .iter()
+        .filter(|s| s.at_ms <= first.created_at && s.step == "review")
+        .collect();
+    assert_eq!(reviews_before.len(), 3, "{:#?}", pilot.state().steps);
+}
+
+/// Item 9, the other trigger: fixes that add more findings than they close,
+/// twice in a row, send the task back to design. A review that never comes
+/// back clean but neither repeats a cause nor grows is left to the round limit
+/// (`a_review_that_never_comes_back_clean_stops_for_the_user_after_the_round_limit`).
+#[test]
+fn fixes_that_keep_adding_findings_send_the_task_to_design() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    let mut agent = FakeAgent::new(&fx.fleet);
+    agent.review_never_clean = true;
+    // Each review records one more finding than the one before.
+    agent.review_growing = true;
+    let mut pilot = autopilot(&fx, Budget::default());
+    let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
+    let rows = fx
+        .fleet
+        .read(|conn| Ok(tod_store::send_back::SendBackRepo::new(conn).list_for_node(fx.node)?))
+        .unwrap();
+    let first = rows.first().unwrap_or_else(|| panic!("no send-back: {outcome:?}"));
+    assert_eq!((first.from_state.as_str(), first.to_state.as_str()), ("review", "design"));
+    assert!(first.reason.contains("fix rounds in a row added more review findings than they closed"), "{}", first.reason);
+}
+
+/// Item 10's gap: with the review steps on, `pr_review` works like
+/// `pr_draft`. The agent commits the feedback's change without pushing, tod's
+/// Review → Fix → Review loop runs on the local head, and only then is it
+/// pushed, as tod's own push, never an unreviewed one.
+#[test]
+fn pr_review_feedback_is_reviewed_before_it_is_pushed_and_not_flagged() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    let dir = git_workspace(&fx);
+    with_pr_draft_review(&fx);
+    let feed = BranchFeed::new(&dir, vec![review_thread("PRRT_1", "src/lib.rs", 2, "Rename b.")], false);
+    crate::pr_readiness::set_feed_override(Some(feed.clone()));
+    linked_to_prs(&fx, "pr_review", &["https://github.com/acme/app/pull/42"]);
+    let mut agent = branch_agent(&fx, &dir, &feed, edit_and_commit);
+    let outcome = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO).run(&fx.fleet, &mut agent).unwrap();
+    let steps = steps_of(&turn_labels(&agent));
+    assert_eq!(steps.get(..5), Some(&["pr:change", "review", "fix", "review", "pr:push"].map(String::from)[..]), "{steps:?} {outcome:?}");
+    let head = git_in(&dir, &["rev-parse", "HEAD"]);
+    assert_eq!(*feed.pushed.lock().unwrap(), head, "pushed once the review was clean");
+    let pushes = pr_pushes(&fx);
+    assert!(
+        pushes.iter().any(|(verdict, protocol)| verdict == "pushed_by_tod" && protocol.as_deref() == Some("pr")),
+        "the push turn's head is tod's own: {pushes:?}"
+    );
+    assert!(pushes.iter().all(|(verdict, _)| verdict != "unreviewed"), "{pushes:?}");
+    assert!(failed_notes(&fx).is_empty(), "{:?}", failed_notes(&fx));
 }

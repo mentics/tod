@@ -44,8 +44,10 @@ state cannot be set here.
 `lifecycle-config` sets the skills the agent for a phase uses, and the model
 and effort it runs with, for this node and everything below it. <PHASE> is one
 of proposed, design, planning, implement, verify, verify_evaluate, review,
-fix, pr, pr_draft, pr_review, merged, released, learn (`verify_evaluate` is
-the evaluator of verification's evidence; unset, it takes `verify`'s). `--skills` replaces that phase's list
+review_risk, fix, pr, pr_draft, pr_review, merged, released, learn
+(`verify_evaluate` is the evaluator of verification's evidence; unset, it
+takes `verify`'s. `review_risk` is a review round's risk reviewer; unset, it
+takes `review`'s). `--skills` replaces that phase's list
 (`--skills ''` means no skills, even where an ancestor sets some); `--model`
 and `--effort` set that phase's (`--model ''` unsets one, so an ancestor's, the
 node's Agent capability, or the settings apply again); each resolves on its own

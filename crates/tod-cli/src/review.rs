@@ -111,6 +111,7 @@ fn finding_json(f: &ReviewFinding) -> serde_json::Value {
         "status": f.status,
         "response": f.response,
         "root_cause": f.root_cause,
+        "reviewer": f.reviewer.map(|r| r.as_str()),
     })
 }
 
@@ -120,12 +121,16 @@ fn finding_line(f: &ReviewFinding) -> String {
         Some(cause) => format!("\n    root cause: {cause}"),
         None => String::new(),
     };
+    let reviewer = match f.reviewer {
+        Some(reviewer) => format!("\n    reviewer: {}", reviewer.title()),
+        None => String::new(),
+    };
     let response = match &f.response {
         Some(response) => format!("\n    response: {response}"),
         None => String::new(),
     };
     format!(
-        "[{}] {} {}{location}: {}{root_cause}{response}",
+        "[{}] {} {}{location}: {}{root_cause}{reviewer}{response}",
         short_id(f.id),
         f.status,
         f.severity,

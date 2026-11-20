@@ -460,6 +460,10 @@ pub struct Autopilot {
     /// ([`Self::sent_back_during`]): the step's outcome only unwinds it, and
     /// the run goes on in the new state.
     sent_back: bool,
+    /// What a new conversation the next step starts is sent first, in place
+    /// of its protocol's starter ([`Self::pr_reopen_with`]); taken by
+    /// [`Self::converse_group`].
+    first_message: Option<String>,
 }
 
 /// How often a waiting pull request is read again, at first.
@@ -517,6 +521,7 @@ impl Autopilot {
             fresh_session,
             lost_checked: None,
             sent_back: false,
+            first_message: None,
         };
         if fresh_session {
             pilot.start_fresh_session()?;
@@ -894,6 +899,15 @@ impl Autopilot {
             if lifecycle != "review" {
                 self.state.loops.review_rounds = 0;
             }
+            // A review that keeps finding one cause, or that the fixes make
+            // grow, goes back to design rather than round again (ahead of
+            // the round limit, which only stops for the user).
+            if lifecycle == "review"
+                && matches!(step, NextStep::Review | NextStep::Fix)
+                && let Some(outcome) = self.escalate_fixes(fleet, &lifecycle, self.state.loops.review_floor_ms, false)?
+            {
+                return Ok(outcome);
+            }
             if step == NextStep::Review {
                 let round_limit = tod_store::TodSettings::load(&tod_store::TodPaths::at(&self.config.data_root))?
                     .lifecycle
@@ -912,14 +926,19 @@ impl Autopilot {
                     )
                 {
                     let standing = fleet.read(|conn| {
-                        // What the latest review recorded and the fixer claims to have fixed.
+                        // What the latest review round (both reviewers) recorded
+                        // and the fixer claims to have fixed.
                         let latest = tod_store::conversation::ConversationRepo::new(conn)
                             .latest_for_focus_with_protocol(Focus::Node(node), ProtocolKind::Review)?
                             .map(|c| c.id);
+                        let members = match latest {
+                            Some(lead) => tod_store::review::round::conversations(conn, lead)?,
+                            None => Vec::new(),
+                        };
                         Ok(tod_store::review::ReviewRepo::new(conn)
                             .list_for_node(node)?
                             .iter()
-                            .filter(|f| f.conversation_id == latest)
+                            .filter(|f| f.conversation_id.is_some_and(|c| members.contains(&c)))
                             .filter(|f| !matches!(f.status.as_str(), "out_of_scope" | "declined"))
                             .map(|f| format!("[{}] {} ({})", tod_store::interview::short_id(f.id), f.summary, f.status))
                             .collect::<Vec<_>>())
@@ -1367,9 +1386,10 @@ impl Autopilot {
     /// With its review steps on, work is reviewed before it reaches the pull
     /// request ([`Self::pr_change_reviewed`]): the agent makes the change and
     /// commits it, tod's Review → Fix loop runs on it until a review is clean,
-    /// and only then does the agent push and answer the threads. Once nothing
-    /// but a person is left, a head that did not go through that loop is
-    /// reviewed there ([`Self::own_review`]).
+    /// and only then does the agent push and answer the threads. `pr_review`
+    /// works the same way with the review steps on, held commits included.
+    /// In `pr_draft`, once nothing but a person is left, a head that did not go
+    /// through that loop is reviewed there ([`Self::own_review`]).
     fn babysit<A: AgentAccess + ?Sized, H: StepHook + ?Sized>(
         &mut self,
         fleet: &FleetStore,
@@ -1515,11 +1535,14 @@ impl Autopilot {
                 hook.waiting(None, None);
                 return Ok(Some(outcome));
             }
-            if before_review && self.state.pr_change.is_none() && fleet.read(|conn| crate::pr_draft_review::enabled(conn, node))? {
+            // In `pr_review` too: commits a conversation held back are a
+            // change awaiting review there (the head pushed without one is
+            // reviewed at once only in `pr_draft`, by `own_review`).
+            if self.state.pr_change.is_none() && fleet.read(|conn| crate::pr_draft_review::enabled(conn, node))? {
                 if let Some(local) = crate::pr_pushes::held_for(fleet, node, &live)?
                     && !self.state.tod_pushed.contains(&local)
                 {
-                    let cleared = fleet.read(|conn| crate::pr_draft_review::cleared_shas(conn, node, false))?;
+                    let cleared = fleet.read(|conn| crate::pr_draft_review::cleared_shas(conn, node, !before_review))?;
                     let now = state::now_ms();
                     self.state.pr_change = Some(PrChange {
                         started_ms: now,
@@ -1530,7 +1553,7 @@ impl Autopilot {
                         held: true,
                     });
                     self.save()?;
-                } else {
+                } else if before_review {
                     let owed: Vec<String> = fleet
                         .read(|conn| crate::pr_pushes::review_owed_now(conn, node, &live))?
                         .into_iter()
@@ -1575,8 +1598,7 @@ impl Autopilot {
             // A change the agent made and tod has not reviewed or pushed yet
             // (the run stopped in between) is finished first, whatever the
             // pull request shows meanwhile.
-            let change_owed = before_review
-                && self.state.pr_change.as_ref().is_some_and(|c| c.made_at_ms.is_some())
+            let change_owed = self.state.pr_change.as_ref().is_some_and(|c| c.made_at_ms.is_some())
                 && overall != PrNext::Merged;
             if change_owed {
                 overall = PrNext::Work(Vec::new());
@@ -1632,9 +1654,9 @@ impl Autopilot {
                     waited_since = None;
                     self.clear_poll_waits(fleet)?;
                     hook.waiting(None, None);
-                    // With the review steps on in `pr_draft`, the agent takes
-                    // two turns a round: the change, then the push.
-                    let reviewed = before_review && fleet.read(|conn| crate::pr_draft_review::enabled(conn, node))?;
+                    // With the review steps on (`pr_draft` and `pr_review`), the
+                    // agent takes two turns a round: the change, then the push.
+                    let reviewed = fleet.read(|conn| crate::pr_draft_review::enabled(conn, node))?;
                     // Only feedback on the change itself is a round; merging
                     // the base in or asking a bot again is housekeeping.
                     // Rounds the pull request has not got clear since, counted.
@@ -2706,9 +2728,7 @@ impl Autopilot {
             Some(at) => (at, change.changed),
             None => {
                 hook.working_on("the change the pull request's feedback needs, committed for tod's review before it is pushed");
-                let reopen = self
-                    .pr_reopen(fleet, live)?
-                    .map(|(id, _)| (id, crate::conversation::pr::change_message(live)));
+                let reopen = self.pr_reopen_with(fleet, live, crate::conversation::pr::change_message(live))?;
                 if let Some(outcome) = self.pr_turn(fleet, agent, hook, reopen, phase_key)? {
                     return Ok(Some(outcome));
                 }
@@ -2750,7 +2770,7 @@ impl Autopilot {
             }
         };
         let cleared = if changed {
-            if let Some(outcome) = self.review_change(fleet, agent, hook, made_at)? {
+            if let Some(outcome) = self.review_change(fleet, agent, hook, made_at, phase_key)? {
                 return Ok(Some(outcome));
             }
             fleet.read(|conn| Ok(pr_draft_review::reviews_since(conn, node, made_at)?.pop()))?
@@ -2782,7 +2802,7 @@ impl Autopilot {
         } else {
             crate::conversation::pr::push_message(changed)
         };
-        let reopen = self.pr_reopen(fleet, live)?.map(|(id, _)| (id, message));
+        let reopen = self.pr_reopen_with(fleet, live, message)?;
         if let Some(outcome) = self.converse(fleet, agent, hook, ProtocolKind::Pr, reopen)? {
             return Ok(Some(outcome));
         }
@@ -2805,6 +2825,7 @@ impl Autopilot {
         agent: &mut A,
         hook: &mut H,
         made_at: i64,
+        lifecycle: &str,
     ) -> Result<Option<Outcome>> {
         use crate::pr_draft_review::{self, ChangeStep};
         let node = self.node;
@@ -2828,7 +2849,15 @@ impl Autopilot {
             if let Some(reason) = hook.at(fleet, Boundary::Step)? {
                 return Ok(Some(Outcome::Stopped { reason }));
             }
-            match fleet.read(|conn| pr_draft_review::change_step(conn, node, made_at))? {
+            let step = fleet.read(|conn| pr_draft_review::change_step(conn, node, made_at))?;
+            // As in `review`: a review of the pull request's changes that keeps
+            // finding one cause, or that the fixes make grow, goes back to design.
+            if step != ChangeStep::Clean
+                && let Some(outcome) = self.escalate_fixes(fleet, lifecycle, self.state.loops.review_floor_ms, true)?
+            {
+                return Ok(Some(outcome));
+            }
+            match step {
                 ChangeStep::Clean => return Ok(None),
                 ChangeStep::Fix => {
                     let open = open_of_round(fleet)?;
@@ -2836,8 +2865,8 @@ impl Autopilot {
                     if let Some(outcome) = self.converse(fleet, agent, hook, ProtocolKind::Fix, None)? {
                         return Ok(Some(outcome));
                     }
-                    self.owe_groups(fleet, ProtocolKind::Fix, "fix", pr_draft_review::STATE)?;
-                    if let Some(outcome) = self.run_pending_groups(fleet, agent, hook, pr_draft_review::STATE)? {
+                    self.owe_groups(fleet, ProtocolKind::Fix, "fix", lifecycle)?;
+                    if let Some(outcome) = self.run_pending_groups(fleet, agent, hook, lifecycle)? {
                         return Ok(Some(outcome));
                     }
                     if open_of_round(fleet)? == open {
@@ -2853,7 +2882,7 @@ impl Autopilot {
                     let rounds = fleet.read(|conn| pr_draft_review::unconverged_rounds_since(conn, node, Some(made_at.max(floor))))?;
                     // A review the last run left unfinished is resumed, not a new round.
                     let resuming = self.state.current.as_ref().is_some_and(|c| {
-                        c.protocol == protocol_name(ProtocolKind::Review) && c.lifecycle == pr_draft_review::STATE
+                        c.protocol == protocol_name(ProtocolKind::Review) && c.lifecycle == lifecycle
                     });
                     if !resuming
                         && rounds >= round_limit
@@ -2875,8 +2904,8 @@ impl Autopilot {
                     if let Some(outcome) = self.converse(fleet, agent, hook, ProtocolKind::Review, None)? {
                         return Ok(Some(outcome));
                     }
-                    self.owe_groups(fleet, ProtocolKind::Review, "review", pr_draft_review::STATE)?;
-                    if let Some(outcome) = self.run_pending_groups(fleet, agent, hook, pr_draft_review::STATE)? {
+                    self.owe_groups(fleet, ProtocolKind::Review, "review", lifecycle)?;
+                    if let Some(outcome) = self.run_pending_groups(fleet, agent, hook, lifecycle)? {
                         return Ok(Some(outcome));
                     }
                 }
@@ -3036,6 +3065,26 @@ impl Autopilot {
         Ok(conversation.map(|c| (c.id, crate::conversation::pr::work_message(live))))
     }
 
+    /// [`Self::pr_reopen`], sent `message`. With no pull request conversation
+    /// in this stay yet (`pr_review` opens none on entry unless it has
+    /// skills), the new one the next turn starts is sent `message` first
+    /// instead of its starter, so it is told to commit without pushing (or
+    /// to push) exactly as a reopened one is.
+    fn pr_reopen_with(
+        &mut self,
+        fleet: &FleetStore,
+        live: &[crate::pr_readiness::LivePr],
+        message: String,
+    ) -> Result<Option<(Uuid, String)>> {
+        match self.pr_reopen(fleet, live)? {
+            Some((id, _)) => Ok(Some((id, message))),
+            None => {
+                self.first_message = Some(message);
+                Ok(None)
+            }
+        }
+    }
+
     /// Sleep `interval` in slices, so a pause or stop is heard within a
     /// second; time asleep is not time worked. `Some(reason)` when asked to stop.
     fn sleep_watching<H: StepHook + ?Sized>(
@@ -3173,6 +3222,10 @@ impl Autopilot {
         reopen: Option<(Uuid, String)>,
         group: usize,
     ) -> Result<Option<Outcome>> {
+        let first_message = self.first_message.take();
+        if kind == ProtocolKind::Review && group == 0 {
+            return self.converse_review(fleet, agent, hook, reopen);
+        }
         if let Some(limit) = self.over_budget() {
             return Ok(Some(Outcome::BudgetExhausted { limit }));
         }
@@ -3193,12 +3246,16 @@ impl Autopilot {
                     .then(|| (current.conversation_id, RESUME_MESSAGE.to_string()))
             })
             .or(reopen);
+        let new_driver = |pilot: &Self| {
+            let (driver, starter) = pilot.new_driver(kind, group);
+            (driver, first_message.clone().unwrap_or(starter))
+        };
         let (mut driver, message) = match resumable {
             Some((id, message)) => match ConversationDriver::open(self.config.clone(), fleet, id) {
                 Ok(driver) => (driver, message),
-                Err(_) => self.new_driver(kind, group),
+                Err(_) => new_driver(self),
             },
-            None => self.new_driver(kind, group),
+            None => new_driver(self),
         };
         self.state.sessions += 1;
         if let Err(err) = driver.send(fleet, agent, &message) {
@@ -3219,6 +3276,7 @@ impl Autopilot {
             lifecycle: lifecycle.clone(),
             conversation_id,
             skill_group: group,
+            partner: None,
         });
         self.save()?;
 
@@ -3310,6 +3368,228 @@ impl Autopilot {
         self.sent_back_during(fleet, &lifecycle, started)
     }
 
+    /// A review round ([`Self::converse_group`] for `Review`, group 0): the
+    /// main and the risk reviewer (`tod_store::review::Reviewer`), each a
+    /// fresh session of the Review protocol with its own assignment, run at
+    /// the same time against the one agent, recording into the node's one
+    /// findings list. The main reviewer's conversation is the round's lead
+    /// (it is [`CurrentStep::conversation_id`]); the risk reviewer's names it
+    /// as its round and is [`CurrentStep::partner`]. The round is over when
+    /// both are (`tod_store::review::round::done`). A stop, a failure or a
+    /// permission nobody granted cancels both, kept as current, so the next
+    /// run reopens whichever has not recorded done. A lead from before there
+    /// were two reviewers (no reviewer recorded) runs alone.
+    fn converse_review<A: AgentAccess + ?Sized, H: StepHook + ?Sized>(
+        &mut self,
+        fleet: &FleetStore,
+        agent: &mut A,
+        hook: &mut H,
+        reopen: Option<(Uuid, String)>,
+    ) -> Result<Option<Outcome>> {
+        use tod_store::review::Reviewer;
+        let kind = ProtocolKind::Review;
+        if let Some(limit) = self.over_budget() {
+            return Ok(Some(Outcome::BudgetExhausted { limit }));
+        }
+        let lifecycle = lifecycle::current_state(fleet, self.node)?;
+        let started = state::now_ms();
+        if let Some(outcome) = self.check_pushes(fleet, &lifecycle, None)? {
+            return Ok(Some(outcome));
+        }
+        self.fresh_session = false;
+        let resumable = self.state.current.as_ref().and_then(|current| {
+            (current.protocol == protocol_name(kind) && current.lifecycle == lifecycle && current.skill_group == 0)
+                .then(|| (current.conversation_id, RESUME_MESSAGE.to_string(), current.partner))
+        });
+        let resumable = resumable.or(reopen.map(|(id, message)| (id, message, None)));
+        let opened = resumable.and_then(|(id, message, partner)| {
+            ConversationDriver::open(self.config.clone(), fleet, id)
+                .ok()
+                .map(|driver| (driver, message, partner))
+        });
+        let (lead, lead_message, partner) = match opened {
+            Some(opened) => opened,
+            None => {
+                let (driver, message) = self.new_driver(kind, 0);
+                (driver.with_reviewer(Reviewer::Main, None), message, None)
+            }
+        };
+        let mut lanes = vec![Lane::new(lead, step_label(kind, 0))];
+        if let Some(outcome) = self.start_lane(fleet, agent, &mut lanes[0], true, &lead_message)? {
+            return Ok(Some(outcome));
+        }
+        let lead_id = lanes[0]
+            .id()
+            .ok_or_else(|| anyhow::anyhow!("the review's main conversation was not saved"))?;
+        self.state.current = Some(CurrentStep {
+            protocol: protocol_name(kind).to_string(),
+            lifecycle: lifecycle.clone(),
+            conversation_id: lead_id,
+            skill_group: 0,
+            partner: None,
+        });
+        self.save()?;
+        if lanes[0].driver.reviewer() == Some(Reviewer::Main) {
+            let opened = partner.and_then(|id| ConversationDriver::open(self.config.clone(), fleet, id).ok());
+            let (risk, message) = match opened {
+                Some(driver) => (driver, RESUME_MESSAGE.to_string()),
+                None => {
+                    let (driver, message) = self.new_driver(kind, 0);
+                    (driver.with_reviewer(Reviewer::Risk, Some(lead_id)), message)
+                }
+            };
+            lanes.push(Lane::new(risk, format!("{} ({})", step_label(kind, 0), Reviewer::Risk.title())));
+            if let Some(outcome) = self.start_lane(fleet, agent, &mut lanes[1], false, &message)? {
+                // Kept as current: the next run reopens the lead and starts
+                // the risk reviewer again.
+                cancel_lanes(fleet, agent, &mut lanes)?;
+                return Ok(Some(outcome));
+            }
+            if let Some(current) = self.state.current.as_mut() {
+                current.partner = lanes[1].id();
+            }
+            self.save()?;
+        }
+
+        loop {
+            // The first lane still at work stands for the round: its turn is
+            // the one shown live, and a stop asked for is heard through it.
+            if let Some(lane) = lanes.iter().find(|l| !l.done && l.driver.status().running) {
+                let status = lane.driver.status();
+                if let Some(reason) = hook.watch(Turn {
+                    protocol: kind,
+                    conversation_id: lane.id(),
+                    status: &status,
+                }) {
+                    // Kept as current: the next run reopens them.
+                    cancel_lanes(fleet, agent, &mut lanes)?;
+                    return Ok(Some(Outcome::Stopped { reason }));
+                }
+            }
+            let mut turn_ended = false;
+            for index in 0..lanes.len() {
+                if lanes[index].done {
+                    continue;
+                }
+                let mut finished = false;
+                for event in lanes[index].driver.tick(fleet, agent) {
+                    match event {
+                        ConversationEvent::TurnFinished { error: Some(error) } => {
+                            // Kept as current: a restart reopens it.
+                            cancel_lanes(fleet, agent, &mut lanes)?;
+                            return Ok(Some(Outcome::NeedsHuman {
+                                reason: NeedsHuman::AgentFailed { error },
+                            }));
+                        }
+                        ConversationEvent::TurnFinished { error: None } => {
+                            finished = true;
+                            turn_ended = true;
+                        }
+                        ConversationEvent::Notice(notice) => {
+                            // Errors are also in the conversation's transcript.
+                            tracing::warn!(node = %self.node, ?notice, "autopilot notice");
+                        }
+                        ConversationEvent::FilesBusy { message } => {
+                            cancel_lanes(fleet, agent, &mut lanes)?;
+                            let what = format!("another node is still making its files: {message}");
+                            return Ok(Some(self.wait_for_files(fleet, what)?));
+                        }
+                        ConversationEvent::Continued => turn_ended = true,
+                        ConversationEvent::Rotated => {}
+                    }
+                }
+                if finished || !lanes[index].driver.status().running {
+                    lanes[index].done = true;
+                    lanes[index].answered = None;
+                    let (label, id) = (lanes[index].label.clone(), lanes[index].id());
+                    self.record(fleet, &label, &lifecycle, id)?;
+                    close_session(agent, id);
+                }
+            }
+            if turn_ended && let Some(reason) = hook.at(fleet, Boundary::Turn)? {
+                if lanes.iter().all(|l| l.done) {
+                    self.state.current = None;
+                    self.save()?;
+                } else {
+                    // Kept as current: the next run reopens what is unfinished.
+                    cancel_lanes(fleet, agent, &mut lanes)?;
+                }
+                return Ok(Some(Outcome::Stopped { reason }));
+            }
+            if lanes.iter().all(|l| l.done) {
+                break;
+            }
+            for index in 0..lanes.len() {
+                if lanes[index].done {
+                    continue;
+                }
+                match lanes[index].driver.status().permission {
+                    None => lanes[index].answered = None,
+                    Some(request) if lanes[index].answered.as_deref() == Some(request.title.as_str()) => {}
+                    Some(request) => {
+                        let id = lanes[index].id();
+                        if let Some(outcome) =
+                            self.handle_permission(fleet, agent, &mut lanes[index].driver, id, &request)?
+                        {
+                            cancel_lanes(fleet, agent, &mut lanes)?;
+                            return Ok(Some(outcome));
+                        }
+                        lanes[index].answered = Some(request.title);
+                    }
+                }
+            }
+            if let Some(limit) = self.over_budget().filter(|l| matches!(l, BudgetLimit::Time { .. })) {
+                cancel_lanes(fleet, agent, &mut lanes)?;
+                return Ok(Some(Outcome::BudgetExhausted { limit }));
+            }
+            std::thread::sleep(self.poll);
+        }
+        self.state.current = None;
+        self.save()?;
+        // A head a reviewer pushed that tod's review did not clear.
+        if let Some(outcome) = self.check_pushes(fleet, &lifecycle, Some((lead_id, kind)))? {
+            return Ok(Some(outcome));
+        }
+        self.sent_back_during(fleet, &lifecycle, started)
+    }
+
+    /// Send a review round's lane its message, unless its reviewer already
+    /// recorded the review done (a resumed round whose other reviewer had
+    /// not), which leaves it done. `Some` when the send failed: the run stops
+    /// as [`Self::converse_group`]'s does (a failed lead is no longer
+    /// current).
+    fn start_lane<A: AgentAccess + ?Sized>(
+        &mut self,
+        fleet: &FleetStore,
+        agent: &mut A,
+        lane: &mut Lane,
+        lead: bool,
+        message: &str,
+    ) -> Result<Option<Outcome>> {
+        if let Some(id) = lane.id()
+            && fleet.read(|conn| tod_store::review::round::recorded_done(conn, id))?
+        {
+            lane.done = true;
+            return Ok(None);
+        }
+        self.state.sessions += 1;
+        if let Err(err) = lane.driver.send(fleet, agent, message) {
+            if lead {
+                self.state.current = None;
+            }
+            self.save()?;
+            if tod_store::fleet::worktree::is_lock_busy(&err) {
+                return Ok(Some(self.files_busy(fleet, &err)?));
+            }
+            return Ok(Some(Outcome::NeedsHuman {
+                reason: NeedsHuman::AgentFailed {
+                    error: format!("{err:#}"),
+                },
+            }));
+        }
+        Ok(None)
+    }
+
     /// What a send-back made during a conversation that began at `started`
     /// in `lifecycle` means for the run. A refused one (the loop guard,
     /// `tod_store::send_back::guard`) stops it for the user with every
@@ -3345,6 +3625,24 @@ impl Autopilot {
         Ok(Some(Outcome::Stopped {
             reason: format!("sent back from {} to {}", latest.from_state, latest.to_state),
         }))
+    }
+
+    /// Fix escalation ([`crate::fix_escalation`]): when the finished review
+    /// rounds of this stay since `since_ms` repeat one root cause or keep
+    /// growing under the fixes, the task goes back to `design` (as the
+    /// autopilot, the findings as reason and evidence) instead of another
+    /// review or fix. `Some` as [`Self::sent_back_during`] reads it: moved
+    /// (the run goes on in `design`), or refused by the loop guard (the run
+    /// stops for the user).
+    fn escalate_fixes(&mut self, fleet: &FleetStore, lifecycle: &str, since_ms: i64, on_pr: bool) -> Result<Option<Outcome>> {
+        let node = self.node;
+        let Some(escalation) = fleet.read(|conn| crate::fix_escalation::for_node(conn, node, since_ms, on_pr))? else {
+            return Ok(None);
+        };
+        tracing::info!(%node, findings = escalation.findings.len(), "the review is not converging: sending the task back to design");
+        let started = state::now_ms();
+        crate::fix_escalation::send_back(fleet, &escalation)?;
+        self.sent_back_during(fleet, lifecycle, started)
     }
 
     /// A head tod itself makes the pull request's (saved): never an
@@ -3487,6 +3785,36 @@ fn close_session<A: AgentAccess + ?Sized>(agent: &mut A, conversation_id: Option
     if let Some(id) = conversation_id {
         agent.with(|a| a.close_session(&ConversationDriver::session_key(id)));
     }
+}
+
+/// One reviewer's conversation in a review round
+/// ([`Autopilot::converse_review`]).
+struct Lane {
+    driver: ConversationDriver,
+    /// Its step in [`AutopilotState::steps`].
+    label: String,
+    /// Finished (recorded done, or its turn ended for good).
+    done: bool,
+    /// The permission already answered from saved answers, until it clears.
+    answered: Option<String>,
+}
+
+impl Lane {
+    fn new(driver: ConversationDriver, label: String) -> Self {
+        Self { driver, label, done: false, answered: None }
+    }
+
+    fn id(&self) -> Option<Uuid> {
+        self.driver.conversation_id()
+    }
+}
+
+/// Cancel every lane of a review round whose turn is still running.
+fn cancel_lanes<A: AgentAccess + ?Sized>(fleet: &FleetStore, agent: &mut A, lanes: &mut [Lane]) -> Result<()> {
+    for lane in lanes.iter_mut().filter(|l| !l.done && l.driver.status().running) {
+        lane.driver.cancel(fleet, agent)?;
+    }
+    Ok(())
 }
 
 /// The reason in a `blocked` pull request report.

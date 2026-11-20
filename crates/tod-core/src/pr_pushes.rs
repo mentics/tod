@@ -2,8 +2,8 @@
 //! section 8): the heads a node's pull request moves to, checked against what
 //! tod's own review cleared and what tod itself pushed.
 //!
-//! With the review steps on in `pr_draft` (`crate::pr_draft_review`), every
-//! change is reviewed on the local head before the pull request agent is told
+//! With the review steps on in `pr_draft` and `pr_review` (`crate::pr_draft_review`),
+//! every change is reviewed on the local head before the pull request agent is told
 //! to push it. A head that reaches the pull request any other way (an agent
 //! that pushed when told only to commit, the user's conversation told to "push
 //! now", a push from another checkout) is a defect in the process. So around
@@ -15,14 +15,14 @@
 //! (`expected`: the push turn's local head, GitHub's Update branch) or one its
 //! review cleared as accounted for, and anything else as **unreviewed**, with
 //! the turn it appeared around, a failed note in the node's Activity, and the
-//! journey's `DataChanged` row. The autopilot then reviews that head at once
-//! ([`review_owed_now`]); there is no `pre-push` hook.
+//! journey's `DataChanged` row. In `pr_draft` the autopilot then reviews that
+//! head at once ([`review_owed_now`]); there is no `pre-push` hook.
 //!
 //! A conversation the user directs commits on the node's branch rather than
 //! pushing (`workspace/codebase.md`, "Pushing"). [`after_conversation`] finds
 //! those commits ([`held_commits`]), tells the user they are reviewed before
-//! they are pushed, and wakes the node's run, whose `pr_draft` loop adopts
-//! them as a change awaiting review (`Autopilot::babysit`), so tod's Review →
+//! they are pushed, and wakes the node's run, whose `pr_draft` or `pr_review`
+//! loop adopts them as a change awaiting review (`Autopilot::babysit`), so tod's Review →
 //! Fix loop and the checks run on them before the pull request agent pushes.
 
 use crate::conversation::protocol::RunNotice;
@@ -148,7 +148,8 @@ fn note_for(push: &PrPush, url: &str) -> TimelineEntry {
     let then = if push.lifecycle == crate::pr_draft_review::STATE {
         "tod reviews that head now."
     } else {
-        "No review runs in pr_review: move the node back to pr_draft to have tod review it."
+        "In pr_review tod reviews a change before the pull request agent pushes it, but does not review a head that \
+         reached the pull request another way: move the node back to pr_draft to have tod review it."
     };
     TimelineEntry::new(
         push.node_id,
@@ -290,23 +291,16 @@ pub fn after_conversation(
     }
     if !held.is_empty() {
         let prs: Vec<&str> = held.iter().map(|(label, _, _)| label.as_str()).collect();
-        let (title, said) = if state == crate::pr_draft_review::STATE {
-            (
-                "Conversation commits held for review",
-                format!(
-                    "This conversation's commits are not on {} yet: tod reviews them and runs the checks first, and the pull request agent pushes them once that is clean.",
-                    prs.join(", ")
-                ),
-            )
-        } else {
-            (
-                "Conversation commits not pushed",
-                format!(
-                    "This conversation's commits are not on {} yet. tod reviews a change before it is pushed only in pr_draft, and this node is in pr_review: move it back to pr_draft to have them reviewed, or they go out with the pull request agent's next push, unreviewed.",
-                    prs.join(", ")
-                ),
-            )
-        };
+        // In `pr_draft` and `pr_review` alike ([`watched`] needs the review
+        // steps on): the run adopts them as a change awaiting review.
+        let (title, said) = (
+            "Conversation commits held for review",
+            format!(
+                "This conversation's commits are not on {} yet: tod reviews them first{}, and the pull request agent pushes them once that is clean.",
+                prs.join(", "),
+                if state == crate::pr_draft_review::STATE { " and runs the checks" } else { "" }
+            ),
+        );
         let detail = held
             .iter()
             .map(|(label, head, local)| format!("{label}: {} on top of the pushed {}", short(local), short(head)))

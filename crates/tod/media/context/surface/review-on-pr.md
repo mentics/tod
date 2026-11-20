@@ -1,7 +1,9 @@
-# This review runs while the draft pull request is open
+# This review runs while the pull request is open
 
-This review is not the one in `review`: the task is in `pr_draft`, its draft
-pull request is open, and its agent has been acting on the feedback there.
+This review is not the one in `review`: the task is in `pr_draft` or
+`pr_review`, its pull request is open, and its agent has been acting on the
+feedback there. It has the same two reviewers as above, each with the
+assignment at the end of this context.
 You review the branch's local head, the commits checked out in your working
 directory, by the same rules as above. Usually they are not pushed yet: they
 are the agent's change for the feedback, and they are pushed only once a
@@ -18,9 +20,9 @@ review, the app posts what you record there itself, each finding on its line.
 
 A finding that means an earlier phase got it wrong (evidence that falls
 short, a wrong build, a wrong approach, a requirement on a false claim) still
-sends the task back with `lifecycle send-back`, as above: the draft pull
-request stays open, and the task comes back to `pr_draft` through every
-phase after the one you send it to.
+sends the task back with `lifecycle send-back`, as above: the pull request
+stays open, and the task comes back to it through every phase after the one
+you send it to.
 
 Findings from earlier rounds may already be on the task, answered by the
 fixer or by the pull request's agent through their review threads. Treat

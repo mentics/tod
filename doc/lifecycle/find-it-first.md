@@ -1,6 +1,7 @@
 # Find it first: every issue caught before anyone else looks
 
-Status: plan, nothing built. Written 2026-11-19 from the post-mortem of
+Status: plan, partly built (items 9 and 12, and item 10 in `pr_review`, on
+2026-11-19; see the work items). Written 2026-11-19 from the post-mortem of
 Cofactr/kb PR 2888 (node "DigiKey productdetails 404s: ~50% of lookups
 failing, most avoidable").
 
