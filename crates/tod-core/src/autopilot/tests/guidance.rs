@@ -42,7 +42,9 @@ fn the_selection_is_recorded_before_the_work_and_inlined_in_its_opening() {
     assert_eq!(outcome, Outcome::Done, "{steps:?}");
     assert_eq!(&steps[..2], ["guidance", "implementation"], "{steps:?}");
     // Before the review, a selection against the change.
-    let review_at = steps.iter().position(|s| s == "review").unwrap();
+    // (A round's two reviewers are recorded as each finishes, the risk
+    // reviewer's as "review (risk reviewer)".)
+    let review_at = steps.iter().position(|s| s.starts_with("review")).unwrap();
     assert_eq!(steps[review_at - 1], "guidance", "{steps:?}");
 
     let runs = runs(&fx);
@@ -75,7 +77,8 @@ fn the_selection_is_recorded_before_the_work_and_inlined_in_its_opening() {
         .filter(|(k, s)| *k == ProtocolKind::Review && s.contains("# Current context"))
         .map(|(_, s)| s)
         .collect();
-    assert_eq!(reviews.len(), steps.iter().filter(|s| *s == "review").count(), "{steps:?}");
+    // Both reviewers of every round, main and risk.
+    assert_eq!(reviews.len(), steps.iter().filter(|s| s.starts_with("review")).count(), "{steps:?}");
     let block = |s: &str| s[s.find("## Project guidance").unwrap()..].split("\n## ").next().unwrap().to_string();
     let first = block(reviews[0]);
     assert!(first.contains("### File `REVIEW.md`"), "{first}");

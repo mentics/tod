@@ -5926,7 +5926,13 @@ fn pr_review_feedback_is_reviewed_before_it_is_pushed_and_not_flagged() {
     let mut agent = branch_agent(&fx, &dir, &feed, edit_and_commit);
     let outcome = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO).run(&fx.fleet, &mut agent).unwrap();
     let steps = steps_of(&turn_labels(&agent));
-    assert_eq!(steps.get(..5), Some(&["pr:change", "review", "fix", "review", "pr:push"].map(String::from)[..]), "{steps:?} {outcome:?}");
+    // The review is preceded by the stay's guidance selection against the
+    // change (`crate::guidance`).
+    assert_eq!(
+        steps.get(..6),
+        Some(&["pr:change", "guidance", "review", "fix", "review", "pr:push"].map(String::from)[..]),
+        "{steps:?} {outcome:?}"
+    );
     let head = git_in(&dir, &["rev-parse", "HEAD"]);
     assert_eq!(*feed.pushed.lock().unwrap(), head, "pushed once the review was clean");
     let pushes = pr_pushes(&fx);

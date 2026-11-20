@@ -735,7 +735,8 @@ Guidance section with Remove and Add. Some of it differs from the plan:
 - The selector loops only while a lens is not recorded either way.
 - A `pr_draft` review owes an actual selection once per stay, as `review`
   does.
-- Selector sessions count toward the run's session budget.
+- Selector sessions do not count toward the run's session budget: they are
+  part of the work they select for.
 - A selected file that is missing at inlining time fails the session as an
   agent failure. No supervisor-specific handling was added.
 

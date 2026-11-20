@@ -3273,7 +3273,12 @@ impl Autopilot {
             },
             None => new_driver(self),
         };
-        self.state.sessions += 1;
+        // The guidance selector (a one-turn Haiku matcher, `crate::guidance`)
+        // is part of the work it selects for, not a session of its own
+        // against the run's budget.
+        if kind != ProtocolKind::Guidance {
+            self.state.sessions += 1;
+        }
         if let Err(err) = driver.send(fleet, agent, &message) {
             self.state.current = None;
             self.save()?;
