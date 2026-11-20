@@ -79,6 +79,43 @@ pub struct AutopilotState {
     /// (`crate::pr_pushes`).
     #[serde(default)]
     pub tod_pushed: Vec<String>,
+    /// The reruns tod asked GitHub for of a CI job that failed for the
+    /// infrastructure's reasons, one per (pull request, head, check)
+    /// (`super::Autopilot::rerun_infra_failures`), newest last, at most
+    /// [`MECHANICAL_KEPT`].
+    #[serde(default)]
+    pub infra_reruns: Vec<InfraRerun>,
+    /// How often tod's configured fixer ran for a failing CI check
+    /// (`super::Autopilot::run_ci_fixers`), per (pull request, check).
+    #[serde(default)]
+    pub ci_fix_attempts: Vec<CiFixAttempt>,
+}
+
+/// How many entries of [`AutopilotState::infra_reruns`] and
+/// [`AutopilotState::ci_fix_attempts`] are kept.
+pub const MECHANICAL_KEPT: usize = 32;
+
+/// tod's reruns of one CI check at one head.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InfraRerun {
+    pub pr: String,
+    pub head: String,
+    pub check: String,
+    /// Reruns asked for so far.
+    pub count: u32,
+    /// When the last one was asked (ms since the epoch).
+    pub at_ms: i64,
+    /// Whether the check's passing after a rerun is already recorded as a flake.
+    #[serde(default)]
+    pub flaked: bool,
+}
+
+/// How often the configured fixer ran for one CI check of one pull request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CiFixAttempt {
+    pub pr: String,
+    pub check: String,
+    pub count: u32,
 }
 
 /// How many of the heads tod pushed are kept ([`AutopilotState::tod_pushed`]).
@@ -270,6 +307,8 @@ impl AutopilotState {
             pending_groups: None,
             pr_change: None,
             tod_pushed: Vec::new(),
+            infra_reruns: Vec::new(),
+            ci_fix_attempts: Vec::new(),
         }
     }
 

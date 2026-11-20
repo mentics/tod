@@ -11,6 +11,12 @@
 //! lists what was tried, and two options: proceed without the bot, or keep
 //! waiting.
 //!
+//! By default no one is asked (`doc/requests/design.md` 4.4): once the asks are
+//! exhausted tod goes on without the bot by itself, recording the same request
+//! answered by tod (`decision_answers.decided_by = tod`, with a rationale
+//! saying what was tried: [`settle_without`]). A bot configured with
+//! `on_silence: ask` keeps the request to the user.
+//!
 //! "Proceed without" is a standing answer on the node: the bot is left out of
 //! the settings every reader of the pull request uses
 //! ([`settings_for_node`]), so the gate's `review-current` and `review-score`
@@ -45,6 +51,9 @@ pub struct Tried {
     /// The bot said it will not review (its `exhausted_pattern` matched its
     /// latest comment): no waiting would bring it.
     pub exhausted: bool,
+    /// The bot's `on_silence` is `proceed` (the default): tod settles the
+    /// request itself ([`settle_without`]) instead of asking the user.
+    pub auto_proceed: bool,
 }
 
 fn when(at: Option<DateTime<Utc>>, none: &str) -> String {
@@ -77,6 +86,59 @@ pub fn question(tried: &Tried) -> String {
         asked = when(tried.last_ask_at, "never"),
         seen = when(tried.last_activity_at, "none seen"),
     )
+}
+
+/// What tod records as its reason for going on without a silent bot by itself:
+/// what was tried, and how to be asked instead.
+pub fn rationale(tried: &Tried) -> String {
+    let asks = format!("{} ask{}", tried.asks, if tried.asks == 1 { "" } else { "s" });
+    let why = if tried.exhausted {
+        format!("{} said it will not review {} (its latest comment matches the out-of-reviews pattern; tod asked {asks}, last {})", tried.bot, tried.prs.join(", "), when(tried.last_ask_at, "never"))
+    } else {
+        format!(
+            "{} did not review {} after {asks} (last asked {}; its last activity {})",
+            tried.bot,
+            tried.prs.join(", "),
+            when(tried.last_ask_at, "never"),
+            when(tried.last_activity_at, "none seen"),
+        )
+    };
+    format!(
+        "{why}. tod went on without {bot} by itself, as no one can bring it; set `on_silence: ask` on {bot} in `pr_readiness.bots` to be asked instead.",
+        bot = tried.bot
+    )
+}
+
+/// Go on without `tried.bot` with nobody asked: the node's bot-silence request
+/// is recorded and answered at once by tod, "Proceed without", with the
+/// [`rationale`], so the same standing as a user's answer holds
+/// ([`settings_for_node`]) and the Answers drawer shows what tod did and why.
+pub fn settle_without(fleet: &tod_store::fleet::FleetStore, node: Uuid, tried: &Tried) -> anyhow::Result<()> {
+    use tod_store::interview::InterviewCommand;
+    fleet
+        .interview(
+            "autopilot",
+            InterviewCommand::AskDecision {
+                node_id: node,
+                conversation_id: None,
+                protocol: Some(PROTOCOL.to_string()),
+                decision: new_decision(tried),
+            },
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let id = fleet
+        .read(|conn| Ok(DecisionRepo::new(conn).list_pending_for_node(node)?))?
+        .into_iter()
+        .find(|d| bot_of(d).is_some_and(|b| b.eq_ignore_ascii_case(&tried.bot)))
+        .map(|d| d.id)
+        .ok_or_else(|| anyhow::anyhow!("the request about {} that was just recorded is not there", tried.bot))?;
+    fleet
+        .interview(
+            "autopilot",
+            InterviewCommand::SettleDecision { decision_id: id, option: 1, text: None, rationale: rationale(tried) },
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(())
 }
 
 /// The options, in order.
@@ -279,7 +341,7 @@ pub fn new_decision(tried: &Tried) -> NewDecision {
 #[cfg(test)]
 pub(crate) fn waive_for_test(fleet: &tod_store::fleet::FleetStore, node: Uuid, bot: &str) {
     use tod_store::interview::{ACTOR_USER, InterviewCommand};
-    let tried = Tried { bot: bot.into(), prs: vec!["o/r#1".into()], asks: 3, last_ask_at: None, last_activity_at: None, exhausted: false };
+    let tried = Tried { bot: bot.into(), prs: vec!["o/r#1".into()], asks: 3, last_ask_at: None, last_activity_at: None, exhausted: false, auto_proceed: false };
     fleet
         .interview(
             "autopilot",
@@ -309,6 +371,7 @@ mod tests {
             last_ask_at: DateTime::parse_from_rfc3339("2026-11-12T10:00:00Z").ok().map(Into::into),
             last_activity_at: None,
             exhausted: false,
+            auto_proceed: true,
         }
     }
 

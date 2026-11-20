@@ -212,6 +212,9 @@ mod tests {
                 text: None,
                 actor: "user".into(),
                 answered_at: at,
+                decided_by: tod_store::decisions::DECIDED_BY_USER.into(),
+                conversation_id: None,
+                rationale: None,
             }],
         }
     }

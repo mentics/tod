@@ -37,7 +37,7 @@ use tod_store::node_timeline::{KIND_NOTE, TimelineEntry};
 use tod_store::outline::uuid_blob::now_ms;
 use tod_store::phase::PhaseRepo;
 use tod_store::pr_pushes::{
-    PrPush, PrPushRepo, VERDICT_BASELINE, VERDICT_REVIEWED, VERDICT_TOD, VERDICT_UNREVIEWED,
+    PrPush, PrPushRepo, VERDICT_BASELINE, VERDICT_MECHANICAL, VERDICT_REVIEWED, VERDICT_TOD, VERDICT_UNREVIEWED,
 };
 use uuid::Uuid;
 
@@ -140,6 +140,28 @@ pub fn check(
         fleet.writer().flush()?;
     }
     Ok(Ok(unreviewed))
+}
+
+/// Records that tod's own fixer commit `head` (the pull request's `pr`, which
+/// stood at `previous`) reached the pull request: a **mechanical** change, for
+/// which no review is owed (`doc/requests/design.md` 4.2.3). Called once the
+/// push has succeeded, so a head that never arrived is never recorded.
+pub fn record_mechanical(fleet: &FleetStore, node: Uuid, pr: &NodePr, previous: Option<String>, head: &str, lifecycle: &str) -> Result<()> {
+    let push = PrPush {
+        id: Uuid::new_v4(),
+        node_id: node,
+        pr: pr_label(pr),
+        head: head.to_string(),
+        previous,
+        verdict: VERDICT_MECHANICAL.to_string(),
+        lifecycle: lifecycle.to_string(),
+        conversation_id: None,
+        protocol: None,
+        seen_at: now_ms(),
+    };
+    fleet.enqueue(FleetMutation::RecordPrPush { push: Box::new(push), note: None })?;
+    fleet.writer().flush()?;
+    Ok(())
 }
 
 /// The failed note an unreviewed push leaves in the node's Activity.

@@ -687,7 +687,7 @@ fn run_command_once(cwd: &Workdir, check: &Check, files: &[String]) -> (Verdict,
 }
 
 /// Run `command` through the shell at `cwd`, stopping it after `limit`.
-fn run_shell(cwd: &Workdir, command_text: &str, files: &[String], limit: Duration) -> (Verdict, String) {
+pub(crate) fn run_shell(cwd: &Workdir, command_text: &str, files: &[String], limit: Duration) -> (Verdict, String) {
     // `exec 2>&1` makes one stream of what a person would see in a terminal.
     let script = format!("exec 2>&1\n{MEM_PROBE}\nexport TOD_CHANGED_FILES={}\n{}", shell_quote(&files.join("\n")), command_text);
     let result = match cwd {
@@ -928,16 +928,20 @@ pub fn run_stale_notifying(fleet: &FleetStore, node: Uuid, state: &str, on_work:
     let mut announced = false;
     let cwd = tod_store::fleet::provision::resolve_launch_cwd(fleet, &node.to_string())
         .with_context(|| format!("find the files to run the {state} checks in"))?;
-    let tree = Tree::new(&cwd)?;
-    let clean_head = tree.clean_head()?;
+    let mut tree = Tree::new(&cwd)?;
+    let mut clean_head = tree.clean_head()?;
     let mut round = Round { fingerprint: tree.fingerprint_all()?, runs: Vec::new() };
     // The commands this round actually ran, for the node's activity.
     let mut ran: Vec<tod_store::node_timeline::CommandResult> = Vec::new();
+    let mut fixed_files = false;
     for check in &checks {
         let dir = clean_dir(&check.dir);
         let assessment = assess(&tree, check)?;
         let latest = fleet.read(|conn| CheckRunRepo::new(conn).latest(node, key, &dir, &check.command))?;
-        let key_now = clean_head.as_deref().map(|head| tree_key(head, check));
+        let mut key_now = clean_head.as_deref().map(|head| tree_key(head, check));
+        let mut assessment = assessment;
+        // The files a fixer changed (below): the tree is read again after this check.
+        let mut refreshed: Option<Tree> = None;
         let run = match latest {
             // Current: the same files, or the same commit (a worktree made
             // again elsewhere has other paths, so another fingerprint).
@@ -989,6 +993,19 @@ pub fn run_stale_notifying(fleet: &FleetStore, node: Uuid, state: &str, on_work:
                 } else {
                     (Verdict::Skipped, format!("nothing changed in {}", check.scope()))
                 };
+                // A configured fixer runs on a failure, then only this check runs again.
+                let (verdict, output) = if verdict == Verdict::Failed && !check.fix.trim().is_empty() && assessment.applicable {
+                    let at = cwd.join(&dir);
+                    let (verdict, output, fixed) = fix_and_rerun(&at, check, &cwd, output, &mut ran)?;
+                    if let Some(new_tree) = fixed {
+                        assessment = assess(&new_tree, check)?;
+                        key_now = new_tree.clean_head()?.as_deref().map(|head| tree_key(head, check));
+                        refreshed = Some(new_tree);
+                    }
+                    (verdict, output)
+                } else {
+                    (verdict, output)
+                };
                 let run = CheckRun {
                     node_id: node,
                     phase: key.to_string(),
@@ -1014,6 +1031,12 @@ pub fn run_stale_notifying(fleet: &FleetStore, node: Uuid, state: &str, on_work:
                 run
             }
         };
+        if let Some(new_tree) = refreshed {
+            fixed_files = true;
+            clean_head = new_tree.clean_head()?;
+            round.fingerprint = new_tree.fingerprint_all()?;
+            tree = new_tree;
+        }
         round.runs.push(run);
     }
     if !ran.is_empty() {
@@ -1030,7 +1053,55 @@ pub fn run_stale_notifying(fleet: &FleetStore, node: Uuid, state: &str, on_work:
         fleet.enqueue(tod_store::fleet::FleetMutation::RecordTimeline(Box::new(entry)))?;
         fleet.writer().flush()?;
     }
+    // A mechanical commit is exempt from review: a round of review that was
+    // done before it covers the new head too, so it does not make the pull
+    // request's first head look unreviewed (`pr_draft_review::latest_review`).
+    if fixed_files {
+        crate::pr_draft_review::record_review_phase_heads(fleet, node, &cwd)?;
+    }
     Ok(round)
+}
+
+/// A check failed and has a configured `fix`: run it (committing what it
+/// changed as tod's own mechanical commit, [`crate::fixer`]) and run only
+/// this check again. Returns the verdict and output to record, and the
+/// freshly read tree when the fix changed files. A fix that fails, changes
+/// nothing, or leaves the check failing hands the failure on as it was, with
+/// what the fixer did added: nothing is hidden, and no agent is asked until
+/// the fixer has had its turn.
+fn fix_and_rerun(
+    at: &Workdir,
+    check: &Check,
+    cwd: &Workdir,
+    first_output: String,
+    ran: &mut Vec<tod_store::node_timeline::CommandResult>,
+) -> Result<(Verdict, String, Option<Tree>)> {
+    let outcome = crate::fixer::run_fix(at, &check.display(), &check.fix)?;
+    let (fix_verdict, fix_output) = match &outcome {
+        crate::fixer::FixOutcome::Failed(why) => (Verdict::Failed, why.clone()),
+        crate::fixer::FixOutcome::NoChange => (Verdict::Passed, "changed nothing".to_string()),
+        crate::fixer::FixOutcome::Committed { head } => (Verdict::Passed, format!("committed as {head} (a mechanical commit)")),
+        crate::fixer::FixOutcome::ChangedUncommitted => {
+            (Verdict::Passed, "changed files, left uncommitted: the tree already had uncommitted work that is not the fixer's".to_string())
+        }
+    };
+    ran.push(tod_store::node_timeline::CommandResult {
+        name: format!("fix for {}", check.display()),
+        command: check.fix.clone(),
+        verdict: fix_verdict.as_str().to_string(),
+        output: fix_output.clone(),
+    });
+    if !outcome.changed() {
+        return Ok((Verdict::Failed, format!("{first_output}\n\nThe configured fix `{}` ran: {fix_output}", check.fix.trim()), None));
+    }
+    let tree = Tree::new(cwd)?;
+    let assessment = assess(&tree, check)?;
+    let (verdict, output) = run_command(at, check, &assessment.files);
+    let output = match verdict {
+        Verdict::Passed => format!("passed after tod's configured fix `{}` ({fix_output})\n\n{output}", check.fix.trim()),
+        _ => format!("{output}\n\n(after tod's configured fix `{}`, which {fix_output}; before it: {first_output})", check.fix.trim()),
+    };
+    Ok((verdict, output, Some(tree)))
 }
 
 /// A check's directory as run keys hold it: `.` is the root, blank.
@@ -1151,6 +1222,60 @@ pub fn record_findings(fleet: &FleetStore, node: Uuid, failed: &[&CheckRun]) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A check that wants `a.txt` to say `pretty`, with a fixer that writes it.
+    fn format_check() -> Check {
+        Check {
+            label: "format".into(),
+            command: "test \"$(cat a.txt)\" = pretty".into(),
+            fix: "echo pretty > a.txt".into(),
+            ..Check::default()
+        }
+    }
+
+    #[test]
+    fn a_failing_check_with_a_fix_is_fixed_committed_and_run_again_by_itself() {
+        let dir = crate::fixer::tests::repo();
+        let at = Workdir::host(dir.path());
+        let check = format_check();
+        let (first, first_out) = run_command(&at, &check, &[]);
+        assert_eq!(first, Verdict::Failed);
+        let mut ran = Vec::new();
+        let (verdict, output, tree) = fix_and_rerun(&at, &check, &at, first_out, &mut ran).unwrap();
+        assert_eq!(verdict, Verdict::Passed, "{output}");
+        assert!(output.contains("passed after tod's configured fix"), "{output}");
+        assert!(tree.is_some(), "the files changed, so the tree is read again");
+        assert!(at.git(&["log", "-1", "--format=%s"]).unwrap().starts_with(crate::fixer::COMMIT_SUBJECT_PREFIX));
+        assert_eq!(ran.len(), 1);
+        assert_eq!(ran[0].name, "fix for format");
+        assert!(at.git(&["status", "--porcelain"]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_fix_that_changes_nothing_leaves_the_failure_as_it_was_with_what_the_fixer_did() {
+        let dir = crate::fixer::tests::repo();
+        let at = Workdir::host(dir.path());
+        let check = Check { fix: "true".into(), ..format_check() };
+        let before = at.git(&["rev-parse", "HEAD"]).unwrap();
+        let mut ran = Vec::new();
+        let (verdict, output, tree) = fix_and_rerun(&at, &check, &at, "it failed".into(), &mut ran).unwrap();
+        assert_eq!(verdict, Verdict::Failed);
+        assert!(tree.is_none());
+        assert!(output.contains("it failed") && output.contains("changed nothing"), "{output}");
+        assert_eq!(at.git(&["rev-parse", "HEAD"]).unwrap(), before);
+    }
+
+    #[test]
+    fn a_fix_that_does_not_cure_the_check_still_fails_it_after_the_commit() {
+        let dir = crate::fixer::tests::repo();
+        let at = Workdir::host(dir.path());
+        let check = Check { fix: "echo other > a.txt".into(), ..format_check() };
+        let mut ran = Vec::new();
+        let (verdict, output, tree) = fix_and_rerun(&at, &check, &at, "it failed".into(), &mut ran).unwrap();
+        assert_eq!(verdict, Verdict::Failed);
+        assert!(tree.is_some());
+        assert!(output.contains("after tod's configured fix"), "{output}");
+    }
 
     #[test]
     fn missing_dependencies_are_named_plainly_for_a_failure_or_a_timeout() {
