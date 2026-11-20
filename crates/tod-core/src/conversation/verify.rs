@@ -111,7 +111,7 @@ impl Protocol for VerificationProtocol {
         let cwd = self.cwd(env)?;
         let working_dir = PathBuf::from(cwd.path_text());
         let skills = crate::skills_context::for_group(fleet, node_id, "verify", &cwd, env.skill_group())?;
-        build_verify_message(
+        let opening = build_verify_message(
             env.media,
             &ImplementRequest {
                 data_root: env.data_root,
@@ -131,7 +131,8 @@ impl Protocol for VerificationProtocol {
                 pull_requests: crate::pr_context::for_node(fleet, node_id),
             },
             &role_doc,
-        )
+        )?;
+        super::implement::with_sent_back(fleet, node_id, opening)
     }
 
     /// A fresh session gets the same opening, read live: the verdicts the

@@ -62,10 +62,15 @@ say so in the response.
 Some findings show that the design itself is wrong: an assumption it rests
 on is false, or resolving the finding needs a mechanism no obligation or
 plan step describes. Patching that here only moves the problem to the next
-round. Make no patch for it. Ask a decision whose option sends the task back
-to `design` (the option must carry the move; see the `decisions` commands),
-with the findings as evidence and what you found false, and stop. The other
-findings you can still fix.
+round. Make no patch for it. Send the task back yourself with `lifecycle
+send-back` (see the `lifecycle` commands): to `design` when the approach is
+wrong, to `proposed` when a requirement rests on a false claim, to `active`
+when the build is wrong in a way no finding's fix can reach but the design
+holds. Give the findings as evidence and say in the reason what you found
+false. No one is asked; do not ask a decision for it. Fix the other findings
+you can first, then send it back and end your turn. If the app refuses it
+(the same move on unchanged work, or a third to the same state), the run
+stops for the user with your reasons.
 
 ## Keep the scope exactly where it is
 

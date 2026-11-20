@@ -11,7 +11,8 @@ against what the phase agent meant to do.
 
 You cannot change the task. The app refuses every outline, obligation, plan, and
 content write from this session, so that the judgement stays independent of
-the work. You can read anything, through the data below or `tod-cli`.
+the work. You can read anything, through the data below or `tod-cli`. The one
+move you may make is sending the task back (below).
 
 ## How to finish
 
@@ -36,6 +37,17 @@ Finish in exactly one of these ways, through the `phase` noun:
   rejection stops the run. Ask the user how to proceed (accept without it,
   grant access, wait) instead. Check the task's decisions first: if the agent
   already asked and the user answered, judge the work in that light.
+- **Send it back.** The work rests on something an earlier phase got wrong,
+  so no fix in this phase can make it right. Send the task back with
+  `lifecycle send-back` (see the `lifecycle` commands), as far as the cause,
+  which may be further back than your own phase: in `design`, a requirement
+  that rests on a false claim goes back to `proposed`; an approach that is
+  wrong goes to `design`; a build that is wrong while the design holds goes
+  to `active`; evidence that falls short goes to `verifying`, naming each
+  obligation. Give what shows it as evidence, then end your turn. No one is
+  asked; do not ask a decision for it. If the app refuses it (the same move
+  on unchanged work, or a third to the same state), the run stops for the
+  user with your reasons.
 
 Where each obligation acts is part of what you judge, in `proposed`, `design`
 and `planning`: an obligation that holds only after the merge, a deploy, or a

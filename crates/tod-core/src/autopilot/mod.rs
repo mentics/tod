@@ -236,6 +236,12 @@ pub enum NeedsHuman {
     /// it is in that state again: the rebuilt work is gone too, or the steps
     /// make no commits.
     LostWork { why: String },
+    /// An agent asked to send the node back and the loop guard refused it
+    /// (`tod_store::send_back::guard`): the same move again on unchanged
+    /// obligations, plan and design, or a third send-back to the same state
+    /// since the user last acted. `reasons` are the earlier send-backs'
+    /// reasons and then this one's.
+    SendBackLoop { from: String, to: String, why: String, reasons: Vec<String> },
 }
 
 impl NeedsHuman {
@@ -354,6 +360,12 @@ impl NeedsHuman {
                 "the same problem has come back {times} times and the agent is going in circles: {what}. \
                  Look at it yourself, or change the plan or the instructions, then run it again"
             ),
+            Self::SendBackLoop { from, to, why, reasons } => format!(
+                "an agent asked to send the task back from {from} to {to} and was stopped: {why}. \
+                 The reasons it gave: {}. Change the obligations, plan or design, tell the agent \
+                 what to do, or move the node yourself, then run it again",
+                reasons.iter().map(|r| format!("\"{r}\"")).collect::<Vec<_>>().join("; ")
+            ),
         }
     }
 }
@@ -444,6 +456,10 @@ pub struct Autopilot {
     /// The state [`crate::lost_work`] last looked in for this run, so the
     /// checkout is read once per state, not at every step in it.
     lost_checked: Option<String>,
+    /// An agent sent the node back during the step that just ended
+    /// ([`Self::sent_back_during`]): the step's outcome only unwinds it, and
+    /// the run goes on in the new state.
+    sent_back: bool,
 }
 
 /// How often a waiting pull request is read again, at first.
@@ -495,6 +511,7 @@ impl Autopilot {
             state,
             fresh_session,
             lost_checked: None,
+            sent_back: false,
         };
         if fresh_session {
             pilot.start_fresh_session()?;
@@ -716,17 +733,57 @@ impl Autopilot {
         }
         self.state.begin_active();
         self.save()?;
+        // A send-back the loop guard refused during this run stops it for the
+        // user (`tod_store::send_back::guard`); one refused before it started
+        // was what the user dealt with by running it again.
+        let run_started = state::now_ms();
+        loop {
+            let outcome = self.steps(fleet, agent, hook, run_started)?;
+            // An agent sent the node back mid-step (`tod-cli lifecycle
+            // send-back`): whatever the step was doing is over, and the run
+            // goes on from the state it was sent to.
+            if std::mem::take(&mut self.sent_back) {
+                continue;
+            }
+            return self.finish(outcome);
+        }
+    }
+
+    /// The steps of a run until one ends it (or an agent sends the node back,
+    /// [`Self::sent_back`]); [`Self::run_steps`] records the outcome.
+    fn steps<A: AgentAccess + ?Sized, H: StepHook + ?Sized>(
+        &mut self,
+        fleet: &FleetStore,
+        agent: &mut A,
+        hook: &mut H,
+        run_started: i64,
+    ) -> Result<Outcome> {
         let mut last: Option<(Standing, NextStep)> = None;
         loop {
             if let Some(reason) = hook.at(fleet, Boundary::Step)? {
-                return self.finish(Outcome::Stopped { reason });
+                return Ok(Outcome::Stopped { reason });
             }
             if let Some(limit) = self.over_budget() {
-                return self.finish(Outcome::BudgetExhausted { limit });
+                return Ok(Outcome::BudgetExhausted { limit });
             }
             let lifecycle = lifecycle::current_state(fleet, self.node)?;
             if lifecycle == "done" {
-                return self.finish(Outcome::Done);
+                return Ok(Outcome::Done);
+            }
+            let refused = fleet.read(|conn| {
+                Ok(tod_store::send_back::SendBackRepo::new(conn).stopped_since(self.node, run_started)?)
+            })?;
+            if let Some(stopped) = refused.into_iter().last() {
+                let mut reasons = stopped.earlier;
+                reasons.push(stopped.reason);
+                return Ok(Outcome::NeedsHuman {
+                    reason: NeedsHuman::SendBackLoop {
+                        from: stopped.from_state,
+                        to: stopped.to_state,
+                        why: stopped.stop_why,
+                        reasons,
+                    },
+                });
             }
             // Work the node's branch no longer holds is rebuilt, never asked
             // about, and comes before a question an agent asked about it.
@@ -736,7 +793,7 @@ impl Autopilot {
                     last = None;
                     continue;
                 }
-                ChecksStep::Stop(outcome) => return self.finish(outcome),
+                ChecksStep::Stop(outcome) => return Ok(outcome),
             }
             let mut pending = fleet
                 .read(|conn| Ok(DecisionRepo::new(conn).list_pending_for_node(self.node)?))?
@@ -745,20 +802,20 @@ impl Autopilot {
                 // A request about a bot that does not review drafts, on a
                 // pull request that is still one, has nothing to ask.
                 if let Some(outcome) = self.withdraw_draft_bot_requests(fleet)? {
-                    return self.finish(outcome);
+                    return Ok(outcome);
                 }
                 // A silence question about a bot still silent does not stop
                 // the run: it parks on the bot's review (a bot that comes
                 // withdraws the question).
                 let open_silence = match self.tend_silence_questions(fleet)? {
-                    (Some(outcome), _) => return self.finish(outcome),
+                    (Some(outcome), _) => return Ok(outcome),
                     (None, open) => open,
                 };
                 // Likewise a check-unrelated question about one check: the
                 // babysitter excludes that check from the agent's work and
                 // waits on the answer only when nothing else is left.
                 let open_unrelated = match self.tend_unrelated_check_questions(fleet)? {
-                    (Some(outcome), _) => return self.finish(outcome),
+                    (Some(outcome), _) => return Ok(outcome),
                     (None, open) => open,
                 };
                 pending = fleet
@@ -767,7 +824,7 @@ impl Autopilot {
                 pending = pending.saturating_sub(open_silence).saturating_sub(open_unrelated);
             }
             if pending > 0 {
-                return self.finish(Outcome::NeedsHuman {
+                return Ok(Outcome::NeedsHuman {
                     reason: NeedsHuman::Decision { pending },
                 });
             }
@@ -775,7 +832,7 @@ impl Autopilot {
             // after it, whatever stopped the run before they were done.
             let owed = self.state.pending_groups.is_some();
             if let Some(outcome) = self.run_pending_groups(fleet, agent, hook, &lifecycle)? {
-                return self.finish(outcome);
+                return Ok(outcome);
             }
             if owed {
                 // Their sessions are work done: the standing may read the same
@@ -791,7 +848,7 @@ impl Autopilot {
                     last = None;
                     continue;
                 }
-                ChecksStep::Stop(outcome) => return self.finish(outcome),
+                ChecksStep::Stop(outcome) => return Ok(outcome),
             }
             // `approved` waits for the merge and `merged` for the release.
             // `pr_draft` waits for a person to take the draft too, but only
@@ -802,7 +859,7 @@ impl Autopilot {
                 && let Some(outcome) = self.hold_for_github(fleet, &lifecycle)?
             {
                 hook.waiting(None, None);
-                return self.finish(outcome);
+                return Ok(outcome);
             }
             if lifecycle != "pr_draft" {
                 hook.wait_over();
@@ -816,12 +873,12 @@ impl Autopilot {
                 } else {
                     NeedsHuman::NoPlan
                 };
-                return self.finish(Outcome::NeedsHuman { reason });
+                return Ok(Outcome::NeedsHuman { reason });
             };
             // The same step again on the same standing: the last one did
             // nothing, and another would do the same.
             if last.as_ref() == Some(&(standing.clone(), step)) {
-                return self.finish(Outcome::NeedsHuman {
+                return Ok(Outcome::NeedsHuman {
                     reason: NeedsHuman::NoProgress {
                         step: step_name(step).to_string(),
                     },
@@ -865,7 +922,7 @@ impl Autopilot {
                     // Nothing standing is not non-convergence (the failed
                     // attempts that filled the count recorded nothing): review again.
                     if let Some(reason) = NeedsHuman::review_not_converging(self.state.loops.review_rounds, standing) {
-                        return self.finish(Outcome::NeedsHuman { reason });
+                        return Ok(Outcome::NeedsHuman { reason });
                     }
                 }
             }
@@ -886,7 +943,7 @@ impl Autopilot {
                             .collect::<Vec<_>>())
                     })?;
                     if let Some(reason) = cycle_stop(&mut self.state.loops, &lifecycle, &failing) {
-                        return self.finish(Outcome::NeedsHuman { reason });
+                        return Ok(Outcome::NeedsHuman { reason });
                     }
                     self.state.loops.fix_cycles += 1;
                     // Back to `active`; the next round implements the fix.
@@ -916,7 +973,7 @@ impl Autopilot {
                 }
             }
             if let Some(outcome) = stopped {
-                return self.finish(outcome);
+                return Ok(outcome);
             }
         }
     }
@@ -3052,6 +3109,7 @@ impl Autopilot {
             return Ok(Some(Outcome::BudgetExhausted { limit }));
         }
         let lifecycle = lifecycle::current_state(fleet, self.node)?;
+        let started = state::now_ms();
         self.fresh_session = false;
         let resumable = self
             .state
@@ -3172,7 +3230,44 @@ impl Autopilot {
         self.state.current = None;
         self.record(fleet, &step_label(kind, group), &lifecycle, conversation_id)?;
         close_session(agent, conversation_id);
-        Ok(None)
+        self.sent_back_during(fleet, &lifecycle, started)
+    }
+
+    /// What a send-back made during a conversation that began at `started`
+    /// in `lifecycle` means for the run. A refused one (the loop guard,
+    /// `tod_store::send_back::guard`) stops it for the user with every
+    /// reason given. One that moved the node ends the step that ran it,
+    /// whatever its caller meant to do next (the phase's later skill groups,
+    /// a pull request round): [`Self::sent_back`] is set, and the outcome
+    /// returned only unwinds to [`Self::run_steps`], which goes on in the
+    /// state the node was sent to.
+    fn sent_back_during(&mut self, fleet: &FleetStore, lifecycle: &str, started: i64) -> Result<Option<Outcome>> {
+        let node = self.node;
+        let rows = fleet.read(|conn| Ok(tod_store::send_back::SendBackRepo::new(conn).list_for_node(node)?))?;
+        let Some(latest) = rows.into_iter().filter(|r| r.created_at >= started).last() else {
+            return Ok(None);
+        };
+        if !latest.moved() {
+            let mut reasons = latest.earlier;
+            reasons.push(latest.reason);
+            return Ok(Some(Outcome::NeedsHuman {
+                reason: NeedsHuman::SendBackLoop {
+                    from: latest.from_state,
+                    to: latest.to_state,
+                    why: latest.stop_why,
+                    reasons,
+                },
+            }));
+        }
+        if lifecycle::current_state(fleet, node)? == lifecycle {
+            return Ok(None);
+        }
+        self.state.pending_groups = None;
+        self.save()?;
+        self.sent_back = true;
+        Ok(Some(Outcome::Stopped {
+            reason: format!("sent back from {} to {}", latest.from_state, latest.to_state),
+        }))
     }
 
     /// The agent is blocked on `request`. What the node's saved answers

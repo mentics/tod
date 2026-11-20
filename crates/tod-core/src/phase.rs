@@ -302,6 +302,9 @@ pub struct PhaseStanding {
     /// and the latest certify or reject. Lets the runner tell a step that did something
     /// from one that did nothing.
     pub marker: String,
+    /// The send-back that brought the node into this stay, rendered
+    /// (`tod_store::send_back::render_for_opening`); empty when none did.
+    pub sent_back: String,
 }
 
 impl PhaseStanding {
@@ -333,6 +336,7 @@ impl PhaseStanding {
             evaluation_requested,
             fixes,
             marker,
+            sent_back: tod_store::send_back::render_for_opening(conn, node)?,
         })
     }
 
@@ -386,6 +390,10 @@ pub fn render_status(standing: &PhaseStanding, independent: bool) -> String {
         out.push('\n');
     }
     out.push('\n');
+    if !standing.sent_back.is_empty() {
+        out.push_str(&standing.sent_back);
+        out.push('\n');
+    }
     if !certifiable {
         return out;
     }
@@ -429,5 +437,47 @@ mod tests {
         for state in ["ready", "active", "verifying", "review", "pr", "pr_draft", "pr_review", "approved", "done"] {
             assert!(!has_phase_agent(state), "{state}");
         }
+    }
+
+    /// An evaluator in `design` sends the task back to `proposed`: the
+    /// `proposed` phase agent's status block starts from that cause.
+    #[test]
+    fn the_phase_status_carries_the_send_back_that_brought_the_task_here() {
+        use tod_store::conversation::{ConversationRepo, Focus, ProtocolKind, actor_for};
+        use tod_store::fleet::schema;
+        use tod_store::interview::InterviewCommand;
+        use tod_store::outline::repos::NodeRepo;
+
+        let dir = tod_test_util::scratch_dir(format!("tod-phase-sent-back-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = schema::open_writer_connection(&dir.join("tod.db")).unwrap();
+        let node = Uuid::new_v4();
+        NodeRepo::new(&conn).create_with_id(node, "n", "N").unwrap();
+        NodeRepo::new(&conn).set_lifecycle(node, "design").unwrap();
+        let before = render_status(&PhaseStanding::load(&conn, node, "design").unwrap(), true);
+        assert!(!before.contains("## Sent back"), "{before}");
+
+        let evaluator = ConversationRepo::new(&conn)
+            .create(Focus::Node(node), ProtocolKind::Evaluate, None, None, None)
+            .unwrap()
+            .id;
+        tod_store::interview::execute(
+            &conn,
+            &dir,
+            &actor_for(evaluator),
+            &InterviewCommand::SendBack(tod_store::send_back::Request {
+                conversation_id: evaluator,
+                to: "proposed".into(),
+                reason: "the org has no DigiKey id, so the requirement rests on a false claim".into(),
+                evidence: Vec::new(),
+                obligations: Vec::new(),
+            }),
+        )
+        .unwrap();
+
+        let status = render_status(&PhaseStanding::load(&conn, node, "proposed").unwrap(), true);
+        assert!(status.contains("## Sent back"), "{status}");
+        assert!(status.contains("evaluator sent this task back from `design` to `proposed`"), "{status}");
+        assert!(status.contains("rests on a false claim"), "{status}");
     }
 }

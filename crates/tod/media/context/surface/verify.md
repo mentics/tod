@@ -25,12 +25,16 @@ decision with the reason `broken` that says what you found (the branch, the
 base, what is missing), and stop; the app reads it, reopens the work if the
 branch proves it lost, and otherwise leaves your question for the user.
 
-When the problem is anything else that only rebuilding fixes (not lost code),
-and you want the user to decide whether to send the task back, offer it as an
-option that carries the move, never as plain words: the app moves the task
-only for an option made with the move (see the `decisions` commands), and
-your session cannot. A plain "send the task back" option leaves the task where
-it is and you asking again.
+A build that falls short is not a send-back: record the `failed` verdicts
+and steps, and the app takes the task back to `active` with them. When what
+you find means an earlier phase got it wrong, send the task back yourself
+with `lifecycle send-back` (see the `lifecycle` commands), as far as the
+cause: to `design` when the approach is wrong (something the design rests
+on is false, or it cannot work), to `proposed` when a requirement rests on
+a false claim. No one is asked; do not ask a decision for it. Give the
+verdicts or obligations that show it as evidence, then end your turn. If
+the app refuses it (the same move on unchanged work, or a third to the same
+state), the run stops for the user with your reasons.
 
 ## What you were given up front
 

@@ -85,6 +85,17 @@ pub const IMPLEMENT_NODE_ENV: &str = "TOD_IMPLEMENT_NODE";
 /// which conversation they record for.
 pub const IMPLEMENT_CONVERSATION_ENV: &str = "TOD_IMPLEMENT_CONVERSATION";
 
+/// `opening` with the send-back that brought the node into this stay, when
+/// one did (`tod_store::send_back`): the reason, the evidence, the state it
+/// came from and who sent it, so the session starts from the cause.
+pub(crate) fn with_sent_back(fleet: &FleetStore, node: Uuid, opening: String) -> Result<String> {
+    let section = fleet.read(|conn| tod_store::send_back::render_for_opening(conn, node))?;
+    if section.is_empty() {
+        return Ok(opening);
+    }
+    Ok(format!("{}\n\n{}", opening.trim_end(), section.trim_end()))
+}
+
 pub struct ImplementationProtocol;
 
 impl Protocol for ImplementationProtocol {
@@ -165,7 +176,7 @@ impl Protocol for ImplementationProtocol {
         let cwd = self.cwd(env)?;
         let working_dir = PathBuf::from(cwd.path_text());
         let skills = crate::skills_context::for_group(fleet, node_id, "implement", &cwd, env.skill_group())?;
-        build_implement_message(
+        let opening = build_implement_message(
             env.media,
             &ImplementRequest {
                 data_root: env.data_root,
@@ -184,7 +195,8 @@ impl Protocol for ImplementationProtocol {
                 skills,
                 pull_requests: crate::pr_context::for_node(fleet, node_id),
             },
-        )
+        )?;
+        with_sent_back(fleet, node_id, opening)
     }
 
     /// A fresh session gets the same opening: the plan and obligations it
@@ -1049,6 +1061,47 @@ mod tests {
             failed,
             errors,
         }
+    }
+
+    /// A review sends the task back to `active`: the implementation opening
+    /// starts from that cause; with none, the opening is unchanged.
+    #[test]
+    fn the_implementation_opening_carries_the_send_back() {
+        use tod_store::conversation::{ConversationRepo, Focus};
+        use tod_store::interview::{ACTOR_AGENT, InterviewCommand};
+        use tod_store::outline::repos::NodeRepo;
+
+        let root = tod_test_util::scratch_dir(format!("tod-implement-sent-back-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let fleet = FleetStore::open(&root).unwrap();
+        let conn = tod_store::fleet::schema::open_writer_connection(&root.join("tod.db")).unwrap();
+        let node = Uuid::new_v4();
+        NodeRepo::new(&conn).create_with_id(node, "n", "N").unwrap();
+        NodeRepo::new(&conn).set_lifecycle(node, "review").unwrap();
+        assert_eq!(with_sent_back(&fleet, node, "opening".into()).unwrap(), "opening");
+
+        let review = ConversationRepo::new(&conn)
+            .create(Focus::Node(node), ProtocolKind::Review, None, None, None)
+            .unwrap()
+            .id;
+        tod_store::interview::execute(
+            &conn,
+            &root,
+            ACTOR_AGENT,
+            &InterviewCommand::SendBack(tod_store::send_back::Request {
+                conversation_id: review,
+                to: "active".into(),
+                reason: "the retry loop never backs off".into(),
+                evidence: Vec::new(),
+                obligations: Vec::new(),
+            }),
+        )
+        .unwrap();
+
+        let opening = with_sent_back(&fleet, node, "opening".into()).unwrap();
+        assert!(opening.starts_with("opening\n\n## Sent back"), "{opening}");
+        assert!(opening.contains("review session sent this task back from `review` to `active`"), "{opening}");
+        assert!(opening.contains("never backs off"), "{opening}");
     }
 
     #[test]

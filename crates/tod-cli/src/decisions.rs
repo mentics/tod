@@ -222,7 +222,7 @@ fn parse_move(raw: &str) -> anyhow::Result<OptionMove> {
     Ok(OptionMove { option, to: to.to_string(), asked_in: None })
 }
 
-fn parse_evidence(inv: &Invocation, raw: &str) -> anyhow::Result<EvidenceRef> {
+pub(crate) fn parse_evidence(inv: &Invocation, raw: &str) -> anyhow::Result<EvidenceRef> {
     let (kind, id) = raw
         .split_once(':')
         .ok_or_else(|| anyhow::anyhow!("--evidence must be `kind:id` (got `{raw}`)"))?;

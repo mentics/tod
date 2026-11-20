@@ -529,7 +529,8 @@ pub fn stop_reason(outcome: &Outcome, budget: &Budget) -> Option<String> {
             | NeedsHuman::CheckBroken { .. }
             | NeedsHuman::ChecksNotConverging { .. }
             | NeedsHuman::ChecksUnfixed { .. }
-            | NeedsHuman::LostWork { .. } => Some(reason.describe()),
+            | NeedsHuman::LostWork { .. }
+            | NeedsHuman::SendBackLoop { .. } => Some(reason.describe()),
         },
     }
 }

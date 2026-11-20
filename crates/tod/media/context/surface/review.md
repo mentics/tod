@@ -36,21 +36,26 @@ branch proves it lost, and otherwise leaves your question for the user.
 
 ## Sending the task back
 
-Your session cannot move the task. To send it back, ask a decision whose
-option carries the move (see the `decisions` commands); the app moves the
-task only for an option made with the move, so a plain "send the task back"
-option leaves it where it is and you asking again. Send it back as far as
-the cause:
+When a finding means an earlier phase got it wrong, send the task back
+yourself with `lifecycle send-back` (see the `lifecycle` commands): no one
+is asked, the task moves, and the phase you send it to starts from your
+reason. Do not ask a decision for it. Send it back as far as the cause:
 
 - To `verifying` when the evidence that an obligation holds falls short
-  (below). Name each obligation and what its evidence lacks.
-- To `design` when a finding shows that something the design rests on is
-  false: an assumption about the data, an external system, or code it
-  reuses, or an approach that cannot work. A redesign is not a fix.
-- To `proposed` when a finding shows a requirement rests on something false.
-- To `active` when the problem is anything else only rebuilding fixes.
+  (below). Name each obligation whose evidence falls short, and say in the
+  reason what it lacks; only those verdicts are reopened.
+- To `active` when the build is wrong but the design holds, and only
+  rebuilding fixes it.
+- To `design` when the approach is wrong: something the design rests on is
+  false (an assumption about the data, an external system, or code it
+  reuses), or the approach cannot work. A redesign is not a fix.
+- To `proposed` when a requirement rests on a false claim.
 
-Record the findings as well, so the work that follows has them.
+Record the findings first, and link them to the send-back as evidence, so
+the work that follows has them. Then end your turn: the review is over. If
+the app refuses the send-back (the same move on unchanged work, or a third
+to the same state), the run stops for the user with your reasons; do not
+try another route.
 
 ## What to look for
 

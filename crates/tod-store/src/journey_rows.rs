@@ -65,6 +65,7 @@ pub const ROW_KEYS: &[(&str, &[(&str, KeyKind)])] = &[
     ("decision_answers", &[("id", Int)]),
     ("phase_events", &[("id", Blob)]),
     ("node_subtree_archives", &[("id", Blob)]),
+    ("node_send_backs", &[("id", Blob)]),
 ];
 
 /// True for the tables whose rows hold transcript text (withheld from

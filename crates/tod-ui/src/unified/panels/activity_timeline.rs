@@ -8,7 +8,7 @@
 //! the state that change left; with no change recorded (a node older than the
 //! timeline), everything is in the node's current state.
 
-use tod_store::node_timeline::{KIND_CHECKS, KIND_GATE, KIND_NOTE, KIND_PHASE, TimelineEntry};
+use tod_store::node_timeline::{KIND_CHECKS, KIND_GATE, KIND_NOTE, KIND_PHASE, KIND_SEND_BACK, TimelineEntry};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,8 +19,8 @@ pub enum ItemKind {
     Gate(TimelineEntry),
     /// A round of the phase's configured commands; each is in the entry.
     Commands(TimelineEntry),
-    /// Something the app did by itself and says why (`KIND_NOTE`); the entry's
-    /// detail is the reason.
+    /// Something the app did by itself and says why (`KIND_NOTE`), or an
+    /// agent's send-back (`KIND_SEND_BACK`); the entry's detail is the reason.
     Note(TimelineEntry),
 }
 
@@ -202,7 +202,7 @@ pub fn entry_items(timeline: &[TimelineEntry]) -> Vec<Item> {
             let kind = match e.kind.as_str() {
                 KIND_GATE => ItemKind::Gate(e.clone()),
                 KIND_CHECKS => ItemKind::Commands(e.clone()),
-                KIND_NOTE => ItemKind::Note(e.clone()),
+                KIND_NOTE | KIND_SEND_BACK => ItemKind::Note(e.clone()),
                 _ => return None,
             };
             Some(Item {

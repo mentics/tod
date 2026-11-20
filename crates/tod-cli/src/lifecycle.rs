@@ -1,26 +1,35 @@
-//! `tod-cli lifecycle` — the operator's way to move a node's lifecycle state.
+//! `tod-cli lifecycle` — move a node's lifecycle state: the operator's `set`,
+//! and a judging session's `send-back`.
 //!
-//! The same store change as the task panel's phase chip: both send
+//! `set` is the same store change as the task panel's phase chip: both send
 //! `tod_core::lifecycle::operator::user_move`, so a move back clears what
 //! certified the states being redone, reopens verified verdicts, cancels what
 //! the node waited on and retakes or clears the lifecycle baseline.
 //! Unlike the chip it does not advance the node's Linear ticket (that needs
 //! a second store writer beside the daemon). Refused in an agent session,
 //! and into `pr_review` or beyond.
+//!
+//! `send-back` is the agent's: a phase agent, evaluator, verification, review
+//! or fix session sends its own node back to the phase that got it wrong
+//! (`tod_store::send_back`, the same store move), with the conversation as
+//! the sender. A send-back the loop guard refuses stops the run for the user
+//! and fails here with why.
 
 use crate::Invocation;
 use crate::args::Args;
+use tod_core::conversation::implement::IMPLEMENT_CONVERSATION_ENV;
 use tod_core::interview::client::InterviewClient;
 use tod_core::lifecycle::operator;
-use tod_store::interview::ACTOR_USER;
+use tod_store::interview::{ACTOR_AGENT, ACTOR_ENV, ACTOR_USER, InterviewCommand, InterviewRepo};
 use tod_store::outline::repos::NodeRepo;
 use uuid::Uuid;
 
 pub(crate) const USAGE: &str = "\
-tod-cli lifecycle — move a node's lifecycle state (operator only)
+tod-cli lifecycle — move a node's lifecycle state
 
 COMMANDS:
     set <NODE> <STATE> --reason <TEXT>
+    send-back --to <STATE> --reason <TEXT> [--evidence <KIND>:<ID>]... [--obligation <ID>]...
 
 `set` moves the node to <STATE> at once, bypassing the gates, exactly as the
 task panel's state chip does: a move back clears what certified the states
@@ -30,6 +39,15 @@ node's Linear ticket, as the chip does. <NODE> is a node slug or full UUID.
 It is for the operator only and is refused in an agent session. It also
 refuses `pr_review` and every state after it: marking the pull request ready
 and choosing a reviewer are the user's step.
+
+`send-back` sends the session's own node back to an earlier state, before
+`pr_review`, with the reason and evidence that phase starts from. Only a
+phase agent, an evaluator, or a verification, review or fix session may use
+it. At `active` or earlier the implementation steps and verified verdicts
+reopen; to `verifying`, only the verdicts of the --obligation(s) named, and
+at least one is required. The same move again on unchanged obligations, plan
+and design, or a third send-back to the same state since the user last acted,
+is refused and stops the run for the user.
 ";
 
 pub fn run(inv: Invocation) -> anyhow::Result<String> {
@@ -41,8 +59,54 @@ pub fn run(inv: Invocation) -> anyhow::Result<String> {
     let args = Args::parse(&rest)?;
     match command.as_str() {
         "set" => set(&inv, &args, |name| std::env::var(name).ok()),
+        "send-back" => send_back(&inv, &args, |name| std::env::var(name).ok()),
         other => anyhow::bail!("unknown command `{other}`\n\n{}", USAGE.trim_end()),
     }
+}
+
+/// `env` is the process environment, passed in so a test can play an agent.
+fn send_back(inv: &Invocation, args: &Args, env: impl Fn(&str) -> Option<String>) -> anyhow::Result<String> {
+    let set = |name: &str| env(name).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    let Some(raw) = set(IMPLEMENT_CONVERSATION_ENV) else {
+        anyhow::bail!("not in an agent session: {}", tod_store::send_back::WHO_MAY);
+    };
+    let conversation_id = Uuid::parse_str(&raw)
+        .map_err(|_| anyhow::anyhow!("{IMPLEMENT_CONVERSATION_ENV} is not a UUID (`{raw}`)"))?;
+    let to = args.require("--to")?.trim().to_string();
+    let reason = args.require("--reason")?.trim().to_string();
+    let evidence = args
+        .get_all("--evidence")
+        .iter()
+        .map(|raw| crate::decisions::parse_evidence(inv, raw))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let client = InterviewClient::new(&inv.data_root, set(ACTOR_ENV).unwrap_or_else(|| ACTOR_AGENT.to_string()));
+    let obligations = args
+        .get_all("--obligation")
+        .iter()
+        .map(|raw| client.read(|conn| InterviewRepo::new(conn).resolve_obligation_id(raw)))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let result = client.interview(InterviewCommand::SendBack(tod_store::send_back::Request {
+        conversation_id,
+        to: to.clone(),
+        reason,
+        evidence,
+        obligations,
+    }))?;
+    if result["outcome"] == tod_store::send_back::OUTCOME_STOPPED {
+        anyhow::bail!(
+            "not sent back: {}. The run stops here for the user; end your turn",
+            result["why"].as_str().unwrap_or("the loop guard refused it")
+        );
+    }
+    if inv.json {
+        return Ok(serde_json::to_string(&result)?);
+    }
+    Ok(format!(
+        "ok sent back {} -> {}; end your turn, the {} phase takes it from here",
+        result["from"].as_str().unwrap_or("?"),
+        to,
+        to
+    ))
 }
 
 /// `env` is the process environment, passed in so a test can play an agent.
@@ -171,5 +235,56 @@ mod tests {
         assert_eq!(detail.from, "review");
         assert_eq!(detail.reason.as_deref(), Some("tod-cli: work was lost"));
         assert_eq!(verdict[&obligation].status, tod_store::verification::VERDICT_REOPENED);
+    }
+
+    fn conversation(root: &PathBuf, node: Uuid, protocol: tod_store::conversation::ProtocolKind) -> Uuid {
+        let db = tod_store::fleet::FleetStore::open(root).unwrap().paths().db().to_path_buf();
+        let conn = tod_store::fleet::schema::open_writer_connection(&db).unwrap();
+        tod_store::conversation::ConversationRepo::new(&conn)
+            .create(tod_store::conversation::Focus::Node(node), protocol, None, None, None)
+            .unwrap()
+            .id
+    }
+
+    fn session(conversation: Uuid) -> impl Fn(&str) -> Option<String> {
+        move |name| (name == IMPLEMENT_CONVERSATION_ENV).then(|| conversation.to_string())
+    }
+
+    #[test]
+    fn send_back_outside_a_session_says_who_may() {
+        let (root, node, _) = crate::tests::data_root();
+        crate::tests::set_lifecycle(&root, node, "review");
+        let (i, a) = inv(&root, &["--to", "active", "--reason", "x"]);
+        let err = send_back(&i, &a, no_env).unwrap_err();
+        assert!(err.to_string().contains("only a phase agent"), "{err}");
+        assert_eq!(state(&root, node), "review");
+    }
+
+    #[test]
+    fn send_back_by_an_implementation_session_is_refused() {
+        let (root, node, _) = crate::tests::data_root();
+        crate::tests::set_lifecycle(&root, node, "active");
+        let id = conversation(&root, node, tod_store::conversation::ProtocolKind::Implementation);
+        let (i, a) = inv(&root, &["--to", "design", "--reason", "x"]);
+        let err = send_back(&i, &a, session(id)).unwrap_err();
+        assert!(err.to_string().contains("only a phase agent"), "{err}");
+        assert_eq!(state(&root, node), "active");
+    }
+
+    #[test]
+    fn a_review_session_sends_the_node_back_and_a_repeat_is_refused() {
+        let (root, node, _) = crate::tests::data_root();
+        crate::tests::set_lifecycle(&root, node, "review");
+        let id = conversation(&root, node, tod_store::conversation::ProtocolKind::Review);
+        let (i, a) = inv(&root, &["--to", "active", "--reason", "the build is wrong"]);
+        let out = send_back(&i, &a, session(id)).unwrap();
+        assert!(out.starts_with("ok sent back review -> active"), "{out}");
+        assert_eq!(state(&root, node), "active");
+
+        crate::tests::set_lifecycle(&root, node, "review");
+        let err = send_back(&i, &a, session(id)).unwrap_err();
+        assert!(err.to_string().contains("not sent back"), "{err}");
+        assert!(err.to_string().contains("unchanged"), "{err}");
+        assert_eq!(state(&root, node), "review");
     }
 }
