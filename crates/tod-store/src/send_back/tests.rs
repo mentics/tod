@@ -4,7 +4,7 @@ use crate::fleet::schema;
 use crate::interview::{ACTOR_AGENT, InterviewCommand};
 use crate::node_timeline::TimelineRepo;
 use crate::outline::repos::{NodeRepo, ObligationRepo};
-use crate::verification::VerdictRepo;
+use crate::verification::{VerdictHow, VerdictRepo};
 use std::path::Path;
 
 struct Fx {
@@ -112,8 +112,8 @@ fn back_to_verifying_reopens_only_the_named_obligations() {
     let fx = setup("review");
     let (shown, short) = (obligation(&fx, 0, "Shown live"), obligation(&fx, 1, "Only mocked"));
     let verdicts = VerdictRepo::new(&fx.conn);
-    verdicts.record(fx.node, shown, None, "verified", "ran it").unwrap();
-    verdicts.record(fx.node, short, None, "verified", "a unit test").unwrap();
+    verdicts.record(fx.node, shown, None, "verified", "ran it", &VerdictHow::method("live")).unwrap();
+    verdicts.record(fx.node, short, None, "verified", "a unit test", &VerdictHow::method("unit")).unwrap();
     let review = conversation(&fx, ProtocolKind::Review);
 
     let err = send(&fx, ACTOR_AGENT, request(review, "verifying", "evidence short")).unwrap_err();
@@ -133,8 +133,8 @@ fn back_to_active_reopens_every_verdict_as_before() {
     let fx = setup("review");
     let (a, b) = (obligation(&fx, 0, "A"), obligation(&fx, 1, "B"));
     let verdicts = VerdictRepo::new(&fx.conn);
-    verdicts.record(fx.node, a, None, "verified", "ok").unwrap();
-    verdicts.record(fx.node, b, None, "verified", "ok").unwrap();
+    verdicts.record(fx.node, a, None, "verified", "ok", &VerdictHow::method("live")).unwrap();
+    verdicts.record(fx.node, b, None, "verified", "ok", &VerdictHow::method("live")).unwrap();
     let fix = conversation(&fx, ProtocolKind::Fix);
     send(&fx, ACTOR_AGENT, request(fix, "active", "the build is wrong")).unwrap();
     let latest = verdicts.latest_for_node(fx.node).unwrap();

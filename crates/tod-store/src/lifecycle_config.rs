@@ -83,12 +83,13 @@ pub fn add_delete_sandbox(conn: &Connection) -> Result<()> {
 /// The phases an agent works in, and so the keys a config may name: the
 /// lifecycle states that have a phase agent, and the protocols that run
 /// in the others (`implement`, `verify`, `review`, `fix`, `pr`).
-pub const PHASES: [&str; 13] = [
+pub const PHASES: [&str; 14] = [
     "proposed",
     "design",
     "planning",
     "implement",
     "verify",
+    "verify_evaluate",
     "review",
     "fix",
     "pr",
@@ -98,6 +99,26 @@ pub const PHASES: [&str; 13] = [
     "released",
     "learn",
 ];
+
+/// The independent evaluator of verification's evidence (in `verifying`).
+/// Unset, it runs with what [`VERIFY`] sets: see [`fallback`].
+pub const VERIFY_EVALUATE: &str = "verify_evaluate";
+
+/// The verification protocol's key.
+pub const VERIFY: &str = "verify";
+
+/// The key whose settings `phase` takes where no node sets its own: the
+/// evidence evaluator takes verification's, so a config written before it had
+/// a key of its own keeps applying to it.
+pub fn fallback(phase: &str) -> Option<&'static str> {
+    (phase == VERIFY_EVALUATE).then_some(VERIFY)
+}
+
+/// Whether a phase's gate runs checks: not the evidence evaluator's, which is
+/// one session inside `verifying` (whose checks are [`VERIFY`]'s).
+pub fn takes_checks(phase: &str) -> bool {
+    phase != VERIFY_EVALUATE
+}
 
 /// The last lifecycle state (`done`, which has no agent and so no entry in
 /// [`PHASES`]): a node entering it has its sandbox deleted unless
@@ -262,6 +283,8 @@ pub fn set_skills(conn: &Connection, node_id: Uuid, config: &Skills) -> Result<(
 
 /// The skills for `phase` on `node_id`: the nearest node, from itself up,
 /// that lists the phase wins. `None` when no node does.
+///
+/// Where no node lists it, a phase with a [`fallback`] resolves as that one.
 pub fn resolve(conn: &Connection, node_id: Uuid, phase: &str) -> Result<Option<Resolved>> {
     // `ancestor_chain` runs from the root down to the node: scan nearest first.
     for id in crate::outline::ancestor_chain(conn, node_id)?.into_iter().rev() {
@@ -269,7 +292,10 @@ pub fn resolve(conn: &Connection, node_id: Uuid, phase: &str) -> Result<Option<R
             return Ok(Some(Resolved { skills: list, source_node: id, inherited: id != node_id }));
         }
     }
-    Ok(None)
+    match fallback(phase) {
+        Some(other) => resolve(conn, node_id, other),
+        None => Ok(None),
+    }
 }
 
 /// The model and effort defined on `node_id` itself, by phase.
@@ -326,6 +352,16 @@ pub fn resolve_agent(conn: &Connection, node_id: Uuid, phase: &str) -> Result<Re
         }
         if out.model.is_some() && out.effort.is_some() {
             break;
+        }
+    }
+    // Each field no node sets for `phase` comes from its fallback's.
+    if let Some(other) = fallback(phase) && (out.model.is_none() || out.effort.is_none()) {
+        let from = resolve_agent(conn, node_id, other)?;
+        if out.model.is_none() {
+            out.model = from.model;
+        }
+        if out.effort.is_none() {
+            out.effort = from.effort;
         }
     }
     Ok(out)
@@ -465,6 +501,9 @@ pub fn set_checks(conn: &Connection, node_id: Uuid, config: &Checks) -> Result<(
     for (phase, list) in config {
         if !is_phase(phase) {
             bail!("{phase} is not a lifecycle phase ({})", PHASES.join(", "));
+        }
+        if !takes_checks(phase) && !list.is_empty() {
+            bail!("{phase} runs no checks: its gate is `verifying`'s, so put them under `{VERIFY}`");
         }
         let mut out = Vec::new();
         for check in list {

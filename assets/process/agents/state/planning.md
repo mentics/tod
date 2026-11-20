@@ -14,9 +14,10 @@
    - List assumptions explicitly: as plan steps when they are work, as obligations when they are requirements.
 3. Resolve planning and implementation unknowns here. Spikes are complete, or deferred with decision trees, before the phase is done.
 4. Drain parked items: promote every open parked interview memory item to a plan step or obligation, or discard it.
-5. Work that belongs to a different releasable chunk (a follow-up that needs this one released first, or an out-of-scope bug or opportunity you found) does not go in this plan. Offer it as a new task: see "Follow-up work" in the base doc.
-6. **Line up what verification will need.** For each obligation that acts in `verifying` (and every other one verification will check against the real system), list what the check needs: credentials and access (the `secrets`, `access` and `db` nouns list what you have), test data, API quota. Ask the user now for anything missing, with the `access` reason, so it is in place by `verifying`. Missing access is never a reason to move a check to `merged` or `released`.
-7. Ask the user only for a decision you genuinely cannot make yourself: a tradeoff with no right answer the obligations and code settle, or a gap design left open that turns on what the user wants. Offer options with your recommendation first.
+5. Every obligation is live unless design marked it code-only; planning cannot mark or clear that. If one should be code-only, ask the user.
+6. Work that belongs to a different releasable chunk (a follow-up that needs this one released first, or an out-of-scope bug or opportunity you found) does not go in this plan. Offer it as a new task: see "Follow-up work" in the base doc.
+7. **Line up what verification will need.** For each obligation that acts in `verifying` (and every other one verification will check against the real system), list what the check needs: credentials and access (the `secrets`, `access` and `db` nouns list what you have), test data, API quota. Ask the user now for anything missing, with the `access` reason, so it is in place by `verifying`. Missing access is never a reason to move a check to `merged` or `released`.
+8. Ask the user only for a decision you genuinely cannot make yourself: a tradeoff with no right answer the obligations and code settle, or a gap design left open that turns on what the user wants. Offer options with your recommendation first.
 
 ## Done when
 

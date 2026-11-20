@@ -54,6 +54,9 @@ pub struct GateCheckRequest<'a> {
     pub skills: String,
     /// The node's linked pull requests (`crate::pr_context`).
     pub pull_requests: String,
+    /// Every current verdict on the node's obligations. Only the evaluator
+    /// of `verifying` is given them; empty for every other state.
+    pub verdicts: Vec<tod_store::verification::ObligationVerdict>,
     pub from_state: String,
     pub to_state: String,
     /// Criteria for this transition paired with the node's most recent
@@ -112,6 +115,7 @@ fn dynamic_context<'a>(
         work_history: &request.work_history,
         skills: &request.skills,
         pull_requests: &request.pull_requests,
+        verdicts: &request.verdicts,
         ..Default::default()
     }
 }
@@ -135,6 +139,7 @@ mod tests {
             work_history: String::new(),
             skills: String::new(),
             pull_requests: String::new(),
+            verdicts: Vec::new(),
             from_state: "design".into(),
             to_state: "planning".into(),
             criteria: Vec::new(),

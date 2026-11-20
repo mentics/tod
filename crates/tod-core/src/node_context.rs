@@ -173,8 +173,13 @@ pub fn obligation_line(o: &NodeObligation) -> String {
     } else {
         format!(" acts_in={}", o.acts_in)
     };
+    let code_only = o
+        .code_only
+        .as_deref()
+        .map(|reason| format!(" code-only ({reason})"))
+        .unwrap_or_default();
     format!(
-        "[{}] {}{acts_in}{section}: {}{visual_design}",
+        "[{}] {}{acts_in}{code_only}{section}: {}{visual_design}",
         short_id(o.id),
         o.kind,
         one_line(&o.body)
@@ -658,6 +663,7 @@ mod tests {
             phase: "requirements".into(),
             acts_in: "active".into(),
             visual_design_path: None,
+            code_only: None,
         }
     }
 
@@ -730,7 +736,7 @@ mod tests {
 
         // Pass one: a failure, then learn → done.
         VerdictRepo::new(&conn)
-            .record(node, ob.id, None, "failed", "Escape did nothing")
+            .record(node, ob.id, None, "failed", "Escape did nothing", &tod_store::verification::VerdictHow::default())
             .unwrap();
         nodes.set_lifecycle(node, "learn").unwrap();
         LearnRepo::new(&conn).record_draft(node, "Missed Escape.").unwrap();
@@ -755,7 +761,7 @@ mod tests {
         .unwrap();
         nodes.set_lifecycle(node, "planning").unwrap();
         VerdictRepo::new(&conn)
-            .record(node, ob.id, None, "failed", "Enter closed it too")
+            .record(node, ob.id, None, "failed", "Enter closed it too", &tod_store::verification::VerdictHow::default())
             .unwrap();
         let history = render_work_history(&conn, node).unwrap();
         assert!(

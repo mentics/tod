@@ -10,7 +10,10 @@ use crate::args::Args;
 use tod_core::conversation::implement::{IMPLEMENT_CONVERSATION_ENV, IMPLEMENT_NODE_ENV};
 use tod_store::interview::{InterviewCommand, InterviewRepo, short_id};
 use tod_store::review::normalize;
-use tod_store::verification::{AGENT_VERDICTS, ObligationStanding, VerdictRepo};
+use tod_store::verification::{
+    AGENT_VERDICTS, ObligationStanding, ObligationVerdict, VERDICT_VERIFIED, VerdictRepo,
+    parse_method,
+};
 use uuid::Uuid;
 
 pub(crate) const USAGE: &str = "\
@@ -22,6 +25,7 @@ Inside a verification conversation --node defaults to the node being verified.
 COMMANDS:
     list      [--node <UUID>] [--unchecked]
     record    <OBLIGATION_ID> [--node <UUID>] --status verified|failed --evidence <TEXT>
+              [--method live|local-data|static|unit] [--ran <TEXT>]
     history   [--node <UUID>]
 
 `list` shows the node's own obligations with where each stands: unchecked,
@@ -29,6 +33,10 @@ verified, failed, or reopened (verified once, but the code changed since).
 `record` rules on one obligation, the node's own or an inherited constraint:
 --evidence says what you ran and what you saw (use `--evidence -` and a heredoc
 for anything long), and is required for verified as much as for failed.
+--method says how you showed it, and is required for verified: live (the
+running work against the real system), local-data (a local database seeded
+with crafted data), static (reading the code, a type check), or unit (tests
+with mocks). --ran names what you ran: the command, request, or query.
 `history` lists every verdict the node's obligations have been given, oldest
 first.
 ";
@@ -69,16 +77,32 @@ fn env_uuid(name: &str) -> anyhow::Result<Option<Uuid>> {
 
 fn standing_line(standing: &ObligationStanding) -> String {
     let evidence = match &standing.verdict {
-        Some(verdict) => format!("\n    evidence: {}", verdict.evidence),
+        Some(verdict) => format!("{}\n    evidence: {}", how_lines(verdict), verdict.evidence),
+        None => String::new(),
+    };
+    let code_only = match &standing.obligation.code_only {
+        Some(reason) => format!(" (code-only: {reason})"),
         None => String::new(),
     };
     format!(
-        "[{}] {} {}: {}{evidence}",
+        "[{}] {} {}{code_only}: {}{evidence}",
         short_id(standing.obligation.id),
         standing.status(),
         standing.obligation.kind,
         standing.obligation.body
     )
+}
+
+/// The verdict's method and what ran, each on its own indented line.
+fn how_lines(verdict: &ObligationVerdict) -> String {
+    let mut out = String::new();
+    if let Some(method) = &verdict.method {
+        out.push_str(&format!("\n    method: {method}"));
+    }
+    if let Some(ran) = &verdict.ran {
+        out.push_str(&format!("\n    ran: {ran}"));
+    }
+    out
 }
 
 fn list(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
@@ -99,7 +123,10 @@ fn list(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
                     "kind": s.obligation.kind,
                     "body": s.obligation.body,
                     "status": s.status(),
+                    "code_only": s.obligation.code_only,
                     "evidence": s.verdict.as_ref().map(|v| v.evidence.clone()),
+                    "method": s.verdict.as_ref().and_then(|v| v.method.clone()),
+                    "ran": s.verdict.as_ref().and_then(|v| v.ran.clone()),
                 })
             })
             .collect();
@@ -131,6 +158,12 @@ fn record(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
         !evidence.is_empty(),
         "--evidence says what you ran and what you saw; it cannot be empty"
     );
+    let method = args.get("--method").map(parse_method).transpose()?;
+    anyhow::ensure!(
+        status != VERDICT_VERIFIED || method.is_some(),
+        "--method is required for verified: live, local-data, static, or unit (how you showed it holds)"
+    );
+    let ran = args.get("--ran").map(str::trim).filter(|r| !r.is_empty());
     let result = inv
         .client()
         .interview(InterviewCommand::RecordObligationVerdict {
@@ -139,6 +172,8 @@ fn record(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
             conversation_id: env_uuid(IMPLEMENT_CONVERSATION_ENV)?,
             status: status.to_string(),
             evidence: evidence.to_string(),
+            method: method.map(str::to_string),
+            ran: ran.map(str::to_string),
         })?;
     if inv.json {
         return Ok(serde_json::to_string(&result)?);
@@ -159,6 +194,8 @@ fn history(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
                     "obligation_id": v.obligation_id.to_string(),
                     "status": v.status,
                     "evidence": v.evidence,
+                    "method": v.method,
+                    "ran": v.ran,
                     "created_at": v.created_at,
                 })
             })
@@ -170,7 +207,11 @@ fn history(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
     }
     Ok(verdicts
         .iter()
-        .map(|v| format!("[{}] {}: {}", short_id(v.obligation_id), v.status, v.evidence))
+        .map(|v| {
+            let method = v.method.as_deref().map(|m| format!(" ({m})")).unwrap_or_default();
+            let ran = v.ran.as_deref().map(|r| format!(" [ran: {r}]")).unwrap_or_default();
+            format!("[{}] {}{method}: {}{ran}", short_id(v.obligation_id), v.status, v.evidence)
+        })
         .collect::<Vec<_>>()
         .join("\n"))
 }

@@ -38,8 +38,16 @@ pub const CERTIFIER_INDEPENDENT: &str = "independent";
 /// The user did ("Mark phase done").
 pub const CERTIFIER_USER: &str = "user";
 
-/// The states whose leaving needs a certificate.
-pub const CERTIFIABLE_STATES: [&str; 6] = ["proposed", "design", "planning", "pr", "merged", "released"];
+/// The states whose leaving needs a certificate. `verifying` needs one only
+/// with independent evaluation on: the evidence evaluator's audit of
+/// verification's verdicts ([`VERIFYING`]).
+pub const CERTIFIABLE_STATES: [&str; 7] =
+    ["proposed", "design", "planning", "verifying", "pr", "merged", "released"];
+
+/// The state whose certificate is the independent audit of verification's
+/// evidence. No agent records it `ready`, and only the evaluator or the user
+/// certifies or rejects it: verification never judges its own evidence.
+pub const VERIFYING: &str = "verifying";
 
 /// Whether `state` is one a certificate can be recorded for.
 pub fn is_certifiable(state: &str) -> bool {
@@ -159,6 +167,24 @@ struct InObligation {
     /// this keep their digest.
     #[serde(default = "acts_in_active", skip_serializing_if = "is_acts_in_active")]
     acts_in: String,
+    /// Why it is checked in the code alone; left out when live, so earlier
+    /// certificates keep their digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    code_only: Option<String>,
+}
+
+/// An obligation's current verdict on the node, as the evidence evaluator
+/// judged it. No id or time: the same verdict recorded again (after the
+/// evaluator reopened it) reads the same.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct InVerdict {
+    obligation_id: Uuid,
+    status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    method: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ran: Option<String>,
+    evidence: String,
 }
 
 fn acts_in_active() -> String {
@@ -234,6 +260,8 @@ struct Inputs {
     plan_steps: Option<Vec<InStep>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     step_obligations: Option<Vec<InLink>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    verdicts: Option<Vec<InVerdict>>,
 }
 
 /// The canonical inputs of `state`'s phase on `node_id`, or `None` when the
@@ -251,6 +279,9 @@ struct Inputs {
 ///   send the phase back.
 /// - `planning`: own obligations, plan steps (id, body, phase), and which step
 ///   satisfies which obligation.
+/// - `verifying`: own obligations, and each obligation's current verdict on
+///   the node (status, method, what ran, evidence), so a later verdict makes
+///   the evidence evaluator's certificate stale.
 /// - `pr`, `merged`, `released`: `{}` — the certificate is a check mark for
 ///   the stay. In `pr` it is the pull request's agent saying the draft is
 ///   ready; a move back starts a new stay, so it must say so again.
@@ -273,6 +304,11 @@ pub fn phase_inputs(conn: &Connection, node_id: Uuid, state: &str) -> Result<Opt
             step_obligations: Some(step_links(conn, node_id)?),
             ..Default::default()
         },
+        VERIFYING => Inputs {
+            obligations: Some(obligations(conn, node_id)?),
+            verdicts: Some(verdicts(conn, node_id)?),
+            ..Default::default()
+        },
         "pr" | "merged" | "released" => Inputs::default(),
         _ => return Ok(None),
     };
@@ -287,7 +323,7 @@ pub fn digest(inputs: &Value) -> String {
 
 fn obligations(conn: &Connection, node_id: Uuid) -> Result<Vec<InObligation>> {
     let mut stmt = conn.prepare(
-        "SELECT id, kind, body, acts_in FROM node_obligations WHERE node_id = ?1 ORDER BY id",
+        "SELECT id, kind, body, acts_in, code_only FROM node_obligations WHERE node_id = ?1 ORDER BY id",
     )?;
     let rows = stmt
         .query_map(params![uuid_to_blob(node_id)], |row| {
@@ -296,10 +332,26 @@ fn obligations(conn: &Connection, node_id: Uuid) -> Result<Vec<InObligation>> {
                 kind: row.get(1)?,
                 body: row.get(2)?,
                 acts_in: row.get(3)?,
+                code_only: row.get(4)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(sorted(rows, |o| o.id))
+}
+
+fn verdicts(conn: &Connection, node_id: Uuid) -> Result<Vec<InVerdict>> {
+    let rows = crate::verification::VerdictRepo::new(conn)
+        .latest_for_node(node_id)?
+        .into_values()
+        .map(|v| InVerdict {
+            obligation_id: v.obligation_id,
+            status: v.status,
+            method: v.method,
+            ran: v.ran,
+            evidence: v.evidence,
+        })
+        .collect();
+    Ok(sorted(rows, |v| v.obligation_id))
 }
 
 fn content(conn: &Connection, node_id: Uuid) -> Result<Vec<InContent>> {
@@ -420,6 +472,8 @@ pub fn describe_changes(before: &Value, after: &Value) -> Vec<String> {
                 "changed kind"
             } else if a.acts_in != b.acts_in {
                 "changed where it is acted on"
+            } else if a.code_only != b.code_only {
+                "changed whether it is code-only"
             } else {
                 "reworded"
             }
@@ -460,6 +514,20 @@ pub fn describe_changes(before: &Value, after: &Value) -> Vec<String> {
                 "moved to another phase"
             } else {
                 "reworded"
+            }
+        },
+    );
+    diff_keyed(
+        &mut lines,
+        before.verdicts.as_deref().unwrap_or_default(),
+        after.verdicts.as_deref().unwrap_or_default(),
+        |v| (v.obligation_id, short_id(v.obligation_id)),
+        |id| format!("verdict on obligation {id}"),
+        |a, b| {
+            if a.status != b.status {
+                "changed status"
+            } else {
+                "changed evidence"
             }
         },
     );
@@ -546,6 +614,20 @@ impl<'a> PhaseRepo<'a> {
         }
         if ![CERTIFIER_SELF, CERTIFIER_INDEPENDENT, CERTIFIER_USER].contains(&certifier) {
             bail!("unknown certifier `{certifier}`");
+        }
+        if state == VERIFYING {
+            if kind == PHASE_READY {
+                bail!(
+                    "`verifying` is not recorded ready: the evidence evaluator runs once \
+                    verification has ruled on everything"
+                );
+            }
+            if certifier == CERTIFIER_SELF {
+                bail!(
+                    "verification does not judge its own evidence: only the independent \
+                    evidence evaluator or the user certifies or rejects `verifying`"
+                );
+            }
         }
         let current = self.current_state(node_id)?;
         let Some(snapshot) = phase_inputs(self.conn, node_id, state)? else {
@@ -839,7 +921,7 @@ mod tests {
             assert!(is_certifiable(state));
             assert!(phase_inputs(&fx.conn, fx.node, state).unwrap().is_some());
         }
-        for state in ["ready", "active", "verifying", "review", "pr_draft", "pr_review", "approved", "learn", "done"] {
+        for state in ["ready", "active", "review", "pr_draft", "pr_review", "approved", "learn", "done"] {
             assert!(!is_certifiable(state));
             assert!(phase_inputs(&fx.conn, fx.node, state).unwrap().is_none());
         }
@@ -1065,6 +1147,7 @@ mod tests {
                 node_id: fx.node,
                 state: state(),
                 fixes: vec!["Split the second obligation".into(), " ".into()],
+                reopen: Vec::new(),
             },
         )
         .unwrap();
@@ -1099,6 +1182,7 @@ mod tests {
             node_id: fx.node,
             state: state(),
             fixes: vec![" ".into()],
+            reopen: Vec::new(),
         };
         assert!(run(&fx, "user", blank_fix).is_err());
     }

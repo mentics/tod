@@ -68,6 +68,16 @@ API's answer. Prose that says it was checked, or a conclusion with nothing
 behind it, does not hold; reject it with a `--fix` naming what is missing.
 Spot-check a claim yourself when it is cheap (one query, one file read).
 
+## In `verifying`: audit the evidence
+
+In `verifying` you judge verification's evidence, not a phase agent's work.
+For each verdict below ask: does the method fit (a live obligation needs
+`live` or `local-data`), did what ran exercise the obligation's claim, and
+does the evidence show the result? Where the change alters how existing work
+is done, a replay of real items must exist. Certify when every verdict holds.
+Otherwise `reject` with one `--fix` per gap and `--reopen` each verdict that
+falls short; verification redoes them.
+
 Be strict but not pedantic. Reject only for something that would make the next
 phase go wrong, not for style. When you certify, you are vouching that the
 next phase can start from this without coming back.

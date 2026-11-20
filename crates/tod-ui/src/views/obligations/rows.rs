@@ -10,7 +10,7 @@ use crate::ui::style;
 use crate::views::rows::{
     ObligationRowEvent, ObligationRowProps, RowAction, RowHost, RowOptions, obligation_row, op_icon,
 };
-use gpui::{AnyElement, App, Entity, IntoElement, ParentElement, Window, div};
+use gpui::{AnyElement, App, Entity, IntoElement, ParentElement, Styled, Window, div};
 use gpui_component::input::TextareaState;
 use tod_store::conversation::NetOp;
 use tod_store::outline::{KIND_CONSTRAINT, KIND_REQUIREMENT, NodeObligation};
@@ -113,6 +113,8 @@ pub struct ObligationItem {
     /// satisfies it — shown as a trailing badge. `None` before the node has a
     /// plan to stand against.
     pub standing: Option<String>,
+    /// How the current verdict was reached (`live`, `unit`, ...), if any.
+    pub method: Option<String>,
 }
 
 pub type ObRow = ItemListRow<ObligationItem, ObGroup>;
@@ -209,7 +211,7 @@ pub fn render_obligation(
         leading: item
             .marker
             .map(|op| op_icon(("obligation-op", state.row_ix), op)),
-        trailing_context: item.standing.as_deref().map(standing_badge),
+        trailing_context: trailing_badges(item),
         struck: item.struck,
         ..state.row_options()
     };
@@ -223,11 +225,36 @@ pub fn render_obligation(
     obligation_row(props, host, opts, window, cx)
 }
 
+/// The standing badge (with the verdict's method), and a `code-only` badge
+/// for an obligation marked so; its reason is in the CLI and agent blocks.
+fn trailing_badges(item: &ObligationItem) -> Option<AnyElement> {
+    let standing = item.standing.as_deref().map(|standing| match item.method.as_deref() {
+        Some(method) => standing_badge(&format!("{standing} · {method}")),
+        None => standing_badge(standing),
+    });
+    let code_only = item
+        .obligation
+        .code_only
+        .as_ref()
+        .map(|_| style::badge(div()).child("code-only").into_any_element());
+    match (standing, code_only) {
+        (None, None) => None,
+        (Some(one), None) | (None, Some(one)) => Some(one),
+        (Some(standing), Some(code_only)) => Some(
+            gpui_component::h_flex()
+                .gap_1()
+                .child(code_only)
+                .child(standing)
+                .into_any_element(),
+        ),
+    }
+}
+
 /// Where the obligation stands, as a badge; a failed verdict reads as an
 /// error.
 fn standing_badge(standing: &str) -> AnyElement {
     let badge = style::badge(div()).child(standing.to_string());
-    if standing == VERDICT_FAILED {
+    if standing.starts_with(VERDICT_FAILED) {
         style::text_error(badge).into_any_element()
     } else {
         badge.into_any_element()

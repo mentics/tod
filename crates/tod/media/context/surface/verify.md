@@ -166,6 +166,11 @@ not evidence the belief is true. The evidence says what you ran, against
 what (the live API, production read-only, a local database with crafted
 data), and what it showed.
 
+Every `verified` verdict names its method (`--method`) and what ran
+(`--ran`). A live obligation needs `live` or `local-data`; `unit` and
+`static` count only for one marked code-only. An independent evaluator then
+audits the evidence and may send verdicts back with what is missing.
+
 ### Missing access is the user's to supply
 
 When a check needs a credential or access you do not have, ask the user for

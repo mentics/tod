@@ -116,3 +116,15 @@
       say: One `--fix` per problem, saying what is wrong and what would make it right.
     - run: decisions ask <QUESTION>
       say: Only for what no agent can settle. End your turn after asking.
+
+# ── Evaluator: verification's evidence ──────────────────────────────────────
+- role: evaluate
+  states: [verifying]
+  title: The evidence
+  actions:
+    - run: verdicts list --node <UUID>
+      say: Each verdict's method, what ran, and its evidence. A live obligation needs `live` or `local-data`.
+    - run: verdicts history --node <UUID>
+      say: What failed along the way, and what it took to pass.
+    - run: phase reject --fix <TEXT> --reopen <OBLIGATION_ID>
+      say: Reopen each verdict whose evidence falls short; verification redoes it.

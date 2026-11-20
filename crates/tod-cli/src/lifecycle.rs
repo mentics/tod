@@ -211,7 +211,7 @@ mod tests {
             tod_store::outline::repos::ObligationRepo::new(&conn)
                 .insert_at(obligation, node, "requirement", usize::MAX, None, "Holds", "requirements")
                 .unwrap();
-            VerdictRepo::new(&conn).record(node, obligation, None, "verified", "Saw it work.").unwrap();
+            VerdictRepo::new(&conn).record(node, obligation, None, "verified", "Saw it work.", &tod_store::verification::VerdictHow::method("live")).unwrap();
         }
         let id = node.to_string();
         let (i, a) = inv(&root, &[&id, "active", "--reason", "work was lost"]);

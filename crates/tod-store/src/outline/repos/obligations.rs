@@ -54,6 +54,11 @@ pub struct NodeObligation {
     /// mockup HTML file, when one has been saved. At most one per
     /// obligation — saving again overwrites this rather than adding another.
     pub visual_design_path: Option<String>,
+    /// Why this obligation is checked in the code alone (a pure function, a
+    /// refactor, a rename), so a unit or static check verifies it. `None`
+    /// means it is live: verification must exercise it against the running
+    /// work. Set only by the design phase agent or the user.
+    pub code_only: Option<String>,
 }
 
 pub struct ObligationRepo<'a> {
@@ -77,8 +82,8 @@ impl<'a> ObligationRepo<'a> {
     pub fn insert(&self, row: &NodeObligation) -> Result<()> {
         let now = now_ms();
         self.conn.execute(
-            "INSERT INTO node_obligations (id, node_id, kind, ordinal, section, body, phase, acts_in, visual_design_path, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
+            "INSERT INTO node_obligations (id, node_id, kind, ordinal, section, body, phase, acts_in, visual_design_path, code_only, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
             params![
                 uuid_to_blob(row.id),
                 uuid_to_blob(row.node_id),
@@ -89,6 +94,7 @@ impl<'a> ObligationRepo<'a> {
                 row.phase,
                 row.acts_in,
                 row.visual_design_path,
+                row.code_only,
                 now
             ],
         )?;
@@ -97,7 +103,7 @@ impl<'a> ObligationRepo<'a> {
 
     pub fn get(&self, id: Uuid) -> Result<Option<NodeObligation>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, node_id, kind, ordinal, section, body, phase, acts_in, visual_design_path FROM node_obligations WHERE id = ?1",
+            "SELECT id, node_id, kind, ordinal, section, body, phase, acts_in, visual_design_path, code_only FROM node_obligations WHERE id = ?1",
         )?;
         let row = stmt
             .query_row(params![uuid_to_blob(id)], map_obligation)
@@ -107,7 +113,7 @@ impl<'a> ObligationRepo<'a> {
 
     pub fn list_for_node(&self, node_id: Uuid) -> Result<Vec<NodeObligation>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, node_id, kind, ordinal, section, body, phase, acts_in, visual_design_path FROM node_obligations
+            "SELECT id, node_id, kind, ordinal, section, body, phase, acts_in, visual_design_path, code_only FROM node_obligations
              WHERE node_id = ?1 ORDER BY kind, ordinal",
         )?;
         let rows = stmt
@@ -120,7 +126,7 @@ impl<'a> ObligationRepo<'a> {
     /// kind and ordinal. Backs the project-wide `tod-cli obligations list`.
     pub fn list_all(&self) -> Result<Vec<NodeObligation>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, node_id, kind, ordinal, section, body, phase, acts_in, visual_design_path FROM node_obligations
+            "SELECT id, node_id, kind, ordinal, section, body, phase, acts_in, visual_design_path, code_only FROM node_obligations
              ORDER BY node_id, kind, ordinal",
         )?;
         let rows = stmt
@@ -195,6 +201,18 @@ impl<'a> ObligationRepo<'a> {
         Ok(())
     }
 
+    /// Mark the obligation code-only with `reason`, or live again with `None`.
+    pub fn update_code_only(&self, id: Uuid, reason: Option<&str>) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE node_obligations SET code_only = ?1, updated_at = ?2 WHERE id = ?3",
+            params![reason, now_ms(), uuid_to_blob(id)],
+        )?;
+        if n == 0 {
+            anyhow::bail!("obligation not found");
+        }
+        Ok(())
+    }
+
     /// Set (or clear, with `None`) the associated visual-design mockup path.
     /// Overwrites any previous value — an obligation has at most one.
     pub fn update_visual_design_path(&self, id: Uuid, path: Option<&str>) -> Result<()> {
@@ -244,6 +262,7 @@ impl<'a> ObligationRepo<'a> {
             phase: phase.to_string(),
             acts_in: ACTS_IN_ACTIVE.to_string(),
             visual_design_path: None,
+            code_only: None,
         })?;
         ids.insert(index, id);
         self.write_ordinals(node_id, kind, &ids)?;
@@ -302,6 +321,7 @@ impl<'a> ObligationRepo<'a> {
             phase: row.phase,
             acts_in: row.acts_in,
             visual_design_path: row.visual_design_path,
+            code_only: row.code_only,
         })?;
         Ok(())
     }
@@ -402,5 +422,6 @@ fn map_obligation(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeObligation> {
         phase: row.get(6)?,
         acts_in: row.get(7)?,
         visual_design_path: row.get(8)?,
+        code_only: row.get(9)?,
     })
 }

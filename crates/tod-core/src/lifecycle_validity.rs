@@ -405,7 +405,7 @@ mod tests {
             .unwrap();
         assert_eq!(check(&fx).unwrap().target, "verifying");
         VerdictRepo::new(&fx.conn)
-            .record(fx.node, fx.obligation, None, "verified", "Saw it.")
+            .record(fx.node, fx.obligation, None, "verified", "Saw it.", &tod_store::verification::VerdictHow::method("live"))
             .unwrap();
         assert_eq!(check(&fx), None);
     }

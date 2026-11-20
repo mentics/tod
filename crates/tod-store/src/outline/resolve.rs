@@ -129,6 +129,7 @@ pub fn copy_capabilities(conn: &Connection, source_id: Uuid, target_id: Uuid) ->
             phase: ob.phase,
             acts_in: ob.acts_in,
             visual_design_path: None,
+            code_only: ob.code_only,
         };
         obl_repo.insert(&copy)?;
     }

@@ -111,7 +111,8 @@ impl Protocol for VerificationProtocol {
         let cwd = self.cwd(env)?;
         let working_dir = PathBuf::from(cwd.path_text());
         let skills = crate::skills_context::for_group(fleet, node_id, "verify", &cwd, env.skill_group())?;
-        let opening = build_verify_message(
+        let fixes = fleet.read(|conn| crate::phase::evidence_fixes(conn, node_id))?;
+        let message = build_verify_message(
             env.media,
             &ImplementRequest {
                 data_root: env.data_root,
@@ -132,6 +133,10 @@ impl Protocol for VerificationProtocol {
             },
             &role_doc,
         )?;
+        let opening = match evidence_fixes_section(&fixes) {
+            Some(section) => format!("{message}\n\n{section}"),
+            None => message,
+        };
         super::implement::with_sent_back(fleet, node_id, opening)
     }
 
@@ -201,7 +206,12 @@ impl Protocol for VerificationProtocol {
         let standings = due_standings(turn.env.fleet, node);
         let all_standings = self::standings(turn.env.fleet, node);
         let all_steps = plan_steps(turn.env.fleet, node);
+        let evidence_fixes = turn
+            .env
+            .fleet
+            .read(|conn| crate::phase::evidence_fixes(conn, node))?;
         let owed = Owed {
+            evidence_fixes,
             untraced: untraced_for_later_phase(&all_standings, &all_steps),
             obligations: standings.iter().filter(|s| s.is_unchecked()).collect(),
             stranded: stranded_failures(&standings, &steps),
@@ -310,6 +320,9 @@ fn untraced_for_later_phase<'a>(
 
 /// What a verification turn left undone.
 struct Owed<'a> {
+    /// What the evidence evaluator said is missing, while its rejection
+    /// stands (no verdict recorded since).
+    evidence_fixes: Vec<String>,
     untraced: Vec<&'a ObligationStanding>,
     obligations: Vec<&'a ObligationStanding>,
     stranded: Vec<&'a ObligationStanding>,
@@ -320,6 +333,7 @@ struct Owed<'a> {
 impl Owed<'_> {
     fn nothing(&self) -> bool {
         self.obligations.is_empty()
+            && self.evidence_fixes.is_empty()
             && self.untraced.is_empty()
             && self.stranded.is_empty()
             && self.steps.is_empty()
@@ -329,6 +343,9 @@ impl Owed<'_> {
     /// A short account of why the loop is continuing, for the journey.
     fn reason(&self) -> String {
         let mut parts = Vec::new();
+        if !self.evidence_fixes.is_empty() {
+            parts.push("the evidence evaluator sent the evidence back".to_string());
+        }
         if !self.obligations.is_empty() {
             parts.push(format!("{} obligation(s) with no verdict", self.obligations.len()));
         }
@@ -351,6 +368,10 @@ impl Owed<'_> {
     /// transcript entry reads as.
     fn message(&self) -> String {
         let mut out = String::from("Verification is not done yet.\n\n");
+        if let Some(section) = evidence_fixes_section(&self.evidence_fixes) {
+            out.push_str(&section);
+            out.push_str("\n\n");
+        }
         if !self.obligations.is_empty() {
             out.push_str(&format!(
                 "{} with no verdict. Exercise each one in the running work \
@@ -423,6 +444,23 @@ impl Owed<'_> {
     }
 }
 
+/// The evidence evaluator's rejection, for verification to answer: what it
+/// said is missing. `None` when no rejection stands.
+fn evidence_fixes_section(fixes: &[String]) -> Option<String> {
+    if fixes.is_empty() {
+        return None;
+    }
+    let mut out = String::from(
+        "An independent evaluator audited your evidence and sent it back. \
+         Record each verdict it names again (`verdicts record`), with a method \
+         that fits and what you ran, after doing what is missing:\n\n",
+    );
+    for fix in fixes {
+        out.push_str(&format!("- {fix}\n"));
+    }
+    Some(out.trim_end().to_string())
+}
+
 fn count(n: usize, what: &str) -> String {
     match n {
         1 => format!("1 {what}"),
@@ -468,6 +506,8 @@ pub fn mock_turn(
                 conversation_id: Some(conversation_id),
                 status: VERDICT_VERIFIED.to_string(),
                 evidence: "mock agent — nothing was really exercised".to_string(),
+                method: Some(tod_store::verification::METHOD_LIVE.to_string()),
+                ran: Some("mock agent: nothing".to_string()),
             },
         )?;
     }
@@ -646,6 +686,8 @@ mod tests {
                     conversation_id: None,
                     status: status.into(),
                     evidence: "Drove the app and looked.".into(),
+                    method: Some("live".into()),
+                    ran: None,
                 },
             )
             .unwrap();

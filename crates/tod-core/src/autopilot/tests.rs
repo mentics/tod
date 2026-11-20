@@ -102,6 +102,8 @@ impl FakeAgent {
                 conversation_id: Some(conversation),
                 status: if failed { "failed" } else { "verified" }.to_string(),
                 evidence: format!("scripted round {round}"),
+                method: Some("live".into()),
+                ran: Some("the scripted check".into()),
             })?;
         }
         let steps = self.fleet.read(|conn| Ok(PlanStepRepo::new(conn).list_for_node(node)?))?;
@@ -1199,6 +1201,84 @@ fn an_evaluator_that_keeps_rejecting_the_same_work_stops_the_run() {
     assert_eq!(lifecycle::current_state(&fx.fleet, fx.node).unwrap(), "proposed");
     let steps: Vec<_> = pilot.state().steps.iter().map(|s| s.step.clone()).collect();
     assert_eq!(steps, ["phase", "evaluate", "phase", "evaluate"], "{steps:?}");
+}
+
+/// In `verifying`, finished verification is audited by an independent
+/// evaluator before the gate. One that sends the same evidence back twice
+/// (verification redid the reopened verdicts, but they read the same) stops
+/// the run for the user.
+#[test]
+fn the_evidence_evaluator_audits_verification_and_stops_when_stuck() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    fx.fleet
+        .enqueue_outline(OutlineMutation::UpdateNodeTitle {
+            node_id: fx.node,
+            title: "Interview node [reject]".into(),
+        })
+        .unwrap();
+    fx.fleet
+        .enqueue_outline(OutlineMutation::SetLifecycle { node_id: fx.node, state: "verifying".into() })
+        .unwrap();
+    fx.fleet.writer().flush().unwrap();
+    let conn = rusqlite::Connection::open(fx.fleet.paths().db()).unwrap();
+    conn.execute("UPDATE node_plan_steps SET status = 'implemented'", []).unwrap();
+    drop(conn);
+    fx.fleet.reload_if_stale().ok();
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut pilot = autopilot(&fx, Budget::default());
+    let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
+    let steps: Vec<_> = pilot.state().steps.iter().map(|s| s.step.clone()).collect();
+    assert!(
+        matches!(
+            &outcome,
+            Outcome::NeedsHuman { reason: NeedsHuman::EvaluationStuck { fixes } } if !fixes.is_empty()
+        ),
+        "{outcome:?} {steps:?}"
+    );
+    assert_eq!(lifecycle::current_state(&fx.fleet, fx.node).unwrap(), "verifying");
+    assert_eq!(steps, ["verification", "evaluate", "verification", "evaluate"], "{steps:?}");
+    // The evaluator was given the verdicts with their method.
+    let log = agent.log.lock().unwrap();
+    let audit = log
+        .iter()
+        .find(|(kind, _)| *kind == ProtocolKind::Evaluate)
+        .map(|(_, sent)| sent.clone())
+        .unwrap();
+    assert!(audit.contains("method: live"), "{audit}");
+    assert!(audit.contains("audit the evidence"), "{audit}");
+}
+
+/// Without the rejection, the evaluator certifies verification's evidence
+/// and the node goes on to review.
+#[test]
+fn the_evidence_evaluator_certifies_and_the_node_moves_on() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    fx.fleet
+        .enqueue_outline(OutlineMutation::SetLifecycle { node_id: fx.node, state: "verifying".into() })
+        .unwrap();
+    fx.fleet.writer().flush().unwrap();
+    let conn = rusqlite::Connection::open(fx.fleet.paths().db()).unwrap();
+    conn.execute("UPDATE node_plan_steps SET status = 'implemented'", []).unwrap();
+    drop(conn);
+    fx.fleet.reload_if_stale().ok();
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut pilot = autopilot(&fx, Budget::default());
+    let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
+    let steps: Vec<_> = pilot.state().steps.iter().map(|s| s.step.clone()).collect();
+    assert_eq!(&steps[..3], ["verification", "evaluate", "advance"], "{outcome:?} {steps:?}");
+    let events = fx
+        .fleet
+        .read(|conn| tod_store::phase::PhaseRepo::new(conn).list_for_node(fx.node))
+        .unwrap();
+    assert!(
+        events.iter().any(|e| e.state == tod_store::phase::VERIFYING
+            && e.kind == tod_store::phase::PHASE_CERTIFY
+            && e.certifier == tod_store::phase::CERTIFIER_INDEPENDENT),
+        "the evaluator certified verification's evidence"
+    );
+    assert_ne!(lifecycle::current_state(&fx.fleet, fx.node).unwrap(), "verifying", "{steps:?}");
 }
 
 /// A pull request that changes as the agent takes turns: it opens with an

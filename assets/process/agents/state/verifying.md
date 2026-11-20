@@ -74,4 +74,4 @@ Complete self-review before `review`. **`review` is not where functional bugs ar
 
 Failed verification, untraceable results, or known functional defects → stay in `verifying` or move back to `active` for fixes; do not enter `review` hoping review will catch bugs.
 
-Any `failed` or unchecked obligation, and any `failed` plan step, blocks the gate. The fix is not made here: implementation works every `failed` step again from its note, and verification then runs again over the result.
+Any `failed` or unchecked obligation, and any `failed` plan step, blocks the gate. So does a `verified` verdict on a live obligation whose method is `unit` or `static`: only a code-only obligation may be verified that way. With independent evaluation on, a separate session then audits the evidence (the method fits, what ran exercised the claim, the output shows it, and a replay exists where behavior changes) and certifies it or reopens the verdicts that fall short; the gate needs its current certificate. The fix is not made here: implementation works every `failed` step again from its note, and verification then runs again over the result.

@@ -12,6 +12,12 @@
 //! reads to see what failed along the way. Reimplementing a plan step reopens
 //! the node's `verified` verdicts ([`VerdictRepo::reopen_verified`]): the
 //! code they were earned against has changed.
+//!
+//! A verdict says how it was reached (`method`, one of [`VERDICT_METHODS`];
+//! required for `verified`) and what was run (`ran`). A unit test or reading
+//! the code shows what its author believed, not that the belief holds, so the
+//! `obligations-verified` gate accepts `unit` and `static` only for an
+//! obligation the design phase marked code-only ([`method_proves_live`]).
 
 use crate::outline::repos::plan_steps::PHASE_ACTIVE;
 use crate::outline::repos::{ObligationRepo, PlanStepRepo};
@@ -46,6 +52,37 @@ pub const LISTING_STATUSES: [&str; 5] = [
 ];
 pub const AGENT_VERDICTS: [&str; 2] = [VERDICT_VERIFIED, VERDICT_FAILED];
 
+/// Exercised against the real system: the live API, production read-only,
+/// the running app driven the way its user meets it.
+pub const METHOD_LIVE: &str = "live";
+/// Run against a local database seeded with crafted data (plus a read-only
+/// dry run against production, for a change that writes data).
+pub const METHOD_LOCAL_DATA: &str = "local-data";
+/// Read the code, or a static check (a type check, a lint, a grep).
+pub const METHOD_STATIC: &str = "static";
+/// Unit or integration tests with mocks or fakes.
+pub const METHOD_UNIT: &str = "unit";
+/// How a verdict may have been reached.
+pub const VERDICT_METHODS: [&str; 4] = [METHOD_LIVE, METHOD_LOCAL_DATA, METHOD_STATIC, METHOD_UNIT];
+
+/// Whether `method` exercised the running work against real or realistic
+/// data, so it can verify an obligation that is not code-only.
+pub fn method_proves_live(method: &str) -> bool {
+    method == METHOD_LIVE || method == METHOD_LOCAL_DATA
+}
+
+/// `raw` as one of [`VERDICT_METHODS`], or an error naming them.
+pub fn parse_method(raw: &str) -> Result<&'static str> {
+    let wanted = raw.trim().to_ascii_lowercase().replace('_', "-");
+    VERDICT_METHODS
+        .iter()
+        .find(|m| **m == wanted)
+        .copied()
+        .with_context(|| {
+            format!("unknown method `{raw}` (expected {})", VERDICT_METHODS.join("|"))
+        })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObligationVerdict {
     pub id: i64,
@@ -57,6 +94,11 @@ pub struct ObligationVerdict {
     pub status: String,
     /// The evidence: what was run and what happened.
     pub evidence: String,
+    /// How it was reached (one of [`VERDICT_METHODS`]); `None` for a
+    /// `reopened` row, and for verdicts recorded before methods.
+    pub method: Option<String>,
+    /// What was run: the command, the request, the query.
+    pub ran: Option<String>,
     pub created_at: i64,
 }
 
@@ -67,6 +109,34 @@ impl ObligationVerdict {
 
     pub fn is_failed(&self) -> bool {
         self.status == VERDICT_FAILED
+    }
+}
+
+/// How a verdict was reached: the method and what was run. Both are
+/// optional here; [`VerdictRepo::record`] requires the method for `verified`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct VerdictHow {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ran: Option<String>,
+}
+
+impl VerdictHow {
+    /// `method`, with nothing said about what ran.
+    pub fn method(method: &str) -> Self {
+        Self {
+            method: Some(method.to_string()),
+            ran: None,
+        }
+    }
+
+    /// `method` and what `ran`.
+    pub fn ran(method: &str, ran: &str) -> Self {
+        Self {
+            method: Some(method.to_string()),
+            ran: Some(ran.to_string()),
+        }
     }
 }
 
@@ -140,7 +210,8 @@ pub const CREATE_TABLE: &str = "
         ON obligation_verdicts(node_id, obligation_id, id);
 ";
 
-const COLUMNS: &str = "id, node_id, obligation_id, conversation_id, status, evidence, created_at";
+const COLUMNS: &str =
+    "id, node_id, obligation_id, conversation_id, status, evidence, created_at, method, ran";
 
 pub struct VerdictRepo<'a> {
     conn: &'a Connection,
@@ -153,7 +224,7 @@ impl<'a> VerdictRepo<'a> {
 
     /// Record the agent's verdict on `obligation_id` as it holds for
     /// `node_id`. Evidence is required either way: a verdict nobody can
-    /// retrace is a guess.
+    /// retrace is a guess. A `verified` one also needs its `method`.
     pub fn record(
         &self,
         node_id: Uuid,
@@ -161,15 +232,25 @@ impl<'a> VerdictRepo<'a> {
         conversation_id: Option<Uuid>,
         status: &str,
         evidence: &str,
+        how: &VerdictHow,
     ) -> Result<ObligationVerdict> {
         let status = normalize(status, &AGENT_VERDICTS, "status")?;
         let evidence = evidence.trim();
         if evidence.is_empty() {
             bail!("a verdict needs evidence: what you ran and what happened");
         }
-        self.insert(node_id, obligation_id, conversation_id, status, evidence)
+        let method = how.method.as_deref().map(parse_method).transpose()?;
+        if status == VERDICT_VERIFIED && method.is_none() {
+            bail!(
+                "a `verified` verdict needs its method (one of {}): how you showed it holds",
+                VERDICT_METHODS.join("|")
+            );
+        }
+        let ran = how.ran.as_deref().map(str::trim).filter(|r| !r.is_empty());
+        self.insert(node_id, obligation_id, conversation_id, status, evidence, method, ran)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn insert(
         &self,
         node_id: Uuid,
@@ -177,11 +258,13 @@ impl<'a> VerdictRepo<'a> {
         conversation_id: Option<Uuid>,
         status: &str,
         evidence: &str,
+        method: Option<&str>,
+        ran: Option<&str>,
     ) -> Result<ObligationVerdict> {
         self.conn.execute(
             "INSERT INTO obligation_verdicts
-             (node_id, obligation_id, conversation_id, status, evidence, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             (node_id, obligation_id, conversation_id, status, evidence, created_at, method, ran)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 uuid_to_blob(node_id),
                 uuid_to_blob(obligation_id),
@@ -189,6 +272,8 @@ impl<'a> VerdictRepo<'a> {
                 status,
                 evidence,
                 now_ms(),
+                method,
+                ran,
             ],
         )?;
         let id = self.conn.last_insert_rowid();
@@ -211,7 +296,7 @@ impl<'a> VerdictRepo<'a> {
             .map(|v| v.obligation_id)
             .collect();
         for obligation_id in &verified {
-            self.insert(node_id, *obligation_id, None, VERDICT_REOPENED, why)?;
+            self.insert(node_id, *obligation_id, None, VERDICT_REOPENED, why, None, None)?;
         }
         Ok(verified.len())
     }
@@ -224,8 +309,30 @@ impl<'a> VerdictRepo<'a> {
         let mut reopened = 0;
         for obligation_id in obligations {
             if latest.get(obligation_id).is_some_and(ObligationVerdict::is_verified) {
-                self.insert(node_id, *obligation_id, None, VERDICT_REOPENED, why)?;
+                self.insert(node_id, *obligation_id, None, VERDICT_REOPENED, why, None, None)?;
                 reopened += 1;
+            }
+        }
+        Ok(reopened)
+    }
+
+    /// Withdraw the current verdict on each of `obligations` for `node_id`,
+    /// whatever it is, with `why`: the evidence evaluator found it does not
+    /// show what it claims, so verification rules on it again. One already
+    /// reopened is left as it is; one with no verdict is an error.
+    pub fn reopen_these(&self, node_id: Uuid, obligations: &[Uuid], why: &str) -> Result<usize> {
+        let latest = self.latest_for_node(node_id)?;
+        let mut reopened = 0;
+        for obligation_id in obligations {
+            match latest.get(obligation_id) {
+                Some(v) if v.status != VERDICT_REOPENED => {
+                    self.insert(node_id, *obligation_id, None, VERDICT_REOPENED, why, None, None)?;
+                    reopened += 1;
+                }
+                Some(_) => {}
+                None => bail!(
+                    "obligation {obligation_id} has no verdict on node {node_id} to reopen"
+                ),
             }
         }
         Ok(reopened)
@@ -249,7 +356,7 @@ impl<'a> VerdictRepo<'a> {
             .map(|v| v.node_id)
             .collect();
         for node_id in &verified {
-            self.insert(*node_id, obligation_id, None, VERDICT_REOPENED, why)?;
+            self.insert(*node_id, obligation_id, None, VERDICT_REOPENED, why, None, None)?;
         }
         Ok(verified.len())
     }
@@ -323,6 +430,8 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ObligationVerdict> {
         status: row.get(4)?,
         evidence: row.get(5)?,
         created_at: row.get(6)?,
+        method: row.get(7)?,
+        ran: row.get(8)?,
     })
 }
 
@@ -369,9 +478,9 @@ mod tests {
         let fx = setup();
         let repo = VerdictRepo::new(&fx.conn);
         let syncs = obligation(&fx, "Tickets sync");
-        repo.record(fx.node, syncs, None, "Failed", "Ran the app: no tickets appear.")
+        repo.record(fx.node, syncs, None, "Failed", "Ran the app: no tickets appear.", &VerdictHow::default())
             .unwrap();
-        repo.record(fx.node, syncs, None, "verified", "Ran the app: 3 tickets listed.")
+        repo.record(fx.node, syncs, None, "verified", "Ran the app: 3 tickets listed.", &VerdictHow::method("live"))
             .unwrap();
         let latest = repo.latest_for_node(fx.node).unwrap();
         assert!(latest[&syncs].is_verified());
@@ -384,13 +493,65 @@ mod tests {
         assert_eq!(history, [VERDICT_FAILED, VERDICT_VERIFIED]);
     }
 
+    /// A `verified` verdict says how it was shown; a `failed` one need not.
+    /// The method and what ran are kept with it.
+    #[test]
+    fn a_verified_verdict_needs_its_method() {
+        let fx = setup();
+        let repo = VerdictRepo::new(&fx.conn);
+        let syncs = obligation(&fx, "Tickets sync");
+        let err = repo
+            .record(fx.node, syncs, None, "verified", "Ran it: 3 tickets.", &VerdictHow::default())
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("needs its method"), "{err:#}");
+        let err = repo
+            .record(fx.node, syncs, None, "verified", "Ran it.", &VerdictHow::method("vibes"))
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("live"), "{err:#}");
+        repo.record(fx.node, syncs, None, "failed", "Ran it: none.", &VerdictHow::default())
+            .unwrap();
+        let verdict = repo
+            .record(
+                fx.node,
+                syncs,
+                None,
+                "verified",
+                "3 tickets listed.",
+                &VerdictHow::ran("local-data", "cargo run -- sync --db seeded.db"),
+            )
+            .unwrap();
+        assert_eq!(verdict.method.as_deref(), Some("local-data"));
+        assert_eq!(verdict.ran.as_deref(), Some("cargo run -- sync --db seeded.db"));
+        assert!(method_proves_live("live") && method_proves_live("local-data"));
+        assert!(!method_proves_live("unit") && !method_proves_live("static"));
+    }
+
+    /// The evidence evaluator's reopening withdraws exactly the verdicts it
+    /// names, so verification owes them again.
+    #[test]
+    fn reopening_named_verdicts_makes_them_owed_again() {
+        let fx = setup();
+        let repo = VerdictRepo::new(&fx.conn);
+        let a = obligation(&fx, "Tickets sync");
+        let b = obligation(&fx, "Errors are shown");
+        for id in [a, b] {
+            repo.record(fx.node, id, None, "verified", "Ran it.", &VerdictHow::method("live"))
+                .unwrap();
+        }
+        assert_eq!(repo.reopen_these(fx.node, &[a], "unit test only").unwrap(), 1);
+        let standings = repo.standings(fx.node).unwrap();
+        let of = |id: Uuid| standings.iter().find(|s| s.obligation.id == id).unwrap();
+        assert!(of(a).is_unchecked(), "{:?}", of(a).status());
+        assert!(!of(b).is_unchecked());
+    }
+
     #[test]
     fn a_verdict_needs_evidence_and_a_status_an_agent_may_give() {
         let fx = setup();
         let repo = VerdictRepo::new(&fx.conn);
         let syncs = obligation(&fx, "Tickets sync");
-        assert!(repo.record(fx.node, syncs, None, "verified", "  ").is_err());
-        assert!(repo.record(fx.node, syncs, None, "reopened", "why").is_err());
+        assert!(repo.record(fx.node, syncs, None, "verified", "  ", &VerdictHow::method("live")).is_err());
+        assert!(repo.record(fx.node, syncs, None, "reopened", "why", &VerdictHow::default()).is_err());
     }
 
     /// Reimplementing a step withdraws what was verified against the old
@@ -401,8 +562,8 @@ mod tests {
         let repo = VerdictRepo::new(&fx.conn);
         let holds = obligation(&fx, "Holds");
         let broken = obligation(&fx, "Broken");
-        repo.record(fx.node, holds, None, "verified", "Saw it work.").unwrap();
-        repo.record(fx.node, broken, None, "failed", "Saw it fail.").unwrap();
+        repo.record(fx.node, holds, None, "verified", "Saw it work.", &VerdictHow::method("live")).unwrap();
+        repo.record(fx.node, broken, None, "failed", "Saw it fail.", &VerdictHow::default()).unwrap();
         let steps = PlanStepRepo::new(&fx.conn);
         let step = Uuid::new_v4();
         steps.insert_at(step, fx.node, 0, "Build it").unwrap();
@@ -423,8 +584,8 @@ mod tests {
         let repo = VerdictRepo::new(&fx.conn);
         let holds = obligation(&fx, "Holds");
         let broken = obligation(&fx, "Broken");
-        repo.record(fx.node, holds, None, "verified", "Saw it work.").unwrap();
-        repo.record(fx.node, broken, None, "failed", "Saw it fail.").unwrap();
+        repo.record(fx.node, holds, None, "verified", "Saw it work.", &VerdictHow::method("live")).unwrap();
+        repo.record(fx.node, broken, None, "failed", "Saw it fail.", &VerdictHow::default()).unwrap();
         let steps = PlanStepRepo::new(&fx.conn);
         let (checked, failing) = (Uuid::new_v4(), Uuid::new_v4());
         steps.insert_at(checked, fx.node, 0, "Build it").unwrap();
@@ -458,8 +619,8 @@ mod tests {
         let repo = VerdictRepo::new(&fx.conn);
         let reworded = obligation(&fx, "Old wording");
         let untouched = obligation(&fx, "Untouched");
-        repo.record(fx.node, reworded, None, "verified", "Saw it work.").unwrap();
-        repo.record(fx.node, untouched, None, "verified", "Saw it work.").unwrap();
+        repo.record(fx.node, reworded, None, "verified", "Saw it work.", &VerdictHow::method("live")).unwrap();
+        repo.record(fx.node, untouched, None, "verified", "Saw it work.", &VerdictHow::method("live")).unwrap();
         ObligationRepo::new(&fx.conn)
             .update_body(reworded, "New wording")
             .unwrap();

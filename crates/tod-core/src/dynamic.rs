@@ -249,14 +249,22 @@ pub fn review_findings_lines(findings: &[ReviewFinding]) -> String {
     out
 }
 
-/// One verdict as a session is shown it: the obligation's id and status, then
-/// the evidence indented under it.
+/// One verdict as a session is shown it: the obligation's id and status (with
+/// how it was shown and what ran, when recorded), then the evidence indented
+/// under it.
 pub fn obligation_verdict_lines(verdict: &ObligationVerdict) -> String {
     let mut out = format!(
-        "- [{}] {}\n",
+        "- [{}] {}",
         tod_store::interview::short_id(verdict.obligation_id),
         verdict.status
     );
+    if let Some(method) = &verdict.method {
+        out.push_str(&format!(" (method: {method})"));
+    }
+    out.push('\n');
+    if let Some(ran) = verdict.ran.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
+        out.push_str(&format!("  ran: {ran}\n"));
+    }
     for line in verdict.evidence.trim().lines() {
         out.push_str("  ");
         out.push_str(line);

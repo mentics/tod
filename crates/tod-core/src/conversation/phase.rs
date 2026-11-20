@@ -17,7 +17,7 @@ use super::protocol::{
     Next, Protocol, ProtocolEnv, Stop, TurnContext, cap_or_stall, focus_cwd_or_scratch,
     hand_back_for_pending_decision,
 };
-use crate::context_recipes::{EVALUATE, PHASE};
+use crate::context_recipes::{EVALUATE, EVALUATE_VERIFYING, PHASE};
 use crate::gate::context::build_phase_message;
 use crate::usual_actions::Role;
 use crate::phase::{PhaseStanding, PhaseStep, evaluation_is_independent, render_status};
@@ -118,12 +118,29 @@ fn build_request<'a>(
         work_history,
         // The phase agent's skills are how it does the work; the evaluator
         // judges the result against the gate and the role doc's checklist.
+        // Verification's evidence evaluator is the exception: it may spot-check,
+        // so it gets its own key's (`verify_evaluate`, else `verify`'s) first
+        // group.
         skills: if with_skills {
             crate::skills_context::for_group(fleet, node, from, cwd, env.skill_group())?
+        } else if from == tod_store::phase::VERIFYING {
+            crate::skills_context::for_group(
+                fleet,
+                node,
+                tod_store::lifecycle_config::VERIFY_EVALUATE,
+                cwd,
+                0,
+            )?
         } else {
             String::new()
         },
         pull_requests: crate::pr_context::for_node(fleet, node),
+        // The evidence evaluator audits the verdicts themselves.
+        verdicts: if from == tod_store::phase::VERIFYING {
+            crate::conversation::verify::current_verdicts(fleet, node)
+        } else {
+            Vec::new()
+        },
         from_state: from.to_string(),
         to_state: to.to_string(),
         criteria,
@@ -389,7 +406,13 @@ impl Protocol for EvaluateProtocol {
     }
 
     fn opening(&self, env: &ProtocolEnv<'_>) -> Result<String> {
-        opening_for(env, &EVALUATE, "evaluate", Role::Evaluate)
+        let (state, _) = transition(env)?;
+        let recipe = if state == tod_store::phase::VERIFYING {
+            &EVALUATE_VERIFYING
+        } else {
+            &EVALUATE
+        };
+        opening_for(env, recipe, "evaluate", Role::Evaluate)
     }
 
     fn resume_snapshot(
@@ -595,10 +618,25 @@ pub fn mock_evaluate_turn(access: &impl super::mock::Access, node: Uuid) -> Resu
     })?;
     let state = state.unwrap_or_else(|| "proposed".to_string());
     let command = if title.contains("[reject]") {
+        // In `verifying` the evidence is sent back by reopening every verdict
+        // verification gave, as a real evaluator names the ones that fall short.
+        let reopen = if state == tod_store::phase::VERIFYING {
+            access.read(|conn| {
+                Ok(tod_store::verification::VerdictRepo::new(conn)
+                    .standings(node)?
+                    .into_iter()
+                    .filter(|s| s.due_by(tod_store::phase::VERIFYING) && !s.is_unchecked())
+                    .map(|s| s.obligation.id)
+                    .collect())
+            })?
+        } else {
+            Vec::new()
+        };
         InterviewCommand::PhaseReject {
             node_id: node,
             state,
             fixes: vec!["Mock fix: the title asks for a rejection.".to_string()],
+            reopen,
         }
     } else {
         InterviewCommand::PhaseCertify {

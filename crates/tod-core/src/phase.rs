@@ -62,6 +62,90 @@ pub fn evaluation_is_independent(
     Ok(has_phase_agent(state) && crate::skills_context::extra_groups(conn, node, state)? > 0)
 }
 
+/// [`independent_evaluation`] for the data root `conn`'s database lives in
+/// (`tod.db` sits directly at the data root). On for a database with no file
+/// (in memory): the stricter reading, as when the settings cannot be read.
+pub fn independent_evaluation_at(conn: &Connection) -> bool {
+    match conn.path().filter(|p| !p.is_empty()).and_then(|p| Path::new(p).parent()) {
+        Some(data_root) => independent_evaluation(data_root),
+        None => true,
+    }
+}
+
+/// Where the independent audit of verification's evidence stands for a node
+/// in `verifying` (`tod_store::phase::VERIFYING`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EvidenceAudit {
+    /// No audit: independent evaluation is off, or no obligation is owed a
+    /// verdict in `verifying`.
+    #[default]
+    NotNeeded,
+    /// A current certificate covers the obligations and verdicts as they are.
+    Certified,
+    /// The evaluator rejected the evidence, and verification has recorded no
+    /// verdict since: its fixes are verification's to make.
+    Rejected,
+    /// Not judged yet, or changed since it was: the evaluator audits it.
+    Due,
+}
+
+impl EvidenceAudit {
+    /// Nothing about the evidence holds the node in `verifying`.
+    pub fn settled(self) -> bool {
+        matches!(self, Self::NotNeeded | Self::Certified)
+    }
+}
+
+/// Where the audit of `node`'s verification evidence stands. Read in any
+/// state; it means something only in `verifying`.
+pub fn evidence_audit(conn: &Connection, node: Uuid) -> Result<EvidenceAudit> {
+    use tod_store::phase::{PHASE_CERTIFY, VERIFYING};
+    use tod_store::verification::VerdictRepo;
+    if !independent_evaluation_at(conn) {
+        return Ok(EvidenceAudit::NotNeeded);
+    }
+    let owed = VerdictRepo::new(conn)
+        .standings(node)?
+        .iter()
+        .any(|s| s.due_by(VERIFYING));
+    if !owed {
+        return Ok(EvidenceAudit::NotNeeded);
+    }
+    let repo = PhaseRepo::new(conn);
+    if matches!(repo.certificate_status(node, VERIFYING)?, CertificateStatus::Current(_)) {
+        return Ok(EvidenceAudit::Certified);
+    }
+    let judged = repo
+        .events_in_stay(node, VERIFYING)?
+        .into_iter()
+        .rev()
+        .find(|e| e.kind == PHASE_CERTIFY || e.kind == PHASE_REJECT);
+    if let Some(rejection) = judged.filter(|e| e.kind == PHASE_REJECT) {
+        // The evaluator's own reopening is not verification answering it.
+        let answered = VerdictRepo::new(conn)
+            .history_for_node(node)?
+            .iter()
+            .any(|v| v.created_at > rejection.created_at && (v.is_verified() || v.is_failed()));
+        if !answered {
+            return Ok(EvidenceAudit::Rejected);
+        }
+    }
+    Ok(EvidenceAudit::Due)
+}
+
+/// The fixes the evidence evaluator's latest rejection asked for, while
+/// verification still owes them ([`EvidenceAudit::Rejected`]); empty otherwise.
+pub fn evidence_fixes(conn: &Connection, node: Uuid) -> Result<Vec<String>> {
+    if evidence_audit(conn, node)? != EvidenceAudit::Rejected {
+        return Ok(Vec::new());
+    }
+    Ok(PhaseRepo::new(conn)
+        .rejections_in_stay(node, tod_store::phase::VERIFYING)?
+        .last()
+        .map(|e| e.fixes())
+        .unwrap_or_default())
+}
+
 /// One criterion of a gate, as checked now.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CriterionCheck {
@@ -362,7 +446,18 @@ pub fn render_status(standing: &PhaseStanding, independent: bool) -> String {
         None => out.push_str(&format!("Phase: `{}` (the last state; no gate)\n", gate.from)),
     }
     let certifiable = tod_store::phase::is_certifiable(&gate.from);
-    if certifiable {
+    let verifying = gate.from == tod_store::phase::VERIFYING;
+    if certifiable && verifying {
+        out.push_str(&format!(
+            "Independent evaluation: {}\n\n",
+            if independent {
+                "**on** — verification records the verdicts; a separate session audits \
+                 their evidence and certifies it"
+            } else {
+                "**off** — the evidence is not audited; the gate's method rule is all there is"
+            }
+        ));
+    } else if certifiable {
         out.push_str(&format!(
             "Independent evaluation: {}\n\n",
             if independent {
@@ -414,10 +509,13 @@ pub fn render_status(standing: &PhaseStanding, independent: bool) -> String {
         }
     }
     if !standing.fixes.is_empty() {
-        out.push_str(
+        out.push_str(if verifying {
+            "\n**The evaluator sent the evidence back.** Verification makes each of \
+             these fixes and records the verdicts again:\n\n"
+        } else {
             "\n**The evaluator sent the phase back.** Make each of these fixes, then \
-             record the phase `ready` again:\n\n",
-        );
+             record the phase `ready` again:\n\n"
+        });
         for fix in &standing.fixes {
             out.push_str(&format!("- {fix}\n"));
         }

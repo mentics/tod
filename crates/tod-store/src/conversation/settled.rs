@@ -14,6 +14,10 @@
 //! later phase can deliver (it needs production, a deploy, or a run only the
 //! release makes) moves it there itself ([`verify_may_retag`]), never asking
 //! the user about a phase mistake.
+//!
+//! Marking an obligation code-only (or live again) is narrower still, at any
+//! state: only the design phase agent, in `design`, and the user may
+//! ([`check_code_only`]). Every other agent is refused, planning included.
 
 use super::repo::ConversationRepo;
 use super::types::{EntitySnapshot, ProtocolKind};
@@ -47,6 +51,9 @@ pub fn check_conversation_agent(
     let Some(conversation) = ConversationRepo::new(conn).get(conversation_id)? else {
         bail!("conversation {conversation_id} not found");
     };
+    if let OutlineMutation::UpdateObligationCodeOnly { obligation_id, .. } = mutation {
+        return check_code_only(conn, Some(&conversation), *obligation_id);
+    }
     if user_directed(conversation.protocol) {
         return Ok(());
     }
@@ -194,9 +201,56 @@ fn verify_may_retag(
 }
 
 /// Refuse `mutation`, written by an agent, when it changes an obligation of
-/// a node past `planning`.
+/// a node past `planning`, or marks one code-only (only the design phase
+/// agent and the user may).
 pub fn check_agent(conn: &Connection, mutation: &OutlineMutation) -> Result<()> {
+    if let OutlineMutation::UpdateObligationCodeOnly { obligation_id, .. } = mutation {
+        return check_code_only(conn, None, *obligation_id);
+    }
     check_agent_noting(conn, mutation, None)
+}
+
+/// Whether an agent writing in `conversation` (or in none) may mark
+/// `obligation_id` code-only, or live again. Every obligation is live unless
+/// the design phase agent (a phase conversation on the obligation's own node
+/// while it is in `design`) or the user marks it: a later agent would only be
+/// excusing a check it does not want to run.
+fn check_code_only(
+    conn: &Connection,
+    conversation: Option<&super::types::Conversation>,
+    obligation_id: Uuid,
+) -> Result<()> {
+    let refuse = |why: &str| -> Result<()> {
+        bail!(
+            "refused: only the design phase agent (in `design`, on the obligation's own node) \
+            and the user may mark an obligation code-only or live; {why}. Every other \
+            obligation is verified live. If you believe this one can only be checked in the \
+            code, ask the user with `tod-cli decisions ask`."
+        )
+    };
+    let Some(conversation) = conversation else {
+        return refuse("this writer is not a conversation's agent");
+    };
+    if conversation.protocol != ProtocolKind::Phase {
+        return refuse(&format!(
+            "this is a `{}` conversation",
+            conversation.protocol.as_str()
+        ));
+    }
+    let Some(obligation) = ObligationRepo::new(conn).get(obligation_id)? else {
+        bail!("obligation {obligation_id} not found");
+    };
+    if conversation.focus != super::types::Focus::Node(obligation.node_id) {
+        return refuse("the obligation is not on this phase agent's own node");
+    }
+    let state = NodeRepo::new(conn).get_lifecycle(obligation.node_id)?;
+    if state.as_deref() != Some("design") {
+        return refuse(&format!(
+            "the node is in `{}`, not `design`",
+            state.as_deref().unwrap_or("no lifecycle state")
+        ));
+    }
+    Ok(())
 }
 
 /// [`check_agent`], saying in the refusal why a retag a verification agent
@@ -265,6 +319,7 @@ fn obligation_nodes(conn: &Connection, mutation: &OutlineMutation) -> Result<Vec
         | M::UpdateObligationSection { obligation_id, .. }
         | M::UpdateObligationPhase { obligation_id, .. }
         | M::UpdateObligationActsIn { obligation_id, .. }
+        | M::UpdateObligationCodeOnly { obligation_id, .. }
         | M::DeleteObligation { obligation_id }
         | M::ReorderObligation { obligation_id, .. } => {
             nodes.extend(owner(*obligation_id)?);
@@ -690,13 +745,13 @@ mod tests {
         let fx = setup("verifying");
         let verify = conversation(&fx, ProtocolKind::Verification);
         VerdictRepo::new(&fx.conn)
-            .record(fx.node, fx.obligation, None, "failed", "Ran it: panics.")
+            .record(fx.node, fx.obligation, None, "failed", "Ran it: panics.", &crate::verification::VerdictHow::default())
             .unwrap();
         let err = outline(&fx, &verify, retag(&fx, "released")).unwrap_err();
         assert!(format!("{err:#}").contains("stays a failure"), "{err:#}");
         // Nor one that failed once, however it was ruled on since.
         VerdictRepo::new(&fx.conn)
-            .record(fx.node, fx.obligation, None, "verified", "Ran it again: fine.")
+            .record(fx.node, fx.obligation, None, "verified", "Ran it again: fine.", &crate::verification::VerdictHow::method("live"))
             .unwrap();
         let err = outline(&fx, &verify, retag(&fx, "released")).unwrap_err();
         assert!(format!("{err:#}").contains("stays a failure"), "{err:#}");
@@ -720,7 +775,7 @@ mod tests {
         let fx = setup("verifying");
         let verify = conversation(&fx, ProtocolKind::Verification);
         VerdictRepo::new(&fx.conn)
-            .record(fx.node, fx.obligation, None, "failed", "The code was missing.")
+            .record(fx.node, fx.obligation, None, "failed", "The code was missing.", &crate::verification::VerdictHow::default())
             .unwrap();
         // The node went back and came again: a new stay, later than the failure.
         let nodes = NodeRepo::new(&fx.conn);
@@ -766,5 +821,78 @@ mod tests {
             .unwrap();
         outline(&fx, ACTOR_AGENT, edit(&fx)).unwrap();
         assert_eq!(body(&fx), "Export as JSON");
+    }
+
+    fn mark_code_only(fx: &Fx, reason: Option<&str>) -> OutlineMutation {
+        OutlineMutation::UpdateObligationCodeOnly {
+            obligation_id: fx.obligation,
+            code_only: reason.map(str::to_string),
+        }
+    }
+
+    fn code_only(fx: &Fx) -> Option<String> {
+        ObligationRepo::new(&fx.conn).get(fx.obligation).unwrap().unwrap().code_only
+    }
+
+    fn assert_code_only_refused(err: anyhow::Error) {
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("only the design phase agent") && message.contains("decisions ask"),
+            "{message}"
+        );
+    }
+
+    /// The design phase agent marks an obligation code-only, with a reason,
+    /// and may make it live again.
+    #[test]
+    fn the_design_phase_agent_may_mark_an_obligation_code_only() {
+        let fx = setup("design");
+        let phase = conversation(&fx, ProtocolKind::Phase);
+        outline(&fx, &phase, mark_code_only(&fx, Some("a pure function"))).unwrap();
+        assert_eq!(code_only(&fx).as_deref(), Some("a pure function"));
+        outline(&fx, &phase, mark_code_only(&fx, None)).unwrap();
+        assert_eq!(code_only(&fx), None);
+    }
+
+    /// Every other agent is refused: planning's phase agent, a design-state
+    /// agent of another kind, a freeform chat, verification, and a plain
+    /// agent with no conversation.
+    #[test]
+    fn no_other_agent_may_mark_an_obligation_code_only() {
+        let fx = setup("planning");
+        let phase = conversation(&fx, ProtocolKind::Phase);
+        assert_code_only_refused(
+            outline(&fx, &phase, mark_code_only(&fx, Some("a refactor"))).unwrap_err(),
+        );
+        let fx = setup("design");
+        // An evaluator may not change the node at all.
+        let evaluator = conversation(&fx, ProtocolKind::Evaluate);
+        outline(&fx, &evaluator, mark_code_only(&fx, Some("a rename"))).unwrap_err();
+        for protocol in [ProtocolKind::Outline, ProtocolKind::Chat] {
+            let actor = conversation(&fx, protocol);
+            assert_code_only_refused(
+                outline(&fx, &actor, mark_code_only(&fx, Some("a rename"))).unwrap_err(),
+            );
+        }
+        assert_code_only_refused(
+            outline(&fx, ACTOR_AGENT, mark_code_only(&fx, Some("a rename"))).unwrap_err(),
+        );
+        let fx = setup("verifying");
+        let verify = conversation(&fx, ProtocolKind::Verification);
+        assert_code_only_refused(
+            outline(&fx, &verify, mark_code_only(&fx, Some("a pure function"))).unwrap_err(),
+        );
+        assert_eq!(code_only(&fx), None);
+    }
+
+    /// The user marks it in any state; a blank reason is refused.
+    #[test]
+    fn the_user_may_mark_an_obligation_code_only_with_a_reason() {
+        let fx = setup("verifying");
+        outline(&fx, ACTOR_USER, mark_code_only(&fx, Some("a rename"))).unwrap();
+        assert_eq!(code_only(&fx).as_deref(), Some("a rename"));
+        let err = outline(&fx, ACTOR_USER, mark_code_only(&fx, Some("  "))).unwrap_err();
+        assert!(format!("{err:#}").contains("reason"), "{err:#}");
+        assert_eq!(code_only(&fx).as_deref(), Some("a rename"));
     }
 }

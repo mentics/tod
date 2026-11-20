@@ -6,7 +6,7 @@ requirement you checked but gave no verdict counts as unchecked.
 
 ```
 tod-cli --data-root <DATA_ROOT> verdicts list    [--node <NODE_UUID>] [--unchecked]
-tod-cli --data-root <DATA_ROOT> verdicts record  <OBLIGATION_ID> [--node <NODE_UUID>] --status verified|failed --evidence <TEXT>
+tod-cli --data-root <DATA_ROOT> verdicts record  <OBLIGATION_ID> [--node <NODE_UUID>] --status verified|failed --evidence <TEXT> [--method live|local-data|static|unit] [--ran <TEXT>]
 tod-cli --data-root <DATA_ROOT> verdicts history [--node <NODE_UUID>]
 ```
 
@@ -25,6 +25,14 @@ for `failed`: what you ran or drove, and what you saw. "The code does X" or
 "the unit tests pass" is not evidence that a requirement holds; the behaviour
 observed in the running work is. Use `--evidence -` and a heredoc for anything
 long. Recording again replaces the verdict and keeps the old one as history.
+
+`--method` says how you showed it, and is required for `verified`: `live`
+(the running work against the real system), `local-data` (a local database
+seeded with crafted data), `static` (reading the code, a type check), or
+`unit` (tests with mocks). `--ran` names what you ran: the command, request,
+or query. The gate accepts `static` and `unit` only for an obligation marked
+code-only; a live one needs `live` or `local-data`. `list` and `history` show
+each verdict's method and what ran.
 
 `history` lists every verdict the node's obligations have been given, oldest
 first — what failed along the way, and what it took to pass.

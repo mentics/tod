@@ -194,6 +194,13 @@ pub enum OutlineMutation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
+    /// Mark an obligation code-only, with the reason it is checked in the
+    /// code alone (`Some`, non-empty), or live again (`None`). Only the user
+    /// and the design phase agent may (`conversation::settled`).
+    UpdateObligationCodeOnly {
+        obligation_id: Uuid,
+        code_only: Option<String>,
+    },
     /// Bulk-rename every obligation in `node_id`/`kind` whose section is
     /// `old_section` (`None` meaning the implicit "no section" bucket) to
     /// `new_section`.
@@ -490,6 +497,7 @@ impl OutlineMutation {
                 | OutlineMutation::UpdateObligationSection { .. }
                 | OutlineMutation::UpdateObligationPhase { .. }
                 | OutlineMutation::UpdateObligationActsIn { .. }
+                | OutlineMutation::UpdateObligationCodeOnly { .. }
                 | OutlineMutation::RenameObligationSection { .. }
                 | OutlineMutation::DeleteObligation { .. }
                 | OutlineMutation::RestoreObligation { .. }
@@ -757,6 +765,24 @@ impl OutlineMutation {
             } => {
                 let acts_in = parse_obligation_acts_in(acts_in)?;
                 ObligationRepo::new(conn).update_acts_in(*obligation_id, acts_in)?;
+            }
+            OutlineMutation::UpdateObligationCodeOnly {
+                obligation_id,
+                code_only,
+            } => {
+                let reason = match code_only {
+                    None => None,
+                    Some(reason) => {
+                        let reason = reason.trim();
+                        if reason.is_empty() {
+                            anyhow::bail!(
+                                "marking an obligation code-only needs the reason it can be checked in the code alone"
+                            );
+                        }
+                        Some(reason)
+                    }
+                };
+                ObligationRepo::new(conn).update_code_only(*obligation_id, reason)?;
             }
             OutlineMutation::RenameObligationSection {
                 node_id,
@@ -1230,6 +1256,7 @@ fn restore_obligation_row(
         acts_in,
         ordinal,
         visual_design_path,
+        code_only,
     } = snapshot
     else {
         anyhow::bail!("not an obligation snapshot");
@@ -1256,6 +1283,9 @@ fn restore_obligation_row(
     repo.update_acts_in(id, acts_in)?;
     if visual_design_path.is_some() {
         repo.update_visual_design_path(id, visual_design_path.as_deref())?;
+    }
+    if code_only.is_some() {
+        repo.update_code_only(id, code_only.as_deref())?;
     }
     Ok(())
 }

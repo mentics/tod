@@ -894,7 +894,11 @@ fn gate_criteria_seed_on_migration() {
     assert_eq!(slugs("active", "verifying"), [ACTIVE_VERIFYING_PLAN_IMPLEMENTED_SLUG]);
     assert_eq!(
         slugs("verifying", "review"),
-        [VERIFYING_REVIEW_OBLIGATIONS_VERIFIED_SLUG, VERIFYING_REVIEW_PLAN_VERIFIED_SLUG]
+        [
+            VERIFYING_REVIEW_OBLIGATIONS_VERIFIED_SLUG,
+            VERIFYING_REVIEW_PLAN_VERIFIED_SLUG,
+            VERIFYING_REVIEW_EVIDENCE_CERTIFIED_SLUG
+        ]
     );
     assert_eq!(
         slugs("review", "pr"),
@@ -2617,6 +2621,8 @@ fn plan_step_phases_order_dependencies_and_readiness() {
                 conversation_id: None,
                 status: "verified".into(),
                 evidence: "Checked.".into(),
+                method: Some("live".into()),
+                ran: None,
             },
         )
         .unwrap();

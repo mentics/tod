@@ -24,8 +24,8 @@ required) and names each row's node as `on <slug>`.
 COMMANDS:
     list       [--node <UUID>] [--search <TEXT>] [--kind requirement|constraint] [--inherited]
     show       <ID>
-    add        --node <UUID> --kind requirement|constraint --body <TEXT> --phase requirements|design [--acts-in design|active|verifying|merged|released] [--section <NAME>] [--after <ID>] [--before]
-    update     <ID> [--body <TEXT>] [--section <NAME>] [--phase requirements|design|unknown] [--acts-in design|active|verifying|merged|released] [--reason <TEXT>]      (--section \"\" clears it)
+    add        --node <UUID> --kind requirement|constraint --body <TEXT> --phase requirements|design [--acts-in design|active|verifying|merged|released] [--code-only <REASON>] [--section <NAME>] [--after <ID>] [--before]
+    update     <ID> [--body <TEXT>] [--section <NAME>] [--phase requirements|design|unknown] [--acts-in design|active|verifying|merged|released] [--code-only <REASON> | --live] [--reason <TEXT>]      (--section \"\" clears it)
     move       <ID> --node <UUID>
     delete     <ID>
     deleted    --node <UUID> [--by user|agent|<SESSION>]      deleted obligations that can still be restored, newest first
@@ -41,6 +41,11 @@ restorable for 30 days.
 
 `--phase` is the state the obligation was introduced in; `--acts-in` is the
 state whose agent acts on it (default `active`: it is built).
+
+Every obligation is live: verification must show it in the running work.
+`--code-only <REASON>` marks one that only the code can show (a pure function,
+a refactor, a rename), so a unit test or reading the code verifies it; `--live`
+clears the mark. Only the design phase agent and the user may set or clear it.
 
 Inside an interview, an agent's `add` always writes its own session's phase —
 `--phase` there only matters when running `add` outside an interview.
@@ -206,6 +211,7 @@ fn list(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
                     "body": r.body,
                     "phase": r.phase,
                     "acts_in": r.acts_in,
+                    "code_only": r.code_only,
                     "inherited_from": source,
                 });
                 if let Some(item) = item.as_object_mut() {
@@ -229,7 +235,7 @@ fn list(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
                 .as_deref()
                 .map(|s| format!(" ({s})"))
                 .unwrap_or_default();
-            let acts = acts_in_note(&o.acts_in);
+            let acts = format!("{}{}", acts_in_note(&o.acts_in), code_only_note(o.code_only.as_deref()));
             let from = source
                 .as_deref()
                 .map(|s| format!(" [from \"{s}\"]"))
@@ -258,6 +264,35 @@ fn acts_in_note(acts_in: &str) -> String {
     }
 }
 
+/// ` code-only (<reason>)` when the obligation is marked code-only.
+fn code_only_note(code_only: Option<&str>) -> String {
+    code_only
+        .map(|reason| format!(" code-only ({reason})"))
+        .unwrap_or_default()
+}
+
+/// The `--code-only <REASON>` / `--live` pair: `Some(Some(reason))` marks,
+/// `Some(None)` clears, `None` leaves it.
+fn code_only_arg(args: &Args) -> anyhow::Result<Option<Option<String>>> {
+    let reason = args.get("--code-only");
+    let live = args.has("--live");
+    match (reason, live) {
+        (Some(_), true) => anyhow::bail!("--code-only and --live contradict each other: give one"),
+        (Some(reason), false) => {
+            let reason = reason.trim();
+            if reason.is_empty() {
+                anyhow::bail!(
+                    "--code-only needs the reason only the code can show this obligation \
+                     (a pure function, a refactor, a rename)"
+                );
+            }
+            Ok(Some(Some(reason.to_string())))
+        }
+        (None, true) => Ok(Some(None)),
+        (None, false) => Ok(None),
+    }
+}
+
 fn show(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
     let raw = args.target("an obligation id")?;
     let row = inv.client().read(|conn| {
@@ -276,6 +311,7 @@ fn show(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
             "body": row.body,
             "phase": row.phase,
             "acts_in": row.acts_in,
+            "code_only": row.code_only,
         });
         return Ok(value.to_string());
     }
@@ -285,11 +321,12 @@ fn show(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
         .map(|s| format!(" ({s})"))
         .unwrap_or_default();
     Ok(format!(
-        "[{}] {}/{}{}{section} on node {}\n{}",
+        "[{}] {}/{}{}{}{section} on node {}\n{}",
         short_id(row.id),
         row.phase,
         row.kind,
         acts_in_note(&row.acts_in),
+        code_only_note(row.code_only.as_deref()),
         row.node_id,
         row.body
     ))
@@ -305,6 +342,11 @@ fn add(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
         .transpose()?
         .unwrap_or(PHASE_REQUIREMENTS);
     let acts_in = args.get("--acts-in").map(normalize_acts_in).transpose()?;
+    let code_only = match code_only_arg(args)? {
+        Some(None) => anyhow::bail!("--live is for `update`: a new obligation is live already"),
+        Some(Some(reason)) => Some(reason),
+        None => None,
+    };
     let after = args
         .get("--after")
         .map(|raw| resolve(inv, raw))
@@ -341,6 +383,22 @@ fn add(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
             target: None,
         })?;
     }
+    if let Some(reason) = code_only {
+        client
+            .interview(InterviewCommand::Outline {
+                mutation: OutlineMutation::UpdateObligationCodeOnly {
+                    obligation_id: id,
+                    code_only: Some(reason),
+                },
+                target: None,
+            })
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "obligation {} was added, but not marked code-only: {e:#}",
+                    short_id(id)
+                )
+            })?;
+    }
     Ok(ack(id, inv.json))
 }
 
@@ -351,8 +409,9 @@ fn update(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
     let phase = args.get("--phase").map(normalize_phase).transpose()?;
     let acts_in = args.get("--acts-in").map(normalize_acts_in).transpose()?;
     let reason = args.get("--reason");
-    if body.is_none() && section.is_none() && phase.is_none() && acts_in.is_none() {
-        anyhow::bail!("--body, --section, --phase, and/or --acts-in is required");
+    let code_only = code_only_arg(args)?;
+    if body.is_none() && section.is_none() && phase.is_none() && acts_in.is_none() && code_only.is_none() {
+        anyhow::bail!("--body, --section, --phase, --acts-in, --code-only, and/or --live is required");
     }
     let client = inv.client();
     let mut target = Some(id);
@@ -389,6 +448,15 @@ fn update(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
                 obligation_id: id,
                 acts_in: acts_in.to_string(),
                 reason: reason.map(str::to_string),
+            },
+            target: target.take(),
+        })?;
+    }
+    if let Some(code_only) = code_only {
+        client.interview(InterviewCommand::Outline {
+            mutation: OutlineMutation::UpdateObligationCodeOnly {
+                obligation_id: id,
+                code_only,
             },
             target: target.take(),
         })?;
