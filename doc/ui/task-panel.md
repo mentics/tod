@@ -41,7 +41,7 @@ minute below it.
 │ Rounding: the ledger rounds per line, the export rounds  │
 │ the total. Which is correct?                             │  requests
 │  1 Round per line   2 Round the total   3 Answer…        │
-│  Not in the obligations or the repo · Shouldn't have asked│
+│  Not in the obligations or the repo · Discuss            │
 │ Suggestions: Add retry to webhook delivery   (ENG-3557?) │  suggestions
 │  [Accept] [Dismiss]                                      │
 ├──────────────────────────────────────────────────────────┤
@@ -248,12 +248,19 @@ Each request shows:
     Once nothing else is waiting, the runner continues as it would after an
     answer (see "Runner" above), resuming the same agent session, so the
     terminal should be closed first.
-  - **Shouldn't have asked**, at the right end: feedback on the request
-    itself (see below).
+  - **Discuss**, on a request triage escalated (`doc/lifecycle/triage.md`):
+    opens the triage session that read it in the chat drawer, where the user
+    can ask what it means, push back, or settle it in words.
 
   ```
-  Totals match the ledger · Plan step 5 · Missing rule · 14:32     Shouldn't have asked
+  Totals match the ledger · Plan step 5 · Missing rule · 14:32            Discuss
   ```
+
+  A request triage escalated shows triage's brief, then the options. Picking
+  an option answers it directly (a short reflection by its session may
+  follow); the number keys never answer one, since the brief is read first.
+  The agent's own question and options are kept with it (`decisions.asked`)
+  and can be read from the session.
 
 Oldest first. There is rarely more than one; the list scrolls when there is.
 When there are none, the space is empty.
@@ -303,17 +310,32 @@ told about the change and decides how to adjust.
 An entry tod answered itself (`decision_answers.decided_by = 'tod'`: a silent
 review bot gone on without, a pre-existing failure waived) reads "decided by
 tod" where a user's answer shows the actor, with the rationale (what was tried
-or compared) in a "Why:" line below the answer. A triage agent's answer will
-read "decided by triage" the same way.
+or compared) in a "Why:" line below the answer. A triage agent's answer reads
+"decided by triage" the same way, and its entry has a **Triage session**
+button that opens the session in the chat drawer. **Change** works as for any
+answer; when the task has already moved past the phase that asked (the
+request's protocol says which: implementation or fix, verification, review,
+pr), it also offers **Also send the task back to <phase>**, the user's own
+move with the change as its reason.
 
 ## Request feedback
 
-Every request can be marked as a bad question or one that should not have
-been asked, with an optional note. This is recorded whether or not journeys
-are on: it is how agents are taught to need the user less. Each entry keeps
-the request, its reason, the phase, and the context recipe version that asked
-it, so every "shouldn't have asked" becomes a test case for improving that
-phase's prompts.
+There is no "shouldn't have asked" control. Feedback happens in the
+conversation (`doc/lifecycle/triage.md`):
+
+- **Highlight to flag.** Highlight words in a request's text and pick **This
+  is confusing** from the right-click menu (`ui::selectable_text`'s
+  `selectable_markdown_flaggable`). The highlighted words go into the
+  request's triage session as a chat message, which opens in the drawer, and
+  triage explains them and fixes its brief. Known gap: a request with no
+  triage session (an access, broken or capability request, or one the app
+  asks itself) has no one to send the words to, so its menu has no such item.
+- **Say it** in the session: "you could have worked that out from X".
+
+When a triaged request closes its session reflects once and records one
+lesson (`improvement_lessons`, via `tod_store::lessons::record_triage_lesson`).
+The old `request_feedback` table is kept and still readable; nothing writes
+to it any more.
 
 ## Not in the task panel
 

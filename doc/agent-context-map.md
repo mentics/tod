@@ -381,3 +381,9 @@ is banned.
 |---|---|---|---|---|
 | `quick_fix` | `stance/bounded-session` | `surface/quick-fix` | working directory, the failing check (label, command, output tail, the diff of the files it names, the phase's usual commands) | One failing thing and nothing else: no obligations, plan, design or `cli/` noun. Edits files and runs the check's command. |
 | `small_review` | `stance/bounded-session` | `cli/intro`, `cli/review`, `surface/small-review` | data root, working directory, the commit's diff | One cheap reviewer for a quick fix's commit; records findings only. |
+
+## Triage
+
+| Surface | Stance | Fragments | Dynamic blocks | Why |
+|---|---|---|---|---|
+| `triage` | `stance/triage-session` | `cli/intro`, `cli/triage`, `surface/triage` | data root, working directory, the request (question, options, facts, the asking session's last turns, the task's state, obligations with their owner, design summary, earlier answers) | One fresh read-only session per judgment request an agent files. Decides alone on its first turn, then is the user's chat partner for the request. "Wording a request" lives in `surface/triage.md`: only triage writes the brief. No `cli/decisions` noun: it ends with a `triage` verb. |

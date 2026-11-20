@@ -321,6 +321,27 @@ this on (`incident::set_enabled`); an agent-filed request matching an open
 incident is refused as "parked on incident X". The status bar lists open
 incidents. A silent review bot on several nodes is one notice incident.
 
+**Triage** (`doc/lifecycle/triage.md`; `tod_core::conversation::triage`,
+`tod_store::triage`, `tod_store::lessons`, schema v112). A request a lifecycle
+protocol files with reason `intent`, `missing_rule`, `conflict`, `risk` or
+`other` is filed as decision status `triage` (not `pending`: it is not on the
+user's list and the node reads as Working while the session runs); access,
+broken, capability, `check_unrelated` and `bot_silence` stay `pending`. The
+autopilot's `triage_step` starts one fresh, read-only session per request
+(`ProtocolKind::Triage`, lifecycle config key `triage`, Sonnet at low effort)
+that ends it with one `tod-cli triage` verb: `answer` (refused for options that
+edit obligations or move the task), `escalate` with a brief (the session stays
+linked, the user's chat partner: the request card's **Discuss** opens it in the
+chat drawer, whose session list shows request sessions first as "Request: ..."),
+`convert-suggestion`, `convert-dispute`; after the user decides, `settle`, and
+`lesson` for the one reflection a closed request gets
+(`lessons::record_triage_lesson` into `improvement_lessons`). Only triage writes
+a request's wording (`surface/triage.md`). Number keys never answer an escalated
+request. There is no "shouldn't have asked" control: highlight words and pick
+**This is confusing** to send them into the session. An answer's
+`decided_by` is `user`, `tod` or `triage`; the Answered drawer shows it and
+**Change** offers sending the task back to the phase that asked.
+
 **Permissions while unattended** (`tod_core::permission`). A permission an agent asks for that
 nobody has granted is recorded as a pending decision on the node (protocol `permission`,
 reason `access`), so it survives a restart and is answered where requests are. Answering it
