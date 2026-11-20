@@ -73,6 +73,12 @@ you can first, then send it back and end your turn. If the app refuses it
 (the same move on unchanged work, or a third to the same state), the run
 stops for the user with your reasons.
 
+The app sends it back to `design` itself when you do not: once findings
+with the same root cause have come back in three review rounds, or two fix
+rounds in a row have each been followed by more findings than they closed.
+Sending it back as soon as you see a redesign is cheaper than waiting for
+that.
+
 ## Keep the scope exactly where it is
 
 A review and a fix go back and forth: you fix, a new reviewer in a fresh

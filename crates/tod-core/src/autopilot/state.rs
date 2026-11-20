@@ -237,6 +237,11 @@ pub struct CurrentStep {
     /// phase agent's own), so a restart reopens the right session.
     #[serde(default)]
     pub skill_group: usize,
+    /// For a review round, the risk reviewer's conversation beside this one
+    /// (the main reviewer's, the round's lead), once it was started: a
+    /// restart reopens both (`tod_store::review::round`).
+    #[serde(default)]
+    pub partner: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

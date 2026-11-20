@@ -18,6 +18,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
 pub mod coverage;
+pub mod round;
 
 pub use coverage::{
     CoverageEntry, CoverageGaps, CoveragePass, CoverageResult, LatestCoverage, Lens, NewCoverage,
@@ -40,6 +41,68 @@ pub const LENSES: [Lens; 11] = [
     Lens { slug: "tests", title: "Tests" },
     Lens { slug: "verification-evidence", title: "Verification evidence" },
 ];
+
+/// The lenses the risk reviewer sweeps (find-it-first 6h): where defects
+/// that survive review usually live. The main reviewer sweeps all of
+/// [`LENSES`], so these are swept twice, by two sessions that do not share
+/// their reasoning. Data writes is always here until guidance selection
+/// (item 7) can say which tasks write data.
+pub const RISK_LENSES: [&str; 6] = [
+    "data-assumptions",
+    "external-systems",
+    "persisted-results",
+    "interactions",
+    "reach",
+    "data-writes",
+];
+
+/// Which of a review round's two reviewers a review conversation is
+/// (find-it-first 6h): both run at once, in fresh sessions, and record into
+/// the same findings list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Reviewer {
+    /// Sweeps every lens.
+    Main,
+    /// Sweeps only [`RISK_LENSES`].
+    Risk,
+}
+
+impl Reviewer {
+    /// Main first, as a round starts them.
+    pub const ALL: [Reviewer; 2] = [Reviewer::Main, Reviewer::Risk];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Reviewer::Main => "main",
+            Reviewer::Risk => "risk",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Result<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "main" => Ok(Reviewer::Main),
+            "risk" => Ok(Reviewer::Risk),
+            other => bail!("unknown reviewer `{other}` (expected main|risk)"),
+        }
+    }
+
+    /// How a list names it.
+    pub fn title(self) -> &'static str {
+        match self {
+            Reviewer::Main => "main reviewer",
+            Reviewer::Risk => "risk reviewer",
+        }
+    }
+
+    /// The lens slugs this reviewer must cover before it may record done.
+    pub fn lenses(self) -> Vec<&'static str> {
+        match self {
+            Reviewer::Main => LENSES.iter().map(|l| l.slug).collect(),
+            Reviewer::Risk => RISK_LENSES.to_vec(),
+        }
+    }
+}
 
 /// Not yet responded to.
 pub const FINDING_OPEN: &str = "open";
@@ -111,6 +174,10 @@ pub struct ReviewFinding {
     /// The assumption or pattern that made it possible, in the same words
     /// for every finding that shares it (`tod-cli review add --root-cause`).
     pub root_cause: Option<String>,
+    /// Which of the round's reviewers recorded it (schema v105); `None` for
+    /// a finding from before there were two, or recorded outside a review
+    /// conversation (a check, the user).
+    pub reviewer: Option<Reviewer>,
 }
 
 impl ReviewFinding {
@@ -162,13 +229,14 @@ pub const CREATE_TABLE: &str = "
         pr_thread       TEXT,
         pr_posted_at    INTEGER,
         root_cause      TEXT,
+        reviewer        TEXT,
         UNIQUE (node_id, seq)
     );
     CREATE INDEX IF NOT EXISTS idx_review_findings_node ON review_findings(node_id, seq);
 ";
 
 const COLUMNS: &str = "id, node_id, conversation_id, seq, severity, file, line, summary, detail, \
-     status, response, created_at, updated_at, pr_thread, pr_posted_at, root_cause";
+     status, response, created_at, updated_at, pr_thread, pr_posted_at, root_cause, reviewer";
 
 /// The `pr_thread` and `pr_posted_at` columns (idempotent, no schema bump: the
 /// sync copies only the columns both sides have).
@@ -195,9 +263,30 @@ pub fn add_root_cause_column(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Schema v105 (idempotent): which reviewer recorded a finding
+/// (`review_findings.reviewer`), and on a review conversation which reviewer
+/// it is (`conversations.reviewer`) and, for the risk reviewer, the main
+/// reviewer's conversation it shares the round with
+/// (`conversations.review_round`; [`round`]).
+pub fn add_reviewer_columns(conn: &Connection) -> Result<()> {
+    for (table, column, kind) in [
+        ("review_findings", "reviewer", "TEXT"),
+        ("conversations", "reviewer", "TEXT"),
+        ("conversations", "review_round", "BLOB"),
+    ] {
+        let has = conn
+            .prepare(&format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1"))?
+            .exists(params![column])?;
+        if !has {
+            conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {kind}"))?;
+        }
+    }
+    Ok(())
+}
+
 /// A root cause as findings are matched on it: case, and runs of whitespace,
 /// do not tell two apart.
-fn root_cause_key(cause: &str) -> String {
+pub fn root_cause_key(cause: &str) -> String {
     cause.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
 }
 
@@ -291,8 +380,9 @@ impl<'a> ReviewRepo<'a> {
         self.conn.execute(
             "INSERT INTO review_findings
              (id, node_id, conversation_id, seq, severity, file, line, summary, detail,
-              status, created_at, updated_at, root_cause)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'open', ?10, ?10, ?11)",
+              status, created_at, updated_at, root_cause, reviewer)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'open', ?10, ?10, ?11,
+                     (SELECT reviewer FROM conversations WHERE id = ?3))",
             params![
                 uuid_to_blob(id),
                 uuid_to_blob(node_id),
@@ -452,6 +542,13 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReviewFinding> {
         pr_thread: row.get(13)?,
         pr_posted_at: row.get(14)?,
         root_cause: row.get(15)?,
+        reviewer: row
+            .get::<_, Option<String>>(16)?
+            .map(|r| Reviewer::parse(&r))
+            .transpose()
+            .map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(16, rusqlite::types::Type::Text, e.into())
+            })?,
     })
 }
 

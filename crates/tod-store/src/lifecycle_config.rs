@@ -83,7 +83,7 @@ pub fn add_delete_sandbox(conn: &Connection) -> Result<()> {
 /// The phases an agent works in, and so the keys a config may name: the
 /// lifecycle states that have a phase agent, and the protocols that run
 /// in the others (`implement`, `verify`, `review`, `fix`, `pr`).
-pub const PHASES: [&str; 14] = [
+pub const PHASES: [&str; 15] = [
     "proposed",
     "design",
     "planning",
@@ -91,6 +91,7 @@ pub const PHASES: [&str; 14] = [
     "verify",
     "verify_evaluate",
     "review",
+    "review_risk",
     "fix",
     "pr",
     "pr_draft",
@@ -107,17 +108,31 @@ pub const VERIFY_EVALUATE: &str = "verify_evaluate";
 /// The verification protocol's key.
 pub const VERIFY: &str = "verify";
 
+/// The code review protocol's key: a review round's main reviewer.
+pub const REVIEW: &str = "review";
+
+/// A review round's risk reviewer (find-it-first 6h), which runs beside the
+/// main reviewer. Unset, it runs with what [`REVIEW`] sets: see [`fallback`].
+pub const REVIEW_RISK: &str = "review_risk";
+
 /// The key whose settings `phase` takes where no node sets its own: the
-/// evidence evaluator takes verification's, so a config written before it had
-/// a key of its own keeps applying to it.
+/// evidence evaluator takes verification's, and the risk reviewer the main
+/// review's, so a config written before either had a key of its own keeps
+/// applying to it.
 pub fn fallback(phase: &str) -> Option<&'static str> {
-    (phase == VERIFY_EVALUATE).then_some(VERIFY)
+    match phase {
+        VERIFY_EVALUATE => Some(VERIFY),
+        REVIEW_RISK => Some(REVIEW),
+        _ => None,
+    }
 }
 
 /// Whether a phase's gate runs checks: not the evidence evaluator's, which is
-/// one session inside `verifying` (whose checks are [`VERIFY`]'s).
+/// one session inside `verifying` (whose checks are [`VERIFY`]'s), nor the
+/// risk reviewer's, one session inside `review` (whose checks are
+/// [`REVIEW`]'s).
 pub fn takes_checks(phase: &str) -> bool {
-    phase != VERIFY_EVALUATE
+    phase != VERIFY_EVALUATE && phase != REVIEW_RISK
 }
 
 /// The last lifecycle state (`done`, which has no agent and so no entry in

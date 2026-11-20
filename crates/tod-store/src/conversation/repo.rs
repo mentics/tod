@@ -11,7 +11,8 @@ use uuid::Uuid;
 const OPENING_WORDS: usize = 8;
 
 const CONVERSATION_COLUMNS: &str = "id, focus_kind, focus_id, focus_node_id, agent_session_id, \
-     session_name, platform, model, effort, created_at, updated_at, protocol, agent_run_id, from_state, to_state, skill_group";
+     session_name, platform, model, effort, created_at, updated_at, protocol, agent_run_id, from_state, to_state, skill_group, \
+     reviewer, review_round";
 
 const ACTION_COLUMNS: &str = "id, conversation_id, source, turn_seq, actor, kind, entity, entity_id, \
      node_id, mutation, before, after, archive_id, reverses, reversed_by, at";
@@ -79,7 +80,9 @@ impl<'a> ConversationRepo<'a> {
     /// The focus's most recently updated conversation running `protocol` —
     /// how a protocol with one conversation per focus (implementation) finds
     /// the one to reopen. Never one for a later group of the phase's skills,
-    /// which is a session of its own (`set_skill_group`).
+    /// which is a session of its own (`set_skill_group`), and never a review
+    /// round's risk reviewer: the round's main conversation stands for the
+    /// round (`crate::review::round`).
     pub fn latest_for_focus_with_protocol(
         &self,
         focus: Focus,
@@ -90,6 +93,7 @@ impl<'a> ConversationRepo<'a> {
                 &format!(
                     "SELECT {CONVERSATION_COLUMNS} FROM conversations
                      WHERE focus_kind = ?1 AND focus_id IS ?2 AND protocol = ?3 AND skill_group = 0
+                       AND reviewer IS NOT 'risk'
                      ORDER BY updated_at DESC, created_at DESC
                      LIMIT 1"
                 ),
@@ -440,6 +444,52 @@ impl<'a> ConversationRepo<'a> {
         Ok(())
     }
 
+    /// Record which of a review round's reviewers the conversation is and,
+    /// for the risk reviewer, the main reviewer's conversation of its round.
+    pub fn set_reviewer(
+        &self,
+        conversation_id: Uuid,
+        reviewer: crate::review::Reviewer,
+        round: Option<Uuid>,
+    ) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE conversations SET reviewer = ?1, review_round = ?2 WHERE id = ?3",
+            params![reviewer.as_str(), round.map(uuid_to_blob), uuid_to_blob(conversation_id)],
+        )?;
+        anyhow::ensure!(n == 1, "conversation {conversation_id} not found");
+        Ok(())
+    }
+
+    /// The other conversations of the review round `lead` (the round's main
+    /// reviewer) leads: its risk reviewer, oldest first
+    /// (`crate::review::round`).
+    pub fn review_partners(&self, lead: Uuid) -> Result<Vec<Conversation>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {CONVERSATION_COLUMNS} FROM conversations
+             WHERE review_round = ?1 AND id != ?1
+             ORDER BY created_at, id"
+        ))?;
+        let rows = stmt
+            .query_map(params![uuid_to_blob(lead)], map_conversation)?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter().collect()
+    }
+
+    /// Which of a review round's reviewers the conversation is; `None` for a
+    /// review from before there were two, and for every other kind.
+    pub fn reviewer(&self, conversation_id: Uuid) -> Result<Option<crate::review::Reviewer>> {
+        self.conn
+            .query_row(
+                "SELECT reviewer FROM conversations WHERE id = ?1",
+                params![uuid_to_blob(conversation_id)],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+            .map(|r| crate::review::Reviewer::parse(&r))
+            .transpose()
+    }
+
     /// The group of the phase's skills the conversation works with: 0, the
     /// phase agent's own, unless it was started for a later group.
     pub fn skill_group(&self, conversation_id: Uuid) -> Result<usize> {
@@ -665,7 +715,10 @@ fn map_conversation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Conversa
     let from_state = row.get(13)?;
     let to_state = row.get(14)?;
     let skill_group: i64 = row.get(15)?;
+    let reviewer: Option<String> = row.get(16)?;
+    let review_round = opt_uuid(row, 17)?;
     Ok(Focus::from_columns(&kind, focus_id, focus_node).and_then(|focus| {
+        let reviewer = reviewer.as_deref().map(crate::review::Reviewer::parse).transpose()?;
         Ok(Conversation {
             id,
             focus,
@@ -679,6 +732,8 @@ fn map_conversation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Conversa
             from_state,
             to_state,
             skill_group: skill_group.max(0) as usize,
+            reviewer,
+            review_round,
             created_at,
             updated_at,
         })

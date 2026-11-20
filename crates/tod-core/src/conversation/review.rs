@@ -25,7 +25,7 @@ use tod_store::outline::EXTRA_CONTENT_DETAILS;
 use tod_store::outline::repos::NodeRepo;
 use tod_store::review::{
     CoveragePass, CoverageResult, FINDING_DECLINED, FINDING_OUT_OF_SCOPE, NewCoverage, NewFinding,
-    ReviewRepo,
+    ReviewRepo, Reviewer,
 };
 use uuid::Uuid;
 
@@ -37,9 +37,9 @@ const REVIEW: &str = "review";
 /// (`tod_store::review::coverage::record_done`).
 pub use tod_store::review::{done_report, is_done_report};
 
-/// Whether the node's review conversation last reported the review finished.
-/// A review started again reports nothing until it finishes too, so this stays
-/// true meanwhile: the earlier review's findings are still there to answer.
+/// Whether the node's latest review round is done: each of its reviewers
+/// (find-it-first 6h) recorded its review finished
+/// (`tod_store::review::round::done`).
 pub fn review_recorded_done(conn: &Connection, node_id: Uuid) -> Result<bool> {
     let repo = ConversationRepo::new(conn);
     let Some(conversation) =
@@ -47,9 +47,7 @@ pub fn review_recorded_done(conn: &Connection, node_id: Uuid) -> Result<bool> {
     else {
         return Ok(false);
     };
-    Ok(repo
-        .latest_report(conversation.id)?
-        .is_some_and(|report| is_done_report(&report)))
+    tod_store::review::round::done(conn, conversation.id)
 }
 
 /// Whether the node's latest review came back clean: it recorded itself
@@ -65,16 +63,15 @@ pub fn review_passed(conn: &Connection, node_id: Uuid) -> Result<bool> {
     else {
         return Ok(false);
     };
-    if !repo
-        .latest_report(conversation.id)?
-        .is_some_and(|report| is_done_report(&report))
-    {
+    if !tod_store::review::round::done(conn, conversation.id)? {
         return Ok(false);
     }
+    // The round's findings: both reviewers'.
+    let round = tod_store::review::round::conversations(conn, conversation.id)?;
     Ok(ReviewRepo::new(conn)
         .list_for_node(node_id)?
         .iter()
-        .filter(|f| f.conversation_id == Some(conversation.id))
+        .filter(|f| f.conversation_id.is_some_and(|c| round.contains(&c)))
         .all(|f| matches!(f.status.as_str(), FINDING_OUT_OF_SCOPE | FINDING_DECLINED)))
 }
 
@@ -144,10 +141,19 @@ impl Protocol for ReviewProtocol {
         let role_doc = state_role_doc(&manifest, REVIEW)?;
         let cwd = self.cwd(env)?;
         let working_dir = PathBuf::from(cwd.path_text());
-        let skills = crate::skills_context::for_group(fleet, node_id, "review", &cwd, env.skill_group())?;
-        // In `pr_draft` the review runs on the draft pull request, and the app
-        // posts what it records there (`crate::pr_draft_review`).
-        let build = if node.lifecycle == crate::pr_draft_review::STATE {
+        // The risk reviewer's skills are its own key's, which falls back to
+        // the review's: with neither set apart, both reviewers' openings are
+        // the same up to their assignment ([`Self::opening_tail`]).
+        let key = match env.reviewer()? {
+            Some(Reviewer::Risk) => tod_store::lifecycle_config::REVIEW_RISK,
+            _ => tod_store::lifecycle_config::REVIEW,
+        };
+        let skills = crate::skills_context::for_group(fleet, node_id, key, &cwd, env.skill_group())?;
+        // With the pull request open (`pr_draft`, `pr_review`) the review runs
+        // on its local head, and the app posts what it records there when
+        // that head reaches the pull request unreviewed
+        // (`crate::pr_draft_review`).
+        let build = if crate::pr_draft_review::reviews_on_pr(&node.lifecycle) {
             build_review_on_pr_message
         } else {
             build_review_message
@@ -194,22 +200,40 @@ impl Protocol for ReviewProtocol {
         Ok(out)
     }
 
+    /// The reviewer's assignment (find-it-first 6h), last in the context so
+    /// the two reviewers of a round share everything before it.
+    fn opening_tail(&self, env: &ProtocolEnv<'_>) -> Result<Option<String>> {
+        Ok(Some(assignment(env.reviewer()?)))
+    }
+
     fn loops(&self) -> bool {
         true
     }
 
-    /// Every finding on the node, with its status: a continuation that
-    /// records nothing is getting nowhere.
+    /// Every finding on the node, with its status, and how many coverage
+    /// entries this conversation recorded: a continuation that records
+    /// nothing is getting nowhere. The other reviewer of the round works at
+    /// the same time, so its findings alone do not count as progress here:
+    /// only this conversation's coverage and findings do.
     fn progress(&self, env: &ProtocolEnv<'_>) -> Result<Option<String>> {
-        let node = node_id(env)?;
-        let findings = env
-            .fleet
-            .read(|conn| ReviewRepo::new(conn).list_for_node(node))?;
+        let conversation = env.conversation_id;
+        let (findings, coverage) = env.fleet.read(|conn| {
+            let node = match ConversationRepo::new(conn).get(conversation)?.map(|c| c.focus) {
+                Some(Focus::Node(node)) => node,
+                _ => anyhow::bail!("review conversation {conversation} is not about a node"),
+            };
+            Ok((
+                ReviewRepo::new(conn).list_for_node(node)?,
+                tod_store::review::coverage::for_conversation(conn, conversation)?.len(),
+            ))
+        })?;
         let mut marks: Vec<String> = findings
             .iter()
+            .filter(|f| f.conversation_id == Some(conversation))
             .map(|f| format!("{}={}", f.id, f.status))
             .collect();
         marks.sort();
+        marks.push(format!("coverage={coverage}"));
         Ok(Some(marks.join("\n")))
     }
 
@@ -232,6 +256,44 @@ impl Protocol for ReviewProtocol {
     }
 }
 
+/// A reviewer's assignment: which reviewer of the round it is and the lenses
+/// it sweeps (find-it-first 6h). The one part of a review's context that
+/// differs between the round's two reviewers, so it goes last
+/// ([`Protocol::opening_tail`]). A review from before there were two (no
+/// reviewer) sweeps every lens on its own.
+pub fn assignment(reviewer: Option<Reviewer>) -> String {
+    let lenses = |reviewer: Reviewer| {
+        let slugs = reviewer.lenses();
+        tod_store::review::LENSES
+            .iter()
+            .filter(|l| slugs.contains(&l.slug))
+            .map(|l| format!("- {} (`{}`)", l.title, l.slug))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let mut out = String::from("# Your assignment\n\n");
+    match reviewer {
+        Some(Reviewer::Main) => out.push_str(&format!(
+            "You are this round's **main reviewer**. The risk reviewer works beside you at the same \
+             time, sweeping only the lenses where defects that survive review usually live. Sweep \
+             every lens:\n\n{}\n",
+            lenses(Reviewer::Main)
+        )),
+        Some(Reviewer::Risk) => out.push_str(&format!(
+            "You are this round's **risk reviewer**. The main reviewer works beside you at the same \
+             time and sweeps every lens; you sweep only these, and go deeper in each than a review \
+             of every lens can:\n\n{}\n\nRecord coverage for these lenses only. Your saturation pass \
+             looks again at these same lenses.\n",
+            lenses(Reviewer::Risk)
+        )),
+        None => out.push_str(&format!(
+            "You are this round's only reviewer. Sweep every lens:\n\n{}\n",
+            lenses(Reviewer::Main)
+        )),
+    }
+    out
+}
+
 /// What the loop sends when a turn ends without the review recorded as
 /// finished. Its first sentence is what the collapsed transcript entry reads
 /// as.
@@ -249,9 +311,10 @@ fn continuation_message() -> String {
 
 /// Plays the review agent for `--agent mock`: the first turn records one
 /// finding and stops without finishing, so the app's loop sends it back; the
-/// next sweeps every lens, makes the saturation pass, and records the review
-/// done through the same check `tod-cli review done` runs — like
-/// [`super::verify::mock_turn`], a review takes one continuation.
+/// next sweeps every lens of its assignment, makes the saturation pass, and
+/// records the review done through the same check `tod-cli review done` runs —
+/// like [`super::verify::mock_turn`], a review takes one continuation. A
+/// round's risk reviewer records no finding and finishes in its first turn.
 pub fn mock_turn(
     access: &impl super::mock::Access,
     node_id: Uuid,
@@ -260,14 +323,17 @@ pub fn mock_turn(
     // The first review records one finding. A review after a fix (the node
     // already has findings from an earlier session) finds nothing: it is
     // clean, so the mock loop ends in a round or two instead of going round.
-    let (mine, any) = access.read(|conn| {
+    // Only the main reviewer (or a review on its own) records it; the risk
+    // reviewer of the round sweeps its lenses and finishes in one turn.
+    let (mine, any, reviewer) = access.read(|conn| {
         let findings = ReviewRepo::new(conn).list_for_node(node_id)?;
         Ok((
             findings.iter().any(|f| f.conversation_id == Some(conversation_id)),
             !findings.is_empty(),
+            ConversationRepo::new(conn).reviewer(conversation_id)?,
         ))
     })?;
-    if !mine && !any {
+    if !mine && !any && reviewer != Some(Reviewer::Risk) {
         access.interview(tod_store::interview::InterviewCommand::AddReviewFinding {
             node_id,
             conversation_id: Some(conversation_id),
@@ -290,7 +356,8 @@ pub fn mock_turn(
             .map(|f| f.id)
             .collect())
     })?;
-    for lens in tod_store::review::LENSES {
+    let assigned = reviewer.unwrap_or(Reviewer::Main).lenses();
+    for lens in tod_store::review::LENSES.iter().filter(|l| assigned.contains(&l.slug)) {
         // The finding the first turn recorded is the obligations lens's.
         let result = if lens.slug == "obligations" && !mine.is_empty() {
             CoverageResult::Findings(mine.clone())

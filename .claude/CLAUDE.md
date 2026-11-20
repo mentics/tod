@@ -215,7 +215,7 @@ or role doc names a bot, so it cannot contradict the project's skill in the
 same prompt. The project's bots and round limits are
 `pr_readiness` in `tod.yml`. With the lifecycle config's **Include review
 steps** on for `pr_draft` (`lifecycle_config::resolve_pr_draft_review`), feedback
-is reviewed before it is pushed (`Autopilot::pr_change_reviewed`): the PR agent
+in `pr_draft` and `pr_review` (held chat commits too) is reviewed before it is pushed (`Autopilot::pr_change_reviewed`): the PR agent
 fixes and commits without pushing or answering, then, if the branch's change
 against its base differs (`pr_draft_review::pr_change`, in each pull request's
 own repository, a submodule's included; a merge of the base alone does not
@@ -458,7 +458,16 @@ nothing that still stands** (`review::review_passed`; a finding the user marked
 out of scope or declined does not count), and no finding is open. The fixer's
 `fixed` is a claim, never the verdict: `lifecycle_next` sends a fixed-up node to
 Review again, each Review and Fix a conversation (session) of its own, until a
-review comes back clean. The autopilot stops for the user at
+review comes back clean. Each round is two reviewers at once, in fresh
+sessions recording into the one findings list (`review_findings.reviewer`,
+schema v105): the main reviewer (the round's lead conversation) and the risk
+reviewer (`conversations.reviewer = 'risk'`, `review_round` = the lead;
+`tod_store::review::round`), with byte-identical openings up to the
+assignment (`Protocol::opening_tail`), lenses per reviewer, and lifecycle
+config key `review_risk` (falls back to `review`). The round is done when both
+recorded done. Before that limit, `tod_core::fix_escalation` sends the task back
+to `design` as the autopilot when one root cause recurs across 3 rounds or two
+fix rounds in a row add more findings than they close. The autopilot stops for the user at
 `REVIEW_ROUND_LIMIT` reviews in one stay (`NeedsHuman::ReviewNotConverging`,
 shown as the node's stopped reason). Adding a kind means a
 `ProtocolKind` variant, an impl, and a registry arm. The spec,

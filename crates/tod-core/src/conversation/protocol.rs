@@ -44,6 +44,13 @@ impl ProtocolEnv<'_> {
             .read(|conn| tod_store::conversation::ConversationRepo::new(conn).skill_group(self.conversation_id))
             .unwrap_or(0)
     }
+
+    /// Which of a review round's reviewers this conversation is; `None`
+    /// before there were two, and for every other kind.
+    pub fn reviewer(&self) -> Result<Option<tod_store::review::Reviewer>> {
+        self.fleet
+            .read(|conn| tod_store::conversation::ConversationRepo::new(conn).reviewer(self.conversation_id))
+    }
 }
 
 /// What the driver does once a reply has landed.
@@ -198,6 +205,16 @@ pub trait Protocol: Send + Sync {
 
     /// The first message's context.
     fn opening(&self, env: &ProtocolEnv<'_>) -> Result<String>;
+
+    /// What goes at the very end of a fresh session's context (the opening
+    /// or a rotation's snapshot), after everything the driver adds to it.
+    /// Two sessions whose contexts differ only here share the rest as a
+    /// cached prefix: a review round's two reviewers get the same context
+    /// and differ only in their assignment (find-it-first 6h). `None` for
+    /// most kinds.
+    fn opening_tail(&self, _env: &ProtocolEnv<'_>) -> Result<Option<String>> {
+        Ok(None)
+    }
 
     /// What changed since the previous turn that the agent did not do itself.
     /// Empty when the protocol has nothing to report.

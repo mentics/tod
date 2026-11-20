@@ -14,10 +14,10 @@
 
 use anyhow::Result;
 use rusqlite::Connection;
-use std::collections::{BTreeMap, BTreeSet};
-use tod_store::conversation::{ConversationRepo, Focus, ProtocolKind};
+use std::collections::BTreeSet;
+use tod_store::conversation::{Conversation, ConversationRepo, Focus, ProtocolKind};
 use tod_store::phase::PhaseRepo;
-use tod_store::review::{FINDING_DECLINED, FINDING_OUT_OF_SCOPE, ReviewRepo};
+use tod_store::review::{FINDING_DECLINED, FINDING_OUT_OF_SCOPE, ReviewFinding, ReviewRepo};
 use uuid::Uuid;
 
 /// The most rounds a review gets while it keeps finding only new problems, as
@@ -59,46 +59,69 @@ pub fn limit_reached(rounds: u32, limit: u32, finding_rounds: &[Vec<String>]) ->
     rounds >= limit.saturating_mul(HARD_LIMIT_FACTOR) || (rounds >= limit && !all_new(finding_rounds))
 }
 
-/// The findings of each finished review in the node's current stay in the
-/// review state (`pr_draft` when `in_pr_draft`, else tod's `review`), started
-/// at or after `since_ms`, oldest first, as keys. A review whose agent never
-/// finished is skipped (it is no round), and so is a finding that was
-/// dismissed (out of scope, declined): those do not stand.
-pub fn finding_rounds(conn: &Connection, node: Uuid, since_ms: i64, in_pr_draft: bool) -> Result<Vec<Vec<String>>> {
+/// One finished review round: its main conversation (the round's lead,
+/// `tod_store::review::round`) and every finding its reviewers recorded, in
+/// the order recorded.
+#[derive(Debug, Clone)]
+pub struct Round {
+    pub lead: Conversation,
+    pub findings: Vec<ReviewFinding>,
+}
+
+/// Each finished review round in the node's current stay in the review state
+/// (with the pull request open, [`crate::pr_draft_review::STATES`], when
+/// `on_pr`, else tod's `review`), started at or after `since_ms`, oldest
+/// first. A round whose reviewers did not both finish is skipped (it is no
+/// round). Every site that reads a review's rounds reads them here.
+pub fn rounds(conn: &Connection, node: Uuid, since_ms: i64, on_pr: bool) -> Result<Vec<Round>> {
     let stay = PhaseRepo::new(conn).stay_started_at(node)?;
-    let repo = ConversationRepo::new(conn);
-    let mut reviews: Vec<_> = repo
-        .conversations_for_focus(Focus::Node(node))?
-        .into_iter()
+    let all = ConversationRepo::new(conn).conversations_for_focus(Focus::Node(node))?;
+    let mut leads: Vec<&Conversation> = all
+        .iter()
         .filter(|c| {
             c.protocol == ProtocolKind::Review
                 && c.skill_group == 0
-                && (c.from_state.as_deref() == Some(crate::pr_draft_review::STATE)) == in_pr_draft
+                && !c.is_risk_reviewer()
+                && c.from_state.as_deref().is_some_and(crate::pr_draft_review::reviews_on_pr) == on_pr
                 && stay.is_none_or(|s| c.created_at >= s)
                 && c.created_at >= since_ms
         })
         .collect();
-    reviews.sort_by_key(|c| c.created_at);
-    let mut by_conversation: BTreeMap<Uuid, Vec<String>> = BTreeMap::new();
-    for f in ReviewRepo::new(conn).list_for_node(node)? {
-        if matches!(f.status.as_str(), FINDING_OUT_OF_SCOPE | FINDING_DECLINED) {
-            continue;
-        }
-        if let Some(id) = f.conversation_id {
-            by_conversation.entry(id).or_default().push(key(f.file.as_deref(), &f.summary));
-        }
-    }
+    leads.sort_by_key(|c| c.created_at);
+    let findings = ReviewRepo::new(conn).list_for_node(node)?;
     let mut out = Vec::new();
-    for review in reviews {
-        let done = repo
-            .latest_report(review.id)?
-            .is_some_and(|r| crate::conversation::review::is_done_report(&r));
-        if !done {
+    for lead in leads {
+        if !tod_store::review::round::done(conn, lead.id)? {
             continue;
         }
-        out.push(by_conversation.remove(&review.id).unwrap_or_default());
+        let members = tod_store::review::round::conversations(conn, lead.id)?;
+        out.push(Round {
+            lead: lead.clone(),
+            findings: findings
+                .iter()
+                .filter(|f| f.conversation_id.is_some_and(|c| members.contains(&c)))
+                .cloned()
+                .collect(),
+        });
     }
     Ok(out)
+}
+
+/// The findings of each finished review round ([`rounds`]), as keys. A
+/// finding that was dismissed (out of scope, declined) is left out: it does
+/// not stand.
+pub fn finding_rounds(conn: &Connection, node: Uuid, since_ms: i64, on_pr: bool) -> Result<Vec<Vec<String>>> {
+    Ok(rounds(conn, node, since_ms, on_pr)?
+        .into_iter()
+        .map(|round| {
+            round
+                .findings
+                .iter()
+                .filter(|f| !matches!(f.status.as_str(), FINDING_OUT_OF_SCOPE | FINDING_DECLINED))
+                .map(|f| key(f.file.as_deref(), &f.summary))
+                .collect()
+        })
+        .collect())
 }
 
 #[cfg(test)]

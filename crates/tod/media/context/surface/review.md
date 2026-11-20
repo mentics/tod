@@ -83,11 +83,27 @@ Review the whole change this branch adds to its base, every time, including
 a review that follows a fix. Give the fixes extra attention, since they are
 written fast, but never review only them.
 
+### Two reviewers, one assignment each
+
+Every review round has two reviewers, each in a session of its own, working
+at the same time on the same change: the **main** reviewer sweeps every lens
+below, and the **risk** reviewer sweeps only the lenses where defects that
+survive review usually live (data assumptions, external systems, persisted
+results, interactions, reach, data writes). The last section of this context,
+**Your assignment**, says which one you are and names your lenses. Everything
+else here applies to both.
+
+Sweep the lenses your assignment names, and record coverage for each of
+them. Recording your review done needs only those, and a saturation pass of
+your own. Both of you record into the task's one list of findings: list it
+before you record, and again before you record a finding late in the
+review, and do not record what the other reviewer already has.
+
 ### Sweep every lens
 
-Go through the change once per lens. In each, check every changed file and
-every path the change reaches. A lens that does not apply needs a reason you
-could state.
+Go through the change once per lens of your assignment. In each, check every
+changed file and every path the change reaches. A lens that does not apply
+needs a reason you could state.
 
 1. **Obligations** (`obligations`). Does every path make each obligation
    true?
@@ -122,8 +138,8 @@ the `review` noun's `coverage`, named by the slug in brackets above: the
 changed files it covers, what you checked and how, the files you read for it,
 and what it found (nothing, the findings, or why it does not apply). The user
 sees the record beside the findings, and the next round sees what this one
-checked. Recording the review done is refused until every lens has an entry
-and the saturation pass (below) is recorded.
+checked. Recording the review done is refused until every lens of your
+assignment has an entry and the saturation pass (below) is recorded.
 
 ### One finding, its whole class
 

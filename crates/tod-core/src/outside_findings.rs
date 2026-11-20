@@ -72,20 +72,33 @@ pub struct Round {
 }
 
 /// The node's review rounds in the current pass, oldest first: one per
-/// review conversation, with the findings it recorded.
+/// round (its main reviewer's conversation, with the risk reviewer's folded
+/// in: `tod_store::review::round`), with the findings its reviewers recorded.
 fn review_rounds(conn: &rusqlite::Connection, node: Uuid, since: Option<i64>) -> Result<Vec<Round>> {
     use tod_store::conversation::{ConversationRepo, Focus, ProtocolKind};
     let findings = tod_store::review::ReviewRepo::new(conn).list_for_node(node)?;
-    let mut conversations: Vec<_> = ConversationRepo::new(conn)
+    let all: Vec<_> = ConversationRepo::new(conn)
         .list_for_focus_with_protocol(Focus::Node(node), ProtocolKind::Review)?
         .into_iter()
         .map(|summary| summary.conversation)
-        .filter(|c| since.is_none_or(|since| c.created_at > since))
         .collect();
-    conversations.sort_by_key(|c| c.created_at);
-    Ok(conversations
+    let mut leads: Vec<_> = all
         .iter()
-        .map(|c| Round { findings: findings.iter().filter(|f| f.conversation_id == Some(c.id)).count() })
+        .filter(|c| !c.is_risk_reviewer() && since.is_none_or(|since| c.created_at > since))
+        .collect();
+    leads.sort_by_key(|c| c.created_at);
+    Ok(leads
+        .iter()
+        .map(|lead| Round {
+            findings: findings
+                .iter()
+                .filter(|f| {
+                    f.conversation_id.is_some_and(|id| {
+                        all.iter().any(|c| c.id == id && tod_store::review::round::lead_of(c) == lead.id)
+                    })
+                })
+                .count(),
+        })
         .collect())
 }
 

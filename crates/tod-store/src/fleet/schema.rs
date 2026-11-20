@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 103;
+pub const CURRENT_USER_VERSION: i32 = 105;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -687,6 +687,16 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         conn.execute_batch(&crate::journey_changes::send_backs_triggers_sql())?;
         conn.pragma_update(None, "user_version", 103)?;
     }
+    // 104 is guidance selection's (find-it-first item 7, built alongside).
+    if version < 105 {
+        // Two reviewers per review round (find-it-first 6h): which reviewer
+        // recorded each finding, and on a review conversation which reviewer
+        // it is and its round (`crate::review::add_reviewer_columns`).
+        // Synced (sync copies the columns both sides have); the findings
+        // table is journaled already.
+        crate::review::add_reviewer_columns(conn)?;
+        conn.pragma_update(None, "user_version", 105)?;
+    }
     // Other branches (the task panel) numbered their own steps 66–67 at the
     // same time as 66–70 above, so a store may be past a version without
     // having these. Every one is idempotent: make sure of them all.
@@ -721,6 +731,7 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     crate::decisions::add_option_edits(conn)?;
     crate::review::add_pr_columns(conn)?;
     crate::review::add_root_cause_column(conn)?;
+    crate::review::add_reviewer_columns(conn)?;
     conn.execute_batch(crate::review::coverage::CREATE_TABLE)?;
     conn.execute_batch(&crate::journey_changes::review_coverage_triggers_sql())?;
     // A cloud supervisor's heartbeat for a node (`crate::cloud_activity`):

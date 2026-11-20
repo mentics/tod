@@ -3,9 +3,10 @@
 //! project's files it read for it; and the saturation pass that ends the
 //! review (`doc/lifecycle/find-it-first.md` 6c, 6e, 6g).
 //!
-//! One review round is one review conversation, so the record is keyed by the
-//! conversation, and `review done` is refused ([`record_done`]) until every
-//! lens the conversation must sweep ([`required_lenses`]) has an entry and a
+//! A review round is two review conversations, one per reviewer (6h;
+//! [`super::round`]), so the record is keyed by the conversation, and each
+//! reviewer's `review done` is refused ([`record_done`]) until every
+//! lens that reviewer must sweep ([`required_lenses`]) has an entry and a
 //! saturation pass that found nothing was recorded after the last finding the
 //! conversation added. That makes a skipped step visible instead of silent.
 //!
@@ -38,14 +39,16 @@ pub fn lens(slug: &str) -> Option<&'static Lens> {
 }
 
 /// The lenses review conversation `conversation_id` must record coverage for
-/// before it can record the review done: every lens.
+/// before it can record the review done: the lenses of its reviewer's
+/// assignment (find-it-first 6h). The main reviewer, and a review from
+/// before there were two, sweeps every lens; the risk reviewer sweeps
+/// [`super::RISK_LENSES`].
 ///
-/// This is the one place that decides it. A round run by more than one
-/// reviewer, each with its own assignment (find-it-first 6h: a main review of
-/// every lens, a risk review of a few), answers here from the conversation,
-/// and every check and message follows.
-pub fn required_lenses(_conn: &Connection, _conversation_id: Uuid) -> Result<Vec<&'static Lens>> {
-    Ok(LENSES.iter().collect())
+/// This is the one place that decides it; every check and message follows.
+pub fn required_lenses(conn: &Connection, conversation_id: Uuid) -> Result<Vec<&'static Lens>> {
+    let reviewer = ConversationRepo::new(conn).reviewer(conversation_id)?;
+    let slugs = reviewer.unwrap_or(super::Reviewer::Main).lenses();
+    Ok(LENSES.iter().filter(|l| slugs.contains(&l.slug)).collect())
 }
 
 /// Which pass an entry records.

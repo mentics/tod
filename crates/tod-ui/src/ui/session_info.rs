@@ -84,14 +84,18 @@ impl SessionRead {
                 tod_core::run_transcript::usage_for_key(fleet, &ConversationDriver::session_key(id))
             })
         });
-        let expected = self.settings_path.as_deref().map(|path| {
-            tod_core::conversation::launch::resolve_from(fleet, path, self.shown.focus, self.shown.kind)
-        });
-        let stored = self.shown.conversation.and_then(|id| {
-            let row = fleet
+        let row = self.shown.conversation.and_then(|id| {
+            fleet
                 .read(|conn| tod_store::conversation::ConversationRepo::new(conn).get(id))
                 .ok()
-                .flatten()?;
+                .flatten()
+        });
+        // A review round's risk reviewer launches with its own phase's agent.
+        let reviewer = row.as_ref().and_then(|row| row.reviewer);
+        let expected = self.settings_path.as_deref().map(|path| {
+            tod_core::conversation::launch::resolve_from(fleet, path, self.shown.focus, self.shown.kind, reviewer)
+        });
+        let stored = row.and_then(|row| {
             let platform = tod_store::parse_platform(row.platform.as_deref()?)?;
             Some(AgentLaunchOptions::from_settings(
                 platform,

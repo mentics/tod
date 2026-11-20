@@ -766,6 +766,7 @@ mod tests {
             pr_thread: None,
             pr_posted_at: None,
             root_cause: root_cause.map(str::to_string),
+            reviewer: None,
         }
     }
 

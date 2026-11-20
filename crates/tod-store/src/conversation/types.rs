@@ -453,11 +453,26 @@ pub struct Conversation {
     /// with: 0 is the phase agent's own session, any other a session of its
     /// own for that later group.
     pub skill_group: usize,
+    /// For a review conversation, which of the round's two reviewers it is
+    /// (find-it-first 6h; `None` before there were two, and for every other
+    /// kind).
+    #[serde(default)]
+    pub reviewer: Option<crate::review::Reviewer>,
+    /// For the risk reviewer, the main reviewer's conversation it shares the
+    /// round with (`crate::review::round`).
+    #[serde(default)]
+    pub review_round: Option<Uuid>,
     pub created_at: i64,
     pub updated_at: i64,
 }
 
 impl Conversation {
+    /// Whether it is the risk reviewer of a round, which every "latest
+    /// review" lookup passes over for the round's main conversation.
+    pub fn is_risk_reviewer(&self) -> bool {
+        self.reviewer == Some(crate::review::Reviewer::Risk)
+    }
+
     /// What a list adds to a session for a later group of the phase's skills
     /// (`" · skills 2"`); empty for the phase agent's own.
     pub fn group_suffix(&self) -> String {

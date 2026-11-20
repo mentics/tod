@@ -1725,6 +1725,60 @@ fn a_review_loops_until_it_is_recorded_done() {
     assert_eq!(turns(&fx, id).len(), 4);
 }
 
+/// `--agent mock` gets through a round with both reviewers: the main one
+/// records a finding and finishes on its continuation, the risk one sweeps
+/// its own lenses and finishes at once, and the round is done only once both
+/// have recorded done.
+#[test]
+fn the_mock_gets_through_a_round_with_both_reviewers() {
+    use tod_store::review::{ReviewRepo, Reviewer};
+    let fx = fixture();
+    let workspace = fx.root.join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    fx.fleet
+        .enqueue_outline(OutlineMutation::EnableCapabilities {
+            node_id: fx.node,
+            capabilities: vec![tod_store::outline::Capability::Files],
+        })
+        .unwrap();
+    fx.fleet.writer().flush().unwrap();
+    tod_store::fleet::places::pick_matching(
+        &fx.fleet,
+        &fx.node.to_string(),
+        &tod_store::fleet::FilesPlace {
+            repo: Some(workspace.display().to_string()),
+            use_worktree: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    fx.fleet.writer().flush().unwrap();
+
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut main = ConversationDriver::new(config(&fx, 100_000), Focus::Node(fx.node), ProtocolKind::Review)
+        .with_reviewer(Reviewer::Main, None);
+    main.send(&fx.fleet, &mut agent, "Review the change.").unwrap();
+    let lead = main.conversation_id().unwrap();
+    let mut risk = ConversationDriver::new(config(&fx, 100_000), Focus::Node(fx.node), ProtocolKind::Review)
+        .with_reviewer(Reviewer::Risk, Some(lead));
+    risk.send(&fx.fleet, &mut agent, "Review the change.").unwrap();
+    let partner = risk.conversation_id().unwrap();
+    let fleet = fx.fleet.clone();
+    let done = move || fleet.read(|conn| tod_store::review::round::done(conn, lead)).unwrap();
+
+    assert_eq!(risk.tick(&fx.fleet, &mut agent), [DONE]);
+    assert!(!done(), "the main reviewer has not recorded done yet");
+    assert_eq!(main.tick(&fx.fleet, &mut agent), [ConversationEvent::Continued]);
+    assert_eq!(main.tick(&fx.fleet, &mut agent), [DONE]);
+    assert!(done());
+    let members = fx.fleet.read(|conn| tod_store::review::round::conversations(conn, lead)).unwrap();
+    assert_eq!(members.len(), 2, "{members:?}");
+    assert!(members.contains(&partner));
+    let findings = fx.fleet.read(|conn| ReviewRepo::new(conn).list_for_node(fx.node)).unwrap();
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].reviewer, Some(Reviewer::Main));
+}
+
 /// The fix loop end to end: the agent is given only the open findings, the
 /// mock fixes one per turn with a green test run, and the app sends it back
 /// until none is open.

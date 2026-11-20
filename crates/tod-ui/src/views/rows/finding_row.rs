@@ -175,6 +175,21 @@ pub fn finding_row<A: From<FindingRowEvent> + 'static>(
                 ))),
         );
     }
+    if let Some(reviewer) = finding.reviewer {
+        // Which of the round's two reviewers recorded it.
+        body = body.child(
+            h_flex()
+                .gap(style::space::INLINE)
+                .items_start()
+                .child(style::text_dense_label(div()).flex_shrink_0().child("Found by"))
+                .child(style::text_dense(div()).min_w_0().child(selectable_text(
+                    format!("review-finding-reviewer-{id}"),
+                    reviewer.title().to_string(),
+                    window,
+                    cx,
+                ))),
+        );
+    }
     if let Some(detail) = &finding.detail {
         body = body.child(style::text_dense_muted(div()).child(selectable_text(
             format!("review-finding-detail-{id}"),
