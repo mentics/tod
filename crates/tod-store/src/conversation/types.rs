@@ -141,6 +141,7 @@ str_enum!(
         Phase => "phase",
         Evaluate => "evaluate",
         Guidance => "guidance",
+        Incident => "incident",
     }
 );
 

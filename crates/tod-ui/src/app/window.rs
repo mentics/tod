@@ -113,6 +113,8 @@ pub struct Shell {
     /// The daemon has not answered this long (since, why): nothing syncs, so
     /// the status bar says what is shown is as of then.
     daemon_outage: Option<(i64, String)>,
+    /// Open incidents (`tod_store::incidents`), for the status bar.
+    open_incidents: usize,
     /// Which logged errors have raised a toast, and which repeats fold into one.
     toast_gate: tod_core::logging::buffer::ToastGate,
     agent_status_text: SharedString,
@@ -389,6 +391,11 @@ impl Shell {
         let outage = daemon_outage(chrono::Utc::now().timestamp_millis());
         if outage != self.daemon_outage {
             self.daemon_outage = outage;
+            cx.notify();
+        }
+        let incidents = crate::views::incidents_dialog::open_count(&self.fleet);
+        if incidents != self.open_incidents {
+            self.open_incidents = incidents;
             cx.notify();
         }
         let text = format_status_bar(&self.compute_status_groups());
@@ -728,6 +735,19 @@ impl Shell {
                                 ))
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.open_log_window(cx);
+                                })),
+                        )
+                    })
+                    .when(self.open_incidents > 0, |el| {
+                        el.child(
+                            Button::new("open-incidents")
+                                .outline()
+                                .compact()
+                                .warning()
+                                .label(format!("Incidents ({})", self.open_incidents))
+                                .tooltip("Failures many nodes share: which nodes are parked on each")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    crate::views::incidents_dialog::open_incidents_dialog(window, cx, this.fleet.clone());
                                 })),
                         )
                     })
@@ -1652,6 +1672,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 log_window: log_window.clone(),
                                 log_unread: (0, 0),
                                 daemon_outage: None,
+                                open_incidents: 0,
                                 toast_gate: Default::default(),
                                 agent_status_text,
                                 paths: paths.clone(),

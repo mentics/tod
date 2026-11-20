@@ -56,6 +56,7 @@ pub const INCOMING_SURFACE: &str = "incoming check";
 
 /// The guidance selector (`crate::guidance`).
 pub const GUIDANCE_SURFACE: &str = "guidance";
+pub const INCIDENT_SURFACE: &str = "incident";
 
 /// Name a session, e.g. `Obligations · Ship the chat context fix · Sep 10, 2:41 PM`.
 ///

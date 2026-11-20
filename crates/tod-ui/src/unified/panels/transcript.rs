@@ -167,6 +167,7 @@ fn run_label_base(c: &Conversation) -> String {
         ProtocolKind::Pr => "Pull request",
         ProtocolKind::Incoming => "Incoming changes",
         ProtocolKind::Guidance => "Select guidance",
+        ProtocolKind::Incident => "Investigate incident",
         ProtocolKind::VisualDesign => "Visual design",
         ProtocolKind::Chat => "Chat",
         ProtocolKind::Outline => "Outline",

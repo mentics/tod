@@ -294,6 +294,20 @@ other work goes to the agent, else at most every housekeeping gap in
 follow. Tests replace GitHub with
 `pr_readiness::set_feed_override`.
 
+**Incidents** (`doc/lifecycle/incidents.md`; `tod_store::incident_class`,
+`tod_store::incidents`, `tod_core::incident`, schema v111, machine-local). A
+failure is classified by signature (`auth`, `service_down`, `provider`,
+`tool_broken` park; `ci_infra` and `work` never do). The first node retries; a
+second node with the same signature within 30 minutes opens an incident, which
+parks its nodes (`next_actor`: `Others`, `who` names it) so none retries, runs a
+session or asks. The daemon's tick probes one parked node (backoff 2 to 30
+minutes), resolves on its success and resumes the rest staggered, and
+escalates once: one `access` request for `auth`, else one `incident` protocol
+investigation (Haiku, lifecycle config key `incident`). Only `tod-agentd` turns
+this on (`incident::set_enabled`); an agent-filed request matching an open
+incident is refused as "parked on incident X". The status bar lists open
+incidents. A silent review bot on several nodes is one notice incident.
+
 **Permissions while unattended** (`tod_core::permission`). A permission an agent asks for that
 nobody has granted is recorded as a pending decision on the node (protocol `permission`,
 reason `access`), so it survives a restart and is answered where requests are. Answering it

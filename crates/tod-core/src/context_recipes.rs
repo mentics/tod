@@ -605,10 +605,22 @@ pub const GUIDANCE: ContextRecipe = ContextRecipe {
     ],
 };
 
+/// The incident investigation (`crate::incident`, `ProtocolKind::Incident`):
+/// one failure many nodes share, with samples. One-shot, with one scoped
+/// exception `surface/incident` states: fix what can be fixed, or file one
+/// request through the `decisions` noun.
+pub const INCIDENT: ContextRecipe = ContextRecipe {
+    name: "incident investigation",
+    situational: false,
+    layers: &["stance/one-shot", "cli/intro", "cli/decisions", "surface/incident"],
+    blocks: &[DynamicBlock::DataRoot, DynamicBlock::IncidentSamples],
+};
+
 /// Every registered surface.
 pub const ALL_RECIPES: &[ContextRecipe] = &[
     INCOMING_CHANGES,
     GUIDANCE,
+    INCIDENT,
     CONVERSATION,
     CHAT,
     VISUAL_DESIGN,
@@ -995,6 +1007,7 @@ missing"),
             | DynamicBlock::WorkHistory
             | DynamicBlock::IncomingChanges
             | DynamicBlock::GuidanceSelection
+            | DynamicBlock::IncidentSamples
             | DynamicBlock::VisualDesign => 5,
         }
     }

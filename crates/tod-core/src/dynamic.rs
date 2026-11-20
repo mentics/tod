@@ -148,6 +148,9 @@ pub enum DynamicBlock {
     /// `crate::guidance`): the change or the design, the candidates, the
     /// project's routing table, the lenses, and what is selected so far.
     GuidanceSelection,
+    /// The incident an investigation is about (pre-rendered by
+    /// `crate::incident`): its signature, summary and samples.
+    IncidentSamples,
     /// What a conversation is about: its kind, path, title, and (by kind) its
     /// full text, its obligations and plan steps, or the top-level nodes.
     Focus,
@@ -188,6 +191,8 @@ pub struct DynamicContext<'a> {
     pub focus: Option<&'a FocusSelection>,
     pub incoming: &'a [IncomingChangeItem],
     pub guidance: &'a str,
+    /// What the incident investigation is about (pre-rendered).
+    pub incident: &'a str,
     pub environment: &'a str,
     pub skills: &'a str,
     pub pull_requests: &'a str,
@@ -522,6 +527,12 @@ fn render_block(block: DynamicBlock, ctx: &DynamicContext<'_>, out: &mut String)
         DynamicBlock::GuidanceSelection => {
             out.push_str("\n## Guidance to select from\n\n");
             out.push_str(ctx.guidance.trim());
+            out.push('\n');
+        }
+
+        DynamicBlock::IncidentSamples => {
+            out.push_str("\n## The incident\n\n");
+            out.push_str(ctx.incident.trim());
             out.push('\n');
         }
 

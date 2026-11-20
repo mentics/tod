@@ -123,6 +123,9 @@ pub fn run(data_root: &Path) -> Result<bool> {
     if mock {
         tod_core::interview::mock::install_mock_interview_handler(data_root.to_path_buf());
     }
+    // Failures many nodes share are one incident here, not one per node
+    // (`doc/lifecycle/incidents.md`); a cloud supervisor never parks.
+    tod_core::incident::set_enabled(true);
     shared.runners.resume_saved();
     // The cloud: the outbox and the lost-sandbox check, and the orchestrator's
     // notifications. One process holds them, whoever has the app open.

@@ -84,10 +84,11 @@ pub fn add_delete_sandbox(conn: &Connection) -> Result<()> {
 /// lifecycle states that have a phase agent, and the protocols that run
 /// in the others (`implement`, `verify`, `review`, `fix`, `pr`), and the
 /// guidance selector (`guidance`), which runs before `active` and review.
-pub const PHASES: [&str; 16] = [
+pub const PHASES: [&str; 17] = [
     "proposed",
     "design",
     "guidance",
+    "incident",
     "planning",
     "implement",
     "verify",
@@ -134,7 +135,7 @@ pub fn fallback(phase: &str) -> Option<&'static str> {
 /// risk reviewer's, one session inside `review` (whose checks are
 /// [`REVIEW`]'s), nor the guidance selector's, which has no gate.
 pub fn takes_checks(phase: &str) -> bool {
-    phase != VERIFY_EVALUATE && phase != REVIEW_RISK && phase != GUIDANCE
+    phase != VERIFY_EVALUATE && phase != REVIEW_RISK && phase != GUIDANCE && phase != INCIDENT
 }
 
 /// The guidance selector (`tod_core::guidance`): only its model and effort
@@ -148,8 +149,16 @@ pub const GUIDANCE_DEFAULT_EFFORT: &str = "low";
 /// Whether a phase's agent takes skills: not the guidance selector, which
 /// reads none (it picks the guidance every other phase gets).
 pub fn takes_skills(phase: &str) -> bool {
-    phase != GUIDANCE
+    phase != GUIDANCE && phase != INCIDENT
 }
+
+/// The incident investigation (`tod_core::incident`): one short session
+/// about a failure many nodes share. Only its model and effort are
+/// configured; unset, it runs on [`INCIDENT_DEFAULT_MODEL`] at
+/// [`INCIDENT_DEFAULT_EFFORT`].
+pub const INCIDENT: &str = "incident";
+pub const INCIDENT_DEFAULT_MODEL: &str = "haiku";
+pub const INCIDENT_DEFAULT_EFFORT: &str = "low";
 
 /// The last lifecycle state (`done`, which has no agent and so no entry in
 /// [`PHASES`]): a node entering it has its sandbox deleted unless
@@ -286,7 +295,7 @@ pub fn set_skills(conn: &Connection, node_id: Uuid, config: &Skills) -> Result<(
         }
         if !takes_skills(phase) && names.iter().any(|n| !n.trim().is_empty()) {
             bail!(
-                "{phase} takes no skills: the guidance selector only picks the guidance the other phases get; \
+                "{phase} takes no skills: it is a short session the app runs on its own; \
                  set its model and effort instead"
             );
         }
@@ -549,8 +558,8 @@ pub fn set_checks(conn: &Connection, node_id: Uuid, config: &Checks) -> Result<(
             bail!("{phase} is not a lifecycle phase ({})", PHASES.join(", "));
         }
         if !takes_checks(phase) && !list.is_empty() {
-            if phase == GUIDANCE {
-                bail!("{phase} runs no checks: the guidance selector has no gate");
+            if phase == GUIDANCE || phase == INCIDENT {
+                bail!("{phase} runs no checks: it has no gate");
             }
             bail!("{phase} runs no checks: its gate is `verifying`'s, so put them under `{VERIFY}`");
         }

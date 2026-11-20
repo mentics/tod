@@ -80,6 +80,11 @@ pub fn check_github(
     if !matches!(found, GithubCheck::Unreadable(_)) {
         clear_read_failures(fleet, node)?;
     }
+    // A look that really read GitHub shows it works for this node: it leaves
+    // any incident it was parked on, and resolves it when it was the probe.
+    if matches!(found, GithubCheck::Clear | GithubCheck::Waiting { .. } | GithubCheck::Feedback { .. }) {
+        crate::incident::node_ok(fleet, node)?;
+    }
     Ok(found)
 }
 
@@ -116,6 +121,22 @@ pub fn github_look_failed(
     releasing: bool,
     error: &str,
 ) -> Result<Outcome> {
+    // A failure other nodes have too is one incident, not one per node
+    // (`doc/lifecycle/incidents.md`): an open incident parks the node, with
+    // no retry of its own; the daemon probes and resumes it.
+    let observed = crate::incident::observe(
+        fleet,
+        node,
+        tod_store::incident_class::Source::Github,
+        "looking at GitHub",
+        error,
+    )?;
+    if observed.verdict == tod_store::incidents::Verdict::Parked {
+        clear_read_failures(fleet, node)?;
+        if let Some(parking) = crate::incident::parking(fleet, node)? {
+            return Ok(crate::incident::parked_outcome(&parking));
+        }
+    }
     let spec = read_wait_spec(releasing);
     let now = chrono::Utc::now().timestamp_millis();
     let existing = fleet
@@ -141,7 +162,11 @@ pub fn github_look_failed(
             (id, 0)
         }
     };
-    let transient = tod_store::github::is_transient_message(error);
+    // A first sighting of a cause that can be an incident is retried with
+    // backoff like a transient failure, so a second node's sighting can open
+    // one before this node asks the user.
+    let transient = tod_store::github::is_transient_message(error)
+        || observed.verdict == tod_store::incidents::Verdict::Retry;
     // A spent rate limit is waited out until its reset, which GitHub told us:
     // looking sooner only fails again, so it spends none of the retry budget
     // and never stops the run.

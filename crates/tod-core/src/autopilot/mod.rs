@@ -795,6 +795,9 @@ impl Autopilot {
             if let Some(limit) = self.over_budget() {
                 return Ok(Outcome::BudgetExhausted { limit });
             }
+            if let Some(outcome) = self.incident_step(fleet, agent, hook)? {
+                return Ok(outcome);
+            }
             let lifecycle = lifecycle::current_state(fleet, self.node)?;
             if lifecycle == "done" {
                 return Ok(Outcome::Done);
@@ -1155,6 +1158,82 @@ impl Autopilot {
     /// looks again.
     fn files_busy(&self, fleet: &FleetStore, err: &anyhow::Error) -> Result<Outcome> {
         self.wait_for_files(fleet, format!("another node is still making its files: {err:#}"))
+    }
+
+    /// An agent turn failed with `error`. A failure other nodes have too (the
+    /// model API overloaded or rate limiting, the agent's login rejected) is an
+    /// incident, not this task's: it parks with the others, or retries with
+    /// backoff until a second node shows it is shared
+    /// (`crate::incident`, `doc/lifecycle/incidents.md`). Anything else is the
+    /// task's own failure, for its owner.
+    fn agent_failed(&self, fleet: &FleetStore, error: String) -> Result<Outcome> {
+        use tod_store::incidents::Verdict;
+        /// Retries of a first sighting before it is the user's after all.
+        const RETRIES: u32 = 3;
+        let observed = crate::incident::observe(
+            fleet,
+            self.node,
+            tod_store::incident_class::Source::Agent,
+            "an agent turn",
+            &error,
+        )?;
+        match observed.verdict {
+            Verdict::Parked => {
+                if let Some(parking) = crate::incident::parking(fleet, self.node)? {
+                    return Ok(crate::incident::parked_outcome(&parking));
+                }
+            }
+            Verdict::Retry if observed.attempt <= RETRIES => {
+                let now = chrono::Utc::now().timestamp_millis();
+                let due_at_ms = now + 60_000i64 * (1i64 << observed.attempt.min(5));
+                return Ok(Outcome::Waiting {
+                    what: format!("the agent turn failed ({} of {RETRIES} retries): {error}", observed.attempt),
+                    due_at_ms,
+                });
+            }
+            _ => {}
+        }
+        Ok(Outcome::NeedsHuman { reason: NeedsHuman::AgentFailed { error } })
+    }
+
+    /// The steps the incident machinery owes this node before its own work:
+    /// a node parked on an incident waits (nothing retries, nothing asks), and
+    /// the node an incident's investigation was claimed for runs it once.
+    /// `Some` ends the run.
+    fn incident_step<A: AgentAccess + ?Sized, H: StepHook + ?Sized>(
+        &mut self,
+        fleet: &FleetStore,
+        agent: &mut A,
+        hook: &mut H,
+    ) -> Result<Option<Outcome>> {
+        if !crate::incident::enabled() {
+            return Ok(None);
+        }
+        if let Some(parking) = crate::incident::parking(fleet, self.node)? {
+            return Ok(Some(crate::incident::parked_outcome(&parking)));
+        }
+        let Some(incident) = crate::incident::investigation_owed(fleet, self.node)? else {
+            return Ok(None);
+        };
+        if let Some(outcome) = self.converse_group(fleet, agent, hook, ProtocolKind::Incident, None, 0)? {
+            return Ok(Some(outcome));
+        }
+        let conversation = fleet.read(|conn| {
+            Ok(tod_store::conversation::ConversationRepo::new(conn)
+                .latest_for_focus_with_protocol(tod_store::conversation::Focus::Node(self.node), ProtocolKind::Incident)?)
+        })?;
+        if let Some(conversation) = conversation {
+            fleet
+                .interview(
+                    "autopilot",
+                    InterviewCommand::Incident(tod_store::incidents::Op::RecordInvestigation {
+                        incident: incident.id,
+                        conversation: conversation.id,
+                    }),
+                )
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        Ok(None)
     }
 
     fn wait_for_files(&self, fleet: &FleetStore, what: String) -> Result<Outcome> {
@@ -2035,9 +2114,25 @@ impl Autopilot {
             if tried.auto_proceed {
                 tracing::info!(%node, bot = %tried.bot, asks = tried.asks, "a review bot stayed silent: going on without it (decided by tod)");
                 bot_silence::settle_without(fleet, node, &tried)?;
+                crate::incident::notice(
+                    fleet,
+                    node,
+                    &format!("bot_silent:{}", tried.bot),
+                    &format!("{} is not reviewing", tried.bot),
+                    &format!("silent on {}", tried.prs.join(", ")),
+                )?;
                 settled = true;
                 continue;
             }
+            // The same bot silent on several nodes' pull requests is one
+            // notice in the status bar (`crate::incident`), not a fleet's worth.
+            crate::incident::notice(
+                fleet,
+                node,
+                &format!("bot_silent:{}", tried.bot),
+                &format!("{} is not reviewing", tried.bot),
+                &format!("silent on {}", tried.prs.join(", ")),
+            )?;
             tracing::info!(%node, bot = %tried.bot, asks = tried.asks, "a review bot stayed silent: asking the user");
             fleet
                 .interview(
@@ -3594,9 +3689,7 @@ impl Autopilot {
                 match event {
                     ConversationEvent::TurnFinished { error: Some(error) } => {
                         // Kept as current: a restart reopens it.
-                        return Ok(Some(Outcome::NeedsHuman {
-                            reason: NeedsHuman::AgentFailed { error },
-                        }));
+                        return Ok(Some(self.agent_failed(fleet, error)?));
                     }
                     ConversationEvent::TurnFinished { error: None } => {
                         finished = true;
@@ -3770,9 +3863,7 @@ impl Autopilot {
                         ConversationEvent::TurnFinished { error: Some(error) } => {
                             // Kept as current: a restart reopens it.
                             cancel_lanes(fleet, agent, &mut lanes)?;
-                            return Ok(Some(Outcome::NeedsHuman {
-                                reason: NeedsHuman::AgentFailed { error },
-                            }));
+                            return Ok(Some(self.agent_failed(fleet, error)?));
                         }
                         ConversationEvent::TurnFinished { error: None } => {
                             finished = true;

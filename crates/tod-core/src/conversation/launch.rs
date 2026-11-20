@@ -32,6 +32,7 @@ pub fn role_for(kind: ProtocolKind) -> AgentRole {
         | ProtocolKind::Evaluate
         | ProtocolKind::Incoming
         | ProtocolKind::Guidance
+        | ProtocolKind::Incident
         | ProtocolKind::Pr => AgentRole::Default,
     }
 }
@@ -63,6 +64,7 @@ pub fn phase_for(
         },
         ProtocolKind::Fix => "fix".to_string(),
         ProtocolKind::Guidance => lifecycle_config::GUIDANCE.to_string(),
+        ProtocolKind::Incident => lifecycle_config::INCIDENT.to_string(),
         ProtocolKind::Pr => match state()?.as_str() {
             "pr_draft" => "pr_draft".to_string(),
             "pr_review" => "pr_review".to_string(),
@@ -127,6 +129,8 @@ pub fn try_for_focus(
         // at low effort, whatever the node's Agent capability says.
         let (default_model, default_effort) = if phase == lifecycle_config::GUIDANCE {
             (Some(lifecycle_config::GUIDANCE_DEFAULT_MODEL), Some(lifecycle_config::GUIDANCE_DEFAULT_EFFORT))
+        } else if phase == lifecycle_config::INCIDENT {
+            (Some(lifecycle_config::INCIDENT_DEFAULT_MODEL), Some(lifecycle_config::INCIDENT_DEFAULT_EFFORT))
         } else {
             (None, None)
         };

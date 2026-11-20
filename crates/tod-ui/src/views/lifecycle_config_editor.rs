@@ -91,6 +91,7 @@ fn phase_label(phase: &str) -> &'static str {
         "proposed" => "Proposed",
         "design" => "Design",
         "guidance" => "Guidance selector",
+        "incident" => "Incident investigation",
         "planning" => "Planning",
         "implement" => "Implement",
         "verify" => "Verify",
@@ -130,6 +131,11 @@ fn phase_blurb(phase: &str) -> Option<&'static str> {
             "The short session that picks which of the project's skills, files, lenses and checks a \
              task's change needs, before the work and again at review. It takes no skills; it runs on \
              haiku at low effort unless set here.",
+        ),
+        "incident" => Some(
+            "The short session that looks into a failure many nodes share, once per incident: it fixes \
+             what it can or files one request. It takes no skills; it runs on haiku at low effort \
+             unless set here.",
         ),
         "verify_evaluate" => Some(
             "For the independent agent that audits verification's evidence (with independent \
