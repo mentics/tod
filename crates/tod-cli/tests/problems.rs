@@ -19,7 +19,7 @@ fn lines(root: &std::path::Path) -> Vec<serde_json::Value> {
 }
 
 #[test]
-fn an_error_exit_is_recorded_as_a_problem() {
+fn a_rejected_command_is_recorded_as_a_warning() {
     let root = tod_test_util::scratch_dir(format!("tod-cli-problems-{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
     let out = run(&root, &["no-such-noun"]);
@@ -28,7 +28,9 @@ fn an_error_exit_is_recorded_as_a_problem() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("unknown noun"));
     let recorded = lines(&root);
     assert_eq!(recorded.len(), 1);
-    assert_eq!(recorded[0]["level"], "error");
+    // Turned down (an unknown noun), not a failure of tod: a warning, never a
+    // toast (`is_rejection` in main.rs).
+    assert_eq!(recorded[0]["level"], "warn");
     assert_eq!(recorded[0]["process"], "tod-cli");
     assert!(recorded[0]["message"].as_str().unwrap().contains("unknown noun"));
     std::fs::remove_dir_all(&root).ok();
