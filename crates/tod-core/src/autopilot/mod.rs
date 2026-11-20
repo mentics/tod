@@ -24,6 +24,7 @@
 //! conversation that was in progress instead of starting another.
 
 mod github_wait;
+mod process_review;
 mod quick_fix;
 mod triage;
 pub use github_wait::{
@@ -804,6 +805,11 @@ impl Autopilot {
             // A request an agent filed is read by triage before anything below
             // decides the run must stop for the user.
             if let Some(outcome) = self.triage_step(fleet, agent, hook)? {
+                return Ok(outcome);
+            }
+            // A node made for a process-review run holds its review session
+            // before any phase agent works on it.
+            if let Some(outcome) = self.process_review_step(fleet, agent, hook)? {
                 return Ok(outcome);
             }
             let lifecycle = lifecycle::current_state(fleet, self.node)?;

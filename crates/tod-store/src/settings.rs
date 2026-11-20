@@ -136,12 +136,17 @@ pub struct ProcessReviewSettings {
     /// the process review does not run.
     #[serde(default)]
     pub parent: Option<String>,
-    /// A review is due once this many hours passed since the last one (and at
-    /// least one lesson is new).
+    /// The slug (or UUID) of a second parent, for the lessons that belong to a
+    /// project's own files (a project skill) rather than to tod's: a run then
+    /// makes a node under each. Unset: they go in the one node.
+    #[serde(default)]
+    pub project_parent: Option<String>,
+    /// A review is due once this many hours passed since a run last took
+    /// lessons in (and `min_lessons` are new).
     #[serde(default = "default_process_review_every_hours")]
     pub every_hours: u32,
-    /// A review is due as soon as this many lessons are new, whenever the
-    /// last one ran.
+    /// A review needs at least this many new lessons: a model session is
+    /// not worth running for fewer.
     #[serde(default = "default_process_review_min_lessons")]
     pub min_lessons: u32,
 }
@@ -150,6 +155,7 @@ impl Default for ProcessReviewSettings {
     fn default() -> Self {
         Self {
             parent: None,
+            project_parent: None,
             every_hours: default_process_review_every_hours(),
             min_lessons: default_process_review_min_lessons(),
         }
@@ -158,6 +164,9 @@ impl Default for ProcessReviewSettings {
 
 impl ProcessReviewSettings {
     pub fn validate(&self) -> Result<()> {
+        if self.project_parent.is_some() && self.parent.is_none() {
+            bail!("process_review.project_parent needs process_review.parent");
+        }
         if self.parent.as_deref().is_some_and(|p| p.trim().is_empty()) {
             bail!("process_review.parent is blank: name the parent node's slug, or leave it out");
         }
@@ -1761,6 +1770,7 @@ mod tests {
             },
             process_review: ProcessReviewSettings {
                 parent: Some("process-improvements".into()),
+                project_parent: Some("project-process".into()),
                 every_hours: 12,
                 min_lessons: 4,
             },

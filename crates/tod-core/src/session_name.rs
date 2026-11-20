@@ -61,6 +61,8 @@ pub const SMALL_REVIEW_SURFACE: &str = "small review";
 pub const INCIDENT_SURFACE: &str = "incident";
 /// A triage session reading one request (`crate::conversation::triage`).
 pub const TRIAGE_SURFACE: &str = "triage";
+/// A process-review session (`crate::conversation::process_review`).
+pub const PROCESS_REVIEW_SURFACE: &str = "process review";
 
 /// Name a session, e.g. `Obligations · Ship the chat context fix · Sep 10, 2:41 PM`.
 ///

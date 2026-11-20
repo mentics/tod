@@ -163,6 +163,10 @@ pub enum DynamicBlock {
     /// `crate::conversation::triage`): the request, the asking session's last
     /// turns, the task's state, obligations, design and answered requests.
     TriageRequest,
+    /// The lessons a process-review run took in (pre-rendered by
+    /// `crate::process_review`): the `brief_unclear` ones with the user's words
+    /// first, then every group by target and cause.
+    ProcessReviewLessons,
     /// What a conversation is about: its kind, path, title, and (by kind) its
     /// full text, its obligations and plan steps, or the top-level nodes.
     Focus,
@@ -211,6 +215,8 @@ pub struct DynamicContext<'a> {
     pub incident: &'a str,
     /// What a triage session reads (pre-rendered).
     pub triage: &'a str,
+    /// What a process-review session reads (pre-rendered).
+    pub process_review: &'a str,
     pub environment: &'a str,
     pub skills: &'a str,
     pub pull_requests: &'a str,
@@ -567,6 +573,11 @@ fn render_block(block: DynamicBlock, ctx: &DynamicContext<'_>, out: &mut String)
         DynamicBlock::TriageRequest => {
             out.push_str("\n## The request\n\n");
             out.push_str(ctx.triage.trim());
+            out.push('\n');
+        }
+        DynamicBlock::ProcessReviewLessons => {
+            out.push_str("\n## The lessons of this run\n\n");
+            out.push_str(ctx.process_review.trim());
             out.push('\n');
         }
 

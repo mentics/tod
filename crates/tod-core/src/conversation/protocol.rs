@@ -291,6 +291,7 @@ pub fn protocol_for(kind: ProtocolKind) -> &'static dyn Protocol {
         ProtocolKind::SmallReview => &super::small_review::SmallReviewProtocol,
         ProtocolKind::Incident => &super::incident::IncidentProtocol,
         ProtocolKind::Triage => &super::triage::TriageProtocol,
+        ProtocolKind::ProcessReview => &super::process_review::ProcessReviewProtocol,
         ProtocolKind::Phase => &super::phase::PhaseProtocol,
         ProtocolKind::Evaluate => &super::phase::EvaluateProtocol,
         ProtocolKind::Chat => &ChatProtocol,

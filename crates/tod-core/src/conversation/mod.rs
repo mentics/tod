@@ -23,6 +23,7 @@ pub mod pr;
 pub mod problems;
 pub mod protocol;
 pub mod quick_fix;
+pub mod process_review;
 pub mod triage;
 pub mod review;
 pub mod small_review;

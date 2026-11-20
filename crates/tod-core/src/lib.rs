@@ -90,6 +90,7 @@ pub mod orchestrator_github;
 pub mod checks;
 pub mod fixer;
 pub mod pr_readiness;
+pub mod process_review;
 pub mod release_watch;
 pub mod request_brief;
 pub mod pr_actions;

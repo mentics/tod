@@ -87,12 +87,13 @@ pub fn add_delete_sandbox(conn: &Connection) -> Result<()> {
 /// the two cheap sessions of the escalation ladder (`doc/requests/design.md`
 /// sections 5 and 4.2): the quick fix of one failing check (`quick_fix`) and
 /// the small-change review of its commit in `pr_draft` (`small_review`).
-pub const PHASES: [&str; 20] = [
+pub const PHASES: [&str; 21] = [
     "proposed",
     "design",
     "guidance",
     "incident",
     "triage",
+    "process_review",
     "planning",
     "implement",
     "verify",
@@ -168,6 +169,13 @@ pub const TRIAGE: &str = "triage";
 pub const TRIAGE_DEFAULT_MODEL: &str = "sonnet";
 pub const TRIAGE_DEFAULT_EFFORT: &str = "low";
 
+/// The process review (`tod_core::process_review`, `doc/lifecycle/self-improvement.md`):
+/// one session per run, drafting changes to tod's own process from the lessons.
+/// Only its model and effort are configured.
+pub const PROCESS_REVIEW: &str = "process_review";
+pub const PROCESS_REVIEW_DEFAULT_MODEL: &str = "sonnet";
+pub const PROCESS_REVIEW_DEFAULT_EFFORT: &str = "low";
+
 /// What the cheap sessions run on unless their key says otherwise.
 pub const CHEAP_DEFAULT_MODEL: &str = "haiku";
 pub const CHEAP_DEFAULT_EFFORT: &str = "low";
@@ -178,13 +186,16 @@ pub const QUICK_FIX_DEFAULT_EFFORT: &str = CHEAP_DEFAULT_EFFORT;
 /// only a model and effort: the guidance selector, the quick fix and the
 /// small-change review.
 pub fn agent_only(phase: &str) -> bool {
-    phase == GUIDANCE || phase == QUICK_FIX || phase == SMALL_REVIEW || phase == INCIDENT || phase == TRIAGE
+    phase == GUIDANCE || phase == QUICK_FIX || phase == SMALL_REVIEW || phase == INCIDENT || phase == TRIAGE || phase == PROCESS_REVIEW
 }
 
 /// The model and effort a phase's session runs on when no node sets them:
 /// the cheap tier for the sessions that are matching or small work
 /// (`doc/requests/design.md` section 6).
 pub fn default_agent(phase: &str) -> Option<(&'static str, &'static str)> {
+    if phase == PROCESS_REVIEW {
+        return Some((PROCESS_REVIEW_DEFAULT_MODEL, PROCESS_REVIEW_DEFAULT_EFFORT));
+    }
     if phase == TRIAGE {
         return Some((TRIAGE_DEFAULT_MODEL, TRIAGE_DEFAULT_EFFORT));
     }

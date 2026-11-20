@@ -25,6 +25,7 @@ mod guidance;
 mod lost_work;
 mod push_failure;
 mod quiet_resume;
+mod process_review;
 mod triage;
 
 /// Plays every protocol's mock agent; each run finishes at once.

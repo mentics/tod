@@ -997,6 +997,21 @@ pub fn run_stale_notifying(fleet: &FleetStore, node: Uuid, state: &str, on_work:
                 let (verdict, output) = if verdict == Verdict::Failed && !check.fix.trim().is_empty() && assessment.applicable {
                     let at = cwd.join(&dir);
                     let (verdict, output, fixed) = fix_and_rerun(&at, check, &cwd, output, &mut ran)?;
+                    if verdict == Verdict::Failed {
+                        // The configured fix did not settle it: the failure goes on to an
+                        // agent, which is a lesson about the fix (once per task and check).
+                        fleet
+                            .interview(
+                                "autopilot",
+                                tod_store::interview::InterviewCommand::Lessons(tod_store::lessons::Op::FixerFailed {
+                                    node,
+                                    check_name: check.display(),
+                                    check_key: tod_store::quick_fixes::check_key(&dir, &check.command),
+                                    why: output.clone(),
+                                }),
+                            )
+                            .map_err(|e| anyhow::anyhow!("could not record the fixer failure of {}: {e}", check.display()))?;
+                    }
                     if let Some(new_tree) = fixed {
                         assessment = assess(&new_tree, check)?;
                         key_now = new_tree.clean_head()?.as_deref().map(|head| tree_key(head, check));

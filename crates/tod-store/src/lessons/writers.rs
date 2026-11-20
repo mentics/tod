@@ -390,6 +390,12 @@ pub enum Op {
     /// A lesson was acted on: by the commit or node `applied_ref`. By a
     /// process-review session (only for the lessons its run took in) or the user.
     Apply { ids: Vec<Uuid>, applied_ref: String },
+    /// A check's configured fixer ran and the check still failed, so the failure
+    /// goes on to an agent (rung 2 of the ladder). Once per task and check.
+    FixerFailed { node: Uuid, check_name: String, check_key: String, why: String },
+    /// tod takes lessons (still `new`) into the process-review run made as
+    /// `run_node`. Only the app does this, never a session.
+    Group { ids: Vec<Uuid>, run_node: Uuid },
 }
 
 fn session_of(conn: &Connection, actor: &str) -> Result<Option<(Uuid, crate::conversation::Conversation)>> {
@@ -441,6 +447,19 @@ pub fn run_op(conn: &Connection, actor: &str, op: &Op) -> Result<serde_json::Val
                 params![uuid_to_blob(*id), now_ms()],
             )?;
             Ok(serde_json::json!({ "id": id }))
+        }
+        Op::FixerFailed { node, check_name, check_key, why } => {
+            if session_of(conn, actor)?.is_some() {
+                bail!("only the app records a fixer failure");
+            }
+            record_fixer_failure(conn, *node, check_name, check_key, why)?;
+            Ok(serde_json::json!({ "node": node }))
+        }
+        Op::Group { ids, run_node } => {
+            if session_of(conn, actor)?.is_some() {
+                bail!("only the app groups lessons into a process review");
+            }
+            Ok(serde_json::json!({ "grouped": group_into(conn, ids, *run_node, now_ms())? }))
         }
         Op::Apply { ids, applied_ref } => {
             if applied_ref.trim().is_empty() {

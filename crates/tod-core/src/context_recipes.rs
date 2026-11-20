@@ -648,6 +648,17 @@ pub const TRIAGE: ContextRecipe = ContextRecipe {
     blocks: &[DynamicBlock::DataRoot, DynamicBlock::WorkingDirectory, DynamicBlock::TriageRequest],
 };
 
+/// The process review (`crate::conversation::process_review`,
+/// `ProtocolKind::ProcessReview`, `doc/lifecycle/self-improvement.md`): one
+/// session per run, drafting changes to the process from the lessons the run
+/// took in, in the run task's own checkout.
+pub const PROCESS_REVIEW: ContextRecipe = ContextRecipe {
+    name: "process review",
+    situational: false,
+    layers: &["stance/autonomous-session", "cli/intro", "cli/lessons", "surface/process-review"],
+    blocks: &[DynamicBlock::DataRoot, DynamicBlock::WorkingDirectory, DynamicBlock::ProcessReviewLessons],
+};
+
 /// Every registered surface.
 pub const ALL_RECIPES: &[ContextRecipe] = &[
     INCOMING_CHANGES,
@@ -656,6 +667,7 @@ pub const ALL_RECIPES: &[ContextRecipe] = &[
     SMALL_REVIEW,
     INCIDENT,
     TRIAGE,
+    PROCESS_REVIEW,
     CONVERSATION,
     CHAT,
     VISUAL_DESIGN,
@@ -1046,6 +1058,7 @@ missing"),
             | DynamicBlock::SmallReviewDiff
             | DynamicBlock::IncidentSamples
             | DynamicBlock::TriageRequest
+            | DynamicBlock::ProcessReviewLessons
             | DynamicBlock::VisualDesign => 5,
         }
     }

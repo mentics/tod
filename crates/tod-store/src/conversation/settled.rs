@@ -64,7 +64,7 @@ pub fn check_conversation_agent(
     if conversation.protocol == ProtocolKind::Triage {
         bail!("refused: a triage session edits nothing; it answers, escalates or converts the request it reads (`tod-cli triage`)");
     }
-    if matches!(conversation.protocol, ProtocolKind::QuickFix | ProtocolKind::SmallReview) {
+    if matches!(conversation.protocol, ProtocolKind::QuickFix | ProtocolKind::SmallReview | ProtocolKind::ProcessReview) {
         bail!(
             "refused: a {} session edits files and nothing else; obligations, the plan and decisions are not its to change",
             conversation.protocol.as_str().replace('_', " ")
