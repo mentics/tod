@@ -72,7 +72,17 @@ pub struct AutopilotState {
     /// change again.
     #[serde(default)]
     pub pr_change: Option<PrChange>,
+    /// The heads tod had the pull request's agent push after its review (the
+    /// local head before each push turn), newest last and at most
+    /// [`TOD_PUSHED_KEPT`]: a head the pull request shows later, once GitHub
+    /// caught up, is still tod's own push, never an unreviewed one
+    /// (`crate::pr_pushes`).
+    #[serde(default)]
+    pub tod_pushed: Vec<String>,
 }
+
+/// How many of the heads tod pushed are kept ([`AutopilotState::tod_pushed`]).
+pub const TOD_PUSHED_KEPT: usize = 8;
 
 /// A change the pull request's agent is making for feedback in `pr_draft`,
 /// not yet reviewed by tod or pushed.
@@ -96,6 +106,12 @@ pub struct PrChange {
     /// reviewed.
     #[serde(default)]
     pub conflict: bool,
+    /// Commits found on the branch and not pushed (a conversation the user
+    /// directs commits rather than pushing), adopted to be reviewed before
+    /// they are pushed (`crate::pr_pushes::held_for`), rather than a change
+    /// the pull request's agent made for feedback.
+    #[serde(default)]
+    pub held: bool,
 }
 
 /// The later skill groups (`lifecycle_config::groups`, 1 and up) a finished
@@ -248,6 +264,7 @@ impl AutopilotState {
             loops: LoopCounters::default(),
             pending_groups: None,
             pr_change: None,
+            tod_pushed: Vec::new(),
         }
     }
 

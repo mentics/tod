@@ -1288,6 +1288,13 @@ impl Github {
 
     /// Switch a draft pull request to open (ready for review). REST cannot;
     /// GraphQL can, by the pull request's node id.
+    /// The commit a pull request's head is at now: one uncached read, the
+    /// cheap look `tod_core::pr_pushes` takes around every agent turn.
+    pub fn pr_head_sha(&self, owner: &str, repo: &str, number: i64) -> Result<Option<String>, GithubError> {
+        let raw: PrDetailRaw = self.get_json(&format!("/repos/{owner}/{repo}/pulls/{number}"))?;
+        Ok(raw.head.map(|h| h.sha))
+    }
+
     pub fn mark_ready_for_review(&self, owner: &str, repo: &str, number: i64) -> Result<(), GithubError> {
         const QUERY: &str = "query($owner: String!, $repo: String!, $number: Int!) { repository(owner: $owner, name: $repo) { pullRequest(number: $number) { id } } }";
         const MUTATION: &str = "mutation($id: ID!) { markPullRequestReadyForReview(input: {pullRequestId: $id}) { pullRequest { id } } }";

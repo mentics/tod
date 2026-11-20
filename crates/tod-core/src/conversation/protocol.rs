@@ -334,6 +334,13 @@ impl Protocol for OutlineProtocol {
         ProtocolKind::Outline
     }
 
+    /// A conversation on a node whose pull request is watched commits rather
+    /// than pushing: says that its commits are reviewed first, or that a push
+    /// it made is recorded as unreviewed (`crate::pr_pushes`).
+    fn finish(&self, env: &ProtocolEnv<'_>) -> Vec<RunNotice> {
+        pr_push_notices(env, ProtocolKind::Outline)
+    }
+
     fn surface(&self) -> &'static str {
         crate::session_name::CONVERSATION_SURFACE
     }
@@ -394,6 +401,13 @@ pub struct ChatProtocol;
 impl Protocol for ChatProtocol {
     fn kind(&self) -> ProtocolKind {
         ProtocolKind::Chat
+    }
+
+    /// A conversation on a node whose pull request is watched commits rather
+    /// than pushing: says that its commits are reviewed first, or that a push
+    /// it made is recorded as unreviewed (`crate::pr_pushes`).
+    fn finish(&self, env: &ProtocolEnv<'_>) -> Vec<RunNotice> {
+        pr_push_notices(env, ProtocolKind::Chat)
     }
 
     fn surface(&self) -> &'static str {
@@ -518,6 +532,18 @@ impl Protocol for VisualDesignProtocol {
 /// else the scratch directory `name`. The agent CLI discovers the workspace's
 /// agent docs from its working directory, so this is what gives a
 /// conversation about a node the docs of the workspace that node lives in.
+/// [`crate::pr_pushes::after_conversation`] for the focus node, its failure
+/// shown as an error rather than dropped.
+fn pr_push_notices(env: &ProtocolEnv<'_>, kind: ProtocolKind) -> Vec<RunNotice> {
+    let Some(node) = env.focus.node_id() else { return Vec::new() };
+    match crate::pr_pushes::after_conversation(env.fleet, env.data_root, env.conversation_id, kind, node) {
+        Ok(notices) => notices,
+        Err(err) => vec![RunNotice::Error(format!(
+            "Checking what this conversation did to the pull request's branch failed: {err:#}"
+        ))],
+    }
+}
+
 pub(super) fn focus_cwd_or_scratch(env: &ProtocolEnv<'_>, name: &str) -> Result<Workdir> {
     if let Some(node) = env.focus.node_id() {
         let node = node.to_string();

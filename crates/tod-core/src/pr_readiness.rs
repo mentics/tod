@@ -2800,6 +2800,13 @@ pub trait PrFeed: Send + Sync {
     fn post_review(&self, _pr: &tod_store::github::NodePr, _post: &ReviewPost) -> Result<(), String> {
         Err("this feed does not post reviews".to_string())
     }
+    /// The commit the pull request's head is at now, read fresh (never from
+    /// the snapshot cache): what `crate::pr_pushes` compares around each
+    /// agent turn. `None` when GitHub names no head.
+    fn pushed_head(&self, pr: &tod_store::github::NodePr) -> Result<Option<String>, String> {
+        forget_snapshot(pr);
+        self.snapshot(pr).map(|s| s.status.head_sha)
+    }
     /// Merge the base branch into the pull request's branch on GitHub, as its
     /// "Update branch" button does: how tod brings a branch that is only
     /// behind up to date, with no agent (`Autopilot::update_branches`).
@@ -2824,6 +2831,10 @@ pub struct ReviewPost {
 pub struct GithubFeed(pub tod_store::github::Github);
 
 impl PrFeed for GithubFeed {
+    fn pushed_head(&self, pr: &tod_store::github::NodePr) -> Result<Option<String>, String> {
+        self.0.pr_head_sha(&pr.owner, &pr.repo, pr.pr_number).map_err(|err| err.to_string())
+    }
+
     fn merge(&self, pr: &tod_store::github::NodePr) -> Result<tod_store::github::PrMerge, String> {
         self.0.get_pr_merge(&pr.owner, &pr.repo, pr.pr_number).map_err(|err| err.to_string())
     }

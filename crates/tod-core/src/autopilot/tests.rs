@@ -3529,6 +3529,154 @@ fn pr_draft_feedback_is_reviewed_and_fixed_before_it_is_pushed() {
     assert!(Autopilot::new(config(&fx), fx.node, Budget::default()).unwrap().state().pr_change.is_none());
 }
 
+/// The pull request's heads recorded on the node (`tod_store::pr_pushes`), as
+/// `(verdict, protocol)`.
+fn pr_pushes(fx: &Fixture) -> Vec<(String, Option<String>)> {
+    fx.fleet
+        .read(|conn| Ok(tod_store::pr_pushes::PrPushRepo::new(conn).list_for_node(fx.node)?))
+        .unwrap()
+        .into_iter()
+        .map(|p| (p.verdict, p.protocol))
+        .collect()
+}
+
+/// The titles of the failed notes in the node's Activity.
+fn failed_notes(fx: &Fixture) -> Vec<String> {
+    fx.fleet
+        .read(|conn| Ok(tod_store::node_timeline::TimelineRepo::new(conn).list(fx.node)?))
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == tod_store::node_timeline::KIND_NOTE && e.failed)
+        .map(|e| e.title)
+        .collect()
+}
+
+/// Section 8 of `doc/lifecycle/find-it-first.md`: tod's push after a clean
+/// review is accounted for, never a process failure.
+#[test]
+fn a_head_tod_pushed_after_a_clean_review_is_not_flagged() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    let dir = git_workspace(&fx);
+    with_pr_draft_review(&fx);
+    let feed = BranchFeed::new(&dir, vec![review_thread("PRRT_1", "src/lib.rs", 2, "Rename b.")], false);
+    crate::pr_readiness::set_feed_override(Some(feed.clone()));
+    linked_to_prs(&fx, "pr_draft", &["https://github.com/acme/app/pull/42"]);
+    let mut agent = branch_agent(&fx, &dir, &feed, edit_and_commit);
+    let outcome = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO).run(&fx.fleet, &mut agent).unwrap();
+    assert_eq!(steps_of(&turn_labels(&agent)), ["pr", "pr:change", "review", "fix", "review", "pr:push"], "{outcome:?}");
+    let pushes = pr_pushes(&fx);
+    assert_eq!(pushes.first().map(|p| p.0.as_str()), Some("baseline"), "{pushes:?}");
+    assert!(
+        pushes.iter().any(|(verdict, protocol)| verdict == "pushed_by_tod" && protocol.as_deref() == Some("pr")),
+        "the push turn's head is tod's own: {pushes:?}"
+    );
+    assert!(pushes.iter().all(|(verdict, _)| verdict != "unreviewed"), "{pushes:?}");
+    assert!(failed_notes(&fx).is_empty(), "{:?}", failed_notes(&fx));
+}
+
+/// A push nothing reviewed (here the agent's opening turn pushes a change and
+/// a person comments on it) is recorded around the turn it appeared in, shown
+/// as a failed note in the Activity, and reviewed at once: before the
+/// person's feedback is worked on.
+#[test]
+fn an_unexpected_head_is_recorded_and_reviewed_at_once() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    let dir = git_workspace(&fx);
+    with_pr_draft_review(&fx);
+    let feed = BranchFeed::new(&dir, Vec::new(), false);
+    crate::pr_readiness::set_feed_override(Some(feed.clone()));
+    linked_to_prs(&fx, "pr_draft", &["https://github.com/acme/app/pull/42"]);
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let pushed_once = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let changes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (hook_dir, hook_feed) = (dir.clone(), feed.clone());
+    agent.pr_hook = Some(Arc::new(move |sent: &str| {
+        if sent.contains(CHANGE_TURN) {
+            let n = changes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::fs::write(hook_dir.join("src/lib.rs"), format!("fn a() {{}}\nfn b() {{ /* {n} */ }}\nfn c() {{}}\n")).unwrap();
+            git_in(&hook_dir, &["commit", "-q", "-am", "answer the feedback"]);
+        } else if sent.contains(PUSH_TURN) {
+            hook_feed.push(&hook_dir);
+        } else if !pushed_once.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            // The opening turn pushes a change of its own, unreviewed, and a
+            // person comments on it.
+            std::fs::write(hook_dir.join("src/lib.rs"), "fn a() {}\nfn b() {}\nfn c() {}\n").unwrap();
+            git_in(&hook_dir, &["commit", "-q", "-am", "an unreviewed change"]);
+            hook_feed.push(&hook_dir);
+            // Written after the turn ended, so not one it answered.
+            let mut thread = review_thread("PRRT_9", "src/lib.rs", 3, "Why c?");
+            thread.comments[0].created_at = "2999-01-01T00:00:00Z".into();
+            hook_feed.threads.lock().unwrap().push(thread);
+        }
+    }));
+    let outcome = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO).run(&fx.fleet, &mut agent).unwrap();
+    let steps = steps_of(&turn_labels(&agent));
+    assert_eq!(
+        steps.get(..2),
+        Some(&["pr".to_string(), "review".to_string()][..]),
+        "reviewed at once, before the feedback: {steps:?} {outcome:?}"
+    );
+    let unreviewed = fx
+        .fleet
+        .read(|conn| Ok(tod_store::pr_pushes::PrPushRepo::new(conn).unreviewed(fx.node)?))
+        .unwrap();
+    assert_eq!(unreviewed.len(), 1, "{:?}", pr_pushes(&fx));
+    let push = &unreviewed[0];
+    assert_eq!(push.pr, "acme/app#42");
+    assert_eq!(push.protocol.as_deref(), Some("pr"), "it appeared around the opening turn");
+    assert!(push.conversation_id.is_some());
+    assert_eq!(failed_notes(&fx), ["Unreviewed push to acme/app#42"]);
+    // tod's own review recorded the head that was pushed without it.
+    let reviewed = fx
+        .fleet
+        .read(|conn| {
+            let mut heads = Vec::new();
+            for review in crate::pr_draft_review::reviews_since(conn, fx.node, 0)? {
+                heads.extend(crate::pr_draft_review::reviewed_heads(conn, review.id)?.unwrap_or_default().into_values());
+            }
+            Ok(heads)
+        })
+        .unwrap();
+    assert!(reviewed.contains(&push.head), "{reviewed:?} lacks {}", push.head);
+}
+
+/// Commits a conversation the user directs made on the branch, and did not
+/// push, are reviewed (Review, Fix, Review) before the pull request agent
+/// pushes them; the conversation is told so when it ends.
+#[test]
+fn a_conversation_commit_on_a_pr_branch_is_reviewed_before_it_is_pushed() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    let dir = git_workspace(&fx);
+    with_pr_draft_review(&fx);
+    let feed = BranchFeed::new(&dir, Vec::new(), false);
+    crate::pr_readiness::set_feed_override(Some(feed.clone()));
+    linked_to_prs(&fx, "pr_draft", &["https://github.com/acme/app/pull/42"]);
+    // The conversation commits and stops; the pull request does not move.
+    let before = feed.pushed.lock().unwrap().clone();
+    edit_and_commit(&dir);
+    let notices =
+        crate::pr_pushes::after_conversation(&fx.fleet, &fx.root, uuid::Uuid::new_v4(), ProtocolKind::Chat, fx.node)
+            .unwrap();
+    assert!(
+        notices
+            .iter()
+            .any(|n| matches!(n, crate::conversation::protocol::RunNotice::Warning(w) if w.contains("tod reviews them"))),
+        "{notices:?}"
+    );
+    assert_eq!(*feed.pushed.lock().unwrap(), before, "nothing reached the pull request");
+    let mut agent = branch_agent(&fx, &dir, &feed, edit_and_commit);
+    let outcome = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO).run(&fx.fleet, &mut agent).unwrap();
+    let steps = steps_of(&turn_labels(&agent));
+    assert_eq!(steps, ["pr", "review", "fix", "review", "pr:push"], "{outcome:?}");
+    let head = git_in(&dir, &["rev-parse", "HEAD"]);
+    assert_eq!(*feed.pushed.lock().unwrap(), head, "pushed once the review was clean");
+    assert!(pr_pushes(&fx).iter().all(|(verdict, _)| verdict != "unreviewed"), "{:?}", pr_pushes(&fx));
+    assert!(Autopilot::new(config(&fx), fx.node, Budget::default()).unwrap().state().pr_change.is_none());
+}
+
 /// A pending question about one check (gap 76) must not stop a draft whose
 /// agent just made a change for the feedback: tod's own review follows it.
 #[test]

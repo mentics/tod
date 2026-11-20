@@ -461,6 +461,11 @@ pub const PR_HOUSEKEEPING_GAP: Duration = Duration::from_secs(30 * 60);
 /// live: two or three agent sessions per merge, all night.
 const PR_HOUSEKEEPING_LIMIT: u32 = 8;
 
+/// How many times one run reviews a head pushed without tod's review at once
+/// (`crate::pr_pushes::review_owed_now`) before leaving it to the usual
+/// review once nothing but a person is left.
+const AT_ONCE_TRIES: u32 = 3;
+
 /// How long tod waits for GitHub to show a branch it updated
 /// (`Autopilot::update_branches`), and how often it looks meanwhile.
 const BRANCH_UPDATE_WAIT: Duration = Duration::from_secs(120);
@@ -1323,6 +1328,10 @@ impl Autopilot {
         let mut asked: std::collections::HashSet<String> = std::collections::HashSet::new();
         // The findings last sent to the agent by name ([`OwnReview`]).
         let mut answered: Option<Vec<Uuid>> = None;
+        // The unreviewed heads reviewed at once, and how often
+        // (`crate::pr_pushes::review_owed_now`), so a review that cannot
+        // record one never repeats without end.
+        let mut reviewed_at_once: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
         // Like every phase: coming in, the agent's session and then each later
         // group of the phase's skills run in order, once per stay; the pull
         // request is looked at after. What a later group posts (a code review)
@@ -1441,6 +1450,54 @@ impl Autopilot {
             }
             self.note_fallbacks(fleet, &live, phase_key)?;
             note_draft_skipped(fleet, node, &live, phase_key)?;
+            // Nothing reaches the pull request unreviewed (`crate::pr_pushes`):
+            // a head pushed outside any turn is recorded, commits on the branch
+            // that nobody pushed are reviewed before they are, and a head that
+            // reached the pull request without tod's review is reviewed at once.
+            if let Some(outcome) = self.check_pushes(fleet, phase_key, None)? {
+                hook.waiting(None, None);
+                return Ok(Some(outcome));
+            }
+            if before_review && self.state.pr_change.is_none() && fleet.read(|conn| crate::pr_draft_review::enabled(conn, node))? {
+                if let Some(local) = crate::pr_pushes::held_for(fleet, node, &live)?
+                    && !self.state.tod_pushed.contains(&local)
+                {
+                    let cleared = fleet.read(|conn| crate::pr_draft_review::cleared_shas(conn, node, false))?;
+                    let now = state::now_ms();
+                    self.state.pr_change = Some(PrChange {
+                        started_ms: now,
+                        before: String::new(),
+                        made_at_ms: Some(now),
+                        changed: !cleared.contains(&local),
+                        conflict: false,
+                        held: true,
+                    });
+                    self.save()?;
+                } else {
+                    let owed: Vec<String> = fleet
+                        .read(|conn| crate::pr_pushes::review_owed_now(conn, node, &live))?
+                        .into_iter()
+                        .map(|p| p.head)
+                        .filter(|head| reviewed_at_once.get(head).is_none_or(|tries| *tries < AT_ONCE_TRIES))
+                        .collect();
+                    if !owed.is_empty() {
+                        for head in &owed {
+                            *reviewed_at_once.entry(head.clone()).or_default() += 1;
+                        }
+                        hook.waiting(None, None);
+                        match self.checks_round(fleet, agent, hook, "pr_draft")? {
+                            ChecksStep::Proceed => {}
+                            ChecksStep::Fixed => continue,
+                            ChecksStep::Stop(outcome) => return Ok(Some(outcome)),
+                        }
+                        match self.own_review(fleet, agent, hook, feed.as_ref(), &live, &mut answered)? {
+                            OwnReview::Again => continue,
+                            OwnReview::Stop(outcome) => return Ok(Some(outcome)),
+                            OwnReview::Clear => {}
+                        }
+                    }
+                }
+            }
             // A failing check whose failure the base branch has too is not
             // the agent's to fix (`Assessment::checks_to_fix` already leaves it
             // out): the user is asked once, here, so a pull request that has
@@ -2485,7 +2542,10 @@ impl Autopilot {
                         return Ok(BranchUpdate::Stop(github_wait::github_look_failed(fleet, self.node, false, &err)?));
                     }
                 };
-                if head.is_some() && head != *was {
+                if let Some(head) = head.as_ref().filter(|head| Some(*head) != was.as_ref()) {
+                    // tod's own push: the next look records it as such
+                    // (`crate::pr_pushes`).
+                    self.remember_tod_push(head.clone())?;
                     break;
                 }
                 if waited >= BRANCH_UPDATE_WAIT {
@@ -2578,6 +2638,7 @@ impl Autopilot {
                     made_at_ms: None,
                     changed: false,
                     conflict: live.iter().any(|p| p.assessment.conflicted()),
+                    held: false,
                 };
                 self.state.pr_change = Some(change.clone());
                 self.save()?;
@@ -2655,9 +2716,16 @@ impl Autopilot {
             )?;
         }
         hook.working_on("pushing the reviewed change and answering the pull request's threads");
-        let reopen = self
-            .pr_reopen(fleet, live)?
-            .map(|(id, _)| (id, crate::conversation::pr::push_message(changed)));
+        // What the push makes the pull request's head: tod's own push, not an
+        // unreviewed one (`crate::pr_pushes`), even when GitHub shows it late.
+        let pushing = pr_draft_review::local_head(&cwd).with_context(|| format!("reading the head commit in {cwd}"))?;
+        self.remember_tod_push(pushing)?;
+        let message = if self.state.pr_change.as_ref().is_some_and(|c| c.held) {
+            crate::conversation::pr::push_held_message()
+        } else {
+            crate::conversation::pr::push_message(changed)
+        };
+        let reopen = self.pr_reopen(fleet, live)?.map(|(id, _)| (id, message));
         if let Some(outcome) = self.converse(fleet, agent, hook, ProtocolKind::Pr, reopen)? {
             return Ok(Some(outcome));
         }
@@ -3052,6 +3120,11 @@ impl Autopilot {
             return Ok(Some(Outcome::BudgetExhausted { limit }));
         }
         let lifecycle = lifecycle::current_state(fleet, self.node)?;
+        // A head that reached the pull request since the last look, outside
+        // any turn (`crate::pr_pushes`).
+        if let Some(outcome) = self.check_pushes(fleet, &lifecycle, None)? {
+            return Ok(Some(outcome));
+        }
         self.fresh_session = false;
         let resumable = self
             .state
@@ -3172,7 +3245,47 @@ impl Autopilot {
         self.state.current = None;
         self.record(fleet, &step_label(kind, group), &lifecycle, conversation_id)?;
         close_session(agent, conversation_id);
+        // A head the turn pushed that tod's review did not clear.
+        if let Some(outcome) = self.check_pushes(fleet, &lifecycle, conversation_id.map(|id| (id, kind)))? {
+            return Ok(Some(outcome));
+        }
         Ok(None)
+    }
+
+    /// A head tod itself makes the pull request's (saved): never an
+    /// unreviewed push when it shows (`AutopilotState::tod_pushed`).
+    fn remember_tod_push(&mut self, head: String) -> Result<()> {
+        if !self.state.tod_pushed.contains(&head) {
+            self.state.tod_pushed.push(head);
+            let over = self.state.tod_pushed.len().saturating_sub(state::TOD_PUSHED_KEPT);
+            self.state.tod_pushed.drain(..over);
+        }
+        self.save()
+    }
+
+    /// [`crate::pr_pushes::check`] for a node in `lifecycle`, around the turn
+    /// `around` (`None`: outside any), with the heads tod pushed as expected.
+    /// `Some` when GitHub could not be read (a failed look, retried).
+    fn check_pushes(
+        &mut self,
+        fleet: &FleetStore,
+        lifecycle: &str,
+        around: Option<(Uuid, ProtocolKind)>,
+    ) -> Result<Option<Outcome>> {
+        if !crate::pr_pushes::STATES.contains(&lifecycle) {
+            return Ok(None);
+        }
+        let node = self.node;
+        if fleet.read(|conn| crate::pr_pushes::watched(conn, node))?.is_none() {
+            return Ok(None);
+        }
+        let Some(feed) = crate::pr_readiness::feed_for(&self.config.data_root) else {
+            return Ok(Some(github_wait::github_look_failed(fleet, node, false, "GitHub credentials are not set up")?));
+        };
+        match crate::pr_pushes::check(fleet, feed.as_ref(), node, around, &self.state.tod_pushed)? {
+            Ok(_) => Ok(None),
+            Err(err) => Ok(Some(github_wait::github_look_failed(fleet, node, false, &err)?)),
+        }
     }
 
     /// The agent is blocked on `request`. What the node's saved answers

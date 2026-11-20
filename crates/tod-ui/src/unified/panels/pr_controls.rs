@@ -582,7 +582,10 @@ impl PrControls {
                     (format!("Review requested from {}", f.requested_reviewers.join(", ")), false)
                 })
             });
-        crate::ui::key_context::forward_menu_arrows(div().id(("pr-controls-row", ix)))
+        // Someone marked it ready before tod cleared what its gate checks
+        // (`PrFacts::ready_warning`): said under the row, never hidden.
+        let ready_warning = facts.and_then(|f| f.ready_warning());
+        let controls = crate::ui::key_context::forward_menu_arrows(div().id(("pr-controls-row", ix)))
             .flex()
             .flex_wrap()
             .items_center()
@@ -636,6 +639,15 @@ impl PrControls {
             .children(status.map(|(text, is_error)| {
                 let el = if is_error { style::text_error(div()) } else { style::text_muted(div()) };
                 el.child(selectable_text(("pr-controls-status", ix), text, window, cx))
+            }));
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(controls)
+            .children(ready_warning.map(|text| {
+                style::callout_warning(div().flex().flex_col())
+                    .child(selectable_text(("pr-controls-ready-warning", ix), text, window, cx))
             }))
             .into_any_element()
     }
@@ -672,7 +684,19 @@ mod tests {
             labels: labels.iter().map(|s| s.to_string()).collect(),
             only_behind: false,
             requested_reviewers: requested.iter().map(|s| s.to_string()).collect(),
+            outstanding: Vec::new(),
         }
+    }
+
+    #[test]
+    fn an_open_pull_request_tod_has_not_cleared_is_warned_about() {
+        let mut f = facts(false, &[], &[]);
+        assert_eq!(f.ready_warning(), None, "nothing outstanding");
+        f.outstanding = vec!["tod's own review has not cleared the head abc".into()];
+        let warning = f.ready_warning().expect("a warning");
+        assert!(warning.contains("tod's own review has not cleared the head abc"), "{warning}");
+        f.draft = true;
+        assert_eq!(f.ready_warning(), None, "a draft is not ready yet");
     }
 
     #[test]

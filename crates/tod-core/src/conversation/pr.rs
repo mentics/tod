@@ -341,6 +341,18 @@ pub fn push_message(reviewed: bool) -> String {
     )
 }
 
+/// The push turn for commits found on the branch and not pushed (a
+/// conversation the user directs commits without pushing;
+/// `crate::pr_pushes::held_for`), once tod's review of them is clean: they
+/// are not the agent's, and there may be no thread to answer.
+pub fn push_held_message() -> String {
+    "Commits on this branch were not pushed (a conversation with the user commits without pushing). tod reviewed \
+     them and its review is clean (any fixes it needed are committed on the branch). Now push the branch. If any open \
+     review thread is about what they change, answer it with `tod-cli pr threads answer` (which posts your reply and \
+     resolves it). Make no other change.\n\nYour reply, when you stop, is at most a sentence or two, or nothing."
+        .to_string()
+}
+
 /// Why the babysitter must hand back rather than go on: a thread answered
 /// as often as allowed and still open, or as many rounds as allowed.
 pub fn pr_stuck(

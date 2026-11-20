@@ -28,6 +28,10 @@ pub struct PrFacts {
     pub only_behind: bool,
     /// Logins GitHub still waits on for a review.
     pub requested_reviewers: Vec<String>,
+    /// What tod has not cleared on the pull request's head ([`own_outstanding`]):
+    /// its own review, the checks configured for `pr_draft`, and the pull
+    /// request's review state. Opening a draft is refused while any is left.
+    pub outstanding: Vec<String>,
 }
 
 impl PrFacts {
@@ -35,6 +39,50 @@ impl PrFacts {
     pub fn is_open(&self) -> bool {
         !self.draft && !self.merged
     }
+
+    /// The warning the task panel shows when the pull request is open to
+    /// review (someone marked it ready; tod never does while anything is
+    /// outstanding) and tod has not cleared what it would have:
+    /// `doc/lifecycle/find-it-first.md`, "Ready only when the gate would pass".
+    pub fn ready_warning(&self) -> Option<String> {
+        (self.is_open() && !self.outstanding.is_empty()).then(|| {
+            format!(
+                "Marked ready for review before tod cleared it. Outstanding:\n- {}",
+                self.outstanding.join("\n- ")
+            )
+        })
+    }
+}
+
+/// What tod has not cleared on `pr`, whose head is `head`, beyond what the
+/// assessment says (`facts`): tod's own review of the head (with the review
+/// steps on), and the latest result of each check configured for
+/// `pr_draft`.
+fn own_outstanding(
+    fleet: &tod_store::fleet::FleetStore,
+    node: uuid::Uuid,
+    settings: &tod_store::PrReadinessSettings,
+    head: Option<&str>,
+    facts: &PrFacts,
+) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    if settings.own_review.enabled && !settings.own_review.cleared(head) {
+        out.push(match head {
+            Some(head) => format!("tod's own review has not cleared the head {}", crate::pr_pushes::short(head)),
+            None => "tod's own review has not cleared the head (GitHub named none)".to_string(),
+        });
+    }
+    let checks = fleet
+        .read(|conn| crate::checks::gate_criteria(conn, node, "pr_draft", "pr_review"))
+        .map_err(|e| format!("reading the checks' latest results: {e:#}"))?;
+    for check in checks.iter().filter(|c| c.outcome != tod_store::outline::OUTCOME_PASS) {
+        let why = check.detail.lines().next().unwrap_or("not passed");
+        out.push(format!("{}: {why}", check.criterion.label));
+    }
+    if !facts.review_clean && !facts.waiting_on.is_empty() {
+        out.push(format!("the pull request itself: {}", facts.waiting_on));
+    }
+    Ok(out)
 }
 
 fn github(data_root: &Path) -> Result<Github, String> {
@@ -65,19 +113,31 @@ pub fn load(
         .ok_or_else(|| crate::pull_requests::NO_TOKEN.to_string())?;
     let settings = crate::pr_readiness::settings_for_node(fleet, node, data_root).map_err(|e| e.to_string())?;
     let answered_at = crate::pr_readiness::agent_answered_at(fleet, node).map_err(|e| e.to_string())?;
-    let mut facts = facts_from(feed.as_ref(), &settings, answered_at, pr)?;
+    let (mut facts, head) = facts_with_head(feed.as_ref(), &settings, answered_at, pr)?;
+    facts.outstanding = own_outstanding(fleet, node, &settings, head.as_deref(), &facts)?;
     facts.labels = github(data_root)?.pr_labels(&pr.owner, &pr.repo, pr.pr_number).map_err(say)?;
     Ok(facts)
 }
 
 /// [`load`] without the labels: what the feed shows, judged by `settings`
 /// (which must already leave out a waived bot).
+#[cfg(test)]
 fn facts_from(
     feed: &dyn crate::pr_readiness::PrFeed,
     settings: &tod_store::PrReadinessSettings,
     answered_at: Option<chrono::DateTime<chrono::Utc>>,
     pr: &NodePr,
 ) -> Result<PrFacts, String> {
+    facts_with_head(feed, settings, answered_at, pr).map(|(facts, _)| facts)
+}
+
+/// [`facts_from`], with the head commit GitHub named.
+fn facts_with_head(
+    feed: &dyn crate::pr_readiness::PrFeed,
+    settings: &tod_store::PrReadinessSettings,
+    answered_at: Option<chrono::DateTime<chrono::Utc>>,
+    pr: &NodePr,
+) -> Result<(PrFacts, Option<String>), String> {
     let snapshot = feed.snapshot(pr)?;
     let assessment = crate::pr_readiness::assess(feed, pr, &snapshot, settings, chrono::Utc::now())?
         .answered_through(answered_at);
@@ -125,7 +185,7 @@ fn facts_from(
         }
         why
     };
-    Ok(PrFacts {
+    Ok((PrFacts {
         pr: pr.clone(),
         draft: snapshot.status.draft,
         merged: assessment.merged,
@@ -137,7 +197,8 @@ fn facts_from(
             && assessment.work() == [crate::pr_readiness::Work::Behind]
             && assessment.waits().iter().all(|w| matches!(w, crate::pr_readiness::Wait::HumanReview)),
         requested_reviewers: assessment.requested_reviewers.clone(),
-    })
+        outstanding: Vec::new(),
+    }, snapshot.status.head_sha.clone()))
 }
 
 /// Read the repository's labels from GitHub and remember them.
@@ -194,6 +255,10 @@ pub fn update(
         Some(true) if draft => {
             if !facts.review_clean {
                 return Err(not_clean());
+            }
+            // tod never marks it ready while what its gate checks is not clear.
+            if !facts.outstanding.is_empty() {
+                return Err(format!("tod has not cleared it yet: {}", facts.outstanding.join("; ")));
             }
             gh.mark_ready_for_review(&pr.owner, &pr.repo, pr.pr_number).map_err(say)?;
             draft = false;
