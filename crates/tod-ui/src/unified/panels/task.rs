@@ -90,6 +90,9 @@ pub(crate) struct TaskHeader {
     /// Review findings recorded on the node, and how many are still open.
     pub findings_total: usize,
     pub findings_open: usize,
+    /// The latest review's coverage in one line (lenses covered, saturation
+    /// pass owed), or why it could not be read; `None` when never reviewed.
+    pub coverage_label: Option<String>,
 }
 
 impl TaskHeader {
@@ -163,6 +166,12 @@ fn load(fleet: &FleetStore, node_id: Uuid) -> TaskHeader {
         header.findings_total = findings.len();
         header.findings_open = findings.iter().filter(|f| f.is_open()).count();
     }
+    header.coverage_label = match fleet
+        .read(|conn| tod_store::review::coverage::latest_for_node(conn, node_id))
+    {
+        Ok(latest) => latest.map(|latest| latest.summary_label()),
+        Err(err) => Some(format!("Coverage could not be read: {err:#}")),
+    };
     header
 }
 
@@ -613,6 +622,11 @@ impl TaskPanel {
                 cx,
             )
         });
+        // The latest review's coverage, beside its findings; the findings
+        // panel lists it lens by lens.
+        let coverage = self.header.coverage_label.clone().map(|label| {
+            self.artifact_link("unified-task-coverage", label, PanelKind::Findings(node_id), cx)
+        });
         div()
             .flex()
             .flex_wrap()
@@ -621,6 +635,7 @@ impl TaskPanel {
             .child(obligations)
             .child(plan)
             .children(findings)
+            .children(coverage)
             // Only a current count: none while unknown or recomputing.
             .children(self.changes.state.label().map(|label| {
                 self.artifact_link("unified-task-changes", label, PanelKind::Changes(node_id), cx)

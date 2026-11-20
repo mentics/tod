@@ -661,6 +661,7 @@ mod tests {
                         file: None,
                         line: None,
                         detail: None,
+                        root_cause: None,
                     },
                 },
             )

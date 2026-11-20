@@ -667,6 +667,9 @@ fn comment_body(finding: &ReviewFinding, place: &Place) -> String {
         };
         out = format!("**[{}]** ({about}) {}", finding.severity, finding.summary.trim());
     }
+    if let Some(cause) = root_cause(finding) {
+        out.push_str(&format!("\n\nRoot cause: {cause}"));
+    }
     if let Some(detail) = finding.detail.as_deref().filter(|d| !d.trim().is_empty()) {
         out.push_str("\n\n");
         out.push_str(detail.trim());
@@ -687,11 +690,19 @@ fn text_item(finding: &ReviewFinding) -> String {
         finding.summary.trim(),
         tod_store::interview::short_id(finding.id)
     );
+    if let Some(cause) = root_cause(finding) {
+        out.push_str(&format!("\n\n  Root cause: {cause}"));
+    }
     if let Some(detail) = finding.detail.as_deref().filter(|d| !d.trim().is_empty()) {
         out.push_str("\n\n  ");
         out.push_str(&detail.trim().replace('\n', "\n  "));
     }
     out
+}
+
+/// The finding's root cause, when the reviewer gave one.
+fn root_cause(finding: &ReviewFinding) -> Option<&str> {
+    finding.root_cause.as_deref().map(str::trim).filter(|c| !c.is_empty())
 }
 
 /// Which of `live` a finding belongs to: the one whose change has its file,
@@ -810,6 +821,9 @@ pub fn answer_message(findings: &[ReviewFinding]) -> String {
             finding.location().map(|l| format!(" {l}")).unwrap_or_default(),
             finding.summary.trim()
         ));
+        if let Some(cause) = root_cause(finding) {
+            out.push_str(&format!("  Root cause: {cause}\n"));
+        }
         if let Some(detail) = finding.detail.as_deref().filter(|d| !d.trim().is_empty()) {
             out.push_str(&format!("  {}\n", detail.trim().replace('\n', "\n  ")));
         }
@@ -934,6 +948,7 @@ mod tests {
             updated_at: 0,
             pr_thread: None,
             pr_posted_at: None,
+            root_cause: None,
         }
     }
 

@@ -10,10 +10,10 @@
 use std::sync::Arc;
 
 use gpui::{
-    App, Context, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement,
+    AnyElement, App, Context, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement,
     KeyBinding, ParentElement, Render, SharedString, Styled, Window, actions, div,
 };
-use gpui_component::{ActiveTheme, v_flex};
+use gpui_component::{ActiveTheme, h_flex, v_flex};
 
 use crate::ui::panel_export::RecordText as _;
 use crate::ui::item_list::keyboard::{
@@ -24,6 +24,8 @@ use crate::ui::item_list::{
 };
 use crate::ui::key_context;
 use crate::ui::pane_nav::{PaneFocusLeft, bind_modified_pane_nav};
+use crate::ui::selectable_text::selectable_text;
+use crate::ui::style;
 use crate::unified::PanelKind;
 use crate::unified::panel::{ColumnPanel, PanelOpenRequest};
 use crate::views::rows::{
@@ -33,7 +35,8 @@ use crate::views::rows::{
 use tod_store::fleet::FleetStore;
 use tod_store::interview::{ACTOR_USER, InterviewCommand};
 use tod_store::review::{
-    FINDING_REJECTED, FINDING_STATUSES, ReviewFinding, ReviewRepo, USER_FINDING_STATUSES,
+    FINDING_REJECTED, FINDING_STATUSES, LatestCoverage, ReviewFinding, ReviewRepo,
+    USER_FINDING_STATUSES, coverage,
 };
 use uuid::Uuid;
 
@@ -103,10 +106,36 @@ impl From<ItemListEvent> for ListAction {
 
 use super::node_title;
 
+/// One coverage line: the lens (or pass), then what it found.
+fn coverage_line(
+    id: String,
+    pass: String,
+    result: String,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    h_flex()
+        .gap(style::space::RELATED)
+        .items_start()
+        .child(
+            style::text_dense_muted(div())
+                .w(style::size::TABLE_CELL)
+                .flex_shrink_0()
+                .child(pass.clone())
+                .record_text(pass),
+        )
+        .child(style::text_dense(div()).min_w_0().child(selectable_text(id, result, window, cx)))
+        .into_any_element()
+}
+
 pub struct FindingsPanel {
     fleet: Arc<FleetStore>,
     node_id: Uuid,
     items: Vec<ReviewFinding>,
+    /// The latest review's coverage record: what it looked at, lens by lens,
+    /// and what each lens found. `None` when the node was never reviewed; an
+    /// error is shown, not hidden.
+    coverage: Result<Option<LatestCoverage>, String>,
     focus_handle: FocusHandle,
     list: ItemList<FindingItem>,
     host: RowHost<ListAction>,
@@ -125,6 +154,7 @@ impl FindingsPanel {
             fleet,
             node_id,
             items: Vec::new(),
+            coverage: Ok(None),
             focus_handle: cx.focus_handle(),
             list: ItemList::new().with_columns(finding_columns()),
             host,
@@ -145,6 +175,10 @@ impl FindingsPanel {
             .fleet
             .read(|conn| ReviewRepo::new(conn).list_for_node(node_id))
             .unwrap_or_default();
+        self.coverage = self
+            .fleet
+            .read(|conn| coverage::latest_for_node(conn, node_id))
+            .map_err(|err| format!("Could not read the review's coverage: {err:#}"));
         let rows: Vec<FindingRow> = self
             .items
             .iter()
@@ -153,6 +187,58 @@ impl FindingsPanel {
             .collect();
         self.list.set_rows(rows);
         cx.notify();
+    }
+
+    /// The latest review's coverage, compact: one line per lens, its result
+    /// beside it, then the lenses it has not covered yet. Nothing while the
+    /// node was never reviewed.
+    fn render_coverage(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let border = cx.theme().border;
+        let section = v_flex()
+            .flex_shrink_0()
+            .px(style::space::INSET)
+            .py(style::space::RELATED)
+            .gap(style::space::HAIRLINE)
+            .border_t_1()
+            .border_color(border);
+        let latest = match &self.coverage {
+            Ok(None) => return None,
+            Ok(Some(latest)) => latest,
+            Err(err) => {
+                return Some(
+                    section
+                        .child(style::text_error(div()).child(selectable_text(
+                            "unified-findings-coverage-error",
+                            err.clone(),
+                            window,
+                            cx,
+                        )))
+                        .into_any_element(),
+                );
+            }
+        };
+        let summary = latest.summary_label();
+        let mut section =
+            section.child(style::text_dense_label(div()).child(summary.clone()).record_text(summary));
+        for entry in &latest.entries {
+            section = section.child(coverage_line(
+                format!("unified-findings-coverage-{}", entry.id),
+                entry.pass.title(),
+                entry.result_label(),
+                window,
+                cx,
+            ));
+        }
+        for lens in &latest.gaps.missing_lenses {
+            section = section.child(coverage_line(
+                format!("unified-findings-coverage-missing-{}", lens.slug),
+                lens.title.to_string(),
+                "not recorded".to_string(),
+                window,
+                cx,
+            ));
+        }
+        Some(section.into_any_element())
     }
 
     fn selected_finding(&self) -> Option<ReviewFinding> {
@@ -364,6 +450,7 @@ mod tests {
                         file: None,
                         line: None,
                         detail: None,
+                        root_cause: None,
                     },
                 },
             )
@@ -404,6 +491,55 @@ mod tests {
             assert_eq!(view.node_id(), fixture.node_id);
             assert_eq!(view.items.len(), 1);
             assert_eq!(view.items[0].id, finding_id);
+        });
+    }
+
+    #[gpui::test]
+    fn shows_the_latest_reviews_coverage(cx: &mut TestAppContext) {
+        use tod_store::conversation::{Focus, ProtocolKind};
+        use tod_store::review::{CoveragePass, CoverageResult, NewCoverage};
+
+        let fixture = Fixture::new();
+        let review = Uuid::new_v4();
+        fixture
+            .store
+            .interview(
+                ACTOR_AGENT,
+                InterviewCommand::CreateConversation {
+                    id: review,
+                    focus: Focus::Node(fixture.node_id),
+                    protocol: ProtocolKind::Review,
+                    platform: None,
+                    model: None,
+                    effort: None,
+                },
+            )
+            .unwrap();
+        fixture
+            .store
+            .interview(
+                ACTOR_AGENT,
+                InterviewCommand::RecordReviewCoverage {
+                    conversation_id: review,
+                    entry: NewCoverage {
+                        pass: CoveragePass::Lens("reach".into()),
+                        files: vec!["src/import.rs".into()],
+                        checked: Some("every caller of the importer".into()),
+                        result: CoverageResult::None,
+                        read: Vec::new(),
+                    },
+                },
+            )
+            .unwrap();
+        let (view, cx) = open_view(&fixture, cx);
+
+        view.read_with(cx, |view, _| {
+            let latest = view.coverage.as_ref().unwrap().as_ref().unwrap();
+            assert_eq!(latest.conversation_id, review);
+            assert_eq!(latest.entries.len(), 1);
+            assert_eq!(latest.entries[0].result_label(), "nothing found");
+            assert_eq!(latest.gaps.missing_lenses.len(), 10);
+            assert_eq!(latest.summary_label(), "Coverage 1/11 lenses · saturation pass owed");
         });
     }
 
@@ -492,6 +628,7 @@ impl Render for FindingsPanel {
                     cx,
                 )
             })
+            .children(self.render_coverage(window, cx))
             .child(
                 div()
                     .px_3()

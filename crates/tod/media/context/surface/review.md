@@ -84,35 +84,51 @@ Go through the change once per lens. In each, check every changed file and
 every path the change reaches. A lens that does not apply needs a reason you
 could state.
 
-1. **Obligations.** Does every path make each obligation true?
-2. **Data assumptions.** Cardinality, uniqueness, ordering (a `LIMIT 1` or
-   a "first row" with no `ORDER BY`), nulls, scale. Check them against the
-   real data, read-only, not against what the code or its names imply.
-3. **External systems.** What an API answers on every error, its rate
-   limits, quota, cost per call, and retries.
-4. **Persisted results.** Caches, negative caches, TTLs, stored statuses:
-   what wrong value can be stored, for how long, and how it is undone.
-5. **Interactions.** Each pair of new behaviors that touch the same item.
-6. **Reach.** Every caller and path that reaches the changed behavior
-   (background jobs, scripts, other entry points), not only the one the
-   task names. Read a reused function before trusting it for a new purpose.
-7. **Data writes.** Transactions, locks (and any held across a network
-   call), query plans on production-sized tables (EXPLAIN on the real
-   database), idempotency, rollback.
-8. **Concurrency and cancellation.**
-9. **Error paths.** Each new failure classified and handled.
-10. **Tests.** Would each test fail if the change were reverted? Does a mock
-    assume the very answer under test?
-11. **Verification evidence.** Below.
+1. **Obligations** (`obligations`). Does every path make each obligation
+   true?
+2. **Data assumptions** (`data-assumptions`). Cardinality, uniqueness,
+   ordering (a `LIMIT 1` or a "first row" with no `ORDER BY`), nulls, scale.
+   Check them against the real data, read-only, not against what the code or
+   its names imply.
+3. **External systems** (`external-systems`). What an API answers on every
+   error, its rate limits, quota, cost per call, and retries.
+4. **Persisted results** (`persisted-results`). Caches, negative caches,
+   TTLs, stored statuses: what wrong value can be stored, for how long, and
+   how it is undone.
+5. **Interactions** (`interactions`). Each pair of new behaviors that touch
+   the same item.
+6. **Reach** (`reach`). Every caller and path that reaches the changed
+   behavior (background jobs, scripts, other entry points), not only the one
+   the task names. Read a reused function before trusting it for a new
+   purpose.
+7. **Data writes** (`data-writes`). Transactions, locks (and any held across
+   a network call), query plans on production-sized tables (EXPLAIN on the
+   real database), idempotency, rollback.
+8. **Concurrency and cancellation** (`concurrency`).
+9. **Error paths** (`error-paths`). Each new failure classified and handled.
+10. **Tests** (`tests`). Would each test fail if the change were reverted?
+    Does a mock assume the very answer under test?
+11. **Verification evidence** (`verification-evidence`). Below.
+
+### Record the coverage as you go
+
+Each lens, once swept, gets an entry in this review's coverage record through
+the `review` noun's `coverage`, named by the slug in brackets above: the
+changed files it covers, what you checked and how, the files you read for it,
+and what it found (nothing, the findings, or why it does not apply). The user
+sees the record beside the findings, and the next round sees what this one
+checked. Recording the review done is refused until every lens has an entry
+and the saturation pass (below) is recorded.
 
 ### One finding, its whole class
 
 For every finding, name its **root cause**: the assumption or pattern that
 made it possible ("the org's supplier id is treated as unique"). Then search
 the change and the code it reaches for every other place that cause holds,
-and record each as its own finding in this round. Start each finding's
-detail with `Root cause:` and the cause, in the same words for every finding
-that shares it, so the fix covers the class and not one instance.
+and record each as its own finding in this round. Give each finding its root
+cause (the `review` noun's `--root-cause`), in the same words for every
+finding that shares it: the fixer is shown them together, so the fix covers
+the class and not one instance.
 
 ### Verification evidence
 
@@ -134,8 +150,9 @@ Then send the task back to `verifying` (above).
 
 After the sweep, go through the change again assuming you missed at least
 three defects. Look where your findings cluster and in the lenses where you
-found nothing. Record the review done only after a pass that finds nothing
-new.
+found nothing. Record the pass in the coverage record as the saturation
+pass, with what it found. Record the review done only after a pass that
+finds nothing new: a pass that found something means another one.
 
 ## Staying in scope
 

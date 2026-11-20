@@ -197,6 +197,7 @@ impl FakeAgent {
                             line: Some(1),
                             summary: "Another defect.".into(),
                             detail: None,
+                            root_cause: None,
                         },
                     })?;
                     user.interview(InterviewCommand::RecordConversationReport {
@@ -2992,6 +2993,7 @@ fn pr_draft_with_review_steps_reviews_the_clean_head_once() {
                     line: None,
                     summary: "From the review before the pull request.".into(),
                     detail: None,
+                    root_cause: None,
                 },
             },
         )
@@ -3595,6 +3597,7 @@ fn a_merge_of_the_base_alone_is_pushed_without_a_review() {
                     line: None,
                     summary: "From the review before the pull request.".into(),
                     detail: None,
+                    root_cause: None,
                 },
             },
         )
@@ -3726,6 +3729,7 @@ fn a_finding_before_the_pull_request(fx: &Fixture) {
                     line: None,
                     summary: "From the review before the pull request.".into(),
                     detail: None,
+                    root_cause: None,
                 },
             },
         )
@@ -3875,6 +3879,7 @@ fn seed_unclean_review_saying(fx: &Fixture, summary: &str) {
             line: None,
             summary: summary.into(),
             detail: None,
+            root_cause: None,
         },
     });
     conversation(InterviewCommand::RecordConversationReport {
@@ -4520,6 +4525,7 @@ fn bot_node_in_draft(feed: Arc<BotFeed>, bot_yaml: &str) -> (Fixture, FakeAgent)
                     line: None,
                     summary: "From the review before the pull request.".into(),
                     detail: None,
+                    root_cause: None,
                 },
             },
         )

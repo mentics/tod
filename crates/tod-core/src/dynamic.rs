@@ -190,23 +190,60 @@ pub struct DynamicContext<'a> {
 }
 
 /// One finding as a fix session is shown it: a line with its id, severity,
-/// location, and summary, then its detail indented under it.
+/// location, and summary, then its root cause and detail indented under it.
 pub fn review_finding_lines(finding: &ReviewFinding) -> String {
+    finding_lines(finding, "", true)
+}
+
+/// [`review_finding_lines`], indented by `indent`, with or without its root
+/// cause (a group's header already names it).
+fn finding_lines(finding: &ReviewFinding, indent: &str, with_root_cause: bool) -> String {
     let location = finding
         .location()
         .map(|l| format!(" `{l}`"))
         .unwrap_or_default();
     let mut out = format!(
-        "- [{}] {}{location}: {}\n",
+        "{indent}- [{}] {}{location}: {}\n",
         tod_store::interview::short_id(finding.id),
         finding.severity,
         finding.summary.trim()
     );
+    let root_cause = finding.root_cause.as_deref().map(str::trim).filter(|c| !c.is_empty());
+    if with_root_cause && let Some(cause) = root_cause {
+        out.push_str(&format!("{indent}  Root cause: {cause}\n"));
+    }
     if let Some(detail) = finding.detail.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
         for line in detail.lines() {
+            out.push_str(indent);
             out.push_str("  ");
             out.push_str(line);
             out.push('\n');
+        }
+    }
+    out
+}
+
+/// Findings as a fix session is shown them: those that share a root cause
+/// under one entry naming it, so the fixer sees the class and fixes it once,
+/// and the rest one by one ([`review_finding_lines`]).
+pub fn review_findings_lines(findings: &[ReviewFinding]) -> String {
+    let mut out = String::new();
+    for group in tod_store::review::group_by_root_cause(findings) {
+        match (group.root_cause, group.findings.as_slice()) {
+            (Some(cause), [_, _, ..]) => {
+                out.push_str(&format!(
+                    "- Root cause shared by {} findings: {cause}\n",
+                    group.findings.len()
+                ));
+                for finding in &group.findings {
+                    out.push_str(&finding_lines(finding, "  ", false));
+                }
+            }
+            _ => {
+                for finding in &group.findings {
+                    out.push_str(&review_finding_lines(finding));
+                }
+            }
         }
     }
     out
@@ -455,9 +492,7 @@ fn render_block(block: DynamicBlock, ctx: &DynamicContext<'_>, out: &mut String)
             if ctx.findings.is_empty() {
                 out.push_str("(none)\n");
             } else {
-                for finding in ctx.findings {
-                    out.push_str(&review_finding_lines(finding));
-                }
+                out.push_str(&review_findings_lines(ctx.findings));
             }
         }
 
@@ -703,5 +738,52 @@ mod tests {
             &DynamicContext::default(),
         );
         assert_eq!(without, "# Current context\n\n");
+    }
+
+    fn finding(seq: u128, summary: &str, root_cause: Option<&str>) -> ReviewFinding {
+        ReviewFinding {
+            id: Uuid::from_u128(seq << 120),
+            node_id: Uuid::nil(),
+            conversation_id: None,
+            seq: seq as i64,
+            severity: "high".into(),
+            file: Some("a.py".into()),
+            line: Some(seq as i64),
+            summary: summary.into(),
+            detail: Some("How it goes wrong.".into()),
+            status: "open".into(),
+            response: None,
+            created_at: 0,
+            updated_at: 0,
+            pr_thread: None,
+            pr_posted_at: None,
+            root_cause: root_cause.map(str::to_string),
+        }
+    }
+
+    /// Findings that share a root cause are shown as one class; a lone root
+    /// cause stays on its finding.
+    #[test]
+    fn findings_that_share_a_root_cause_are_shown_together() {
+        let findings = [
+            finding(1, "First", Some("The id is treated as unique")),
+            finding(2, "Second", Some("Nulls are not handled")),
+            finding(3, "Third", Some("the id is treated as unique")),
+            finding(4, "Fourth", None),
+        ];
+        let text = review_findings_lines(&findings);
+        assert_eq!(
+            text,
+            "- Root cause shared by 2 findings: The id is treated as unique\n\
+             \x20 - [01000000] high `a.py:1`: First\n\
+             \x20   How it goes wrong.\n\
+             \x20 - [03000000] high `a.py:3`: Third\n\
+             \x20   How it goes wrong.\n\
+             - [02000000] high `a.py:2`: Second\n\
+             \x20 Root cause: Nulls are not handled\n\
+             \x20 How it goes wrong.\n\
+             - [04000000] high `a.py:4`: Fourth\n\
+             \x20 How it goes wrong.\n"
+        );
     }
 }

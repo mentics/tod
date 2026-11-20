@@ -32,6 +32,7 @@ pub const ROW_KEYS: &[(&str, &[(&str, KeyKind)])] = &[
     ("node_plan_steps", &[("id", Blob)]),
     ("interview_sessions", &[("id", Blob)]),
     ("review_findings", &[("id", Blob)]),
+    ("review_coverage", &[("id", Blob)]),
     ("node_fields", &[("node_id", Blob)]),
     ("node_tags", &[("node_id", Blob)]),
     ("node_generator_config", &[("node_id", Blob)]),
