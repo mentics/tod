@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 /// Flags that never take a value.
-const SWITCHES: &[&str] = &["--before", "--append", "--inherited", "--open", "--unchecked", "--all-open", "--all", "--fixed", "--rejected", "--full", "--stop", "--commit", "--discard", "--live"];
+const SWITCHES: &[&str] = &["--before", "--append", "--inherited", "--open", "--unchecked", "--all-open", "--all", "--fixed", "--rejected", "--full", "--stop", "--commit", "--discard", "--live", "--not-applying"];
 
 #[derive(Default)]
 pub struct Args {
@@ -229,5 +229,35 @@ mod tests {
         assert!(parse(&["--body"]).is_err());
         assert!(parse(&["--node", "not-a-uuid"]).unwrap().uuid("--node").is_err());
         assert!(parse(&[]).unwrap().require("--kind").is_err());
+    }
+    /// A switch some command reads with `has` but that is missing from
+    /// `SWITCHES` takes the next word as its value, so `has` never sees it
+    /// (`guidance select --not-applying` once recorded a lens as applying).
+    #[test]
+    fn every_switch_a_command_reads_is_registered() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut missing = Vec::new();
+        let mut stack = vec![src];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).unwrap();
+                for piece in text.split(".has(\"").skip(1) {
+                    let name = &piece[..piece.find('"').unwrap()];
+                    if name.starts_with("--") && !SWITCHES.contains(&name) {
+                        missing.push(format!("{name} ({})", path.display()));
+                    }
+                }
+            }
+        }
+        assert!(missing.is_empty(), "read with `has` but not in SWITCHES: {missing:?}");
+        assert!(parse(&["--reason", "r", "--not-applying"]).unwrap().has("--not-applying"));
     }
 }
