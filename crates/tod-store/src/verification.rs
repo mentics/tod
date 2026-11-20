@@ -216,6 +216,21 @@ impl<'a> VerdictRepo<'a> {
         Ok(verified.len())
     }
 
+    /// [`Self::reopen_verified`] for only `obligations`: each one whose
+    /// current verdict on `node_id` is `verified` is reopened, the rest left
+    /// as they are. Returns how many were reopened.
+    pub fn reopen_verified_of(&self, node_id: Uuid, obligations: &[Uuid], why: &str) -> Result<usize> {
+        let latest = self.latest_for_node(node_id)?;
+        let mut reopened = 0;
+        for obligation_id in obligations {
+            if latest.get(obligation_id).is_some_and(ObligationVerdict::is_verified) {
+                self.insert(node_id, *obligation_id, None, VERDICT_REOPENED, why)?;
+                reopened += 1;
+            }
+        }
+        Ok(reopened)
+    }
+
     /// Withdraw every `verified` verdict on `obligation_id`, on whichever
     /// node recorded it, because its wording changed: what was verified was
     /// the old requirement.

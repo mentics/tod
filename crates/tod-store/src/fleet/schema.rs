@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 101;
+pub const CURRENT_USER_VERSION: i32 = 103;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -668,6 +668,12 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         conn.execute_batch(crate::conversation_usage::CREATE_TABLE)?;
         conn.pragma_update(None, "user_version", 101)?;
     }
+    if version < 103 {
+        // An agent's send-backs (`crate::send_back`): synced, journaled.
+        conn.execute_batch(crate::send_back::CREATE_TABLE)?;
+        conn.execute_batch(&crate::journey_changes::send_backs_triggers_sql())?;
+        conn.pragma_update(None, "user_version", 103)?;
+    }
     // Other branches (the task panel) numbered their own steps 66–67 at the
     // same time as 66–70 above, so a store may be past a version without
     // having these. Every one is idempotent: make sure of them all.
@@ -734,6 +740,8 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     conn.execute_batch(&crate::journey_changes::request_feedback_triggers_sql())?;
     crate::phase::ensure_table(conn)?;
     conn.execute_batch(&crate::journey_changes::phase_events_triggers_sql())?;
+    conn.execute_batch(crate::send_back::CREATE_TABLE)?;
+    conn.execute_batch(&crate::journey_changes::send_backs_triggers_sql())?;
     ensure_turn_attachments(conn)?;
     // Added to the v73 step after stores had passed it, so it is made sure of
     // here, like the rest (`conversations.skill_group`).

@@ -16,6 +16,12 @@ a review there. Anchor each finding to the file and line of the change it is
 about whenever you can: when a head reaches the pull request without this
 review, the app posts what you record there itself, each finding on its line.
 
+A finding that means an earlier phase got it wrong (evidence that falls
+short, a wrong build, a wrong approach, a requirement on a false claim) still
+sends the task back with `lifecycle send-back`, as above: the draft pull
+request stays open, and the task comes back to `pr_draft` through every
+phase after the one you send it to.
+
 Findings from earlier rounds may already be on the task, answered by the
 fixer or by the pull request's agent through their review threads. Treat
 them as above.

@@ -137,6 +137,7 @@ pub const SYNCED_TABLES: &[&str] = &[
     "node_timeline",
     "node_requests",
     "run_state",
+    "node_send_backs",
 ];
 
 /// The HTTP header a client names itself by to the orchestrator

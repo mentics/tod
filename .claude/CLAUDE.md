@@ -155,6 +155,26 @@ protocol kinds remain only so old conversations load, and run
 (`tod-cli decisions ask`, free text with no `--option`) only for what only
 the user can supply.
 
+**Agent send-back** (`tod_store::send_back`, `tod-cli lifecycle send-back`).
+A phase agent, an evaluator (its one allowed write), or a verification,
+review (in `review` or on the PR) or fix session sends its own node back to
+an earlier state, before `pr_review`, with a reason, evidence and, for
+`verifying`, the obligations whose verdicts reopen (only those; at `active`
+or earlier every verdict reopens, as for a user's move). It is the same move
+as the user's (`send_back::apply_move`), recorded in `node_send_backs`
+(schema v103, synced, journaled), shown in the Activity
+(`node_timeline::KIND_SEND_BACK`), and carried into the target phase's
+opening (`send_back::render_for_opening`: the phase status block, the
+implementation and verification openings). The driver hands the
+conversation back after the turn that sent it, and the autopilot goes on in
+the new state (`Autopilot::sent_back_during`). **Loop guard**
+(`send_back::guard`): a send-back is refused, and the run stops with
+`NeedsHuman::SendBackLoop` and every reason given, when the same `from → to`
+was sent before and the obligations, plan and design are unchanged since
+(`send_back::work_digest`), or when it would be the third to the same state
+since the user last acted on the node (`send_back::user_acted_at`: a move,
+request or answer of theirs). Anyone else gets an error naming who may.
+
 **Usual actions** (`tod_core::usual_actions`, `media/context/cli/usual-actions.yml`).
 The phase agent's and the evaluator's opening ends with the `tod-cli` commands
 that role usually runs in that state (and, for the phase agent, with independent
@@ -384,7 +404,8 @@ a disable archives every row it removes (`outline::archive`, following
 lifecycle mutations are not recorded, and nothing sets a lifecycle state
 except the lifecycle process, with two deliberate exceptions for the user:
 the task panel's state chip and the operator's `tod-cli lifecycle set`
-(refused in agent sessions, and into `pr_review` or beyond).
+(refused in agent sessions, and into `pr_review` or beyond), and one for
+agents: the judging sessions' send-back (**Agent send-back** above).
 
 **Protocols.** A conversation's `protocol` (schema v39) decides what kind of
 conversation it is: the context recipe, the working directory, the turn

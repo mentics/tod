@@ -237,6 +237,19 @@ impl<'a> NodeRepo<'a> {
     /// [`Self::set_lifecycle`]; `by_user` says the user chose the state, which
     /// the node's timeline shows.
     pub fn set_lifecycle_by(&self, node_id: Uuid, state: &str, by_user: bool, reason: Option<&str>) -> Result<()> {
+        self.set_lifecycle_scoped(node_id, state, by_user, reason, crate::lifecycle_reset::VerdictScope::All)
+    }
+
+    /// [`Self::set_lifecycle_by`], reopening only the `verified` verdicts
+    /// `verdicts` names when the move goes back to `verifying` or earlier.
+    pub fn set_lifecycle_scoped(
+        &self,
+        node_id: Uuid,
+        state: &str,
+        by_user: bool,
+        reason: Option<&str>,
+        verdicts: crate::lifecycle_reset::VerdictScope<'_>,
+    ) -> Result<()> {
         let now = now_ms();
         let previous = self.get_lifecycle(node_id)?;
         self.conn.execute(
@@ -251,7 +264,7 @@ impl<'a> NodeRepo<'a> {
         // Moving back restarts from there: what certified the states being
         // redone no longer counts (`crate::lifecycle_reset`).
         if let Some(previous) = previous {
-            crate::lifecycle_reset::clear_certifications(self.conn, node_id, &previous, state)?;
+            crate::lifecycle_reset::clear_certifications_scoped(self.conn, node_id, &previous, state, verdicts)?;
             // What the node waited on in the stay it just left (a check, a
             // review, a deadline) is moot, whichever way it left (gate,
             // force-advance, move-back): a stale wait would block the next

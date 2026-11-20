@@ -201,6 +201,7 @@ pub const VERIFY_SESSION: ContextRecipe = ContextRecipe {
         "cli/secrets",
         "cli/environment",
         "cli/decisions",
+        "cli/lifecycle",
         "cli/wait",
         "surface/verify",
     ],
@@ -224,6 +225,7 @@ pub const REVIEW_SESSION: ContextRecipe = ContextRecipe {
         "cli/obligations",
         "cli/review",
         "cli/decisions",
+        "cli/lifecycle",
         "surface/review",
     ],
     // The implementation blocks without the plan: a reviewer judges the change
@@ -259,6 +261,7 @@ pub const REVIEW_ON_PR_SESSION: ContextRecipe = ContextRecipe {
         "cli/obligations",
         "cli/review",
         "cli/decisions",
+        "cli/lifecycle",
         "surface/review",
         "surface/review-on-pr",
     ],
@@ -311,6 +314,7 @@ pub const FIX_SESSION: ContextRecipe = ContextRecipe {
         "cli/secrets",
         "cli/environment",
         "cli/decisions",
+        "cli/lifecycle",
         "cli/wait",
         "surface/fix",
     ],
@@ -352,6 +356,7 @@ pub const PHASE: ContextRecipe = ContextRecipe {
         "cli/decisions",
         "cli/learn",
         "cli/phase",
+        "cli/lifecycle",
         "surface/phase",
     ],
     blocks: &[
@@ -374,7 +379,8 @@ pub const PHASE: ContextRecipe = ContextRecipe {
 /// An independent phase evaluation: a fresh session that judges whether a
 /// phase agent's work is done, and certifies it or sends fixes back. It
 /// cannot edit (`tod-cli` refuses its writes), so it loads only the nouns it
-/// reads through and the two it finishes with.
+/// reads through and the ones it finishes with (`lifecycle` to send the work
+/// back further than its own phase).
 pub const EVALUATE: ContextRecipe = ContextRecipe {
     name: "phase evaluation",
     situational: false,
@@ -390,6 +396,7 @@ pub const EVALUATE: ContextRecipe = ContextRecipe {
         "cli/plan",
         "cli/decisions",
         "cli/phase",
+        "cli/lifecycle",
         "surface/evaluate",
     ],
     blocks: PHASE.blocks,

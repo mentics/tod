@@ -73,7 +73,7 @@ NOUNS:
     verdicts               What verification found for each obligation of a node
     incoming               Changes a node inherits, and the verdict that resolves them
     learn                  A node's retrospective, stored once per pass
-    lifecycle              Move a node's lifecycle state (operator only, refused in an agent session)
+    lifecycle              Send a node back to the phase that got it wrong; the operator's moves
     secrets                Run a command with stored secrets, without seeing them
     db                     Log in to the user's databases through their machine, without seeing the login
     environment            Variables and credentials defined for this work; ask the user for one

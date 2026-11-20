@@ -264,6 +264,9 @@ pub enum InterviewCommand {
         state: String,
         fixes: Vec<String>,
     },
+    /// An agent sends its node back to an earlier state
+    /// (`tod-cli lifecycle send-back`, `crate::send_back::execute`).
+    SendBack(crate::send_back::Request),
     /// The user's "Shouldn't have asked" on a request
     /// (`crate::request_feedback`). Not offered by `tod-cli`.
     RecordRequestFeedback(crate::request_feedback::NewRequestFeedback),
@@ -477,13 +480,15 @@ pub fn execute(
     let now = now_ms();
 
     // An evaluator judges a phase; it never changes what it judges
-    // (`doc/lifecycle/phase-agents.md`).
+    // (`doc/lifecycle/phase-agents.md`). It may send the work back to the
+    // phase that got it wrong, which changes nothing it judged.
     if !matches!(
         command,
         InterviewCommand::AskDecision { .. }
             | InterviewCommand::PhaseCertify { .. }
             | InterviewCommand::PhaseReject { .. }
-    ) && crate::phase::certifier_for_actor(conn, actor)?.1 == crate::phase::CERTIFIER_INDEPENDENT
+            | InterviewCommand::SendBack(_)
+    ) &&crate::phase::certifier_for_actor(conn, actor)?.1 == crate::phase::CERTIFIER_INDEPENDENT
     {
         bail!(
             "an evaluator does not change the node: certify the phase, reject it with \
@@ -1176,6 +1181,7 @@ pub fn execute(
             let body = serde_json::to_string(&fixes)?;
             record_phase(conn, actor, *node_id, state, crate::phase::PHASE_REJECT, &body)
         }
+        InterviewCommand::SendBack(request) => crate::send_back::execute(conn, actor, request),
         InterviewCommand::RecordRequestFeedback(feedback) => {
             let id = crate::request_feedback::RequestFeedbackRepo::new(conn).record(feedback)?;
             Ok(json!({ "id": id.to_string() }))

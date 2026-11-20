@@ -56,6 +56,9 @@
 //! - `review_coverage` (`tod_store::review::coverage`; insert-only, the
 //!   record is append-only), created by [`review_coverage_triggers_sql`] in
 //!   the v99 migration.
+//! - `node_send_backs` (`tod_store::send_back`; insert-only, a record of
+//!   what happened), created by [`send_backs_triggers_sql`] in the v103
+//!   migration step that creates the table.
 //! - `node_files_locations` (`tod_store::fleet::repos::files_location`, the
 //!   worktree or sandbox made for each node), created by
 //!   [`files_locations_triggers_sql`] in the v75 migration.
@@ -408,6 +411,19 @@ pub fn review_coverage_triggers_sql() -> String {
         CREATE TRIGGER IF NOT EXISTS trg_journey_review_coverage_insert AFTER INSERT ON review_coverage BEGIN
             INSERT INTO journey_changes (node_id, tbl, row_id, op, at)
             VALUES (NEW.node_id, 'review_coverage', hex(NEW.id), 'insert', {NOW});
+        END;
+        "
+    )
+}
+
+/// Trigger for `node_send_backs` (`crate::send_back`): append-only, so
+/// insert only.
+pub fn send_backs_triggers_sql() -> String {
+    format!(
+        "
+        CREATE TRIGGER IF NOT EXISTS trg_journey_node_send_backs_insert AFTER INSERT ON node_send_backs BEGIN
+            INSERT INTO journey_changes (node_id, tbl, row_id, op, at)
+            VALUES (NEW.node_id, 'node_send_backs', hex(NEW.id), 'insert', {NOW});
         END;
         "
     )

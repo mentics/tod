@@ -988,12 +988,19 @@ impl ConversationDriver {
             // waiting on a run it started); see `TurnContext::progressed`.
             let (allowed, streak) = super::protocol::quiet_streak_step(self.quiet_streak, progressed);
             new_streak = streak;
-            self.protocol.next(&TurnContext {
-                env: &env,
-                report: report.as_ref(),
-                continuations: self.continuations,
-                progressed: allowed,
-            })?
+            // An agent that sent its node back this turn (`tod-cli lifecycle
+            // send-back`) is done here whatever its protocol would say: the
+            // node is in another phase, or the run stops for the user on a
+            // refused one.
+            match self.sent_back_this_turn(fleet, id, turn_seq)? {
+                Some(why) => Next::Done(super::protocol::Stop::HandBack(why)),
+                None => self.protocol.next(&TurnContext {
+                    env: &env,
+                    report: report.as_ref(),
+                    continuations: self.continuations,
+                    progressed: allowed,
+                })?,
+            }
         };
         self.quiet_streak = new_streak;
         let decision = match &next {
@@ -1048,6 +1055,40 @@ impl ConversationDriver {
             }
         }
         Ok(reply_seq)
+    }
+
+    /// Why the turn that started at `turn_seq` ends the exchange because the
+    /// agent sent the node back in it, recording each send-back in the
+    /// journey with the agent as actor; `None` when it sent none.
+    fn sent_back_this_turn(&self, fleet: &FleetStore, id: Uuid, turn_seq: i64) -> Result<Option<String>> {
+        let sent = fleet.read(|conn| tod_store::send_back::SendBackRepo::new(conn).for_conversation_since(id, turn_seq))?;
+        let Some(last) = sent.last() else {
+            return Ok(None);
+        };
+        for s in &sent {
+            crate::journey::record(
+                self.journey_key(),
+                Actor::Agent { conversation: id },
+                Event::UserAction {
+                    action: format!("send_back:{}", s.to_state),
+                    source: "tod-cli lifecycle send-back".to_string(),
+                    surface: s.protocol.clone(),
+                    presented: Default::default(),
+                },
+            );
+            if s.moved() {
+                crate::journey::record(
+                    self.journey_key(),
+                    Actor::Agent { conversation: id },
+                    Event::Transition { from: s.from_state.clone(), to: s.to_state.clone() },
+                );
+            }
+        }
+        Ok(Some(if last.moved() {
+            format!("sent the task back from {} to {}: {}", last.from_state, last.to_state, last.reason)
+        } else {
+            format!("asked to send the task back to {} and was stopped: {}", last.to_state, last.stop_why)
+        }))
     }
 
     /// Send another turn on the conversation's own session, without a user

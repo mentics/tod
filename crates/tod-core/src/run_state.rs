@@ -69,6 +69,8 @@ pub mod kind {
     pub const CHECKS_UNFIXED: &str = "checks_unfixed";
     /// The node's code was lost again after the app reopened its implementation.
     pub const LOST_WORK: &str = "lost_work";
+    /// An agent's send-back was refused by the loop guard.
+    pub const SEND_BACK_LOOP: &str = "send_back_loop";
 }
 
 /// How a run's words differ by who ran it.
@@ -203,6 +205,7 @@ pub fn for_outcome(outcome: &Outcome, words: Words<'_>) -> Draft {
                 }
                 NeedsHuman::ChecksUnfixed { .. } => draft(Phase::Stopped, kind::CHECKS_UNFIXED, text, RESUMABLE_BY_YOU),
                 NeedsHuman::LostWork { .. } => draft(Phase::Stopped, kind::LOST_WORK, text, RESUMABLE_BY_YOU),
+                NeedsHuman::SendBackLoop { .. } => draft(Phase::Stopped, kind::SEND_BACK_LOOP, text, RESUMABLE_BY_YOU),
             }
         }
     }
@@ -465,6 +468,15 @@ mod tests {
             ),
             (NeedsHuman::ChecksUnfixed { failing: vec!["lint".into()] }, kind::CHECKS_UNFIXED),
             (NeedsHuman::LostWork { why: "w".into() }, kind::LOST_WORK),
+            (
+                NeedsHuman::SendBackLoop {
+                    from: "review".into(),
+                    to: "active".into(),
+                    why: "unchanged".into(),
+                    reasons: vec!["one".into(), "two".into()],
+                },
+                kind::SEND_BACK_LOOP,
+            ),
         ];
         for (reason, expected) in stops {
             let got = needs(reason.clone());

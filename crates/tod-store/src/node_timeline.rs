@@ -7,7 +7,8 @@
 //!
 //! - [`KIND_GATE`]: `Vec<`[`GateLine`]`>`, one per criterion the check read;
 //! - [`KIND_CHECKS`]: `Vec<`[`CommandResult`]`>`, one per command that ran;
-//! - [`KIND_PHASE`]: [`PhaseChange`], the state the node left.
+//! - [`KIND_PHASE`]: [`PhaseChange`], the state the node left;
+//! - [`KIND_NOTE`] and [`KIND_SEND_BACK`]: plain text, not JSON.
 //!
 //! Synced, so a cloud node's supervisor shows its work in the app; not in
 //! `journey_changes` (command output may hold source text, as in
@@ -27,6 +28,10 @@ pub const KIND_PHASE: &str = "phase";
 /// A note the app left on the node's activity about something it did by
 /// itself (`tod_core::lost_work`): the title says what, the detail why.
 pub const KIND_NOTE: &str = "note";
+/// An agent sent the node back, or asked to and was stopped for the user
+/// (`crate::send_back`): the title says who and from where, the detail the
+/// reason and evidence (plain text, shown as a note's is).
+pub const KIND_SEND_BACK: &str = "send_back";
 
 pub const CREATE_TABLE: &str = "
     CREATE TABLE IF NOT EXISTS node_timeline (

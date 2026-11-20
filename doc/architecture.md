@@ -198,9 +198,13 @@ records through `tod-cli` as it works.
 capability mutation is recorded with its before and after state in the same
 transaction. The change set is net per item, reversal applies inverse
 mutations, and conflicts and dependents are reported for confirmation.
-Lifecycle state is never set by an agent; only the lifecycle process moves a
-node, apart from the user's own moves: the task panel's state chip and the
-operator's `tod-cli lifecycle set` (refused in agent sessions).
+Lifecycle state is never set forward by an agent; only the lifecycle process
+moves a node, apart from the user's own moves (the task panel's state chip
+and the operator's `tod-cli lifecycle set`, refused in agent sessions) and
+an agent's send-back: a phase agent, evaluator, or verification, review or
+fix session may send its node back to an earlier state with
+`tod-cli lifecycle send-back`, under a loop guard that stops the run for the
+user (`tod_store::send_back`).
 
 **Protocols.** The conversation's protocol decides the recipe, the working
 directory, what "done" means, whether the app loops it without the user,

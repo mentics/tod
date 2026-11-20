@@ -37,6 +37,25 @@ yourself.
 - Never invent product intent. A task with no stated purpose gets a question,
   not guessed requirements.
 
+## When an earlier phase got it wrong
+
+If this phase's work shows that an earlier one got it wrong, do not build on
+it and do not ask the user: send the task back yourself with `lifecycle
+send-back` (see the `lifecycle` commands), as far as the cause, with what
+shows it as evidence:
+
+- to `proposed` when a requirement rests on a false claim;
+- to `design` when the approach is wrong (something it rests on is false,
+  or it cannot work);
+- to `active` when the build is wrong but the design holds;
+- to `verifying` when the evidence that an obligation holds falls short,
+  naming each such obligation.
+
+Then end your turn; that phase starts from your reason. If the app refuses
+it (the same move on unchanged work, or a third to the same state), the run
+stops for the user with your reasons. If the block at the end of this
+message says this task was sent back here, start from that cause.
+
 ## Finishing the phase
 
 When the phase's **Done when** checklist holds, finish it with the `phase`

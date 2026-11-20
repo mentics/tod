@@ -56,9 +56,30 @@ pub fn is_move_back(from: &str, to: &str) -> bool {
     matches!((rank(from), rank(to)), (Some(from), Some(to)) if to < from)
 }
 
+/// Which `verified` verdicts a move back to `verifying` or earlier reopens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerdictScope<'a> {
+    /// Every one: the node is verified again from scratch.
+    All,
+    /// Only these obligations' (an agent's send-back to `verifying`, which
+    /// names the obligations whose evidence fell short: `crate::send_back`).
+    Only(&'a [Uuid]),
+}
+
 /// Drop what certified the states from `to` through `from`, for a node that
 /// moved back from `from` to `to`. Does nothing for any other move.
 pub fn clear_certifications(conn: &Connection, node_id: Uuid, from: &str, to: &str) -> Result<()> {
+    clear_certifications_scoped(conn, node_id, from, to, VerdictScope::All)
+}
+
+/// [`clear_certifications`], reopening only the verdicts `verdicts` names.
+pub fn clear_certifications_scoped(
+    conn: &Connection,
+    node_id: Uuid,
+    from: &str,
+    to: &str,
+    verdicts: VerdictScope<'_>,
+) -> Result<()> {
     if !is_move_back(from, to) {
         return Ok(());
     }
@@ -98,10 +119,12 @@ pub fn clear_certifications(conn: &Connection, node_id: Uuid, from: &str, to: &s
     }
 
     if to_rank <= rank("verifying").unwrap_or(usize::MAX) && table_exists(conn, "obligation_verdicts")? {
-        crate::verification::VerdictRepo::new(conn).reopen_verified(
-            node_id,
-            &format!("The node moved back from {from} to {to}: verify again."),
-        )?;
+        let why = format!("The node moved back from {from} to {to}: verify again.");
+        let repo = crate::verification::VerdictRepo::new(conn);
+        match verdicts {
+            VerdictScope::All => repo.reopen_verified(node_id, &why)?,
+            VerdictScope::Only(obligations) => repo.reopen_verified_of(node_id, obligations, &why)?,
+        };
     }
     Ok(())
 }
