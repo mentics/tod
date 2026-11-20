@@ -11,7 +11,7 @@ tod-cli --data-root <DATA_ROOT> lessons show <LESSON_ID>
 tod-cli --data-root <DATA_ROOT> lessons stats [--days <N>]
 tod-cli --data-root <DATA_ROOT> lessons add --node <NODE> --text <TEXT> [--category <CATEGORY>] [--target <TEXT>]
 tod-cli --data-root <DATA_ROOT> lessons decline <LESSON_ID>
-tod-cli --data-root <DATA_ROOT> lessons apply <LESSON_ID> (repeatable) --ref <TEXT>
+tod-cli --data-root <DATA_ROOT> lessons apply [<LESSON_ID>] [--lesson <LESSON_ID> (repeatable)] --ref <TEXT>
 ```
 
 - `list` shows the lessons, oldest first. `--status` is `new`, `grouped`,

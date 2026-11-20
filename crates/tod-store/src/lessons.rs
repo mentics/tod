@@ -128,7 +128,7 @@ pub fn ensure_columns(conn: &Connection) -> Result<()> {
 }
 
 /// One recorded lesson.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Lesson {
     pub id: Uuid,
     pub node_id: Uuid,
@@ -243,7 +243,7 @@ fn insert(conn: &Connection, new: &NewLesson, event_key: &str) -> Result<Lesson>
     if summary.is_empty() {
         bail!("a lesson needs a summary: what went wrong, and what would have prevented it");
     }
-    let id = Uuid::now_v7();
+    let id = Uuid::new_v4();
     let now = now_ms();
     conn.execute(
         "INSERT INTO improvement_lessons

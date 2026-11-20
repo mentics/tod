@@ -369,6 +369,31 @@ impl Runners {
         *last = (nodes, now);
     }
 
+    /// The process review's tick (`tod_core::process_review`,
+    /// `doc/lifecycle/self-improvement.md`): when a parent node is configured
+    /// (`process_review.parent`), enough lessons are new and the interval has
+    /// passed, group them into a node of their own under it. Off without a
+    /// parent. A failure is logged; the next tick tries again (nothing was
+    /// taken in unless the node was made).
+    fn process_review_pass(&self) {
+        let root = self.inner.store.paths().root().to_path_buf();
+        let settings = match tod_core::interview::TodSettings::load_from_path(&tod_core::interview::TodPaths::at(&root).settings_path()) {
+            Ok(settings) => settings.process_review,
+            Err(err) => {
+                tracing::error!("could not read the settings for the process review: {err:#}");
+                return;
+            }
+        };
+        match tod_core::process_review::start_due(&self.inner.store, &settings, now_ms()) {
+            Ok(made) => {
+                for node in made {
+                    tracing::info!(%node, "made a process-review node from the new lessons");
+                }
+            }
+            Err(err) => tracing::error!("the process review's pass failed: {err:#}"),
+        }
+    }
+
     /// The incidents' tick (`tod_core::incident`): expire, probe, escalate, and
     /// start the nodes released to resume (the probe node first, then the rest
     /// a few at a time). A released node that cannot be started goes back to
@@ -399,6 +424,7 @@ impl Runners {
 
     fn tick(&self) {
         self.incident_pass();
+        self.process_review_pass();
         self.start_due();
         self.resume_stale_request_waits();
         self.adopt_cut_off_runs();
