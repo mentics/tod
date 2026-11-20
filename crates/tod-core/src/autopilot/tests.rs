@@ -21,6 +21,7 @@ use tod_store::outline::repos::plan_steps::STATUS_BLOCKED;
 use tod_store::outline::{Capability, OutlineMutation};
 use tod_store::settings::InterviewContextSettings;
 
+mod agent_incident;
 mod ci_quick_fix;
 mod guidance;
 mod lost_work;
@@ -62,6 +63,14 @@ struct FakeAgent {
     quick_fix_writes: Option<(PathBuf, String)>,
     /// The small-change reviewer records a finding.
     small_review_finds: bool,
+    /// Every node turn fails with this error (the agent run, not the change).
+    fail_turns: Option<String>,
+    /// The provider refuses to start a turn at all (a launch that fails).
+    send_error: Option<String>,
+    /// The first node turn files `decisions ask --reason broken` with this
+    /// error, as an agent does, and keeps what came back.
+    broken_ask: Option<String>,
+    broken_ask_result: Arc<std::sync::Mutex<Option<serde_json::Value>>>,
     /// Every node turn, in order: its protocol and what it was sent.
     log: Arc<std::sync::Mutex<Vec<(ProtocolKind, String)>>>,
     /// Called with what a pull request turn was sent, before the mock plays
@@ -92,6 +101,10 @@ impl FakeAgent {
             fix_writes: None,
             quick_fix_writes: None,
             small_review_finds: false,
+            fail_turns: None,
+            send_error: None,
+            broken_ask: None,
+            broken_ask_result: Default::default(),
             log: Default::default(),
             pr_hook: None,
         }
@@ -281,6 +294,28 @@ impl FakeAgent {
                     std::fs::write(path, content)?;
                 }
             }
+            if let Some(error) = &self.fail_turns {
+                anyhow::bail!("{error}");
+            }
+            if let Some(error) = &self.broken_ask
+                && self.broken_ask_result.lock().unwrap().is_none()
+            {
+                use crate::conversation::mock::Access;
+                let result = user.interview(InterviewCommand::AskDecision {
+                    node_id: node.parse()?,
+                    conversation_id: Some(conversation.parse()?),
+                    protocol: None,
+                    decision: tod_store::decisions::NewDecision {
+                        question: "The tool is broken".into(),
+                        options: vec!["Fixed: try again".into()],
+                        reason: tod_store::decisions::REASON_BROKEN.into(),
+                        guard_reask: true,
+                        brief: tod_store::decisions::Brief { error: error.clone(), ..Default::default() },
+                        ..Default::default()
+                    },
+                })?;
+                *self.broken_ask_result.lock().unwrap() = Some(result);
+            }
             if self.small_review_finds {
                 let protocol = self.fleet.read(|conn| {
                     Ok(tod_store::conversation::ConversationRepo::new(conn)
@@ -337,6 +372,9 @@ impl AgentProvider for FakeAgent {
     }
 
     fn send_session_turn(&mut self, turn: SessionTurn) -> anyhow::Result<AgentRunHandle> {
+        if let Some(error) = &self.send_error {
+            anyhow::bail!("{error}");
+        }
         let id = RunId::new();
         self.sessions
             .entry(turn.key.clone())
