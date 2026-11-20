@@ -367,6 +367,11 @@ pub struct PrStatus {
     /// For a failing check that could not be compared with the base branch
     /// (a change too large to diff), `(name, why)`: no proof, and the reason.
     pub base_notes: Vec<(String, String)>,
+    /// The failing checks whose GitHub Actions job failed for the
+    /// infrastructure's reasons, not the change's (cancelled, timed out, its
+    /// runner lost): tod reruns the job ([`Github::rerun_job`]) instead of
+    /// sending an agent. Empty from a look that could not read them.
+    pub infra_failures: Vec<InfraFailure>,
     /// Some check is still running (a status `pending`, a run not completed),
     /// whatever else failed: `checks` says `failure` first.
     pub checks_running: bool,
@@ -400,6 +405,40 @@ impl PrStatus {
             .map(|(_, sig)| sig.clone())
             .unwrap_or_default()
     }
+}
+
+/// A failing GitHub Actions job whose failure is the infrastructure's
+/// (`doc/requests/design.md` 4.2.1): rerunning the job is the whole answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InfraFailure {
+    /// The failing check's name.
+    pub check: String,
+    /// The Actions job's id (what [`Github::rerun_job`] takes).
+    pub job_id: i64,
+    /// What happened to it: `cancelled`, `timed out` or `runner lost`.
+    pub kind: String,
+}
+
+/// What an infrastructure failure of a finished job was, from its conclusion
+/// and the text of its annotations; `None` for the change's own failure.
+/// Phrases are the ones GitHub's runner writes when it loses the machine, so a
+/// test failure that mentions "shutdown" is never one.
+pub fn infra_kind(conclusion: &str, annotation_text: &str) -> Option<&'static str> {
+    match conclusion {
+        "timed_out" => return Some("timed out"),
+        "cancelled" => return Some("cancelled"),
+        _ => {}
+    }
+    let lower = annotation_text.to_lowercase();
+    const RUNNER_LOST: &[&str] = &[
+        "the runner has received a shutdown signal",
+        "lost communication with the server",
+        "the hosted runner",
+        "was not acquired by runner",
+        "received request to deprovision",
+        "runner lost",
+    ];
+    RUNNER_LOST.iter().any(|p| lower.contains(p)).then_some("runner lost")
 }
 
 /// A failing check of a pull request whose failure is also on the base
@@ -1004,6 +1043,7 @@ impl Github {
         let mut sigs: Vec<(String, String)> = Vec::new();
         let mut notes: Vec<(String, String)> = Vec::new();
         let mut evidence: Vec<(String, Vec<String>)> = Vec::new();
+        let mut infra: Vec<InfraFailure> = Vec::new();
         let mut record = |name: &String, result: Result<String, String>| match result {
             Ok(sig) => sigs.push((name.clone(), sig)),
             Err(why) => {
@@ -1039,12 +1079,16 @@ impl Github {
             }
             seen.push(name.clone());
             let failure = self.run_signature(owner, repo, run)?;
+            let is_actions = run.app.as_ref().and_then(|a| a.slug.as_deref()) == Some("github-actions") && run.id != 0;
+            if let (Some(kind), true) = (&failure.infra, is_actions) {
+                infra.push(InfraFailure { check: name.clone(), job_id: run.id, kind: kind.clone() });
+            }
             if !failure.lines.is_empty() {
                 evidence.push((name.clone(), failure.lines));
             }
             record(name, failure.signature);
         }
-        Ok((sigs, notes, evidence))
+        Ok((sigs, notes, evidence, infra))
     }
 
     /// Every annotation of a check run, all pages; more than 1,000 is an
@@ -1096,8 +1140,18 @@ impl Github {
         }
         let step = job.as_ref().and_then(|j| j.steps.iter().find(|s| step_failed(s)));
         let mut evidence = String::new();
+        let mut annotation_text = String::new();
         if run.id != 0 {
             let annotations = soft("the annotations", self.get_annotations(owner, repo, run.id), &mut reasons)?;
+            annotation_text = annotations
+                .as_ref()
+                .map(|a| {
+                    a.iter()
+                        .map(|x| format!("{} {}", x.title.as_deref().unwrap_or_default(), x.message.as_deref().unwrap_or_default()))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default();
             evidence = annotations.map(|a| annotation_evidence(&a, actions)).unwrap_or_default();
         }
         if evidence.is_empty() && actions {
@@ -1135,11 +1189,27 @@ impl Github {
         // A refusal is remembered for a while (so a token with no Actions
         // access does not cost three requests a minute); only a signature is
         // kept for good.
-        let result = RunFailure { signature, lines };
+        let infra = if actions { infra_kind(conclusion, &annotation_text).map(str::to_string) } else { None };
+        let result = RunFailure { signature, lines, infra };
         if run.id != 0 {
             signature_cache_put(key, result.clone());
         }
         Ok(result)
+    }
+
+    /// Rerun one GitHub Actions job (`POST /actions/jobs/{id}/rerun`): how
+    /// tod answers an infrastructure failure with no agent turn. Fails with
+    /// GitHub's own words when it cannot (the workflow run is still going, or
+    /// the job is too old).
+    pub fn rerun_job(&self, owner: &str, repo: &str, job_id: i64) -> Result<(), GithubError> {
+        with_retries(&self.retry_delays_ms, |e| matches!(e, GithubError::Unavailable(_) | GithubError::RateLimited { .. }), || {
+            self.post_json_for::<serde_json::Value>(
+                &format!("/repos/{owner}/{repo}/actions/jobs/{job_id}/rerun"),
+                serde_json::json!({}),
+                Some((owner, repo)),
+            )
+            .map(|_| ())
+        })
     }
 
     /// Fetch a pull request's live status: mergeable flag, mergeable state,
@@ -1153,6 +1223,7 @@ impl Github {
         let mut failing_signatures = Vec::new();
         let mut signature_notes = Vec::new();
         let mut failing_evidence = Vec::new();
+        let mut infra_failures = Vec::new();
         let mut checks_running = false;
         let checks = match &raw.head {
             Some(head) => {
@@ -1162,7 +1233,7 @@ impl Github {
                     .get_json::<CombinedStatusRaw>(&format!("/repos/{owner}/{repo}/commits/{}/status", head.sha))?;
                 let runs = self.get_check_runs(owner, repo, &head.sha)?;
                 failing_checks = failing_check_names(Some(&statuses), Some(&runs));
-                (failing_signatures, signature_notes, failing_evidence) =
+                (failing_signatures, signature_notes, failing_evidence, infra_failures) =
                     self.failing_signatures(owner, repo, &failing_checks, &statuses, &runs)?;
                 checks_running = checks_running_in(Some(&statuses), Some(&runs));
                 combine_checks(Some(&statuses), Some(&runs))
@@ -1191,6 +1262,7 @@ impl Github {
             failing_evidence,
             base_failures: Vec::new(),
             base_notes: Vec::new(),
+            infra_failures,
             checks_running,
             head_sha: raw.head.as_ref().map(|h| h.sha.clone()),
             head_committed_at: None,
@@ -2903,11 +2975,13 @@ fn failing_step_log(log: &str, step: &JobStepRaw) -> String {
 struct RunFailure {
     signature: Result<String, String>,
     lines: Vec<String>,
+    /// Set when the job failed for the infrastructure's reasons ([`infra_kind`]).
+    infra: Option<String>,
 }
 
 /// `(signatures, notes, evidence)` of the failing checks
 /// ([`Github::failing_signatures`]).
-type FailingSignatures = (Vec<(String, String)>, Vec<(String, String)>, Vec<(String, Vec<String>)>);
+type FailingSignatures = (Vec<(String, String)>, Vec<(String, String)>, Vec<(String, Vec<String>)>, Vec<InfraFailure>);
 
 type CachedSignature = (RunFailure, Option<std::time::Instant>);
 
@@ -3535,6 +3609,17 @@ impl<'a> NodePrRepo<'a> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn infrastructure_failures_are_told_from_the_changes_own() {
+        assert_eq!(infra_kind("timed_out", ""), Some("timed out"));
+        assert_eq!(infra_kind("cancelled", ""), Some("cancelled"));
+        assert_eq!(
+            infra_kind("failure", "The runner has received a shutdown signal."),
+            Some("runner lost")
+        );
+        assert_eq!(infra_kind("failure", "error[E0308]: mismatched types"), None);
+        assert_eq!(infra_kind("success", ""), None);
+    }
 
     /// Serves one canned `(status line, body)` per request on loopback and
     /// returns how many requests came in.

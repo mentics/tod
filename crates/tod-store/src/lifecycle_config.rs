@@ -435,6 +435,15 @@ pub struct Check {
     /// check's own stop, never a fallback to running the check without it.
     #[serde(default)]
     pub setup: String,
+    /// A command that fixes the check's failure mechanically (a formatter, a
+    /// lint autofix), run by tod in `dir` when the check fails: its change is
+    /// committed as tod's own mechanical commit and only this check is run
+    /// again (`checks::run_stale_notifying`), with no Fix session and no new
+    /// review round when it passes. Blank means none. A fix that fails, or
+    /// leaves the check failing, hands the failure on as it was, with the
+    /// fixer's own output added.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub fix: String,
 }
 
 impl Check {
@@ -560,6 +569,7 @@ pub fn set_checks(conn: &Connection, node_id: Uuid, config: &Checks) -> Result<(
                 changed,
                 pattern: check.pattern.split_whitespace().collect::<Vec<_>>().join(" "),
                 setup: check.setup.trim().to_string(),
+                fix: check.fix.trim().to_string(),
             });
         }
         clean.insert(phase.clone(), out);

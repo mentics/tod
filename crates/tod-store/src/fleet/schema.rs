@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 105;
+pub const CURRENT_USER_VERSION: i32 = 106;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -703,6 +703,17 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         crate::review::add_reviewer_columns(conn)?;
         conn.pragma_update(None, "user_version", 105)?;
     }
+    if version < 106 {
+        // Requests tod settles itself (step 1 of `doc/requests/design.md`):
+        // who decided an answer, the triage session behind it and how
+        // (`crate::decisions::add_answer_columns`), and the `mechanical`
+        // verdict a fixer's commit is recorded with
+        // (`crate::pr_pushes::ensure_mechanical`; the triggers are remade
+        // below). Both tables are synced and journaled already.
+        crate::decisions::add_answer_columns(conn)?;
+        crate::pr_pushes::ensure_mechanical(conn)?;
+        conn.pragma_update(None, "user_version", 106)?;
+    }
     // Other branches (the task panel) numbered their own steps 66–67 at the
     // same time as 66–70 above, so a store may be past a version without
     // having these. Every one is idempotent: make sure of them all.
@@ -735,6 +746,7 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     crate::decisions::add_blocks(conn)?;
     crate::decisions::add_new_evidence(conn)?;
     crate::decisions::add_option_edits(conn)?;
+    crate::decisions::add_answer_columns(conn)?;
     crate::review::add_pr_columns(conn)?;
     crate::review::add_root_cause_column(conn)?;
     crate::review::add_reviewer_columns(conn)?;
@@ -792,7 +804,7 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     // schema version (`crate::git_retries`).
     conn.execute_batch(crate::git_retries::CREATE_TABLE)?;
     // Pull request heads and whether tod's review cleared them (v102).
-    conn.execute_batch(crate::pr_pushes::CREATE_TABLE)?;
+    crate::pr_pushes::ensure_mechanical(conn)?;
     conn.execute_batch(&crate::journey_changes::pr_pushes_triggers_sql())?;
     crate::sync::install(conn)?;
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
