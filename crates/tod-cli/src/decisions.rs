@@ -251,6 +251,10 @@ fn ask(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
     let question = args
         .target("a question (the first positional argument, quoted; there is no --question flag)")?
         .to_string();
+    // Out-of-scope work is a suggestion, never a question (design 7.3).
+    if let Some(why) = tod_core::follow_up_request::refusal(&question) {
+        anyhow::bail!("{why}");
+    }
     let options: Vec<String> = args.get_all("--option").iter().map(|s| s.to_string()).collect();
     let evidence = args
         .get_all("--evidence")

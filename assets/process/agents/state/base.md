@@ -45,13 +45,9 @@ An action against a shared environment (production, staging) runs without asking
 
 ## Follow-up work
 
-Each releasable chunk is its own task. Two kinds of work you may find belong on a new task, not in this task's plan: a **follow-up** (the next chunk, which needs this one released first) and **found work** (an out-of-scope bug or opportunity). In any phase, ask through the `decisions` noun whether to create a ticket for it, with creating it as the recommended option. On yes:
+Each releasable chunk is its own task. Two kinds of work you may find belong on a new ticket, not in this task's plan: a **follow-up** (the next chunk, which needs this one released first) and **found work** (an out-of-scope bug or opportunity). In any phase, file it as a **suggestion** through the `suggest` noun, with the ticket's title, description and acceptance criteria written to stand alone. Never ask a decision whether to open a ticket: a suggestion is how that is offered, and it does not stop you. The user accepts it (the ticket is then created exactly as you wrote it) or dismisses it whenever it suits them.
 
-1. Create the issue in the tracker directly (for Linear, with the stored `linear_api_key` through the `secrets` noun).
-2. Create the task next to this one, with that ticket as its Ticket capability's (`node` and `capabilities` nouns).
-3. Add a note on this task naming the new ticket (`node` noun, notes).
-
-Then carry on with this task's work: its plan and obligations do not change. Starting the new task's lifecycle is the user's call.
+Then carry on with this task's work: its plan and obligations do not change. Do not create the ticket or the task yourself.
 
 ## Principles
 

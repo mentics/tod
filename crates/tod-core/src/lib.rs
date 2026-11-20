@@ -51,6 +51,7 @@ pub mod pr_draft_review;
 pub mod pr_pushes;
 pub mod review_progress;
 pub mod fix_escalation;
+pub mod follow_up_request;
 pub mod skills_context;
 pub mod environment_request;
 pub mod environment_reset;
