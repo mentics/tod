@@ -2510,8 +2510,8 @@ const MAX_BASE_RUNS: usize = 20;
 /// look alike in the diffs, so `blob(path, which)` (the file's blob sha at that
 /// commit, `None` when absent) tells them apart: it is covered only if the
 /// head's file is the reviewed one, or the base's is. Anything else is not
-/// covered. `Err` (with why) when a head file's patch, or its reviewed one, is
-/// missing and so cannot be told, or a blob cannot be read.
+/// covered. A file with no patch (binary, too large) is compared by its blob
+/// instead. `Err` (with why) when a blob cannot be read.
 pub fn change_covered(
     reviewed: &[CompareFile],
     head: &[CompareFile],
@@ -2540,11 +2540,16 @@ pub fn change_covered(
                     return Ok(false);
                 }
             }
+            // GitHub gives no patch for a binary or very large file: the
+            // file itself says whether the two commits differ there. The
+            // same blob is the same change; another one is a change not
+            // reviewed (conservative, and no reason to stop the run).
             _ => {
-                return Err(format!(
-                    "GitHub gives no patch for {} (binary or too large), so the two commits cannot be compared",
-                    h.filename
-                ));
+                let at_reviewed = blob(&h.filename, Which::Reviewed)?;
+                let at_head = blob(&h.filename, Which::Head)?;
+                if at_reviewed.is_none() || at_reviewed != at_head {
+                    return Ok(false);
+                }
             }
         }
     }
@@ -2592,6 +2597,22 @@ mod change_equal_tests {
         assert_eq!(change_covered(&reviewed, &head, &mut blobs(Some("x"), Some("y"), Some("x"))), Ok(true));
     }
 
+    /// A binary or very large file has no patch: its blob decides, and the
+    /// comparison never fails for want of one.
+    #[test]
+    fn a_file_without_a_patch_is_compared_by_its_blob() {
+        let no_patch = |name: &str| CompareFile {
+            filename: name.into(),
+            status: "modified".into(),
+            previous_filename: None,
+            patch: None,
+        };
+        let reviewed = [no_patch("big.py")];
+        let head = [no_patch("big.py")];
+        assert_eq!(change_covered(&reviewed, &head, &mut blobs(Some("x"), Some("x"), Some("b"))), Ok(true));
+        assert_eq!(change_covered(&reviewed, &head, &mut blobs(Some("x"), Some("y"), Some("b"))), Ok(false));
+    }
+
     /// A commit after the review reverted (or deleted) a reviewed file: the
     /// diffs look like an absorbed one, but neither head nor base has the
     /// reviewed version.
@@ -2613,10 +2634,12 @@ mod change_equal_tests {
         assert_eq!(change_covered(&reviewed, &[renamed], &mut blobs(None, None, None)), Ok(false));
     }
 
+    /// Neither commit has the file's blob readable: that is "not the same",
+    /// not a failure.
     #[test]
-    fn a_missing_patch_cannot_be_compared() {
+    fn a_missing_patch_and_no_blob_is_not_covered() {
         let a = [CompareFile { patch: None, ..file("img.png", "") }];
-        assert!(change_covered(&a, &a, &mut blobs(None, None, None)).is_err());
+        assert_eq!(change_covered(&a, &a, &mut blobs(None, None, None)), Ok(false));
     }
 }
 

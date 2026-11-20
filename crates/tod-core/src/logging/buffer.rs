@@ -302,7 +302,31 @@ impl<S: Subscriber> Layer<S> for RingLayer {
         let mut visitor = MessageVisitor::default();
         event.record(&mut visitor);
         let message = format!("{}{}", visitor.message, visitor.fields);
+        let level = level_for(level, &message);
         with_ring(|ring| ring.push(level, LogSource::for_target(meta.target()), message));
+    }
+}
+
+/// An error line of a library that is no failure of tod's: macOS refusing a
+/// display link (code -6661) when a window opens while the display is asleep
+/// or disconnected. The window works and redraws when the display is back, so
+/// it is a warning in the log, never a toast.
+fn level_for(level: Level3, message: &str) -> Level3 {
+    if level == Level3::Error && message.starts_with("could not create display link") {
+        Level3::Warn
+    } else {
+        level
+    }
+}
+
+#[cfg(test)]
+mod level_tests {
+    use super::*;
+
+    #[test]
+    fn the_display_link_error_is_only_a_warning() {
+        assert_eq!(level_for(Level3::Error, "could not create display link, code: -6661 log.line=853"), Level3::Warn);
+        assert_eq!(level_for(Level3::Error, "could not save the plan"), Level3::Error);
     }
 }
 

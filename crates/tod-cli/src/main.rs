@@ -147,13 +147,44 @@ fn main() -> ExitCode {
             // Options left unread because the command failed first say nothing.
             args::take_ignored_options();
             report_problem(
-                tod_problems::Level::Error,
+                if is_rejection(&err) { tod_problems::Level::Warn } else { tod_problems::Level::Error },
                 &format!("{err:#}\n{}", failure_context(&args)),
                 data_root_flag(&args).as_deref(),
             );
             ExitCode::FAILURE
         }
     }
+}
+
+/// Whether `err` is the command being turned down (misused, a missing
+/// argument, a node that is not there, a move the lifecycle refuses), as
+/// against tod failing to do something it was asked, rightly. The caller
+/// sees the message and corrects itself, which an agent does constantly, so
+/// it is a warning in the log and never a toast; only a failure of tod itself
+/// (the store, the daemon, the disk, the network) is an error the user is told
+/// of.
+fn is_rejection(err: &anyhow::Error) -> bool {
+    if err.chain().any(|e| e.is::<std::io::Error>()) {
+        return false;
+    }
+    let text = format!("{err:#}").to_ascii_lowercase();
+    const FAILURES: &[&str] = &[
+        "another tod instance",
+        "tod-agentd",
+        "different build",
+        "open store",
+        "open the store",
+        "database",
+        "sqlite",
+        "no space left",
+        "could not",
+        "cannot ",
+        "failed",
+        "timed out",
+        "connection",
+        "unauthorized",
+    ];
+    !FAILURES.iter().any(|f| text.contains(f))
 }
 
 /// Where this process reports problems: the data root `run` resolved.
@@ -1314,5 +1345,33 @@ Second."), "{listed}");
         assert!(cli(&root, &["phase", "certify", "--node", &node, "--note", "x"]).is_err());
 
         let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod rejection_tests {
+    use super::is_rejection;
+
+    #[test]
+    fn a_misused_command_is_a_rejection_and_a_broken_tod_is_not() {
+        for text in [
+            "--parent or --list is required",
+            "node `ENG-3419` not found",
+            "unknown noun `runner` (expected: node, obligations)",
+            "refused: node x is in `verifying`, past planning, and the obligations change only with approval",
+            "`resume` (Resume) is not offered for this node now (it is running)",
+            "malformed batch, nothing ran: the script has no commands",
+        ] {
+            assert!(is_rejection(&anyhow::anyhow!("{text}")), "{text}");
+        }
+        for text in [
+            "open store at /x: another tod instance is using the fleet storage root",
+            "tod-agentd (pid 1) serves the store, but this program is from a different build",
+            "get sandbox: not authorized (401 Unauthorized)",
+        ] {
+            assert!(!is_rejection(&anyhow::anyhow!("{text}")), "{text}");
+        }
+        let io = anyhow::Error::new(std::io::Error::other("disk")).context("save the plan");
+        assert!(!is_rejection(&io));
     }
 }

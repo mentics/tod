@@ -327,8 +327,63 @@ pub fn cached_pull_state(pr: &NodePr) -> Option<PullState> {
     states.as_ref()?.get(&state_key(pr)).map(|(state, _)| *state)
 }
 
-/// Whether `pr`'s state is unknown or may have changed since it was read.
+/// Pull requests whose last read failed, and when to ask again. Without it a
+/// failing read (GitHub's quota spent, no network) leaves the state stale, and
+/// every redraw asks again and logs again.
+static FAILED: Mutex<Option<HashMap<String, Instant>>> = Mutex::new(None);
+
+/// How long to leave a pull request alone after a read of it failed, when the
+/// error names no better time.
+const FAILED_BACKOFF: Duration = Duration::from_secs(60);
+
+/// The longest to leave one alone: a reset far off is retried now and then,
+/// since a person may have fixed the cause meanwhile.
+const FAILED_BACKOFF_MAX: Duration = Duration::from_secs(15 * 60);
+
+fn backed_off(key: &str) -> bool {
+    let Ok(mut failed) = FAILED.lock() else {
+        return false;
+    };
+    let Some(map) = failed.as_mut() else {
+        return false;
+    };
+    match map.get(key) {
+        Some(until) if Instant::now() < *until => true,
+        Some(_) => {
+            map.remove(key);
+            false
+        }
+        None => false,
+    }
+}
+
+fn back_off(key: String, wait: Duration) {
+    if let Ok(mut failed) = FAILED.lock() {
+        failed.get_or_insert_with(HashMap::new).insert(key, Instant::now() + wait.min(FAILED_BACKOFF_MAX));
+    }
+}
+
+/// How long to wait after a failed read whose message is `err`: until the
+/// rate limit resets when it is one, else [`FAILED_BACKOFF`].
+fn backoff_for(err: &str) -> Duration {
+    if tod_store::github::is_rate_limited_message(err)
+        && let Some(reset_ms) = tod_store::github::rate_limit_reset_ms(err)
+    {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        return Duration::from_millis((reset_ms - now_ms).max(0) as u64 + 1000);
+    }
+    FAILED_BACKOFF
+}
+
+/// Whether `pr`'s state is unknown or may have changed since it was read, and
+/// is worth asking GitHub about now (a read that just failed is not).
 pub fn pull_state_stale(pr: &NodePr) -> bool {
+    if backed_off(&state_key(pr)) {
+        return false;
+    }
     let Ok(states) = STATES.lock() else {
         return false;
     };
@@ -355,16 +410,30 @@ pub fn remember_pull_states(repo: &GithubRepo, pulls: &[PullSummary]) {
 /// into the cache. Returns whether any state changed. Calls GitHub: run it
 /// off the UI thread.
 pub fn refresh_pull_states(data_root: &Path, prs: &[NodePr]) -> bool {
-    let stale: Vec<&NodePr> = prs.iter().filter(|pr| pull_state_stale(pr)).collect();
-    if stale.is_empty() {
+    if !prs.iter().any(pull_state_stale) {
         return false;
     }
     let Some(source) = GithubPulls::from_data_root(data_root) else {
         tracing::warn!("pull request states not read: {NO_TOKEN}");
         return false;
     };
+    refresh_pull_states_from(&source, prs)
+}
+
+/// [`refresh_pull_states`] over any source. A failed read backs that pull
+/// request off (until the rate limit resets, when that is the reason) and is
+/// logged once; a rate limit also ends the round, since GitHub would refuse
+/// the rest too.
+pub fn refresh_pull_states_from(source: &dyn PullSource, prs: &[NodePr]) -> bool {
     let mut changed = false;
-    for pr in stale {
+    let mut unread = 0usize;
+    let mut rate_limit: Option<String> = None;
+    for pr in prs.iter().filter(|pr| pull_state_stale(pr)) {
+        if let Some(err) = &rate_limit {
+            back_off(state_key(pr), backoff_for(err));
+            unread += 1;
+            continue;
+        }
         let repo = GithubRepo {
             owner: pr.owner.clone(),
             repo: pr.repo.clone(),
@@ -372,13 +441,21 @@ pub fn refresh_pull_states(data_root: &Path, prs: &[NodePr]) -> bool {
         let pull = match source.pull(&repo, pr.pr_number) {
             Ok(pull) => pull,
             Err(err) => {
-                tracing::warn!("could not read {}/{}#{}: {err}", pr.owner, pr.repo, pr.pr_number);
+                back_off(state_key(pr), backoff_for(&err));
+                if tod_store::github::is_rate_limited_message(&err) {
+                    rate_limit = Some(err);
+                } else {
+                    tracing::warn!("could not read {}/{}#{}: {err}", pr.owner, pr.repo, pr.pr_number);
+                }
                 continue;
             }
         };
         let before = cached_pull_state(pr);
         remember_pull_states(&repo, std::slice::from_ref(&pull));
         changed |= before != Some(pull.state);
+    }
+    if let Some(err) = rate_limit {
+        tracing::warn!("pull request states not read, and not asked again until the rate limit resets ({unread} more skipped): {err}");
     }
     changed
 }
@@ -733,5 +810,49 @@ mod tests {
         );
         assert!(found.sections.is_empty());
         assert_eq!(found.warnings.len(), 1);
+    }
+
+    /// Always fails with `message`, and counts the asks.
+    struct Failing {
+        message: String,
+        asks: Mutex<usize>,
+    }
+
+    impl PullSource for Failing {
+        fn open_pulls(&self, _: &GithubRepo) -> Result<Vec<PullSummary>, String> {
+            unreachable!()
+        }
+        fn branch_pulls(&self, _: &GithubRepo, _: &str) -> Result<Vec<PullSummary>, String> {
+            unreachable!()
+        }
+        fn pull(&self, _: &GithubRepo, _: i64) -> Result<PullSummary, String> {
+            *self.asks.lock().unwrap() += 1;
+            Err(self.message.clone())
+        }
+    }
+
+    /// A failed read is not asked again at once, and a rate limit ends the
+    /// round: GitHub is asked once, not once per pull request per redraw.
+    #[test]
+    fn a_failed_read_backs_off_and_a_rate_limit_ends_the_round() {
+        let prs: Vec<NodePr> = (1..=5).map(|n| NodePr::new("backoff-test", "rate", 9000 + n)).collect();
+        let reset = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + 600;
+        let source = Failing {
+            message: format!("GitHub: GitHub rate limit reached (not asked: spent); resets (epoch {reset}); x"),
+            asks: Mutex::new(0),
+        };
+        assert!(prs.iter().all(pull_state_stale));
+        assert!(!refresh_pull_states_from(&source, &prs));
+        assert_eq!(*source.asks.lock().unwrap(), 1, "the rest of the round was not asked");
+        assert!(prs.iter().all(|pr| !pull_state_stale(pr)), "all are backed off");
+        assert!(!refresh_pull_states_from(&source, &prs));
+        assert_eq!(*source.asks.lock().unwrap(), 1, "a second round asks nothing");
+
+        let other: Vec<NodePr> = (1..=3).map(|n| NodePr::new("backoff-test", "net", 9100 + n)).collect();
+        let source = Failing { message: "GitHub: HTTP request failed: no network".into(), asks: Mutex::new(0) };
+        refresh_pull_states_from(&source, &other);
+        assert_eq!(*source.asks.lock().unwrap(), 3, "another failure is asked about each once");
+        refresh_pull_states_from(&source, &other);
+        assert_eq!(*source.asks.lock().unwrap(), 3);
     }
 }
