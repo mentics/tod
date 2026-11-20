@@ -59,7 +59,7 @@ use tod_store::conversation::{Focus, ProtocolKind};
 
 use crate::ui::agent_runs::AgentRuns;
 use crate::unified::columns::PanelKind;
-use crate::unified::panel::{ColumnPanel, PanelOpenRequest};
+use crate::unified::panel::{ColumnPanel, PanelDiscussRequest, PanelOpenRequest};
 use crate::unified::panels::changes::{ChangesWatch, HasChangesWatch};
 
 // T4: the requests.
@@ -426,6 +426,7 @@ impl TaskPanel {
         };
         let _requests_subs = vec![
             cx.subscribe(&requests, |_, _, event: &PanelOpenRequest, cx| cx.emit(event.clone())),
+            cx.subscribe(&requests, |_, _, event: &PanelDiscussRequest, cx| cx.emit(event.clone())),
             cx.observe(&requests, |_, _, cx| cx.notify()),
         ];
         let mut panel = Self {
@@ -1899,6 +1900,7 @@ impl ColumnPanel for TaskPanel {
 }
 
 impl EventEmitter<PanelOpenRequest> for TaskPanel {}
+impl EventEmitter<PanelDiscussRequest> for TaskPanel {}
 
 impl Focusable for TaskPanel {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {

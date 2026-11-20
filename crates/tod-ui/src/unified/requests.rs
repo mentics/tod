@@ -24,9 +24,11 @@
 //! Each request ends with one footer line: its evidence links (each item's
 //! name), the reason ([`reason_label`]), when it was raised ([`when_label`]:
 //! the wall-clock time, with the date once it is not today's), and at the
-//! right **Shouldn't have asked** (`doc/ui/task-panel.md`): one click records `should_not_ask`
-//! feedback (`tod_store::request_feedback`) without answering or dismissing
-//! the request, then offers a note and a switch to "bad question".
+//! right, for a request triage escalated, **Discuss** (`doc/lifecycle/triage.md`):
+//! it opens the triage session that read the request in the chat drawer.
+//! There is no "shouldn't have asked" button: a confusing request is flagged
+//! by highlighting its text (see [`Requests::flag_confusing`]), which sends the
+//! highlighted words into the triage session.
 //!
 //! The decision answer log with **Change** is here too
 //! ([`Requests::render_log_entries`]), for the task panel's Answered drawer.
@@ -63,7 +65,7 @@ use gpui::{
     prelude::FluentBuilder,
 };
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
+use gpui_component::input::{InputEvent, Textarea, TextareaState};
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::{ActiveTheme, Disableable, IconName, Sizable};
 use tod_core::attention::{AttentionItem, AttentionKind, RequestReason};
@@ -72,14 +74,10 @@ use tod_journey::{Presented, PresentedAction};
 use tod_store::conversation::{ConversationRepo, Focus, ProtocolKind};
 use tod_store::decisions::{DECISION_PENDING, Decision, DecisionAnswer, DecisionRepo, EvidenceRef};
 use tod_store::fleet::FleetStore;
-use tod_store::interview::{ACTOR_USER, InterviewCommand, short_id};
+use tod_store::interview::short_id;
 use tod_store::outline::PlanStep;
 use tod_store::outline::repos::plan_steps::HandoffReason;
 use tod_store::outline::repos::{ObligationRepo, PlanStepRepo};
-use tod_store::request_feedback::{
-    KIND_DECISION, KIND_PLAN_STEP_HANDOFF, KIND_REVIEW_FINDING, NewRequestFeedback,
-    VERDICT_BAD_QUESTION, VERDICT_SHOULD_NOT_ASK,
-};
 use tod_store::review::{FINDING_DECLINED, FINDING_FIXED, FINDING_OUT_OF_SCOPE, ReviewFinding, ReviewRepo};
 use uuid::Uuid;
 
@@ -88,11 +86,11 @@ use crate::ui::off_thread::off_thread;
 use crate::ui::agent_runs::AgentRuns;
 use crate::ui::journey::{Source, record_action};
 use crate::ui::key_context;
-use crate::ui::selectable_text::{selectable_markdown, selectable_text};
+use crate::ui::selectable_text::{FlagHandler, selectable_markdown, selectable_markdown_flaggable, selectable_text};
 use crate::ui::style;
 use crate::ui::terminal_handoff::{self, CONTINUE_IN_TERMINAL};
 use crate::unified::columns::PanelKind;
-use crate::unified::panel::PanelOpenRequest;
+use crate::unified::panel::{PanelDiscussRequest, PanelOpenRequest};
 use crate::views::lifecycle_control::LifecycleController;
 
 /// The key context a host panel puts on its focused root so the request keys
@@ -111,13 +109,19 @@ const FREEFORM_TAG: &str = "RequestsFreeform";
 /// Height of the free-text answer area while it is being edited (a textarea
 /// has no height of its own).
 const FREEFORM_HEIGHT: f32 = 96.;
-/// Key-context tag for the feedback note field while it is in edit mode.
-const FEEDBACK_NOTE_TAG: &str = "RequestsFeedbackNote";
 /// The journey surface every answer is recorded under; the name "decisions"
 /// is kept so earlier journeys still compare.
 const JOURNEY_SURFACE: &str = "decisions";
 /// The journey action id of **Answered elsewhere**.
 const RESOLVED_ELSEWHERE_ACTION: &str = "answered-elsewhere";
+/// The journey action id of **Discuss** (open the triage session in the chat).
+const DISCUSS_ACTION: &str = "discuss";
+/// The journey action id of the highlight menu's **This is confusing**.
+const FLAG_CONFUSING_ACTION: &str = "flag-confusing";
+/// The journey action id of **Send the task back** beside a changed answer.
+const SEND_BACK_ACTION: &str = "send-back";
+/// The label of the highlight menu's flag.
+pub const FLAG_CONFUSING_LABEL: &str = "This is confusing";
 
 /// Answer the top request with option `.0` (1-based, matching the numbered
 /// options shown).
@@ -148,11 +152,6 @@ pub fn register_request_keyboard_bindings(cx: &mut App) {
         KeyBinding::new("ctrl-enter", DecisionsCtrlActivate, outside_input),
         KeyBinding::new("escape", DecisionsFreeformEscape, with_input),
         KeyBinding::new("ctrl-enter", DecisionsFreeformSubmit, with_input),
-        KeyBinding::new(
-            "escape",
-            DecisionsFreeformEscape,
-            Some(key_context::including_tag(REQUESTS_CONTEXT, FEEDBACK_NOTE_TAG)),
-        ),
         KeyBinding::new("up", DecisionsLinkPrev, outside_input),
         KeyBinding::new("down", DecisionsLinkNext, outside_input),
     ]);
@@ -271,6 +270,30 @@ pub struct Loaded {
     /// Per request id: the lifecycle conversation that asked it, when that
     /// conversation has an agent session a terminal can resume.
     pub sessions: HashMap<Uuid, Uuid>,
+    /// The node's lifecycle state, to tell whether a changed answer's task
+    /// has moved past the phase that asked.
+    pub lifecycle: Option<String>,
+}
+
+/// The lifecycle state a request filed by an agent running `protocol` was
+/// asked in, when the protocol says (a phase agent's state is the node's own
+/// at the time, which is not recorded).
+pub fn asking_state(protocol: &str) -> Option<&'static str> {
+    match protocol {
+        "implementation" | "fix" => Some("active"),
+        "verification" => Some("verifying"),
+        "review" => Some("review"),
+        "pr" => Some("pr"),
+        _ => None,
+    }
+}
+
+/// The state to offer sending the task back to after the user changes the
+/// answer to `decision`: the phase that asked, when the node has moved past it.
+pub fn send_back_target(decision: &Decision, lifecycle: Option<&str>) -> Option<&'static str> {
+    let asked = asking_state(decision.protocol.as_deref()?)?;
+    let now = tod_core::task::model::lifecycle_rank(lifecycle?);
+    (now > tod_core::task::model::lifecycle_rank(asked)).then_some(asked)
 }
 
 /// The conversation `item` came from: a decision's or finding's own, or the
@@ -364,7 +387,8 @@ pub fn load(fleet: &FleetStore, node_id: Uuid) -> Loaded {
                     names.insert(evidence.id, name);
                 }
             }
-            anyhow::Ok(Loaded { pending, handoff_steps, findings, items, log, names, sessions })
+            let lifecycle = lifecycle.get(&node_id).cloned();
+            anyhow::Ok(Loaded { pending, handoff_steps, findings, items, log, names, sessions, lifecycle })
         })
         .unwrap_or_default();
     let node_ids: Vec<Uuid> = loaded
@@ -419,15 +443,6 @@ fn evidence_links(node_id: Uuid, evidence: &[EvidenceRef], names: &HashMap<Uuid,
         .collect()
 }
 
-/// "Shouldn't have asked" feedback given on one request in this session.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FeedbackState {
-    /// The `request_feedback` row, once the first write has landed.
-    pub id: Option<Uuid>,
-    pub verdict: &'static str,
-    pub note: Option<String>,
-}
-
 pub struct Requests {
     pub(crate) node_id: Option<Uuid>,
     fleet: Arc<FleetStore>,
@@ -452,16 +467,12 @@ pub struct Requests {
     /// Index of the keyboard stop on the current decision.
     selected_link: usize,
     pub(crate) last_error: Option<String>,
-    /// Feedback given per request id.
-    feedback: HashMap<Uuid, FeedbackState>,
-    /// The request whose feedback note field is in edit mode.
-    feedback_note_editing: Option<Uuid>,
-    feedback_note_input: Entity<InputState>,
     _subscriptions: Vec<Subscription>,
     _poll: gpui::Task<()>,
 }
 
 impl EventEmitter<PanelOpenRequest> for Requests {}
+impl EventEmitter<PanelDiscussRequest> for Requests {}
 
 impl Requests {
     pub fn new(
@@ -484,14 +495,6 @@ impl Requests {
                     }
                 }
                 _ => {}
-            }
-        });
-        let feedback_note_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Why? (Enter to save)"));
-        let note_sub = cx.subscribe_in(&feedback_note_input, window, |this, _, event, window, cx| {
-            if matches!(event, InputEvent::PressEnter { .. }) {
-                this.commit_feedback_note(cx);
-                this.host_focus.focus(window, cx);
             }
         });
         // A change to the shared controller (the criteria it shows) reloads here too.
@@ -524,10 +527,7 @@ impl Requests {
             changing: None,
             selected_link: 0,
             last_error: None,
-            feedback: HashMap::new(),
-            feedback_note_editing: None,
-            feedback_note_input,
-            _subscriptions: vec![freeform_sub, lifecycle_sub, note_sub],
+            _subscriptions: vec![freeform_sub, lifecycle_sub],
             _poll,
         };
         this.reload(cx);
@@ -550,7 +550,6 @@ impl Requests {
         }
         self.node_id = node_id;
         self.freeform_editing = None;
-        self.feedback_note_editing = None;
         self.changing = None;
         self.selected_link = 0;
         self.loaded = Loaded::default();
@@ -681,6 +680,11 @@ impl Requests {
         match top.kind {
             AttentionKind::Decision => {
                 if let Some(decision) = self.loaded.pending.iter().find(|d| d.id == top.id).cloned() {
+                    // A request triage escalated is read with its session
+                    // first: a number key never answers it.
+                    if decision.triage_conversation_id.is_some() {
+                        return;
+                    }
                     // "I've provided it" is the dialog's Save, never a bare pick.
                     if tod_core::environment_request::is_request(&decision) && action.0 == 1 {
                         self.provide_credential(&decision, _window, cx);
@@ -696,6 +700,94 @@ impl Requests {
             }
             AttentionKind::Finding => {}
         }
+    }
+
+    /// **Discuss**: open the triage session that read `decision` in the chat
+    /// drawer, with `message` sent into it when there is one.
+    pub(crate) fn discuss(&mut self, decision: &Decision, message: Option<String>, source: Source, cx: &mut Context<Self>) {
+        let Some(conversation) = decision.triage_conversation_id else { return };
+        let (id, label) = match message {
+            Some(_) => (FLAG_CONFUSING_ACTION, FLAG_CONFUSING_LABEL),
+            None => (DISCUSS_ACTION, "Discuss"),
+        };
+        let mut presented = Self::presented_for(decision);
+        presented.actions.push(PresentedAction {
+            id: id.to_string(),
+            label: label.to_string(),
+            primary: false,
+            disabled: false,
+        });
+        record_action(cx, Focus::Node(decision.node_id), id.to_string(), source, JOURNEY_SURFACE, presented);
+        cx.emit(PanelDiscussRequest { node_id: decision.node_id, conversation, message });
+    }
+
+    /// The highlight menu's **This is confusing**: the highlighted words go
+    /// into the request's triage session as a chat message, so it can explain
+    /// or rewrite its brief.
+    pub(crate) fn flag_confusing(&mut self, decision_id: Uuid, text: String, cx: &mut Context<Self>) {
+        let Some(decision) = self.loaded.pending.iter().find(|d| d.id == decision_id).cloned() else { return };
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        let message = format!(
+            "I highlighted this in the request and it is confusing: \"{text}\". Say what it means in plain \
+             words, and fix the brief if it should have said it better."
+        );
+        self.discuss(&decision, Some(message), Source::Click, cx);
+    }
+
+    /// The flag a request's text offers when highlighted: only a request with
+    /// a triage session has someone to send it to (a request an agent filed
+    /// that triage never read has no menu item).
+    fn flag_for(&self, decision: &Decision, cx: &mut Context<Self>) -> Option<(&'static str, FlagHandler)> {
+        decision.triage_conversation_id?;
+        let this = cx.weak_entity();
+        let id = decision.id;
+        let handler: FlagHandler = std::rc::Rc::new(move |text, _window, cx| {
+            let _ = this.update(cx, |this, cx| this.flag_confusing(id, text, cx));
+        });
+        Some((FLAG_CONFUSING_LABEL, handler))
+    }
+
+    /// **Send the task back** beside a changed answer: the user moves the
+    /// task back to the phase that asked, since it went on without the answer
+    /// they are now changing.
+    pub(crate) fn send_back(&mut self, decision: &Decision, state: &'static str, cx: &mut Context<Self>) {
+        record_action(
+            cx,
+            Focus::Node(decision.node_id),
+            SEND_BACK_ACTION.to_string(),
+            Source::Click,
+            JOURNEY_SURFACE,
+            Presented {
+                actions: vec![PresentedAction {
+                    id: SEND_BACK_ACTION.to_string(),
+                    label: format!("Send the task back to {state}"),
+                    primary: false,
+                    disabled: false,
+                }],
+                focused: None,
+                notices: vec![tod_core::request_brief::headline(decision)],
+            },
+        );
+        let fleet = self.fleet.clone();
+        let node = decision.node_id;
+        off_thread(
+            cx,
+            move || {
+                tod_core::lifecycle::set_lifecycle_by_user_because(
+                    &fleet,
+                    node,
+                    state,
+                    Some("The user changed the answer to a request the task had already gone past"),
+                )
+            },
+            |this, result, cx| {
+                this.set_error("send the task back", result);
+                this.reload(cx);
+            },
+        );
     }
 
     /// Open the dialog that takes a requested credential's value.
@@ -845,213 +937,6 @@ impl Requests {
         );
     }
 
-    /// The feedback given on request `id` in this session, if any.
-    #[allow(dead_code)] // for tests.
-    pub fn feedback_for(&self, id: Uuid) -> Option<&FeedbackState> {
-        self.feedback.get(&id)
-    }
-
-    /// What a feedback row records about `item`: its kind, and the
-    /// conversation and protocol that asked when the request has them.
-    fn new_feedback(&self, item: &AttentionItem) -> NewRequestFeedback {
-        let (kind, conversation_id, protocol) = match item.kind {
-            AttentionKind::Decision => {
-                let decision = self.loaded.pending.iter().find(|d| d.id == item.id);
-                (KIND_DECISION, decision.and_then(|d| d.conversation_id), decision.and_then(|d| d.protocol.clone()))
-            }
-            AttentionKind::PlanStep => (KIND_PLAN_STEP_HANDOFF, None, None),
-            AttentionKind::Finding => (
-                KIND_REVIEW_FINDING,
-                self.loaded.findings.iter().find(|f| f.id == item.id).and_then(|f| f.conversation_id),
-                None,
-            ),
-        };
-        NewRequestFeedback {
-            node_id: item.node_id,
-            request_kind: kind.to_string(),
-            request_id: item.id,
-            reason: item.reason.as_str().to_string(),
-            conversation_id,
-            protocol,
-            verdict: VERDICT_SHOULD_NOT_ASK.to_string(),
-            note: None,
-        }
-    }
-
-    /// Run one feedback write on the fleet writer off the UI thread; `done`
-    /// gets its result back on it.
-    fn write_feedback(
-        &self,
-        command: InterviewCommand,
-        cx: &mut Context<Self>,
-        done: impl FnOnce(&mut Self, anyhow::Result<serde_json::Value>, &mut Context<Self>) + 'static,
-    ) {
-        let fleet = self.fleet.clone();
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { fleet.interview(ACTOR_USER, command).map_err(anyhow::Error::from) })
-                .await;
-            let _ = this.update(cx, |this: &mut Requests, cx| {
-                done(this, result, cx);
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    /// **Shouldn't have asked**: record `should_not_ask` feedback on `item`.
-    /// The request itself stays pending.
-    pub(crate) fn should_not_have_asked(&mut self, item: &AttentionItem, source: Source, cx: &mut Context<Self>) {
-        if self.feedback.contains_key(&item.id) {
-            return;
-        }
-        record_action(
-            cx,
-            tod_store::conversation::Focus::Node(item.node_id),
-            VERDICT_SHOULD_NOT_ASK.to_string(),
-            source,
-            JOURNEY_SURFACE,
-            Presented {
-                actions: vec![PresentedAction {
-                    id: VERDICT_SHOULD_NOT_ASK.to_string(),
-                    label: "Shouldn't have asked".to_string(),
-                    primary: false,
-                    disabled: false,
-                }],
-                focused: None,
-                notices: vec![item.summary.clone()],
-            },
-        );
-        let request_id = item.id;
-        self.feedback.insert(request_id, FeedbackState { id: None, verdict: VERDICT_SHOULD_NOT_ASK, note: None });
-        let feedback = self.new_feedback(item);
-        cx.notify();
-        self.write_feedback(InterviewCommand::RecordRequestFeedback(feedback), cx, move |this, result, cx| {
-            let id = result
-                .as_ref()
-                .ok()
-                .and_then(|v| v.get("id")?.as_str().and_then(|raw| Uuid::parse_str(raw).ok()));
-            let Some(id) = id else {
-                this.feedback.remove(&request_id);
-                this.set_error("record feedback", result.map(|_| ()));
-                return;
-            };
-            let Some(state) = this.feedback.get_mut(&request_id) else { return };
-            state.id = Some(id);
-            // A switch or note made while the first write was in flight.
-            if state.verdict != VERDICT_SHOULD_NOT_ASK || state.note.is_some() {
-                this.save_feedback(request_id, cx);
-            }
-        });
-    }
-
-    /// Write the feedback on `request_id` as it now stands. Before its row
-    /// exists, the first write saves it when it lands.
-    fn save_feedback(&mut self, request_id: Uuid, cx: &mut Context<Self>) {
-        cx.notify();
-        let Some(FeedbackState { id: Some(id), verdict, note }) = self.feedback.get(&request_id).cloned() else {
-            return;
-        };
-        let command = InterviewCommand::UpdateRequestFeedback { id, verdict: verdict.to_string(), note };
-        self.write_feedback(command, cx, |this, result, _| this.set_error("update feedback", result.map(|_| ())));
-    }
-
-    /// Switch the feedback on `request_id` between "shouldn't have asked"
-    /// and "bad question".
-    pub(crate) fn toggle_bad_question(&mut self, request_id: Uuid, cx: &mut Context<Self>) {
-        let Some(state) = self.feedback.get_mut(&request_id) else { return };
-        state.verdict =
-            if state.verdict == VERDICT_BAD_QUESTION { VERDICT_SHOULD_NOT_ASK } else { VERDICT_BAD_QUESTION };
-        self.save_feedback(request_id, cx);
-    }
-
-    fn begin_feedback_note_edit(&mut self, request_id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
-        let note = self.feedback.get(&request_id).and_then(|s| s.note.clone()).unwrap_or_default();
-        self.feedback_note_editing = Some(request_id);
-        self.freeform_editing = None;
-        self.feedback_note_input.update(cx, |input, cx| input.set_value(note, window, cx));
-        cx.notify();
-        let input = self.feedback_note_input.clone();
-        cx.on_next_frame(window, move |_, window, cx| {
-            input.update(cx, |input, cx| input.focus(window, cx));
-        });
-    }
-
-    /// Enter in the note field: save its text on the request being edited.
-    fn commit_feedback_note(&mut self, cx: &mut Context<Self>) {
-        let Some(request_id) = self.feedback_note_editing.take() else { return };
-        let text = self.feedback_note_input.read(cx).text().to_string().trim().to_string();
-        self.set_feedback_note(request_id, (!text.is_empty()).then_some(text), cx);
-    }
-
-    pub(crate) fn set_feedback_note(&mut self, request_id: Uuid, note: Option<String>, cx: &mut Context<Self>) {
-        let Some(state) = self.feedback.get_mut(&request_id) else { return };
-        state.note = note;
-        self.save_feedback(request_id, cx);
-    }
-
-    /// The control at the right of a request's footer line.
-    fn render_feedback(&self, item: &AttentionItem, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let request_id = item.id;
-        let Some(state) = self.feedback.get(&request_id).cloned() else {
-            let item = item.clone();
-            return Button::new(SharedString::from(format!("unified-requests-should-not-ask-{request_id}")))
-                .label("Shouldn't have asked")
-                .xsmall()
-                .on_click(cx.listener(move |this, _, _, cx| this.should_not_have_asked(&item, Source::Click, cx)))
-                .into_any_element();
-        };
-        let editing = self.feedback_note_editing == Some(request_id);
-        key_context::set_input_tab_stop(&self.feedback_note_input, editing, cx);
-        let bad = state.verdict == VERDICT_BAD_QUESTION;
-        let recorded = if state.id.is_some() { "Feedback recorded" } else { "Recording feedback…" };
-        let note: AnyElement = if editing {
-            div()
-                .id(SharedString::from(format!("unified-requests-feedback-note-{request_id}")))
-                .key_context(FEEDBACK_NOTE_TAG)
-                .w_48()
-                .child(Input::new(&self.feedback_note_input).xsmall())
-                .into_any_element()
-        } else {
-            div()
-                .flex()
-                .items_center()
-                .gap_1()
-                .children(state.note.clone().map(|note| {
-                    style::text_muted(div().text_xs()).child(selectable_text(
-                        SharedString::from(format!("unified-requests-feedback-note-text-{request_id}")),
-                        note,
-                        window,
-                        cx,
-                    ))
-                }))
-                .child(
-                    Button::new(SharedString::from(format!("unified-requests-feedback-note-edit-{request_id}")))
-                        .label(if state.note.is_some() { "Edit note" } else { "Add note" })
-                        .xsmall()
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.begin_feedback_note_edit(request_id, window, cx)
-                        })),
-                )
-                .into_any_element()
-        };
-        div()
-            .flex()
-            .flex_wrap()
-            .items_center()
-            .gap_1()
-            .child(style::text_muted(div().text_xs()).child(recorded).record_text(recorded))
-            .child(
-                Button::new(SharedString::from(format!("unified-requests-feedback-bad-question-{request_id}")))
-                    .label(if bad { "Bad question ✓" } else { "Bad question" })
-                    .xsmall()
-                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_bad_question(request_id, cx))),
-            )
-            .child(note)
-            .into_any_element()
-    }
-
     fn begin_freeform_edit(&mut self, decision_id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
         self.freeform_editing = Some(decision_id);
         // The one input is shared by every decision, and the panel is rebuilt
@@ -1097,7 +982,6 @@ impl Requests {
 
     pub(crate) fn exit_freeform_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.freeform_editing = None;
-        self.feedback_note_editing = None;
         self.host_focus.focus(window, cx);
         cx.notify();
     }
@@ -1253,7 +1137,7 @@ impl Requests {
     }
 
     /// The one footer line: evidence links, the reason, and "Shouldn't have asked".
-    fn render_footer(&self, item: &AttentionItem, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_footer(&self, item: &AttentionItem, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let stops = item.kind == AttentionKind::Decision
             && self.changing.is_none()
             && self.loaded.pending.first().map(|d| d.id) == Some(item.id);
@@ -1261,7 +1145,7 @@ impl Requests {
         let links = self.render_evidence_links(item.id, item.node_id, &evidence, stops, cx);
         let terminal = self.render_terminal_button(item, cx);
         let elsewhere = self.render_resolved_elsewhere_button(item, cx);
-        let feedback = self.render_feedback(item, window, cx);
+        let discuss = self.render_discuss_button(item, cx);
         div()
             .id(SharedString::from(format!("unified-requests-footer-{}", item.id)))
             .flex()
@@ -1281,10 +1165,29 @@ impl Requests {
                     .record_text(when)
             })
             .child(div().flex_1())
+            .children(discuss)
             .children(terminal)
             .children(elsewhere)
-            .child(feedback)
             .into_any_element()
+    }
+
+    /// **Discuss**, on a request triage escalated: its session, in the chat.
+    fn render_discuss_button(&self, item: &AttentionItem, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if item.kind != AttentionKind::Decision {
+            return None;
+        }
+        let decision = self.loaded.pending.iter().find(|d| d.id == item.id)?.clone();
+        decision.triage_conversation_id?;
+        Some(
+            Button::new(SharedString::from(format!("unified-requests-discuss-{}", item.id)))
+                .label("Discuss")
+                .xsmall()
+                .tooltip("Talk it over with the session that read this request, in the chat")
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.discuss(&decision, None, Source::Click, cx);
+                }))
+                .into_any_element(),
+        )
     }
 
     /// The terminal icon: continue the lifecycle session that asked, in the
@@ -1530,9 +1433,10 @@ impl Requests {
                     // Written by the app from the agent's fields
                     // (`tod_core::request_brief`), never by a model.
                     Some(brief) => self.render_brief(decision.id, brief, window, cx),
-                    None => selectable_markdown(
+                    None => selectable_markdown_flaggable(
                         SharedString::from(format!("unified-decisions-question-{}", decision.id)),
                         decision.question.clone(),
+                        self.flag_for(&decision, cx),
                         window,
                         cx,
                     )
@@ -1830,6 +1734,17 @@ impl Requests {
                                 }
                             })),
                     )
+                    .when_some(decision.triage_conversation_id, |el, conversation| {
+                        let node_id = decision.node_id;
+                        el.child(
+                            Button::new(("unified-decisions-triage-session", entry.answer.id as u64))
+                                .label("Triage session")
+                                .small()
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    cx.emit(PanelDiscussRequest { node_id, conversation, message: None });
+                                })),
+                        )
+                    })
                     .when_some(decision.conversation_id, |el, conversation_id| {
                         el.child(
                             Button::new(("unified-decisions-transcript", entry.answer.id as u64))
@@ -1840,6 +1755,19 @@ impl Requests {
                                 })),
                         )
                     }),
+            )
+            .when_some(
+                send_back_target(&decision, self.loaded.lifecycle.as_deref()).filter(|_| changing),
+                |el, state| {
+                    let decision = decision.clone();
+                    el.child(
+                        Button::new(("unified-decisions-send-back", entry.answer.id as u64))
+                            .label(format!("Also send the task back to {state}"))
+                            .small()
+                            .tooltip("The task went on past the phase that asked, without this answer")
+                            .on_click(cx.listener(move |this, _, _, cx| this.send_back(&decision, state, cx))),
+                    )
+                },
             )
             .when(changing, |el| {
                 el.child(self.render_options(&decision, cx))
@@ -1975,6 +1903,8 @@ mod tests {
             new_evidence: String::new(),
             brief: Default::default(),
             error_signature: String::new(),
+            triage_conversation_id: None,
+            asked: None,
         };
         let answer = DecisionAnswer {
             id: 1,
@@ -2014,6 +1944,8 @@ mod tests {
             new_evidence: String::new(),
             brief: Default::default(),
             error_signature: String::new(),
+            triage_conversation_id: None,
+            asked: None,
         };
         let answer = DecisionAnswer {
             id: 2,
@@ -2048,6 +1980,8 @@ mod tests {
             new_evidence: String::new(),
             brief: Default::default(),
             error_signature: String::new(),
+            triage_conversation_id: None,
+            asked: None,
         };
         assert_eq!(edit_preview(&decision), None);
         decision.edits.push(tod_store::decisions::OptionEdit {
@@ -2073,34 +2007,83 @@ mod tests {
         assert_eq!(evidence_label(&evidence, &names), "Rounds per line");
     }
 
+    fn escalated(protocol: &str, triage: bool) -> Decision {
+        Decision {
+            id: Uuid::new_v4(),
+            node_id: Uuid::new_v4(),
+            conversation_id: None,
+            protocol: Some(protocol.into()),
+            question: "Brief: which?".into(),
+            options: vec!["A".into(), "B".into()],
+            evidence: Vec::new(),
+            status: "pending".into(),
+            created_at: 0,
+            reason: "intent".into(),
+            moves: Vec::new(),
+            edits: Vec::new(),
+            blocks: Vec::new(),
+            new_evidence: String::new(),
+            brief: Default::default(),
+            error_signature: String::new(),
+            triage_conversation_id: triage.then(Uuid::new_v4),
+            asked: None,
+        }
+    }
+
+    #[test]
+    fn a_changed_answer_offers_the_send_back_only_past_the_asking_phase() {
+        let asked_in_implementation = escalated("implementation", true);
+        assert_eq!(send_back_target(&asked_in_implementation, Some("review")), Some("active"));
+        assert_eq!(send_back_target(&asked_in_implementation, Some("active")), None);
+        assert_eq!(send_back_target(&asked_in_implementation, Some("planning")), None);
+        // A phase agent's state is not recorded, so there is nothing to offer.
+        assert_eq!(send_back_target(&escalated("phase", true), Some("review")), None);
+    }
+
     #[gpui::test]
-    fn should_not_have_asked_records_feedback_and_leaves_the_request_pending(cx: &mut gpui::TestAppContext) {
+    fn number_keys_skip_an_escalated_request_and_discuss_opens_its_session(cx: &mut gpui::TestAppContext) {
         use crate::views::rows::fixture::Fixture;
         use std::cell::RefCell;
         use std::rc::Rc;
-        use tod_store::request_feedback::RequestFeedbackRepo;
+        use tod_store::interview::InterviewCommand;
+        use tod_store::triage::Op;
 
         let fixture = Fixture::new();
-        let decision_id = fixture
+        let ask = fixture
             .store
             .interview(
-                ACTOR_USER,
+                "autopilot",
                 InterviewCommand::AskDecision {
                     node_id: fixture.node_id,
                     conversation_id: None,
-                    protocol: Some("implement".to_string()),
+                    protocol: Some("implementation".into()),
                     decision: tod_store::decisions::NewDecision {
-                        question: "Round per line or per invoice?".to_string(),
-                        options: vec!["per line".to_string(), "per invoice".to_string()],
-                        reason: "risk".to_string(),
+                        question: "Keep the old name?".into(),
+                        options: vec!["Keep it".into(), "Drop it".into()],
+                        reason: "intent".into(),
+                        guard_reask: true,
                         ..Default::default()
                     },
                 },
             )
-            .unwrap()
-            .get("id")
-            .and_then(|v| v.as_str())
-            .and_then(|raw| Uuid::parse_str(raw).ok())
+            .unwrap();
+        let decision_id = Uuid::parse_str(ask.get("id").and_then(|v| v.as_str()).unwrap()).unwrap();
+        let session = Uuid::new_v4();
+        fixture
+            .store
+            .interview("autopilot", InterviewCommand::Triage(Op::Start { decision: decision_id, conversation: session }))
+            .unwrap();
+        fixture
+            .store
+            .interview(
+                &tod_store::conversation::actor_for(session),
+                InterviewCommand::Triage(Op::Escalate {
+                    decision: decision_id,
+                    conversation: session,
+                    brief: "Brief: the old name or a new one?".into(),
+                    options: None,
+                }),
+            )
             .unwrap();
 
         cx.update(gpui_component::init);
@@ -2120,34 +2103,26 @@ mod tests {
         let requests: Entity<Requests> = slot.borrow_mut().take().unwrap();
         cx.run_until_parked();
 
-        let item = requests.read_with(cx, |r, _| r.items()[0].clone());
-        assert_eq!(item.id, decision_id);
-        requests.update(cx, |r, cx| r.should_not_have_asked(&item, Source::Click, cx));
-        cx.run_until_parked();
-
-        let feedback_id = requests.read_with(cx, |r, _| r.feedback_for(decision_id).and_then(|s| s.id)).unwrap();
-        let row = fixture.store.read(|conn| RequestFeedbackRepo::new(conn).get(feedback_id)).unwrap().unwrap();
-        assert_eq!(row.verdict, VERDICT_SHOULD_NOT_ASK);
-        assert_eq!(row.request_kind, KIND_DECISION);
-        assert_eq!(row.request_id, decision_id);
-        assert_eq!(row.reason, "risk");
-        assert_eq!(row.protocol.as_deref(), Some("implement"));
-        assert_eq!(row.conversation_id, None);
-
-        requests.update(cx, |r, cx| {
-            r.toggle_bad_question(decision_id, cx);
-            r.set_feedback_note(decision_id, Some("It was in the spec".to_string()), cx);
+        let opened = Rc::new(RefCell::new(Vec::new()));
+        let sink = opened.clone();
+        let _sub = cx.update(|_, app| {
+            app.subscribe(&requests, move |_, event: &PanelDiscussRequest, _| sink.borrow_mut().push(event.clone()))
         });
+        requests.update_in(cx, |r, window, cx| r.answer_option_key(&DecisionOptionKey(1), window, cx));
         cx.run_until_parked();
-        let row = fixture.store.read(|conn| RequestFeedbackRepo::new(conn).get(feedback_id)).unwrap().unwrap();
-        assert_eq!(row.verdict, VERDICT_BAD_QUESTION);
-        assert_eq!(row.note.as_deref(), Some("It was in the spec"));
+        let still = fixture.store.read(|conn| Ok(DecisionRepo::new(conn).get(decision_id)?)).unwrap().unwrap();
+        assert_eq!(still.status, DECISION_PENDING, "a number key never answers an escalated request");
 
-        requests.read_with(cx, |r, _| {
-            assert_eq!(r.items().len(), 1);
-            assert_eq!(r.loaded.pending.len(), 1);
-        });
+        let decision = requests.read_with(cx, |r, _| r.loaded.pending[0].clone());
+        requests.update(cx, |r, cx| r.discuss(&decision, None, Source::Click, cx));
+        requests.update(cx, |r, cx| r.flag_confusing(decision_id, " the old name ".into(), cx));
+        let events = opened.borrow();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].conversation, session);
+        assert_eq!(events[0].message, None);
+        assert!(events[1].message.as_deref().is_some_and(|m| m.contains("the old name")));
     }
+
 }
 
 /// Most rows of agent output a request shows before it scrolls.

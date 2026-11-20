@@ -126,8 +126,15 @@ pub struct ChatDrawer {
     /// `CHAT_START_HEIGHT`.
     height: Option<Pixels>,
     conversation_id: Option<Uuid>,
-    /// The focus's freeform conversations, newest first.
+    /// The protocol of the open conversation: freeform, or a triage session
+    /// the user was sent here to discuss a request with.
+    protocol: ProtocolKind,
+    /// The focus's freeform conversations, newest first, preceded by the
+    /// triage sessions of its requests (open ones first).
     sessions: Vec<ConversationSummary>,
+    /// The list titles of the triage sessions (`Request: ...`), by
+    /// conversation id, and whether each one's request is still open.
+    request_sessions: std::collections::HashMap<Uuid, (String, bool)>,
     /// Whether the sessions list is showing.
     sessions_open: bool,
     /// Bumped on every sessions load so an older one never lands last.
@@ -179,7 +186,9 @@ impl ChatDrawer {
             expanded: false,
             height,
             conversation_id: None,
+            protocol: FREEFORM,
             sessions: Vec::new(),
+            request_sessions: std::collections::HashMap::new(),
             sessions_open: false,
             sessions_generation: 0,
             status: ConversationStatus::default(),
@@ -242,9 +251,11 @@ impl ChatDrawer {
             .ok()
             .flatten()
             .map(|c| c.id);
+        self.protocol = FREEFORM;
         self.about = self.about_text();
         self.error = None;
         self.sessions = Vec::new();
+        self.request_sessions.clear();
         self.transcript.update(cx, |panel, cx| panel.reset(cx));
         self.refresh_status(cx);
         self.reload(cx);
@@ -257,12 +268,45 @@ impl ChatDrawer {
         if self.conversation_id == Some(id) {
             return;
         }
+        self.protocol = self
+            .fleet
+            .read(|conn| ConversationRepo::new(conn).get(id))
+            .ok()
+            .flatten()
+            .map(|c| c.protocol)
+            .filter(|p| *p == ProtocolKind::Triage)
+            .unwrap_or(FREEFORM);
         self.conversation_id = Some(id);
         self.error = None;
         self.transcript.update(cx, |panel, cx| panel.reset(cx));
         self.refresh_status(cx);
         self.reload(cx);
         cx.notify();
+    }
+
+    /// The session a request's **Discuss** opens: the triage session that
+    /// read it, in this node's drawer, expanded.
+    pub fn discuss(
+        &mut self,
+        node_id: Uuid,
+        conversation: Uuid,
+        message: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_focus(Focus::Node(node_id), cx);
+        self.open_session(conversation, window, cx);
+        self.load_sessions(cx);
+        self.expand(window, cx);
+        if let Some(message) = message {
+            self.send(message, Vec::new(), window, cx);
+        }
+    }
+
+    /// The protocol of the open conversation.
+    #[cfg(test)]
+    pub fn protocol(&self) -> ProtocolKind {
+        self.protocol
     }
 
     /// Show or hide the sessions list.
@@ -289,6 +333,26 @@ impl ChatDrawer {
                         .read(|conn| {
                             let repo = ConversationRepo::new(conn);
                             let mut all = repo.list_for_focus_with_protocol(focus, FREEFORM)?;
+                            // A node's requests triage read: each one a
+                            // session here, to discuss the request in.
+                            let mut requests = Vec::new();
+                            if matches!(focus, Focus::Node(_)) {
+                                let decisions = tod_store::decisions::DecisionRepo::new(conn);
+                                for summary in repo.list_for_focus_with_protocol(focus, ProtocolKind::Triage)? {
+                                    let Some(decision) =
+                                        decisions.for_triage_conversation(summary.conversation.id)?
+                                    else {
+                                        continue;
+                                    };
+                                    let open = tod_store::decisions::is_open(&decision.status);
+                                    let title = tod_core::session_name::request_title(
+                                        &tod_core::request_brief::headline(&decision),
+                                    );
+                                    requests.push((summary, title, open));
+                                }
+                                // Pending first, then newest first.
+                                requests.sort_by_key(|(s, _, open)| (!*open, std::cmp::Reverse(s.conversation.updated_at)));
+                            }
                             // An obligation's visual designs are listed with
                             // its chats, labelled; they open in the
                             // conversation view, which hosts their pane.
@@ -301,14 +365,23 @@ impl ChatDrawer {
                                     b.conversation.updated_at.cmp(&a.conversation.updated_at)
                                 });
                             }
-                            Ok(all)
+                            let mut listed = Vec::new();
+                            let mut names = std::collections::HashMap::new();
+                            for (summary, title, open) in requests {
+                                names.insert(summary.conversation.id, (title, open));
+                                listed.push(summary);
+                            }
+                            listed.append(&mut all);
+                            Ok((listed, names))
                         })
                         .unwrap_or_default()
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 if this.sessions_generation == generation {
+                    let (sessions, names) = sessions;
                     this.sessions = sessions;
+                    this.request_sessions = names;
                     cx.notify();
                 }
             });
@@ -354,6 +427,7 @@ impl ChatDrawer {
     /// Start a fresh conversation about the current focus.
     pub fn new_conversation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.conversation_id = None;
+        self.protocol = FREEFORM;
         self.error = None;
         self.expanded = true;
         self.transcript.update(cx, |panel, cx| panel.reset(cx));
@@ -383,7 +457,7 @@ impl ChatDrawer {
                     self.fleet.clone(),
                     self.agent.clone(),
                     self.driver_config(),
-                    FREEFORM,
+                    self.protocol,
                     self.focus,
                     self.conversation_id,
                     self.status.running,
@@ -521,22 +595,23 @@ impl ChatDrawer {
     fn current_index(&self, cx: &App) -> Option<usize> {
         self.agent_runs
             .read(cx)
-            .find_index(self.focus, FREEFORM, self.conversation_id)
+            .find_index(self.focus, self.protocol, self.conversation_id)
     }
 
     fn ensure_current_driver(&mut self, cx: &mut Context<Self>) -> Result<usize, String> {
         let config = self.driver_config();
         let focus = self.focus;
         let conversation_id = self.conversation_id;
+        let protocol = self.protocol;
         let fleet = self.fleet.clone();
         self.agent_runs.update(cx, |runs, cx| {
-            let result = runs.ensure(focus, FREEFORM, conversation_id, move || {
+            let result = runs.ensure(focus, protocol, conversation_id, move || {
                 let config = config?;
                 match conversation_id {
                     Some(id) => {
                         ConversationDriver::open(config, &fleet, id).map_err(|e| format!("{e:#}"))
                     }
-                    None => Ok(ConversationDriver::new(config, focus, FREEFORM)),
+                    None => Ok(ConversationDriver::new(config, focus, protocol)),
                 }
             });
             cx.notify();
@@ -577,7 +652,7 @@ impl ChatDrawer {
     /// platforms' session logs and the settings.
     fn refresh_session_info(&mut self, cx: &mut Context<Self>) {
         self.session_info
-            .show(self.focus, ProtocolKind::Outline, self.conversation_id);
+            .show(self.focus, self.protocol, self.conversation_id);
         let Some(read) = self.session_info.take_due(self.status.running) else {
             return;
         };
@@ -881,10 +956,11 @@ impl ChatDrawer {
             if summary.conversation.protocol == ProtocolKind::VisualDesign {
                 continue;
             }
-            let opening = if summary.opening.is_empty() {
-                "(no messages)".to_string()
-            } else {
-                summary.opening.clone()
+            let request = self.request_sessions.get(&id);
+            let opening = match request {
+                Some((title, _)) => title.clone(),
+                None if summary.opening.is_empty() => "(no messages)".to_string(),
+                None => summary.opening.clone(),
             };
             list = list.child(
                 style::menu_item(
@@ -900,6 +976,9 @@ impl ChatDrawer {
                         this.open_session(id, window, cx)
                     }),
                 )
+                .when(request.is_some(), |el| {
+                    el.child(Icon::new(IconName::Bell).size_3().flex_shrink_0().mr_1())
+                })
                 .child(
                     style::text_dense_muted(div())
                         .flex_shrink_0()
@@ -1152,6 +1231,91 @@ mod tests {
         })
         .unwrap();
         assert_eq!(drawer.read_with(cx, |d, _| d.conversation_id()), Some(freeform));
+    }
+
+    /// A request triage escalated is a session in the node's drawer, titled
+    /// "Request: ..." and listed ahead of the freeform ones; **Discuss** opens
+    /// it, driven as a triage session.
+    #[gpui::test]
+    fn a_requests_triage_session_is_listed_first_and_discuss_opens_it(cx: &mut TestAppContext) {
+        use tod_store::triage::Op;
+        let fixture = Fixture::new();
+        let freeform = Uuid::new_v4();
+        fixture
+            .store
+            .interview(
+                ACTOR_USER,
+                InterviewCommand::CreateConversation {
+                    id: freeform,
+                    protocol: ProtocolKind::Outline,
+                    focus: Focus::Node(fixture.node_id),
+                    platform: None,
+                    model: None,
+                    effort: None,
+                },
+            )
+            .unwrap();
+        let ask = fixture
+            .store
+            .interview(
+                "autopilot",
+                InterviewCommand::AskDecision {
+                    node_id: fixture.node_id,
+                    conversation_id: None,
+                    protocol: Some("implementation".into()),
+                    decision: tod_store::decisions::NewDecision {
+                        question: "Keep the old name?".into(),
+                        options: vec!["Keep it".into(), "Drop it".into()],
+                        reason: "intent".into(),
+                        guard_reask: true,
+                        ..Default::default()
+                    },
+                },
+            )
+            .unwrap();
+        let decision = Uuid::parse_str(ask.get("id").and_then(|v| v.as_str()).unwrap()).unwrap();
+        let triage = Uuid::new_v4();
+        fixture
+            .store
+            .interview("autopilot", InterviewCommand::Triage(Op::Start { decision, conversation: triage }))
+            .unwrap();
+        fixture
+            .store
+            .interview(
+                &tod_store::conversation::actor_for(triage),
+                InterviewCommand::Triage(Op::Escalate {
+                    decision,
+                    conversation: triage,
+                    brief: "Brief: the old name or a new one?".into(),
+                    options: None,
+                }),
+            )
+            .unwrap();
+
+        let (drawer, _runs, cx) = open_drawer(&fixture, mock_agent(), cx);
+        drawer.update(cx, |d, cx| d.set_focus(Focus::Node(fixture.node_id), cx));
+        cx.run_until_parked();
+        let (current, protocol, ids, title) = drawer.read_with(cx, |d, _| {
+            (
+                d.conversation_id(),
+                d.protocol(),
+                d.sessions().iter().map(|s| s.conversation.id).collect::<Vec<_>>(),
+                d.request_sessions.get(&triage).cloned(),
+            )
+        });
+        // The drawer still opens on the freeform chat; the request is listed first.
+        assert_eq!(current, Some(freeform));
+        assert_eq!(protocol, FREEFORM);
+        assert_eq!(ids, vec![triage, freeform]);
+        let (title, open) = title.expect("the triage session is titled");
+        assert!(title.starts_with("Request: "), "{title}");
+        assert!(open);
+
+        cx.update_window(cx.window_handle(), |_, window, cx| {
+            drawer.update(cx, |d, cx| d.discuss(fixture.node_id, triage, None, window, cx));
+        })
+        .unwrap();
+        assert_eq!(drawer.read_with(cx, |d, _| (d.conversation_id(), d.protocol(), d.expanded())), (Some(triage), ProtocolKind::Triage, true));
     }
 
     #[gpui::test]

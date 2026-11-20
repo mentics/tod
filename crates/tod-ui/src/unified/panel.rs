@@ -3,6 +3,7 @@
 
 use gpui::{App, SharedString};
 use tod_store::conversation::Focus;
+use uuid::Uuid;
 
 use super::columns::PanelKind;
 
@@ -22,6 +23,19 @@ pub trait ColumnPanel {
 pub struct PanelOpenRequest {
     pub target: PanelKind,
     pub ctrl: bool,
+}
+
+/// Emitted by the task panel's requests when **Discuss** is clicked on an
+/// escalated request: open the triage session that read it
+/// (`conversation`) in the chat drawer, about `node_id`.
+///
+/// `message`, when set, is sent into that session at once: the words a user
+/// highlighted and flagged as confusing.
+#[derive(Debug, Clone)]
+pub struct PanelDiscussRequest {
+    pub node_id: Uuid,
+    pub conversation: Uuid,
+    pub message: Option<String>,
 }
 
 /// Emitted by a panel when its own selection changes to something that can

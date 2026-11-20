@@ -22,7 +22,7 @@ pub mod status_label;
 pub use columns::{Column, ColumnModel, PanelKind};
 pub use panel::ColumnPanel;
 use chat_drawer::{ChatDrawer, ChatDrawerEvent};
-use panel::{PanelFocusSelected, PanelOpenChat, PanelOpenRequest};
+use panel::{PanelDiscussRequest, PanelFocusSelected, PanelOpenChat, PanelOpenRequest};
 use panels::DetailsPanel;
 use resize::{
     ChatDrawerEdge, ColumnDivider, DIVIDER_WIDTH, DividerDrag, PANEL_MIN_WIDTH, ResizeStart,
@@ -786,9 +786,22 @@ impl UnifiedView {
                     cx.subscribe_in(&panel, window, move |this, _, event: &PanelOpenRequest, window, cx| {
                         this.route_open_request(panel_id, event, window, cx);
                     });
+                let discuss_sub =
+                    cx.subscribe_in(&panel, window, |this, _, event: &PanelDiscussRequest, window, cx| {
+                        this.set_chat_focus(Focus::Node(event.node_id), cx);
+                        this.chat_drawer.update(cx, |drawer, cx| {
+                            drawer.discuss(
+                                event.node_id,
+                                event.conversation,
+                                event.message.as_deref(),
+                                window,
+                                cx,
+                            )
+                        });
+                    });
                 HostedColumn {
                     panel: HostedPanel::Task(panel),
-                    _subscriptions: vec![subscription],
+                    _subscriptions: vec![subscription, discuss_sub],
                 }
             }
             PanelKind::Obligations(id) => {

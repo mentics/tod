@@ -102,6 +102,14 @@ pub fn session_name(
     truncate_chars(&name, MAX_TOTAL_CHARS)
 }
 
+/// How the chat drawer lists a triage session: "Request: " and the request's
+/// headline, shortened. The drawer shows it instead of the stored name, which
+/// carries the time (`session_name` with [`TRIAGE_SURFACE`]).
+pub fn request_title(headline: &str) -> String {
+    let first = headline.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+    format!("Request: {}", shorten(first, MAX_SUBJECT_CHARS))
+}
+
 /// A stored session name with its time shown in this machine's zone.
 ///
 /// A name is stamped where the session starts, and a cloud sandbox's clock is

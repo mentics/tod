@@ -73,6 +73,20 @@ fn with_copy_menu(
     source: SharedString,
     markdown: bool,
 ) -> SelectableText {
+    with_menu(id, view, own_menu, source, markdown, None)
+}
+
+/// What a flaggable text does with the words the user highlighted and flagged.
+pub type FlagHandler = std::rc::Rc<dyn Fn(String, &mut Window, &mut App)>;
+
+fn with_menu(
+    id: ElementId,
+    view: TextView,
+    own_menu: bool,
+    source: SharedString,
+    markdown: bool,
+    flag: Option<(&'static str, FlagHandler)>,
+) -> SelectableText {
     div()
         .id(id)
         .relative()
@@ -85,13 +99,22 @@ fn with_copy_menu(
                 return menu;
             }
             let text = TextSelection::selected_text(window, cx).trim().to_string();
-            menu.item(
+            let flagged = text.clone();
+            let menu = menu.item(
                 PopupMenuItem::new("Copy")
                     .disabled(text.is_empty())
                     .on_click(move |_, _, cx| {
                         cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
                     }),
-            )
+            );
+            match flag.clone() {
+                Some((label, handler)) => menu.item(
+                    PopupMenuItem::new(label)
+                        .disabled(flagged.is_empty())
+                        .on_click(move |_, window, cx| handler(flagged.clone(), window, cx)),
+                ),
+                None => menu,
+            }
         })
 }
 
@@ -185,6 +208,20 @@ fn keep_line_breaks(markdown: &str) -> String {
 pub fn selectable_markdown(
     id: impl Into<ElementId>,
     markdown: impl Into<SharedString>,
+    window: &mut Window,
+    cx: &mut App,
+) -> SelectableText {
+    selectable_markdown_flaggable(id, markdown, None, window, cx)
+}
+
+/// The same, whose right-click menu also offers `flag` (a label, and what to
+/// do with the highlighted words): the hook the request card uses for "This is
+/// confusing", which sends the highlighted words into the triage session.
+/// The item is disabled until something is highlighted.
+pub fn selectable_markdown_flaggable(
+    id: impl Into<ElementId>,
+    markdown: impl Into<SharedString>,
+    flag: Option<(&'static str, FlagHandler)>,
     _window: &mut Window,
     cx: &mut App,
 ) -> SelectableText {
@@ -211,7 +248,7 @@ pub fn selectable_markdown(
                 ),
         )
         .selectable(true);
-    with_copy_menu(id, view, true, markdown, true)
+    with_menu(id, view, true, markdown, true, flag)
 }
 
 #[cfg(test)]
