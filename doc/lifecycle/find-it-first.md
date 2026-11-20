@@ -1,7 +1,7 @@
 # Find it first: every issue caught before anyone else looks
 
-Status: plan, partly built (items 9 and 12, and item 10 in `pr_review`, on
-2026-11-19; see the work items). Written 2026-11-19 from the post-mortem of
+Status: built, every work item (2026-11-19); see the work items for what
+differs from the plan and what is not yet measured. Written 2026-11-19 from the post-mortem of
 Cofactr/kb PR 2888 (node "DigiKey productdetails 404s: ~50% of lookups
 failing, most avoidable").
 
@@ -704,20 +704,22 @@ rules:
 In order. Items 1–4 are prompt changes and stop most of the damage at once;
 5–9 are app changes that enforce them.
 
-**Items 1–4 are done (2026-11-19).** Until the app changes land, the prompts
-use what exists:
+**All sixteen items are built (2026-11-19).** The interim prompt wording
+(a decision carrying the move, `Root cause:` in a finding's detail) is gone:
+agents send back with `lifecycle send-back`, and findings carry
+`--root-cause`. What is not done yet:
 
-- **Send-back** (item 5 makes it a command of its own): an agent asks a
-  decision whose option carries the move.
-- **Root cause** (item 6 adds `--root-cause`): a finding's detail starts with
-  `Root cause:`, in the same words for every finding that shares it.
-- **Coverage** (item 6): the lens sweep is asked for but not yet recorded.
-- **Fix surface** (from item 9): `surface/fix.md` already says to fix the
-  class and to send a redesign back to `design`. The autopilot's own
-  escalation is still item 9.
-- **Pushing:** an agent pushes only until the task's branch has a pull
-  request. That keeps work in a cloud sandbox from being lost. After that,
-  only the pull request agent pushes.
+- **Measured cache share.** Token usage is recorded per turn from now on
+  (`conversation_usage`); the before/after comparison waits for real runs
+  (`doc/lifecycle/cache-measurement.md`).
+- **A second model for the risk reviewer** on a sample of PRs (6h) is not
+  built; both reviewers run on the `review_risk` key, which falls back to
+  `review`.
+- **The runner gap on PR 2888** (item 14) is explained in
+  `doc/lifecycle/runner-gap-pr-2888.md`; the daemon policy it recommends is
+  not changed.
+- Reviewing a head that reached the PR from outside tod happens at once only
+  in `pr_draft`; in `pr_review` it is recorded and warned about.
 
 **Items 7 and 15 are built (2026-11-19).** The store is `tod_store::guidance`
 (schema v104). The app's trigger matching and the selector's material are in
