@@ -343,6 +343,13 @@ impl Protocol for QuickFixProtocol {
             let cwd = self.cwd(env)?;
             let notices = commit_run(env, &cwd, "Quick fix");
             let head = cwd.git(&["rev-parse", "HEAD"]).context("read the commit the quick fix left")?;
+            // A CI attempt starts from the pull request's head (its
+            // fingerprint): a checkout still on it made no commit, and
+            // recording it would send an old, pushed commit to the small
+            // review and make "made no commit" unreachable.
+            if fix.source == SOURCE_CI && head == fix.fingerprint {
+                return Ok(notices);
+            }
             if fix.head != head {
                 fix.head = head;
                 save(env.fleet, &fix)?;
