@@ -337,6 +337,10 @@ pub enum InterviewCommand {
         #[serde(default)]
         note: Option<String>,
     },
+    /// A write of triage (`crate::triage`): the session linked to a request,
+    /// its answer, escalation, conversions, the user's in-chat settlement, or
+    /// the closing reflection.
+    Triage(crate::triage::Op),
     /// Record an open code review finding on a node (`crate::review`).
     AddReviewFinding {
         node_id: Uuid,
@@ -555,6 +559,7 @@ pub fn execute(
             | InterviewCommand::PhaseCertify { .. }
             | InterviewCommand::PhaseReject { .. }
             | InterviewCommand::SendBack(_)
+            | InterviewCommand::Triage(_)
     ) &&crate::phase::certifier_for_actor(conn, actor)?.1 == crate::phase::CERTIFIER_INDEPENDENT
     {
         bail!(
@@ -1166,11 +1171,19 @@ pub fn execute(
             )? {
                 return Ok(json!({ "parked_on": parked }));
             }
+            // An agent's judgment request from a lifecycle session is read by
+            // triage first (`crate::decisions::goes_to_triage`).
+            let mut filed = decision.clone();
+            filed.triage = crate::decisions::goes_to_triage(
+                protocol.as_deref(),
+                &filed.reason,
+                filed.guard_reask,
+            );
             let decision = crate::decisions::DecisionRepo::new(conn).create(
                 *node_id,
                 *conversation_id,
                 protocol.as_deref(),
-                decision,
+                &filed,
             )?;
             if decision.protocol.as_deref() != Some(crate::incidents::PROTOCOL) {
                 crate::incidents::note_request(conn, *node_id, decision.id)?;
@@ -1194,7 +1207,7 @@ pub fn execute(
                     if agent.is_some() {
                         bail!("only the user answers a request whose option edits obligations");
                     }
-                    if found.status != crate::decisions::DECISION_PENDING {
+                    if !crate::decisions::is_open(&found.status) {
                         bail!(
                             "this request was already answered; a changed answer does not edit obligations, so \
                              this option's edits are not made: edit them in the obligations panel if they are still wanted"
@@ -1323,6 +1336,7 @@ pub fn execute(
             Ok(json!({ "run_id": run.id.to_string(), "added": run.added, "dropped": run.dropped }))
         }
         InterviewCommand::Incident(op) => crate::incidents::run_op(conn, op),
+        InterviewCommand::Triage(op) => crate::triage::run_op(conn, actor, op),
         InterviewCommand::FileSuggestion(new) => crate::suggestions::file_json(conn, new),
         InterviewCommand::SetSuggestionDuplicates { id, duplicates, checked, note } => {
             crate::suggestions::set_duplicates(conn, *id, duplicates, *checked, note)?;

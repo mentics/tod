@@ -18,7 +18,7 @@
 use super::operator::{check_operator_target, user_move_answering};
 use super::{current_state, write_user_move};
 use anyhow::{Context, Result, bail};
-use tod_store::decisions::{DECISION_PENDING, DECISION_WITHDRAWN, DecisionRepo, check_move_target};
+use tod_store::decisions::{DECISION_WITHDRAWN, DecisionRepo, check_move_target};
 use tod_store::fleet::FleetStore;
 use tod_store::interview::{ACTOR_USER, InterviewCommand};
 use tod_store::settings::VALID_LIFECYCLE_STATES;
@@ -164,7 +164,7 @@ fn answer_with_reopen(
         if decision.status == DECISION_WITHDRAWN {
             bail!("decision {decision_id} was withdrawn");
         }
-        if decision.status != DECISION_PENDING {
+        if !tod_store::decisions::is_open(&decision.status) {
             bail!(
                 "this request was already answered; a changed answer does not edit obligations, so this option's \
                  edits are not made: edit them in the obligations panel if they are still wanted"
@@ -180,7 +180,7 @@ fn answer_with_reopen(
         // A move is made once, when the request is first answered. A changed
         // answer must not redo it: the node has gone on since, and the steps
         // it has now are not the ones that were sent back.
-        if decision.status != DECISION_PENDING {
+        if !tod_store::decisions::is_open(&decision.status) {
             bail!(
                 "this request was already answered; a changed answer does not move the task, so picking \"{}\" now \
                  does nothing: use the task's state chip if it still needs to go back",
@@ -213,7 +213,7 @@ fn answer_with_reopen(
             .with_context(|| format!("could not send the task back to `{to}` as \"{label}\" asks"))?;
         moved_to = Some(to);
     }
-    let edited: Vec<String> = match (decision.status == DECISION_PENDING, option) {
+    let edited: Vec<String> = match (tod_store::decisions::is_open(&decision.status), option) {
         (true, Some(o)) => decision
             .edits_for(o)
             .iter()

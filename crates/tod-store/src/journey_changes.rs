@@ -70,6 +70,9 @@
 //! - `node_quick_fixes` (`tod_store::quick_fixes`, each quick-fix attempt on a
 //!   failing check), created by [`quick_fixes_triggers_sql`] in the v110
 //!   migration.
+//! - `improvement_lessons` (`tod_store::lessons`, what a closed request or a
+//!   send-back taught), created by [`lessons_triggers_sql`] in the v112
+//!   migration.
 //! - `node_files_locations` (`tod_store::fleet::repos::files_location`, the
 //!   worktree or sandbox made for each node), created by
 //!   [`files_locations_triggers_sql`] in the v75 migration.
@@ -488,6 +491,12 @@ pub fn suggestions_triggers_sql() -> String {
 /// place (the session started, the outcome known).
 pub fn quick_fixes_triggers_sql() -> String {
     simple_id_triggers("node_quick_fixes")
+}
+
+/// Triggers for `improvement_lessons` (`crate::lessons`): rows updated in
+/// place (grouped, applied, declined).
+pub fn lessons_triggers_sql() -> String {
+    simple_id_triggers("improvement_lessons")
 }
 
 /// Triggers for a table shaped `(id BLOB PRIMARY KEY, node_id BLOB, ...)`.

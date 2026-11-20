@@ -73,6 +73,7 @@ pub const ROW_KEYS: &[(&str, &[(&str, KeyKind)])] = &[
     ("node_guidance_runs", &[("id", Blob)]),
     ("node_suggestions", &[("id", Blob)]),
     ("node_quick_fixes", &[("id", Blob)]),
+    ("improvement_lessons", &[("id", Blob)]),
 ];
 
 /// True for the tables whose rows hold transcript text (withheld from

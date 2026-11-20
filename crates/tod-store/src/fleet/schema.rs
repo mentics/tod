@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 111;
+pub const CURRENT_USER_VERSION: i32 = 112;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -754,6 +754,16 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         conn.execute_batch(&crate::journey_changes::incident_nodes_triggers_sql())?;
         conn.pragma_update(None, "user_version", 111)?;
     }
+    if version < 112 {
+        // Triage (`doc/lifecycle/triage.md`): a decision may be `triage`, and
+        // records its triage session and the asking agent's own words; the
+        // improvement lessons it and later steps write (`crate::lessons`):
+        // synced, journaled.
+        crate::decisions::ensure_triage(conn)?;
+        conn.execute_batch(crate::lessons::CREATE_TABLE)?;
+        conn.execute_batch(&crate::journey_changes::lessons_triggers_sql())?;
+        conn.pragma_update(None, "user_version", 112)?;
+    }
     // Other branches (the task panel) numbered their own steps 66–67 at the
     // same time as 66–70 above, so a store may be past a version without
     // having these. Every one is idempotent: make sure of them all.
@@ -854,6 +864,10 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     conn.execute_batch(&crate::journey_changes::pr_pushes_triggers_sql())?;
     conn.execute_batch(crate::quick_fixes::CREATE_TABLE)?;
     conn.execute_batch(&crate::journey_changes::quick_fixes_triggers_sql())?;
+    // Idempotent, so a store that skipped 112 still has them.
+    crate::decisions::ensure_triage(conn)?;
+    conn.execute_batch(crate::lessons::CREATE_TABLE)?;
+    conn.execute_batch(&crate::journey_changes::lessons_triggers_sql())?;
     crate::sync::install(conn)?;
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that

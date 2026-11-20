@@ -153,13 +153,14 @@ pub fn dispute_target(phase: &str) -> Option<&'static str> {
 
 /// The protocols whose sessions may send a node back. An implementation
 /// session only for a dispute (see the module docs).
-pub const SENDERS: [ProtocolKind; 6] = [
+pub const SENDERS: [ProtocolKind; 7] = [
     ProtocolKind::Implementation,
     ProtocolKind::Phase,
     ProtocolKind::Evaluate,
     ProtocolKind::Verification,
     ProtocolKind::Review,
     ProtocolKind::Fix,
+    ProtocolKind::Triage,
 ];
 
 /// The error for a session (or none) that may not send a node back.
@@ -176,6 +177,7 @@ pub fn sender_noun(protocol: &str) -> &'static str {
         "verification" => "verification session",
         "review" => "review session",
         "fix" => "fix session",
+        "triage" => "triage session",
         _ => "agent session",
     }
 }
@@ -553,6 +555,12 @@ pub fn execute(conn: &Connection, actor: &str, request: &Request) -> Result<Valu
         bail!(
             "an implementation session sends a task back only to dispute an obligation (--obligation, to the \
              phase that wrote it); for anything else record the step blocked or ask the user"
+        );
+    }
+    if conversation.protocol == ProtocolKind::Triage && !dispute {
+        bail!(
+            "a triage session sends a task back only to dispute an obligation of the request it reads \
+             (`triage convert-dispute`, to the phase that wrote it); for anything else escalate the request"
         );
     }
     let verdicts = crate::verification::VerdictRepo::new(conn).latest_for_node(node)?;

@@ -11,15 +11,45 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
-/// Not yet answered.
+/// Not yet answered, and waiting on the user (`doc/requests/design.md` 8.1).
 pub const DECISION_PENDING: &str = "pending";
+/// Filed by an agent for triage: a fresh session reads it cold and answers it,
+/// converts it, or escalates it (then it becomes `pending`). The node is
+/// `Working`, not `You`, meanwhile (`tod_core::next_actor`), and no list of
+/// the user's requests holds it.
+pub const DECISION_TRIAGE: &str = "triage";
 /// Has at least one answer.
 pub const DECISION_ANSWERED: &str = "answered";
 /// Withdrawn: no longer needs an answer.
 pub const DECISION_WITHDRAWN: &str = "withdrawn";
 
 /// Every decision status.
-pub const DECISION_STATUSES: [&str; 3] = [DECISION_PENDING, DECISION_ANSWERED, DECISION_WITHDRAWN];
+pub const DECISION_STATUSES: [&str; 4] = [DECISION_PENDING, DECISION_TRIAGE, DECISION_ANSWERED, DECISION_WITHDRAWN];
+
+/// Whether a decision with this status still waits for an answer, from the
+/// user or from triage: the asking agent holds its turn for it either way.
+pub fn is_open(status: &str) -> bool {
+    status == DECISION_PENDING || status == DECISION_TRIAGE
+}
+
+/// The reasons whose request an agent files for triage rather than straight to
+/// the user (`doc/requests/design.md` 7.2); access, broken and capability go
+/// to the user, rendered by the app (7.1).
+pub const TRIAGED_REASONS: [&str; 5] = [REASON_INTENT, REASON_MISSING_RULE, REASON_CONFLICT, REASON_RISK, REASON_OTHER];
+
+/// The protocols whose agents' judgment questions are triaged: the lifecycle's
+/// own sessions. A freeform chat (the user is already talking to it), the
+/// incident investigation and the app's own stop questions go to the user.
+pub const TRIAGED_PROTOCOLS: [&str; 6] = ["implementation", "verification", "review", "fix", "phase", "pr"];
+
+/// Whether an agent's ask with this `reason` from this `protocol` is filed for
+/// triage. `guard_reask` is false for the app's own questions, never triaged.
+pub fn goes_to_triage(protocol: Option<&str>, reason: &str, guard_reask: bool) -> bool {
+    let reason = if reason.trim().is_empty() { REASON_OTHER } else { reason.trim() };
+    guard_reask
+        && TRIAGED_REASONS.contains(&reason)
+        && protocol.is_some_and(|p| TRIAGED_PROTOCOLS.contains(&p))
+}
 
 /// The kinds of thing a decision's evidence can point at.
 pub const EVIDENCE_KINDS: [&str; 6] = [
@@ -232,9 +262,29 @@ pub struct Decision {
     /// there is no error. Another request about the same failure, and an
     /// incident, match on it.
     pub error_signature: String,
+    /// The triage session that read this request (schema v112), set once one
+    /// started; it stays linked after the request is escalated (the user's
+    /// chat partner for it) and after it is answered (the evidence).
+    pub triage_conversation_id: Option<Uuid>,
+    /// What the asking agent wrote, kept when triage replaced it with a
+    /// brief (`question`, `options`); `None` while it stands as asked.
+    pub asked: Option<Asked>,
+}
+
+/// The asking agent's own words, kept when triage escalates with a brief.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Asked {
+    pub question: String,
+    #[serde(default)]
+    pub options: Vec<String>,
 }
 
 impl Decision {
+    /// This request is waiting on triage, not the user.
+    pub fn in_triage(&self) -> bool {
+        self.status == DECISION_TRIAGE
+    }
+
     /// The state picking `option` (1-based) moves the node back to, if it does.
     pub fn move_for(&self, option: i64) -> Option<&str> {
         self.moves.iter().find(|m| m.option == option).map(|m| m.to.as_str())
@@ -326,6 +376,10 @@ pub struct NewDecision {
     /// only for the reasons in [`BRIEF_REASONS`].
     #[serde(default)]
     pub brief: Brief,
+    /// File it with status `triage` (set by the ask command from
+    /// [`goes_to_triage`], never by the caller of `tod-cli`).
+    #[serde(default)]
+    pub triage: bool,
 }
 
 /// `decision_answers.decided_by`: the user picked an option or settled it in
@@ -346,6 +400,9 @@ pub const SETTLEABLE_PROTOCOLS: &[&str] = &["bot_silence", "check_unrelated"];
 /// asking again.
 pub const SETTLED_BY: &str = "tod";
 
+/// The actor a triage session's answers are recorded under.
+pub const TRIAGE_ACTOR: &str = "triage";
+
 /// How recent an answer is for the agent's next turn to carry it
 /// (`tod_core::node_context::render_recent_answers`): 30 minutes, by the
 /// clock. It is no longer a limit on asking again: an answered request stands
@@ -362,7 +419,7 @@ pub const CREATE_TABLE: &str = "
         options         TEXT NOT NULL DEFAULT '[]',
         evidence        TEXT NOT NULL DEFAULT '[]',
         status          TEXT NOT NULL DEFAULT 'pending'
-                            CHECK (status IN ('pending','answered','withdrawn')),
+                            CHECK (status IN ('pending','triage','answered','withdrawn')),
         created_at      INTEGER NOT NULL
         -- `reason` is added by a later migration (schema v71),
         -- which runs after this on every install, fresh or upgraded.
@@ -381,7 +438,62 @@ pub const CREATE_TABLE: &str = "
 ";
 
 const DECISION_COLUMNS: &str =
-    "id, node_id, conversation_id, protocol, question, options, evidence, status, created_at, reason, option_moves, blocks, new_evidence, option_edits, brief_need, brief_command, brief_error, brief_tried, brief_after, error_signature";
+    "id, node_id, conversation_id, protocol, question, options, evidence, status, created_at, reason, option_moves, blocks, new_evidence, option_edits, brief_need, brief_command, brief_error, brief_tried, brief_after, error_signature, triage_conversation_id, asked";
+
+/// Schema v112: `decisions.status` may be `triage`, and a decision records its
+/// triage session and what the asking agent wrote when triage replaced it.
+/// SQLite cannot alter a CHECK, so an older table is rebuilt from its own
+/// stored definition with the status list widened, every row (and rowid
+/// order) kept. Idempotent; the journey triggers go with the old table and
+/// are remade by the caller, the sync triggers by `sync::install`.
+pub fn ensure_triage(conn: &Connection) -> Result<()> {
+    const OLD: &str = "'pending','answered','withdrawn')";
+    const NEW: &str = "'pending','triage','answered','withdrawn')";
+    let sql: Option<String> = conn
+        .query_row("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'decisions'", [], |r| r.get(0))
+        .optional()?;
+    let Some(sql) = sql else { return Ok(()) };
+    if sql.contains(OLD) {
+        let indexes: Vec<String> = conn
+            .prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'decisions' AND sql IS NOT NULL")?
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let names: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'decisions' AND sql IS NOT NULL")?
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
+        let tx = conn.unchecked_transaction()?;
+        for name in &names {
+            tx.execute_batch(&format!("DROP INDEX IF EXISTS {name};"))?;
+        }
+        tx.execute_batch("PRAGMA legacy_alter_table = ON;")?;
+        tx.execute_batch("ALTER TABLE decisions RENAME TO decisions_v112;")?;
+        tx.execute_batch("PRAGMA legacy_alter_table = OFF;")?;
+        tx.execute_batch(&sql.replace(OLD, NEW))?;
+        tx.execute_batch("INSERT INTO decisions SELECT * FROM decisions_v112 ORDER BY rowid; DROP TABLE decisions_v112;")?;
+        for index in &indexes {
+            tx.execute_batch(index)?;
+        }
+        tx.commit()?;
+        conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+        conn.execute_batch(&crate::journey_changes::decisions_triggers_sql())?;
+    }
+    let has = |name: &str| -> Result<bool> {
+        Ok(conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('decisions') WHERE name = ?1",
+            params![name],
+            |row| row.get(0),
+        )?)
+    };
+    if !has("triage_conversation_id")? {
+        conn.execute_batch("ALTER TABLE decisions ADD COLUMN triage_conversation_id BLOB;")?;
+    }
+    if !has("asked")? {
+        conn.execute_batch("ALTER TABLE decisions ADD COLUMN asked TEXT;")?;
+    }
+    Ok(())
+}
 
 /// The structured request fields and the error signature
 /// (`decisions.brief_*`, `error_signature`, schema v107); a no-op for each
@@ -721,7 +833,7 @@ impl<'a> DecisionRepo<'a> {
             "INSERT INTO decisions
              (id, node_id, conversation_id, protocol, question, options, evidence, status, created_at, reason, option_moves, blocks, new_evidence, option_edits,
               brief_need, brief_command, brief_error, brief_tried, brief_after, error_signature)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?20, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             params![
                 uuid_to_blob(id),
                 uuid_to_blob(node_id),
@@ -742,6 +854,7 @@ impl<'a> DecisionRepo<'a> {
                 serde_json::to_string(&brief.tried)?,
                 brief.after,
                 error_signature,
+                if decision.triage { DECISION_TRIAGE } else { DECISION_PENDING },
             ],
         )?;
         self.get(id)?.context("decision vanished after insert")
@@ -772,7 +885,7 @@ impl<'a> DecisionRepo<'a> {
     /// the existing request. A question withdrawn because its step was
     /// retried may be asked again for a new cause, but never twice at once.
     fn check_not_pending(&self, node_id: Uuid, cause: &Cause<'_>) -> Result<()> {
-        if let Some(d) = self.list_pending_for_node(node_id)?.into_iter().find(|d| cause.matches(d)) {
+        if let Some(d) = self.list_open_for_node(node_id)?.into_iter().find(|d| cause.matches(d)) {
             bail!(
                 "this is already waiting for the user's answer (request {}, {}): do not ask it twice. \
                  Carry on with other work until it is answered.",
@@ -892,6 +1005,53 @@ impl<'a> DecisionRepo<'a> {
         Ok(rows)
     }
 
+    /// Decisions on one node still waiting on an answer from the user or from
+    /// triage ([`is_open`]), oldest first: what the asking agent holds its
+    /// turn for.
+    pub fn list_open_for_node(&self, node_id: Uuid) -> Result<Vec<Decision>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {DECISION_COLUMNS} FROM decisions
+             WHERE node_id = ?1 AND status IN ('pending','triage') ORDER BY created_at"
+        ))?;
+        let rows = stmt
+            .query_map(params![uuid_to_blob(node_id)], map_decision)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Decisions on one node waiting on triage, oldest first.
+    pub fn list_triage_for_node(&self, node_id: Uuid) -> Result<Vec<Decision>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {DECISION_COLUMNS} FROM decisions
+             WHERE node_id = ?1 AND status = 'triage' ORDER BY created_at"
+        ))?;
+        let rows = stmt
+            .query_map(params![uuid_to_blob(node_id)], map_decision)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Every decision of every node waiting on triage, oldest first.
+    pub fn list_triage(&self) -> Result<Vec<Decision>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {DECISION_COLUMNS} FROM decisions WHERE status = 'triage' ORDER BY created_at"
+        ))?;
+        let rows = stmt.query_map([], map_decision)?.collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// The decision a triage conversation reads or read, if any.
+    pub fn for_triage_conversation(&self, conversation: Uuid) -> Result<Option<Decision>> {
+        Ok(self
+            .conn
+            .query_row(
+                &format!("SELECT {DECISION_COLUMNS} FROM decisions WHERE triage_conversation_id = ?1"),
+                params![uuid_to_blob(conversation)],
+                map_decision,
+            )
+            .optional()?)
+    }
+
     /// Pending decisions across every node in `node_ids`, oldest first, in
     /// one query — for a list view over many nodes at once.
     pub fn list_pending_for_nodes(&self, node_ids: &[Uuid]) -> Result<Vec<Decision>> {
@@ -960,7 +1120,7 @@ impl<'a> DecisionRepo<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn answer_by(
+    pub(crate) fn answer_by(
         &self,
         decision_id: Uuid,
         option: Option<i64>,
@@ -1001,7 +1161,7 @@ impl<'a> DecisionRepo<'a> {
                 rationale
             ],
         )?;
-        if decision.status == DECISION_PENDING {
+        if is_open(&decision.status) {
             self.conn.execute(
                 "UPDATE decisions SET status = 'answered' WHERE id = ?1",
                 params![uuid_to_blob(decision_id)],
@@ -1071,7 +1231,7 @@ impl<'a> DecisionRepo<'a> {
             if !crate::outline::repos::plan_steps::needs_user(&step.status) {
                 continue;
             }
-            // Another pending decision still holds this step up: its cause
+            // Another open decision still holds this step up: its cause
             // stands, so the step stays handed back until the last holder is
             // settled. (`update_status` would otherwise withdraw that holder.)
             if self.pending_holder_of(*id, step.node_id, Some(decision.id))?.is_some() {
@@ -1086,7 +1246,7 @@ impl<'a> DecisionRepo<'a> {
     /// `except`.
     pub fn pending_holder_of(&self, step: Uuid, node_id: Uuid, except: Option<Uuid>) -> Result<Option<Uuid>> {
         Ok(self
-            .list_pending_for_node(node_id)?
+            .list_open_for_node(node_id)?
             .into_iter()
             .find(|d| Some(d.id) != except && d.blocks.contains(&step))
             .map(|d| d.id))
@@ -1120,7 +1280,7 @@ impl<'a> DecisionRepo<'a> {
     /// the user did and the re-ask guard does not count them.
     pub fn release_for_step(&self, step: Uuid, node_id: Uuid) -> Result<()> {
         let ids: Vec<Uuid> = self
-            .list_pending_for_node(node_id)?
+            .list_open_for_node(node_id)?
             .into_iter()
             .filter(|d| d.blocks.contains(&step))
             .map(|d| d.id)
@@ -1138,11 +1298,11 @@ impl<'a> DecisionRepo<'a> {
         let mut changed = 0;
         for id in ids {
             let Some(decision) = self.get(*id)? else { continue };
-            if decision.status != DECISION_PENDING {
+            if !is_open(&decision.status) {
                 continue;
             }
             self.conn.execute(
-                "UPDATE decisions SET status = 'withdrawn' WHERE id = ?1 AND status = 'pending'",
+                "UPDATE decisions SET status = 'withdrawn' WHERE id = ?1 AND status IN ('pending','triage')",
                 params![uuid_to_blob(*id)],
             )?;
             changed += 1;
@@ -1159,7 +1319,7 @@ impl<'a> DecisionRepo<'a> {
         Ok(self
             .list_for_node(node_id)?
             .iter()
-            .any(|d| d.status != DECISION_PENDING && d.blocks.contains(&step)))
+            .any(|d| !is_open(&d.status) && d.blocks.contains(&step)))
     }
 
     /// Whether `steps` may be held up by `decision_id` (pending, same node);
@@ -1169,7 +1329,7 @@ impl<'a> DecisionRepo<'a> {
         let decision = self
             .get(decision_id)?
             .with_context(|| format!("decision {decision_id} not found"))?;
-        if decision.status != DECISION_PENDING {
+        if !is_open(&decision.status) {
             bail!(
                 "decision {} is already {}: a step it no longer holds up cannot be linked to it",
                 crate::interview::short_id(decision_id),
@@ -1190,7 +1350,7 @@ impl<'a> DecisionRepo<'a> {
     /// Returns how many.
     pub fn withdraw_moving_for_node(&self, node_id: Uuid, keep: Option<Uuid>) -> Result<usize> {
         let ids: Vec<Uuid> = self
-            .list_pending_for_node(node_id)?
+            .list_open_for_node(node_id)?
             .into_iter()
             .filter(|d| !d.moves.is_empty() && Some(d.id) != keep)
             .map(|d| d.id)
@@ -1203,7 +1363,7 @@ impl<'a> DecisionRepo<'a> {
     /// held up are left as they are: a finished node's history is not
     /// rewritten, and nothing runs them again. Returns how many.
     pub fn withdraw_pending_for_node(&self, node_id: Uuid) -> Result<usize> {
-        let ids: Vec<Uuid> = self.list_pending_for_node(node_id)?.into_iter().map(|d| d.id).collect();
+        let ids: Vec<Uuid> = self.list_open_for_node(node_id)?.into_iter().map(|d| d.id).collect();
         self.withdraw_ids(&ids, false)
     }
 
@@ -1213,12 +1373,154 @@ impl<'a> DecisionRepo<'a> {
     /// the same reason. Returns how many.
     pub fn withdraw_for_protocols(&self, node_id: Uuid, protocols: &[&str], keep: Option<Uuid>) -> Result<usize> {
         let ids: Vec<Uuid> = self
-            .list_pending_for_node(node_id)?
+            .list_open_for_node(node_id)?
             .into_iter()
             .filter(|d| d.protocol.as_deref().is_some_and(|p| protocols.contains(&p)) && Some(d.id) != keep)
             .map(|d| d.id)
             .collect();
         self.withdraw_ids(&ids, true)
+    }
+
+    /// Link the triage session that reads a request in triage; once.
+    pub fn link_triage(&self, id: Uuid, conversation: Uuid) -> Result<()> {
+        let decision = self.get(id)?.with_context(|| format!("decision {id} not found"))?;
+        if !decision.in_triage() {
+            bail!("decision {id} is not waiting on triage");
+        }
+        if decision.triage_conversation_id.is_some_and(|c| c != conversation) {
+            bail!("decision {id} already has a triage session");
+        }
+        self.conn.execute(
+            "UPDATE decisions SET triage_conversation_id = ?2 WHERE id = ?1",
+            params![uuid_to_blob(id), uuid_to_blob(conversation)],
+        )?;
+        Ok(())
+    }
+
+    /// The request as `conversation`, its triage session, may act on it: in
+    /// triage (`need_triage`) or escalated and pending, linked to that session.
+    fn triage_target(&self, id: Uuid, conversation: Uuid, need_triage: bool) -> Result<Decision> {
+        let decision = self.get(id)?.with_context(|| format!("decision {id} not found"))?;
+        if decision.triage_conversation_id != Some(conversation) {
+            bail!("decision {id} is not the request this triage session reads");
+        }
+        let ok = if need_triage { decision.in_triage() } else { decision.status == DECISION_PENDING };
+        if !ok {
+            bail!(
+                "decision {id} is {}: {}",
+                decision.status,
+                if need_triage { "triage acts only while a request waits on it" } else { "this applies to an escalated request the user is answering" }
+            );
+        }
+        Ok(decision)
+    }
+
+    /// Triage's own answer (`decided_by = triage`): an option or free text,
+    /// with the rationale. Refused, telling triage to escalate, for a request
+    /// whose options edit obligations, and for a chosen option that moves the
+    /// node: those are the user's to decide.
+    pub fn answer_triaged(
+        &self,
+        id: Uuid,
+        conversation: Uuid,
+        option: Option<i64>,
+        text: Option<&str>,
+        rationale: &str,
+    ) -> Result<DecisionAnswer> {
+        let decision = self.triage_target(id, conversation, true)?;
+        if rationale.trim().is_empty() {
+            bail!("a triage answer needs a rationale: why this is the answer, in the user's terms");
+        }
+        if !decision.edits.is_empty() {
+            bail!("refused: this request carries obligation edits, which only the user may make; escalate it (`triage escalate`)");
+        }
+        if let Some(option) = option {
+            if let Some(to) = decision.move_for(option) {
+                bail!("refused: option {option} moves the task back to `{to}`, which only the user decides; escalate it (`triage escalate`), or convert it to a dispute (`triage convert-dispute`) when it disputes an obligation");
+            }
+        }
+        self.answer_by(id, option, text, TRIAGE_ACTOR, DECIDED_BY_TRIAGE, Some(conversation), Some(rationale.trim()))
+    }
+
+    /// Triage closes a request it converted to something else (a suggestion,
+    /// a dispute): answered in free text saying what it became.
+    pub fn close_converted(&self, id: Uuid, conversation: Uuid, what: &str, rationale: &str) -> Result<DecisionAnswer> {
+        let decision = self.get(id)?.with_context(|| format!("decision {id} not found"))?;
+        if decision.triage_conversation_id != Some(conversation) {
+            bail!("decision {id} is not the request this triage session reads");
+        }
+        if !is_open(&decision.status) {
+            bail!("decision {id} is {}", decision.status);
+        }
+        self.answer_by(id, None, Some(what), TRIAGE_ACTOR, DECIDED_BY_TRIAGE, Some(conversation), Some(rationale.trim()))
+    }
+
+    /// Triage hands a request to the user with a brief: the brief replaces the
+    /// question (and `options`, when given and when no option carries a move
+    /// or an edit the new list would misalign), the asking agent's own words
+    /// are kept in `asked`, and the request is `pending` for the user, its
+    /// triage session still linked as the person's chat partner for it.
+    pub fn escalate(&self, id: Uuid, conversation: Uuid, brief: &str, options: Option<&[String]>) -> Result<()> {
+        let decision = self.triage_target(id, conversation, true)?;
+        let brief = brief.trim();
+        if brief.is_empty() {
+            bail!("an escalation needs a brief: what the user must decide, with the facts they need");
+        }
+        let options: Vec<String> = match options {
+            Some(options) => {
+                let options: Vec<String> = options.iter().map(|o| o.trim().to_string()).filter(|o| !o.is_empty()).collect();
+                if (!decision.moves.is_empty() || !decision.edits.is_empty()) && options.len() != decision.options.len() {
+                    bail!(
+                        "this request's options move the task or edit obligations, so the options cannot be \
+                         replaced by a different number: keep the same {} in the same order, or give none",
+                        decision.options.len()
+                    );
+                }
+                options
+            }
+            None => decision.options.clone(),
+        };
+        let asked = decision
+            .asked
+            .clone()
+            .unwrap_or(Asked { question: decision.question.clone(), options: decision.options.clone() });
+        self.conn.execute(
+            "UPDATE decisions SET status = 'pending', question = ?2, options = ?3, asked = ?4 WHERE id = ?1",
+            params![
+                uuid_to_blob(id),
+                brief,
+                serde_json::to_string(&options)?,
+                serde_json::to_string(&asked)?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The user settles an escalated request in the triage chat
+    /// (`decided_by = user`): the session is the linked one, the request is
+    /// pending, and the user has spoken in it.
+    pub fn answer_in_chat(
+        &self,
+        id: Uuid,
+        conversation: Uuid,
+        option: Option<i64>,
+        text: Option<&str>,
+        rationale: &str,
+    ) -> Result<DecisionAnswer> {
+        self.triage_target(id, conversation, false)?;
+        if crate::conversation::ConversationRepo::new(self.conn).max_user_seq(conversation)? == 0 {
+            bail!("the user has not said anything in this conversation: do not settle the request for them");
+        }
+        let rationale = rationale.trim();
+        self.answer_by(
+            id,
+            option,
+            text,
+            DECIDED_BY_USER,
+            DECIDED_BY_USER,
+            Some(conversation),
+            if rationale.is_empty() { None } else { Some(rationale) },
+        )
     }
 
     /// Withdraw a decision: it no longer needs an answer, because what it
@@ -1312,6 +1614,17 @@ fn map_decision(row: &rusqlite::Row<'_>) -> rusqlite::Result<Decision> {
             after: row.get(18)?,
         },
         error_signature: row.get(19)?,
+        triage_conversation_id: row
+            .get::<_, Option<Vec<u8>>>(20)?
+            .as_deref()
+            .map(blob_to_uuid_sql)
+            .transpose()?,
+        asked: match row.get::<_, Option<String>>(21)? {
+            Some(raw) => Some(serde_json::from_str(&raw).map_err(|err| {
+                rusqlite::Error::FromSqlConversionFailure(21, rusqlite::types::Type::Text, Box::new(err))
+            })?),
+            None => None,
+        },
     })
 }
 
