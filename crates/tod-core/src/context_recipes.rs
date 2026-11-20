@@ -426,16 +426,16 @@ pub const EVALUATE_VERIFYING: ContextRecipe = ContextRecipe {
     blocks: &[
         DynamicBlock::Databases,
         DynamicBlock::DataRoot,
-        DynamicBlock::PullRequests,
         DynamicBlock::Node,
         DynamicBlock::NodeProcessFields,
         DynamicBlock::NodeObligations {
             note: "This node's own — judge the evidence for each against it.",
         },
-        DynamicBlock::ObligationVerdicts,
         DynamicBlock::AncestorContext,
-        DynamicBlock::Plan,
         DynamicBlock::ConfiguredSkills,
+        DynamicBlock::Plan,
+        DynamicBlock::PullRequests,
+        DynamicBlock::ObligationVerdicts,
     ],
 };
 
