@@ -14,6 +14,8 @@ pub mod credentials;
 pub mod deferrals;
 pub mod git_identity;
 pub mod git_retries;
+pub mod incident_class;
+pub mod incidents;
 pub mod decisions;
 pub mod failure_signature;
 pub mod done_close;

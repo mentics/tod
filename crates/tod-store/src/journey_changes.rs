@@ -40,6 +40,9 @@
 //!   [`node_requests_triggers_sql`] (same shape as `waits`).
 //! - `run_state` (`tod_store::run_state`), created by
 //!   [`run_state_triggers_sql`] (same shape as `cloud_nodes`).
+//! - `incident_nodes` (`tod_store::incidents`, machine-local), by
+//!   [`incident_nodes_triggers_sql`]; `incidents` and `incident_sightings`
+//!   have no node and are left out.
 //! - `node_problems` (`tod_store::node_problems`, machine-local), created by
 //!   [`node_problems_triggers_sql`] in the v94 migration.
 //! - `waits` (`tod_store::waits`), created by [`waits_triggers_sql`] in the
@@ -350,6 +353,25 @@ pub fn node_problems_triggers_sql() -> String {
         CREATE TRIGGER IF NOT EXISTS trg_journey_{t}_{op} AFTER {event} ON {t} BEGIN
             INSERT INTO journey_changes (node_id, tbl, row_id, op, at)
             VALUES ({rec}.node_id, '{t}', hex({rec}.node_id) || ':' || {rec}.kind, '{op}', {NOW});
+        END;
+        "
+        ));
+    }
+    sql
+}
+
+/// Triggers for `incident_nodes` (one row per (incident, node): the row id is
+/// both ids). `incidents` itself has no node and is not journaled: what an
+/// incident does to a node is this row, and its request is a decision.
+pub fn incident_nodes_triggers_sql() -> String {
+    let t = "incident_nodes";
+    let mut sql = String::new();
+    for (op, event, rec) in [("insert", "INSERT", "NEW"), ("update", "UPDATE", "NEW"), ("delete", "DELETE", "OLD")] {
+        sql.push_str(&format!(
+            "
+        CREATE TRIGGER IF NOT EXISTS trg_journey_{t}_{op} AFTER {event} ON {t} BEGIN
+            INSERT INTO journey_changes (node_id, tbl, row_id, op, at)
+            VALUES ({rec}.node_id, '{t}', hex({rec}.incident_id) || ':' || hex({rec}.node_id), '{op}', {NOW});
         END;
         "
         ));

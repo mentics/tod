@@ -366,6 +366,12 @@ fn ask(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
             brief,
         },
     })?;
+    if let Some(parked) = result.get("parked_on") {
+        anyhow::bail!(
+            "{}",
+            parked.get("message").and_then(|m| m.as_str()).unwrap_or("this node is parked on an incident")
+        );
+    }
     let id = result
         .get("id")
         .and_then(|v| v.as_str())

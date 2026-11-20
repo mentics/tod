@@ -310,6 +310,9 @@ pub enum InterviewCommand {
     RemoveGuidance { node_id: Uuid, kind: String, item: String },
     /// The app finishes a guidance selection run (`crate::guidance::finish_run`).
     FinishGuidanceRun { run_id: Uuid },
+    /// A write of cross-node incidents (`crate::incidents`): an observation,
+    /// the daemon's tick, a release. Returns the operation's result.
+    Incident(crate::incidents::Op),
     /// File a suggestion on a node (`tod-cli suggest ticket`, the app, triage;
     /// `crate::suggestions::file`). Never blocks the node.
     FileSuggestion(crate::suggestions::NewSuggestion),
@@ -1149,12 +1152,29 @@ pub fn execute(
             protocol,
             decision,
         } => {
+            // A request that is another node's cause too is not filed: the node
+            // joins the open incident, and the refusal says so
+            // (`crate::incidents::attach_request`). Committed, not an error, so
+            // the node stays parked.
+            if let Some(parked) = crate::incidents::attach_request(
+                conn,
+                *node_id,
+                *conversation_id,
+                protocol.as_deref(),
+                decision,
+                crate::outline::uuid_blob::now_ms(),
+            )? {
+                return Ok(json!({ "parked_on": parked }));
+            }
             let decision = crate::decisions::DecisionRepo::new(conn).create(
                 *node_id,
                 *conversation_id,
                 protocol.as_deref(),
                 decision,
             )?;
+            if decision.protocol.as_deref() != Some(crate::incidents::PROTOCOL) {
+                crate::incidents::note_request(conn, *node_id, decision.id)?;
+            }
             Ok(json!({ "id": decision.id.to_string() }))
         }
         InterviewCommand::AnswerDecision {
@@ -1302,6 +1322,7 @@ pub fn execute(
             let run = crate::guidance::finish_run(conn, actor, *run_id)?;
             Ok(json!({ "run_id": run.id.to_string(), "added": run.added, "dropped": run.dropped }))
         }
+        InterviewCommand::Incident(op) => crate::incidents::run_op(conn, op),
         InterviewCommand::FileSuggestion(new) => crate::suggestions::file_json(conn, new),
         InterviewCommand::SetSuggestionDuplicates { id, duplicates, checked, note } => {
             crate::suggestions::set_duplicates(conn, *id, duplicates, *checked, note)?;
