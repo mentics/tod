@@ -7,7 +7,7 @@ as what a node with nothing on it is for. You only ask; answering is the
 user's.
 
 ```
-tod-cli --data-root <DATA_ROOT> decisions ask  [--node <NODE_UUID>] <QUESTION> [--option <TEXT> (repeatable)] [--evidence <KIND>:<ID> (repeatable)] [--reason <KIND>] [--moves-to <N>:<STATE> (repeatable)] [--edit-obligation <N>:<OBLIGATION_ID>=<NEW_TEXT> (repeatable)] [--blocks <STEP_ID> (repeatable)] [--new-evidence <TEXT>]
+tod-cli --data-root <DATA_ROOT> decisions ask  [--node <NODE_UUID>] <QUESTION> [--option <TEXT> (repeatable)] [--evidence <KIND>:<ID> (repeatable)] [--reason <KIND>] [--moves-to <N>:<STATE> (repeatable)] [--edit-obligation <N>:<OBLIGATION_ID>=<NEW_TEXT> (repeatable)] [--blocks <STEP_ID> (repeatable)] [--new-evidence <TEXT>] [--need <TEXT>] [--command <TEXT>] [--error <TEXT>] [--tried <TEXT> (repeatable)] [--after <TEXT>]
 tod-cli --data-root <DATA_ROOT> decisions list [--node <NODE_UUID>] [--all]
 tod-cli --data-root <DATA_ROOT> decisions show <DECISION_ID>
 ```
@@ -63,12 +63,30 @@ in full or as the 8-character prefix listings show.
   under it, and answering it opens the steps again (ready) and tells you the
   answer. If the step is handed back after the question, pass
   `plan update <STEP> --status blocked ... --decision <DECISION_ID>` instead.
-- `--new-evidence`: a question the user answered on this node in the last 30
-  minutes (the same text, or one whose `--blocks` an answer already released)
-  is refused, and the message gives the answer: act on it. Pass
+- `--new-evidence`: a request whose cause is already pending or answered on
+  this node (in any session, however long ago) is refused: the same question,
+  the same `--blocks` steps, or the same `--error`. The message gives the
+  existing request's id, or the answer: act on it, or wait for it. Pass
   `--new-evidence` only when something really changed since (you did what
   they said and it failed: say the command and the error). Never to repeat
   the question, and never to re-word it.
+- `--need`, `--command`, `--error`, `--tried`, `--after`: only with `--reason
+  access`, `broken` or `capability`. The app writes the request from these;
+  you do not word it. `--need` is what you need, in one line ("Read access to
+  the prod-kb Redis"); `--command` is the exact command for the user to paste,
+  every value filled in, when there is one; `--error` is the exact error text
+  you got (required for `broken`; it is how the same failure on other tasks is
+  recognized); `--tried` is one thing you tried per flag, repeated; `--after`
+  is what you will do or check once they are done. The question may be left
+  out when `--need` is given. Without `--option`, the choices are "Done,
+  continue" and "Do not do it". Give the other flags when you have them and
+  leave out the ones you do not.
+
+```
+tod-cli decisions ask --reason access --need "Read access to the prod-kb Redis" \
+  --command "tod-cli access list" --tried "access call redis-prod scan: not set up" \
+  --after "I rerun the scan and continue verification"
+```
 
 `list` shows a node's pending decisions, oldest first; `--all` also lists
 answered and withdrawn ones. `show` prints one decision and its full answer
@@ -84,9 +102,9 @@ resync, a retry, a deploy), file a request (`--reason access`) that asks the
 user to run it on their machine. Never ask for a token, never try another
 route.
 
-- **One call**: put the exact command in the request, ready to paste, with
-  every value filled in, and say what it changes and what you will check
-  afterwards. Options such as "Done, continue" and "Do not run it".
+- **One call**: put the exact command in `--command`, ready to paste, with
+  every value filled in, what it changes in `--need`, and what you will check
+  afterwards in `--after`.
 - **More than one step**: write a script in the sandbox (a file under
   `/tmp`, set to stop on the first error, printing what it does) and test
   what you can without the write. The user copies it from the sandbox and
@@ -99,7 +117,8 @@ mkdir -p .local && tod-sandbox cp "$TOD_SANDBOX":/tmp/<SCRIPT> .local/<SCRIPT> &
 
   Write the request's command with `$TOD_SANDBOX` replaced by your sandbox's
   name (read it from your own `TOD_SANDBOX` environment variable) and
-  `<SCRIPT>` by the file name, so the user pastes one line. `tod-sandbox cp
+  `<SCRIPT>` by the file name, so the user pastes one line (that line is the
+  `--command`). `tod-sandbox cp
   <name>:<absolute path> <local>` copies one file byte for byte. Tell the user
   what the script does, in a few lines, before they run it: they are
   trusting your code with production. Do not leave a secret in the script.

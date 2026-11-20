@@ -56,10 +56,11 @@ A workaround hides the fault: the user finds out only by luck, and it stays
 broken for the next run. Instead:
 
 - Do everything that does not depend on it.
-- File it with `decisions ask` with the `broken` reason, worded as a request (see
-  "Wording a request" below): the exact command you ran, the exact error it
-  printed, and what you had expected. Offer `--option`s such as "Fixed, try
-  again" and "Carry on without it".
+- File it as a request with the `broken` reason (the `decisions` commands), giving `--need` (what is
+  broken, one line), `--command` (the exact command you ran), `--error` (the
+  exact error it printed), `--tried` and `--after` (see the `decisions`
+  commands). The app words the request from those; you do not. Use your own
+  `--option`s only when "Done, continue" and "Do not do it" do not fit.
 - End your turn there. The app queues it for the user and hands the session
   back with their answer.
 
@@ -69,7 +70,10 @@ again: just stop the work that needs it and say what is blocked.
 ## Wording a request
 
 The user reads a request cold, between many others, without your session. It
-must stand on its own. The question text has this shape:
+must stand on its own. An `access`, `broken` or `capability` request is
+written by the app from the fields you give it (`--need`, `--command`,
+`--error`, `--tried`, `--after`); the rest of this section is for every other
+request, whose question text has this shape:
 
 1. **First line: what they must do or decide**, as an imperative. "Decide
    whether...", "Run X in Dagster and paste the run id", "Grant read access to

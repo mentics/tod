@@ -15,7 +15,7 @@ use crate::args::Args;
 use tod_core::conversation::implement::{IMPLEMENT_CONVERSATION_ENV, IMPLEMENT_NODE_ENV};
 use tod_store::conversation::ConversationRepo;
 use tod_store::decisions::{
-    DECISION_REASONS, Decision, DecisionRepo, EVIDENCE_KINDS, EvidenceRef, NewDecision, OptionEdit, OptionMove,
+    Brief, DECISION_REASONS, Decision, DecisionRepo, EVIDENCE_KINDS, EvidenceRef, NewDecision, OptionEdit, OptionMove,
 };
 use tod_store::interview::{InterviewCommand, InterviewRepo, short_id};
 use uuid::Uuid;
@@ -28,7 +28,7 @@ Inside a conversation --node defaults to the node it is about, and asks are
 filed under that conversation and its protocol.
 
 COMMANDS:
-    ask   [--node <UUID>] <QUESTION> [--option <TEXT> (repeatable)] [--evidence <KIND>:<ID> (repeatable)] [--reason <KIND>] [--moves-to <N>:<STATE> (repeatable)] [--edit-obligation <N>:<OBLIGATION_ID>=<NEW_TEXT> (repeatable)] [--blocks <STEP_ID> (repeatable)] [--new-evidence <TEXT>]
+    ask   [--node <UUID>] <QUESTION> [--option <TEXT> (repeatable)] [--evidence <KIND>:<ID> (repeatable)] [--reason <KIND>] [--moves-to <N>:<STATE> (repeatable)] [--edit-obligation <N>:<OBLIGATION_ID>=<NEW_TEXT> (repeatable)] [--blocks <STEP_ID> (repeatable)] [--new-evidence <TEXT>] [--need <TEXT>] [--command <TEXT>] [--error <TEXT>] [--tried <TEXT> (repeatable)] [--after <TEXT>]
     list  [--node <UUID>] [--all]
     show  <ID>
 
@@ -49,10 +49,17 @@ user's own edit, recorded in the asking conversation's change set, where it
 can be reversed.
 --blocks links a plan step of the node that this question holds up (one cause,
 one request): the user answers once, the step opens again, and the question and
-its steps show as one request. A question already answered on the node in the
-last 30 minutes (the same text, or one holding up a step that answer released)
-is refused with the answer in the message; --new-evidence <TEXT>, what has
+its steps show as one request. A request whose cause is already pending or
+answered on the node, in any session and however long ago (the same question,
+the same --blocks steps, or the same --error), is refused with the existing
+request's id or its answer in the message; --new-evidence <TEXT>, what has
 changed since, lets it through.
+With --reason access, broken or capability the app writes the request itself
+from --need (one line), --command (the exact command to paste), --error (the
+exact error; required for broken), --tried (one attempt per flag, repeatable)
+and --after (what you do once it is done); without --option the choices are
+\"Done, continue\" and \"Do not do it\", and the question may be left out when
+--need is given.
 `list` shows a node's pending decisions, oldest first; --all includes
 answered and withdrawn ones too.
 `show` prints one decision and its full answer log, oldest first.
@@ -248,9 +255,21 @@ pub(crate) fn parse_evidence(inv: &Invocation, raw: &str) -> anyhow::Result<Evid
 
 fn ask(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
     let node = node(inv, args)?;
-    let question = args
-        .target("a question (the first positional argument, quoted; there is no --question flag)")?
-        .to_string();
+    let brief = Brief {
+        need: args.get("--need").unwrap_or("").to_string(),
+        command: args.get("--command").unwrap_or("").to_string(),
+        error: args.get("--error").unwrap_or("").to_string(),
+        tried: args.get_all("--tried").iter().map(|s| s.to_string()).collect(),
+        after: args.get("--after").unwrap_or("").to_string(),
+    };
+    let question = match args.target("a question") {
+        Ok(question) => question.to_string(),
+        // The need says it in one line.
+        Err(_) if !brief.need.trim().is_empty() => brief.need.trim().to_string(),
+        Err(_) => anyhow::bail!(
+            "a question is required (the first positional argument, quoted; there is no --question flag)"
+        ),
+    };
     let options: Vec<String> = args.get_all("--option").iter().map(|s| s.to_string()).collect();
     let evidence = args
         .get_all("--evidence")
@@ -269,6 +288,12 @@ fn ask(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
         }
         None => String::new(),
     };
+    if reason == tod_store::decisions::REASON_BROKEN && brief.error.trim().is_empty() {
+        anyhow::bail!(
+            "--reason broken needs --error <TEXT>: the exact error you got, which is how the same failure on \
+             other tasks is recognized and shown to the user"
+        );
+    }
     let moves = args
         .get_all("--moves-to")
         .iter()
@@ -313,6 +338,7 @@ fn ask(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
             blocks,
             guard_reask,
             new_evidence,
+            brief,
         },
     })?;
     let id = result
@@ -340,6 +366,11 @@ fn decision_json(d: &Decision) -> serde_json::Value {
         "moves": d.moves.iter().map(|m| serde_json::json!({"option": m.option, "to": m.to})).collect::<Vec<_>>(),
         "edits": d.edits.iter().map(|e| serde_json::json!({"option": e.option, "obligation_id": e.obligation_id.to_string(), "body": e.body})).collect::<Vec<_>>(),
         "blocks": d.blocks.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+        "need": d.brief.need,
+        "command": d.brief.command,
+        "error": d.brief.error,
+        "tried": d.brief.tried,
+        "after": d.brief.after,
     })
 }
 

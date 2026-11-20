@@ -206,7 +206,13 @@ numbered options needs no label.
 
 Each request shows:
 
-- The question and how to answer it, which depends on its kind:
+- The question and how to answer it, which depends on its kind. An access,
+  broken or capability request is written by the app from the structured fields
+  the agent filed (`tod_core::request_brief`, the one template): the need on
+  the first line, the command in a copy block with a Copy button, the error,
+  what was tried, and what happens after. A request without those fields (any
+  other reason, or one asked before they existed) shows its question as the
+  agent wrote it.
 
   | Kind | Answered with |
   |---|---|

@@ -65,6 +65,57 @@ pub const DECISION_REASONS: [&str; 8] = [
     REASON_OTHER,
 ];
 
+/// The reasons whose request the app renders from structured fields
+/// ([`Brief`], `tod_core::request_brief`).
+pub const BRIEF_REASONS: [&str; 3] = [REASON_ACCESS, REASON_BROKEN, REASON_CAPABILITY];
+
+/// The options an access, broken or capability request gets when the agent
+/// gives none: it was done, or the user will not do it.
+pub const DEFAULT_BRIEF_OPTIONS: [&str; 2] = ["Done, continue", "Do not do it"];
+
+/// The structured fields of an access, broken or capability request
+/// (`decisions ask --need --command --error --tried --after`), which the app
+/// renders from one template (`tod_core::request_brief`). All empty for any
+/// other request, and for one asked before these fields existed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Brief {
+    /// What is needed, in one line.
+    #[serde(default)]
+    pub need: String,
+    /// The exact command to paste, every value filled in.
+    #[serde(default)]
+    pub command: String,
+    /// The exact error (required for `broken`).
+    #[serde(default)]
+    pub error: String,
+    /// What the agent tried, one line per attempt.
+    #[serde(default)]
+    pub tried: Vec<String>,
+    /// What the agent will do or check once the user is done.
+    #[serde(default)]
+    pub after: String,
+}
+
+impl Brief {
+    pub fn is_empty(&self) -> bool {
+        self.need.trim().is_empty()
+            && self.command.trim().is_empty()
+            && self.error.trim().is_empty()
+            && self.tried.iter().all(|t| t.trim().is_empty())
+            && self.after.trim().is_empty()
+    }
+
+    fn trimmed(&self) -> Brief {
+        Brief {
+            need: self.need.trim().to_string(),
+            command: self.command.trim().to_string(),
+            error: self.error.trim().to_string(),
+            tried: self.tried.iter().map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect(),
+            after: self.after.trim().to_string(),
+        }
+    }
+}
+
 /// What picking an option does besides telling the agent: the app moves the
 /// node back to the lifecycle state `to`, as the task panel's state chip does
 /// (`tod_core::lifecycle::send_back`). A person answering "send the task back
@@ -168,6 +219,13 @@ pub struct Decision {
     /// What the agent said was new when it asked again after an answer
     /// (`decisions ask --new-evidence`); shown to the user with the request.
     pub new_evidence: String,
+    /// The structured fields of an access, broken or capability request
+    /// (empty for older ones and for other reasons).
+    pub brief: Brief,
+    /// [`crate::failure_signature::of_text`] of `brief.error`; empty when
+    /// there is no error. Another request about the same failure, and an
+    /// incident, match on it.
+    pub error_signature: String,
 }
 
 impl Decision {
@@ -243,6 +301,10 @@ pub struct NewDecision {
     /// through.
     #[serde(default)]
     pub new_evidence: String,
+    /// The structured fields (`--need --command --error --tried --after`),
+    /// only for the reasons in [`BRIEF_REASONS`].
+    #[serde(default)]
+    pub brief: Brief,
 }
 
 /// The actor of an answer the app recorded, not the user or an agent. Such an
@@ -250,8 +312,10 @@ pub struct NewDecision {
 /// asking again.
 pub const SETTLED_BY: &str = "tod";
 
-/// How long an answer stands against the same question being asked again:
-/// 30 minutes, by the clock, whatever the number of turns in between.
+/// How recent an answer is for the agent's next turn to carry it
+/// (`tod_core::node_context::render_recent_answers`): 30 minutes, by the
+/// clock. It is no longer a limit on asking again: an answered request stands
+/// against a repeat at any age (see `DecisionRepo::create`).
 pub const REASK_WINDOW_MS: i64 = 30 * 60 * 1000;
 
 pub const CREATE_TABLE: &str = "
@@ -283,7 +347,31 @@ pub const CREATE_TABLE: &str = "
 ";
 
 const DECISION_COLUMNS: &str =
-    "id, node_id, conversation_id, protocol, question, options, evidence, status, created_at, reason, option_moves, blocks, new_evidence, option_edits";
+    "id, node_id, conversation_id, protocol, question, options, evidence, status, created_at, reason, option_moves, blocks, new_evidence, option_edits, brief_need, brief_command, brief_error, brief_tried, brief_after, error_signature";
+
+/// The structured request fields and the error signature
+/// (`decisions.brief_*`, `error_signature`, schema v107); a no-op for each
+/// column already there.
+pub fn add_brief(conn: &Connection) -> Result<()> {
+    for (name, ddl) in [
+        ("brief_need", "TEXT NOT NULL DEFAULT ''"),
+        ("brief_command", "TEXT NOT NULL DEFAULT ''"),
+        ("brief_error", "TEXT NOT NULL DEFAULT ''"),
+        ("brief_tried", "TEXT NOT NULL DEFAULT '[]'"),
+        ("brief_after", "TEXT NOT NULL DEFAULT ''"),
+        ("error_signature", "TEXT NOT NULL DEFAULT ''"),
+    ] {
+        let has: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('decisions') WHERE name = ?1",
+            params![name],
+            |row| row.get(0),
+        )?;
+        if !has {
+            conn.execute_batch(&format!("ALTER TABLE decisions ADD COLUMN {name} {ddl};"))?;
+        }
+    }
+    Ok(())
+}
 
 /// `decisions.option_moves` (an option that sends the node back); a no-op
 /// when the column is already there.
@@ -343,6 +431,53 @@ pub fn add_new_evidence(conn: &Connection) -> Result<()> {
 
 const ANSWER_COLUMNS: &str = "id, decision_id, option_index, text, actor, answered_at";
 
+/// What a request is about, for telling whether the node has asked it before.
+struct Cause<'a> {
+    question: &'a str,
+    blocks: &'a [Uuid],
+    signature: &'a str,
+}
+
+fn normal_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+
+fn same_steps(a: &[Uuid], b: &[Uuid]) -> bool {
+    !a.is_empty() && a.len() == b.len() && a.iter().all(|x| b.contains(x))
+}
+
+impl Cause<'_> {
+    fn matches(&self, other: &Decision) -> bool {
+        !self.why(other).is_empty()
+    }
+
+    /// How `other` is the same cause, or empty when it is not.
+    fn why(&self, other: &Decision) -> &'static str {
+        if normal_text(&other.question) == normal_text(self.question) {
+            "the same question"
+        } else if same_steps(self.blocks, &other.blocks) {
+            "it holds up the same plan steps"
+        } else if !self.signature.is_empty() && other.error_signature == self.signature {
+            "the same failure"
+        } else {
+            ""
+        }
+    }
+}
+
+/// `5 minutes`, `3 hours`, `2 days`.
+fn age_label(ms: i64) -> String {
+    let minutes = ms / 60_000;
+    let (n, unit) = if minutes >= 2 * 24 * 60 {
+        (minutes / (24 * 60), "day")
+    } else if minutes >= 120 {
+        (minutes / 60, "hour")
+    } else {
+        (minutes, "minute")
+    };
+    format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
+}
+
 pub struct DecisionRepo<'a> {
     conn: &'a Connection,
 }
@@ -364,7 +499,7 @@ impl<'a> DecisionRepo<'a> {
         if question.is_empty() {
             bail!("a decision needs a question");
         }
-        let options: Vec<String> = decision
+        let mut options: Vec<String> = decision
             .options
             .iter()
             .map(|o| o.trim().to_string())
@@ -388,6 +523,19 @@ impl<'a> DecisionRepo<'a> {
                 DECISION_REASONS.join("|")
             );
         }
+        let brief = decision.brief.trimmed();
+        if !brief.is_empty() {
+            if !BRIEF_REASONS.contains(&reason) {
+                bail!(
+                    "--need, --command, --error, --tried and --after belong to a request with --reason {} (this one is `{reason}`)",
+                    BRIEF_REASONS.join("|")
+                );
+            }
+            if options.is_empty() {
+                options = DEFAULT_BRIEF_OPTIONS.iter().map(|o| o.to_string()).collect();
+            }
+        }
+        let error_signature = crate::failure_signature::of_text(&brief.error);
         let mut seen = Vec::new();
         let mut moves = Vec::new();
         for m in &decision.moves {
@@ -471,17 +619,19 @@ impl<'a> DecisionRepo<'a> {
             blocks.push(*step);
         }
         if decision.guard_reask {
-            self.check_not_pending(node_id, question)?;
+            let cause = Cause { question, blocks: &blocks, signature: &error_signature };
+            self.check_not_pending(node_id, &cause)?;
             if decision.new_evidence.trim().is_empty() {
-                self.check_not_reasked(node_id, question)?;
+                self.check_not_reasked(node_id, &cause)?;
             }
         }
         let id = Uuid::new_v4();
         let now = now_ms();
         self.conn.execute(
             "INSERT INTO decisions
-             (id, node_id, conversation_id, protocol, question, options, evidence, status, created_at, reason, option_moves, blocks, new_evidence, option_edits)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?9, ?10, ?11, ?12, ?13)",
+             (id, node_id, conversation_id, protocol, question, options, evidence, status, created_at, reason, option_moves, blocks, new_evidence, option_edits,
+              brief_need, brief_command, brief_error, brief_tried, brief_after, error_signature)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             params![
                 uuid_to_blob(id),
                 uuid_to_blob(node_id),
@@ -496,6 +646,12 @@ impl<'a> DecisionRepo<'a> {
                 serde_json::to_string(&blocks)?,
                 decision.new_evidence.trim(),
                 serde_json::to_string(&edits)?,
+                brief.need,
+                brief.command,
+                brief.error,
+                serde_json::to_string(&brief.tried)?,
+                brief.after,
+                error_signature,
             ],
         )?;
         self.get(id)?.context("decision vanished after insert")
@@ -520,45 +676,37 @@ impl<'a> DecisionRepo<'a> {
         }
     }
 
-    /// Refuse a question that is already waiting on this node (the same text,
-    /// case and spacing aside): a question withdrawn because its step was
+    /// Refuse a request whose cause is already waiting on this node, in any
+    /// of its sessions: the same question (case and spacing aside), the same
+    /// plan steps held up, or the same failure ([`Cause`]). The message names
+    /// the existing request. A question withdrawn because its step was
     /// retried may be asked again for a new cause, but never twice at once.
-    fn check_not_pending(&self, node_id: Uuid, question: &str) -> Result<()> {
-        let normal = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
-        let wanted = normal(question);
-        if let Some(d) = self.list_pending_for_node(node_id)?.into_iter().find(|d| normal(&d.question) == wanted) {
+    fn check_not_pending(&self, node_id: Uuid, cause: &Cause<'_>) -> Result<()> {
+        if let Some(d) = self.list_pending_for_node(node_id)?.into_iter().find(|d| cause.matches(d)) {
             bail!(
-                "this question is already waiting for the user's answer (request {}): do not ask it twice. \
+                "this is already waiting for the user's answer (request {}, {}): do not ask it twice. \
                  Carry on with other work until it is answered.",
-                crate::interview::short_id(d.id)
+                crate::interview::short_id(d.id),
+                cause.why(&d)
             );
         }
         Ok(())
     }
 
-    /// Refuse a question the user already answered on this node a moment ago
-    /// (the same text, case and spacing aside): asking again makes them
-    /// answer twice for one cause. Only the same question counts: a different
-    /// question that holds up the same step is a different cause. Answers by
-    /// `tod` (not the user's) never count. The message names the answer, and
+    /// Refuse a request the user already answered on this node, however long
+    /// ago (the same question, the same plan steps, or the same failure:
+    /// [`Cause`]): asking again makes them answer twice for one cause. Answers
+    /// by `tod` (not the user's) never count. The message names the answer, and
     /// the way through when something really is new.
-    fn check_not_reasked(&self, node_id: Uuid, question: &str) -> Result<()> {
-        let since = now_ms() - REASK_WINDOW_MS;
-        let normal = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
-        let wanted = normal(question);
+    fn check_not_reasked(&self, node_id: Uuid, cause: &Cause<'_>) -> Result<()> {
         for decision in self.list_for_node(node_id)? {
-            if decision.status != DECISION_ANSWERED {
+            if decision.status != DECISION_ANSWERED || !cause.matches(&decision) {
                 continue;
             }
             let Some(found) = self.get_with_answers(decision.id)? else { continue };
-            let Some(answer) =
-                found.answers.iter().rev().find(|a| a.answered_at >= since && a.actor != SETTLED_BY)
-            else {
+            let Some(answer) = found.answers.iter().rev().find(|a| a.actor != SETTLED_BY) else {
                 continue;
             };
-            if normal(&decision.question) != wanted {
-                continue;
-            }
             let given = match (&answer.option, &answer.text) {
                 (Some(o), Some(t)) => format!("option {o} ({t})"),
                 (Some(o), None) => decision
@@ -569,12 +717,14 @@ impl<'a> DecisionRepo<'a> {
                 (None, Some(t)) => format!("\"{t}\""),
                 (None, None) => "(no text)".to_string(),
             };
-            let minutes = ((now_ms() - answer.answered_at) / 60_000).max(0);
             bail!(
-                "this was already answered {minutes} minute(s) ago ({} by {}): {given}. Carry on with that \
+                "this was already answered {} ago (request {}, {}; {} by {}): {given}. Carry on with that \
                  answer; the steps it held up are open again. Ask again only for something new, by passing \
                  --new-evidence <TEXT> saying what changed since (what you tried with the answer, and the \
                  error it gave).",
+                age_label((now_ms() - answer.answered_at).max(0)),
+                crate::interview::short_id(decision.id),
+                cause.why(&decision),
                 decision.question.lines().next().unwrap_or(""),
                 answer.actor
             );
@@ -1004,6 +1154,19 @@ fn map_decision(row: &rusqlite::Row<'_>) -> rusqlite::Result<Decision> {
                 rusqlite::Error::FromSqlConversionFailure(13, rusqlite::types::Type::Text, Box::new(err))
             })?
         },
+        brief: Brief {
+            need: row.get(14)?,
+            command: row.get(15)?,
+            error: row.get(16)?,
+            tried: {
+                let raw: String = row.get(17)?;
+                serde_json::from_str(&raw).map_err(|err| {
+                    rusqlite::Error::FromSqlConversionFailure(17, rusqlite::types::Type::Text, Box::new(err))
+                })?
+            },
+            after: row.get(18)?,
+        },
+        error_signature: row.get(19)?,
     })
 }
 
@@ -1498,8 +1661,12 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("Carry on without it") && err.contains("--new-evidence"), "{err}");
-        // A different question is a different cause, even for the same step.
-        repo.create(fx.node, None, None, &guarded("Different words", vec![steps[0]], "")).unwrap();
+        // A different question holding up the same step is the same cause.
+        let err = repo
+            .create(fx.node, None, None, &guarded("Different words", vec![steps[0]], ""))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("same plan steps"), "{err}");
         // An unrelated question is fine.
         repo.create(fx.node, None, None, &guarded("Something else entirely?", vec![], "")).unwrap();
         // New evidence lets the repeat through.
@@ -1516,16 +1683,109 @@ mod tests {
     }
 
     #[test]
-    fn an_old_answer_no_longer_blocks_the_question() {
+    fn an_old_answer_still_blocks_the_question_but_new_evidence_lets_it_through() {
         let fx = setup();
         let repo = DecisionRepo::new(&fx.conn);
         let d = repo.create(fx.node, None, None, &decision("Old question?", &["yes"])).unwrap();
         repo.answer(d.id, Some(1), None, "user").unwrap();
         fx.conn
-            .execute("UPDATE decision_answers SET answered_at = answered_at - ?1", params![REASK_WINDOW_MS + 1000])
+            .execute("UPDATE decision_answers SET answered_at = answered_at - ?1", params![3 * 24 * 60 * 60 * 1000i64])
             .unwrap();
-        repo.create(fx.node, None, None, &NewDecision { guard_reask: true, ..decision("Old question?", &["yes"]) })
+        let ask = |evidence: &str| {
+            repo.create(
+                fx.node,
+                None,
+                None,
+                &NewDecision { guard_reask: true, new_evidence: evidence.into(), ..decision("Old question?", &["yes"]) },
+            )
+        };
+        let err = ask("").unwrap_err().to_string();
+        assert!(err.contains("3 days ago") && err.contains(&crate::interview::short_id(d.id)), "{err}");
+        ask("it broke again").unwrap();
+    }
+
+    #[test]
+    fn a_pending_request_is_found_across_sessions_by_text_steps_or_failure() {
+        let fx = setup();
+        let steps = blocked_steps(&fx, 2);
+        let repo = DecisionRepo::new(&fx.conn);
+        let broken = |question: &str, error: &str, blocks: Vec<Uuid>| NewDecision {
+            reason: REASON_BROKEN.into(),
+            guard_reask: true,
+            blocks,
+            brief: Brief { error: error.into(), ..Default::default() },
+            ..decision(question, &[])
+        };
+        let first = repo
+            .create(fx.node, None, None, &broken("Redis is down", "ECONNREFUSED 10.0.0.5:6379 at 2026-11-20T10:00:00Z", vec![steps[0]]))
             .unwrap();
+        assert!(!first.error_signature.is_empty());
+        let short = crate::interview::short_id(first.id);
+        // Same failure, other words, other session, later time.
+        let err = repo
+            .create(fx.node, None, None, &broken("Cannot reach cache", "ECONNREFUSED 10.0.0.5:6379 at 2026-11-21T01:02:03Z", vec![]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(&short) && err.contains("same failure"), "{err}");
+        // Same step.
+        let err = repo.create(fx.node, None, None, &broken("Other words", "different error", vec![steps[0]])).unwrap_err().to_string();
+        assert!(err.contains(&short) && err.contains("same plan steps"), "{err}");
+        // Nothing in common.
+        repo.create(fx.node, None, None, &broken("Another", "disk full", vec![steps[1]])).unwrap();
+    }
+
+    #[test]
+    fn an_answered_failure_is_not_asked_again_without_new_evidence() {
+        let fx = setup();
+        let repo = DecisionRepo::new(&fx.conn);
+        let ask = |evidence: &str| NewDecision {
+            reason: REASON_BROKEN.into(),
+            guard_reask: true,
+            new_evidence: evidence.into(),
+            brief: Brief { error: "permission denied for table orders".into(), ..Default::default() },
+            ..decision("The orders table is unreadable", &[])
+        };
+        let d = repo.create(fx.node, None, None, &ask("")).unwrap();
+        repo.answer(d.id, Some(1), None, "user").unwrap();
+        let again = NewDecision { question: "Worded another way".into(), ..ask("") };
+        assert!(repo.create(fx.node, None, None, &again).unwrap_err().to_string().contains("--new-evidence"));
+        repo.create(fx.node, None, None, &NewDecision { question: "Worded another way".into(), ..ask("granted, still denied") }).unwrap();
+    }
+
+    #[test]
+    fn a_brief_is_stored_with_default_options_and_only_for_its_reasons() {
+        let fx = setup();
+        let repo = DecisionRepo::new(&fx.conn);
+        let brief = Brief {
+            need: " Read access to prod-kb ".into(),
+            command: "aws sso login".into(),
+            error: "AccessDenied".into(),
+            tried: vec!["login".into(), " ".into(), "retry".into()],
+            after: "I rerun the query".into(),
+        };
+        let d = repo
+            .create(fx.node, None, None, &NewDecision { reason: REASON_ACCESS.into(), brief: brief.clone(), ..decision("Need access", &[]) })
+            .unwrap();
+        assert_eq!(d.options, DEFAULT_BRIEF_OPTIONS);
+        let got = repo.get(d.id).unwrap().unwrap();
+        assert_eq!(got.brief.need, "Read access to prod-kb");
+        assert_eq!(got.brief.tried, vec!["login", "retry"]);
+        assert_eq!(got.brief.after, "I rerun the query");
+        assert_eq!(got.error_signature, crate::failure_signature::of_text("AccessDenied"));
+        // Own options are kept.
+        let own = repo
+            .create(fx.node, None, None, &NewDecision { reason: REASON_ACCESS.into(), brief: brief.clone(), ..decision("Need access 2", &["Granted"]) })
+            .unwrap();
+        assert_eq!(own.options, vec!["Granted"]);
+        // An older-style request has no brief.
+        let plain = repo.create(fx.node, None, None, &decision("Plain?", &["a"])).unwrap();
+        assert!(plain.brief.is_empty() && plain.error_signature.is_empty());
+        // Other reasons refuse the fields.
+        let err = repo
+            .create(fx.node, None, None, &NewDecision { reason: REASON_RISK.into(), brief, ..decision("Risky", &["a"]) })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--reason access|broken|capability"), "{err}");
     }
 
     /// Two requests hold the same step for different causes.
