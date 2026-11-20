@@ -94,7 +94,8 @@ fn a_node_whose_done_work_is_not_on_its_branch_is_reopened_not_asked_about() {
         ("lost_work", "review", "active"),
         "{steps:#?}"
     );
-    assert_eq!(steps[1].step, "implementation", "{steps:#?}");
+    assert_eq!(steps[1].step, "guidance", "{steps:#?}");
+    assert_eq!(steps[2].step, "implementation", "{steps:#?}");
     let all = fx.fleet.read(|c| Ok(tod_store::decisions::DecisionRepo::new(c).list_for_node(fx.node)?)).unwrap();
     assert!(!all.is_empty() && all.iter().all(|d| d.status == "withdrawn"), "{all:?}");
     // It says why, on the node's activity.

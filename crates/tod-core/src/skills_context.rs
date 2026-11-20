@@ -332,57 +332,114 @@ fn strip_frontmatter(text: &str) -> &str {
 
 /// The block: what the skills are for, then each one's text in order.
 pub fn render_skills(phase: &str, skills: &[Skill]) -> String {
+    render_skills_besides(phase, skills, &[])
+}
+
+/// [`render_skills`], where `inlined` names the skills whose text the
+/// opening's Project guidance (`crate::guidance::render_selection`) already
+/// carries: they are named here, not repeated.
+pub fn render_skills_besides(phase: &str, skills: &[Skill], inlined: &[String]) -> String {
     if skills.is_empty() {
         return String::new();
     }
     let names = skills
         .iter()
-        .map(|s| match s {
-            Skill::Text { name, .. } | Skill::FromBranch { name, .. } | Skill::ByName(name) => format!("`{name}`"),
-        })
+        .map(|s| format!("`{}`", skill_name(s)))
         .collect::<Vec<_>>()
         .join(", ");
     let mut out = format!(
         "\n## Skills\n\nThe user chose these skills for the {phase} phase: {names}. Their \
-         text is below, in that order: do the phase's work the way they direct. A later one \
-         may fill in what an earlier one leaves to the project. Everything else in this \
-         message still applies: what the phase must record, and how, is unchanged.\n"
+         text is below, in that order: do the phase's work the way they direct, as part of the job. \
+         A later one may fill in what an earlier one leaves to the project. They change how the work \
+         is done, not what the phase must record or how.\n"
     );
     for skill in skills {
-        match skill {
-            Skill::Text { name, path, body } => {
-                out.push_str(&format!("\n### Skill `{name}`\n\n"));
-                if let Some(path) = path {
-                    let dir = Path::new(path)
-                        .parent()
-                        .map(|d| d.display().to_string())
-                        .unwrap_or_default();
-                    out.push_str(&format!(
-                        "From `{path}`. Files it refers to by relative path are in `{dir}`.\n\n"
-                    ));
-                }
-                out.push_str(body.trim());
-                out.push('\n');
-            }
-            Skill::FromBranch { name, git_ref, path, body } => {
-                out.push_str(&format!("\n### Skill `{name}`\n\n"));
-                out.push_str(&format!(
-                    "This checkout does not have this skill, so it is read from `{git_ref}` (`{path}`), \
-                     where the repository has it. Files it refers to by relative path are not \
-                     available from there: they are not in this checkout, so read them with \
-                     `git show {git_ref}:<path>`, or update the branch from `{git_ref}` to have them.\n\n"
-                ));
-                out.push_str(body.trim());
-                out.push('\n');
-            }
-            Skill::ByName(name) => out.push_str(&format!(
-                "\n### Skill `{name}`\n\nNo file has this skill's text, so it is one your agent \
-                 provides: use it through your Skill tool. If you have no such skill, say so in \
-                 your reply and carry on following what it is meant to do as best you can.\n"
-            )),
+        let name = skill_name(skill);
+        if inlined.iter().any(|n| n == name) {
+            out.push_str(&format!(
+                "\n{}\n\nIts text is in the Project guidance above.\n",
+                tod_store::guidance::inline_heading(tod_store::guidance::KIND_SKILL, name)
+            ));
+        } else {
+            out.push_str(&render_skill(skill));
         }
     }
     out
+}
+
+fn skill_name(skill: &Skill) -> &str {
+    match skill {
+        Skill::Text { name, .. } | Skill::FromBranch { name, .. } | Skill::ByName(name) => name,
+    }
+}
+
+/// One skill under its heading: where it is from, then its text.
+pub fn render_skill(skill: &Skill) -> String {
+    let mut out = String::new();
+    match skill {
+        Skill::Text { name, path, body } => {
+            out.push_str(&format!("\n### Skill `{name}`\n\n"));
+            if let Some(path) = path {
+                let dir = Path::new(path)
+                    .parent()
+                    .map(|d| d.display().to_string())
+                    .unwrap_or_default();
+                out.push_str(&format!(
+                    "From `{path}`. Files it refers to by relative path are in `{dir}`.\n\n"
+                ));
+            }
+            out.push_str(body.trim());
+            out.push('\n');
+        }
+        Skill::FromBranch { name, git_ref, path, body } => {
+            out.push_str(&format!("\n### Skill `{name}`\n\n"));
+            out.push_str(&format!(
+                "This checkout does not have this skill, so it is read from `{git_ref}` (`{path}`), \
+                 where the repository has it. Files it refers to by relative path are not \
+                 available from there: they are not in this checkout, so read them with \
+                 `git show {git_ref}:<path>`, or update the branch from `{git_ref}` to have them.\n\n"
+            ));
+            out.push_str(body.trim());
+            out.push('\n');
+        }
+        Skill::ByName(name) => out.push_str(&format!(
+            "\n### Skill `{name}`\n\nNo file has this skill's text, so it is one your agent \
+             provides: use it through your Skill tool. If you have no such skill, say so in \
+             your reply and carry on following what it is meant to do as best you can.\n"
+        )),
+    }
+    out
+}
+
+/// The skills block of an implement, verify, review or fix opening: the
+/// node's Project guidance (its selected skills' and files' text,
+/// `crate::guidance::render_selection`), then group `group` of the phase's
+/// configured skills, which still apply. The guidance is the same in every
+/// group's session, so every reviewer is given the same.
+pub fn for_work(fleet: &FleetStore, node: Uuid, phase: &str, cwd: &Workdir, group: usize) -> Result<String> {
+    let guidance = crate::guidance::render_selection(fleet, node, cwd)?;
+    let names = fleet
+        .read(|conn| configured(conn, node, phase))
+        .with_context(|| format!("could not read the skills configured for the {phase} phase"))?
+        .into_iter()
+        .nth(group)
+        .unwrap_or_default();
+    if names.is_empty() {
+        return Ok(guidance);
+    }
+    let inlined = if guidance.is_empty() { Vec::new() } else { crate::guidance::selected_skills(fleet, node)? };
+    let own = crate::skills::SkillsPaths::discover()?;
+    let skills = names
+        .iter()
+        .map(|name| {
+            if inlined.contains(name) {
+                Ok(Skill::ByName(name.clone()))
+            } else {
+                resolve(&own, cwd, name).with_context(|| format!("the {phase} phase's skills"))
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(format!("{guidance}{}", render_skills_besides(phase, &skills, &inlined)))
 }
 
 #[cfg(test)]

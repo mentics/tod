@@ -55,6 +55,7 @@ pub mod environment_request;
 pub mod environment_reset;
 pub mod fuzzy;
 pub mod gate;
+pub mod guidance;
 pub mod impact;
 pub mod incoming;
 pub mod generator;

@@ -59,6 +59,9 @@
 //! - `node_send_backs` (`tod_store::send_back`; insert-only, a record of
 //!   what happened), created by [`send_backs_triggers_sql`] in the v103
 //!   migration step that creates the table.
+//! - `node_guidance`, `node_guidance_runs` (`tod_store::guidance`, the
+//!   project guidance selected for each node and the runs that selected
+//!   it), created by [`guidance_triggers_sql`] in the v104 migration.
 //! - `node_files_locations` (`tod_store::fleet::repos::files_location`, the
 //!   worktree or sandbox made for each node), created by
 //!   [`files_locations_triggers_sql`] in the v75 migration.
@@ -435,6 +438,13 @@ pub fn send_backs_triggers_sql() -> String {
         END;
         "
     )
+}
+
+/// Triggers for `node_guidance` and `node_guidance_runs`
+/// (`crate::guidance`): both `(id, node_id)` rows that are updated in place
+/// (selected again, removed, a run finished).
+pub fn guidance_triggers_sql() -> String {
+    format!("{}{}", simple_id_triggers("node_guidance"), simple_id_triggers("node_guidance_runs"))
 }
 
 /// Triggers for a table shaped `(id BLOB PRIMARY KEY, node_id BLOB, ...)`.

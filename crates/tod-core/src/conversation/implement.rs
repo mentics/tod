@@ -175,7 +175,7 @@ impl Protocol for ImplementationProtocol {
         let lifecycle = Some(node.lifecycle.clone());
         let cwd = self.cwd(env)?;
         let working_dir = PathBuf::from(cwd.path_text());
-        let skills = crate::skills_context::for_group(fleet, node_id, "implement", &cwd, env.skill_group())?;
+        let skills = crate::skills_context::for_work(fleet, node_id, "implement", &cwd, env.skill_group())?;
         let opening = build_implement_message(
             env.media,
             &ImplementRequest {

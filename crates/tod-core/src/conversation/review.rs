@@ -144,7 +144,7 @@ impl Protocol for ReviewProtocol {
         let role_doc = state_role_doc(&manifest, REVIEW)?;
         let cwd = self.cwd(env)?;
         let working_dir = PathBuf::from(cwd.path_text());
-        let skills = crate::skills_context::for_group(fleet, node_id, "review", &cwd, env.skill_group())?;
+        let skills = crate::skills_context::for_work(fleet, node_id, "review", &cwd, env.skill_group())?;
         // In `pr_draft` the review runs on the draft pull request, and the app
         // posts what it records there (`crate::pr_draft_review`).
         let build = if node.lifecycle == crate::pr_draft_review::STATE {

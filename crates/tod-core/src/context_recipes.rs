@@ -580,9 +580,29 @@ pub const INCOMING_CHANGES: ContextRecipe = ContextRecipe {
     ],
 };
 
+/// The guidance selector (`crate::guidance`, `ProtocolKind::Guidance`): the
+/// task, its obligations, and what to select from. One-shot, with one scoped
+/// exception `surface/guidance` states: each choice is recorded through the
+/// `guidance` noun.
+pub const GUIDANCE: ContextRecipe = ContextRecipe {
+    name: "guidance selection",
+    situational: false,
+    layers: &["stance/one-shot", "cli/intro", "cli/guidance", "surface/guidance"],
+    blocks: &[
+        DynamicBlock::DataRoot,
+        DynamicBlock::Node,
+        DynamicBlock::NodeObligations {
+            note: "This task's own: what the change is meant to do.",
+        },
+        DynamicBlock::GuidanceSelection,
+        DynamicBlock::PullRequests,
+    ],
+};
+
 /// Every registered surface.
 pub const ALL_RECIPES: &[ContextRecipe] = &[
     INCOMING_CHANGES,
+    GUIDANCE,
     CONVERSATION,
     CHAT,
     VISUAL_DESIGN,
@@ -968,6 +988,7 @@ missing"),
             | DynamicBlock::ReviewFindings
             | DynamicBlock::WorkHistory
             | DynamicBlock::IncomingChanges
+            | DynamicBlock::GuidanceSelection
             | DynamicBlock::VisualDesign => 5,
         }
     }

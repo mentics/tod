@@ -319,6 +319,9 @@ impl LatestCoverage {
         if self.gaps.saturation_missing {
             out.push_str(" · saturation pass owed");
         }
+        if !self.gaps.unread_guidance.is_empty() {
+            out.push_str(&format!(" · {} selected guidance unread", self.gaps.unread_guidance.len()));
+        }
         out
     }
 }
@@ -349,11 +352,15 @@ pub struct CoverageGaps {
     /// No saturation pass that found nothing was recorded after the
     /// conversation's last finding.
     pub saturation_missing: bool,
+    /// The node's selected guidance files and skills this review neither had
+    /// inlined in its opening nor lists as read (`kind:item`; find-it-first
+    /// 6g, `crate::guidance::unread_for_review`).
+    pub unread_guidance: Vec<String>,
 }
 
 impl CoverageGaps {
     pub fn is_empty(&self) -> bool {
-        self.missing_lenses.is_empty() && !self.saturation_missing
+        self.missing_lenses.is_empty() && !self.saturation_missing && self.unread_guidance.is_empty()
     }
 
     /// Exactly what is missing, for the agent asked to record the review done.
@@ -366,6 +373,14 @@ impl CoverageGaps {
                 self.missing_lenses.len(),
                 self.required,
                 self.missing_lenses.iter().map(|l| l.slug).collect::<Vec<_>>().join(", ")
+            ));
+        }
+        if !self.unread_guidance.is_empty() {
+            out.push_str(&format!(
+                "\n- the reading of the task's selected guidance: {}. Each was selected for this change \
+                 but was not in your opening; read it, apply it, and list it with `--read <path>` on the \
+                 coverage entries it informed.",
+                self.unread_guidance.join(", ")
             ));
         }
         if self.saturation_missing {
@@ -383,7 +398,7 @@ impl CoverageGaps {
 /// What review conversation `conversation_id` still has to record before it
 /// can record the review done.
 pub fn gaps(conn: &Connection, conversation_id: Uuid) -> Result<CoverageGaps> {
-    review_node(conn, conversation_id)?;
+    let node = review_node(conn, conversation_id)?;
     let required = required_lenses(conn, conversation_id)?;
     let entries = for_conversation(conn, conversation_id)?;
     let missing_lenses = required
@@ -405,6 +420,7 @@ pub fn gaps(conn: &Connection, conversation_id: Uuid) -> Result<CoverageGaps> {
         missing_lenses,
         required: required.len(),
         saturation_missing,
+        unread_guidance: crate::guidance::unread_for_review(conn, conversation_id, node)?,
     })
 }
 
@@ -704,5 +720,46 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM review_coverage", [], |r| r.get(0))
             .unwrap();
         assert_eq!(left, 0);
+    }
+
+    #[test]
+    fn done_is_refused_while_a_selected_guidance_file_was_neither_inlined_nor_read() {
+        let fx = setup();
+        let select = |kind: &str, item: &str| {
+            crate::guidance::select(
+                &fx.conn,
+                crate::interview::ACTOR_USER,
+                &crate::guidance::Selection {
+                    node_id: fx.node,
+                    conversation_id: None,
+                    kind: kind.into(),
+                    item: item.into(),
+                    applies: true,
+                    reason: "the change touches it".into(),
+                },
+            )
+            .unwrap();
+        };
+        select(crate::guidance::KIND_FILE, "kb/CLAUDE.md");
+        select(crate::guidance::KIND_SKILL, "sql-patterns");
+        ConversationRepo::new(&fx.conn)
+            .set_opening_context(
+                fx.review,
+                &format!("...\n{}\n...", crate::guidance::inline_heading("skill", "sql-patterns")),
+            )
+            .unwrap();
+        sweep_all_but(&fx, &[]);
+        add(&fx.conn, fx.review, &saturation(CoverageResult::None)).unwrap();
+        let err = record_done(&fx.conn, fx.review).unwrap_err().to_string();
+        assert!(err.contains("file:kb/CLAUDE.md"), "{err}");
+        assert!(!err.contains("sql-patterns"), "an inlined skill needs no read: {err}");
+        assert!(!err.contains("lenses"), "{err}");
+        add(
+            &fx.conn,
+            fx.review,
+            &NewCoverage { read: vec!["kb/CLAUDE.md".into()], ..lens_entry("reach", CoverageResult::None) },
+        )
+        .unwrap();
+        record_done(&fx.conn, fx.review).unwrap();
     }
 }

@@ -54,6 +54,9 @@ pub const EVALUATE_SURFACE: &str = "evaluation";
 /// Checking a node against its incoming changes.
 pub const INCOMING_SURFACE: &str = "incoming check";
 
+/// The guidance selector (`crate::guidance`).
+pub const GUIDANCE_SURFACE: &str = "guidance";
+
 /// Name a session, e.g. `Obligations · Ship the chat context fix · Sep 10, 2:41 PM`.
 ///
 /// `context_key` is the agent-context key the chat was opened with (see

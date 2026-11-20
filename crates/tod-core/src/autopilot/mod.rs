@@ -3193,6 +3193,13 @@ impl Autopilot {
                     .then(|| (current.conversation_id, RESUME_MESSAGE.to_string()))
             })
             .or(reopen);
+        // The guidance this session's opening carries is selected first
+        // (`crate::guidance`); a session picked up again already has its own.
+        if resumable.is_none()
+            && let Some(outcome) = self.select_guidance(fleet, agent, hook, kind)?
+        {
+            return Ok(Some(outcome));
+        }
         let (mut driver, message) = match resumable {
             Some((id, message)) => match ConversationDriver::open(self.config.clone(), fleet, id) {
                 Ok(driver) => (driver, message),
@@ -3444,6 +3451,62 @@ impl Autopilot {
         };
         driver.cancel(fleet, agent)?;
         Ok(Some(Outcome::NeedsHuman { reason }))
+    }
+
+    /// The guidance selection the node owes before a session of `kind`
+    /// (`crate::guidance::due`: before the first work after the design, on
+    /// entering review, after a fix that reached new areas), made and finished
+    /// before that session's opening is built, so the opening carries it. A
+    /// selector interrupted mid-run is picked up again. `Some` ends the step:
+    /// the selector was stopped or failed, or the selection could not be made.
+    fn select_guidance<A: AgentAccess + ?Sized, H: StepHook + ?Sized>(
+        &mut self,
+        fleet: &FleetStore,
+        agent: &mut A,
+        hook: &mut H,
+        kind: ProtocolKind,
+    ) -> Result<Option<Outcome>> {
+        if !matches!(
+            kind,
+            ProtocolKind::Implementation | ProtocolKind::Verification | ProtocolKind::Review | ProtocolKind::Fix
+        ) {
+            return Ok(None);
+        }
+        let node = self.node;
+        let failed = |err: anyhow::Error| Outcome::NeedsHuman {
+            reason: NeedsHuman::AgentFailed { error: format!("selecting this task's guidance: {err:#}") },
+        };
+        let open = fleet.read(|conn| tod_store::guidance::open_run(conn, node))?;
+        let resuming = open.is_some()
+            && self.state.current.as_ref().is_some_and(|c| c.protocol == protocol_name(ProtocolKind::Guidance));
+        if !resuming {
+            let cwd = match tod_store::fleet::provision::resolve_launch_cwd(fleet, &node.to_string()) {
+                Ok(cwd) => cwd,
+                Err(err) if tod_store::fleet::worktree::is_lock_busy(&err) => return Ok(Some(self.files_busy(fleet, &err)?)),
+                Err(err) => return Ok(Some(failed(err))),
+            };
+            let due = match crate::guidance::due(fleet, node, kind, &cwd) {
+                Ok(Some(due)) => due,
+                Ok(None) => return Ok(None),
+                Err(err) => return Ok(Some(failed(err))),
+            };
+            let run = match crate::guidance::prepare_run(fleet, node, &due, &cwd) {
+                Ok(run) => run,
+                Err(err) => return Ok(Some(failed(err))),
+            };
+            // A run left open by a selector that is gone is abandoned here.
+            fleet.interview("autopilot", InterviewCommand::StartGuidanceRun(run))?;
+        }
+        if let Some(outcome) = self.converse_group(fleet, agent, hook, ProtocolKind::Guidance, None, 0)? {
+            return Ok(Some(outcome));
+        }
+        let Some(run) = fleet.read(|conn| tod_store::guidance::open_run(conn, node))? else {
+            return Ok(Some(failed(anyhow::anyhow!("the selection run is no longer open"))));
+        };
+        if let Err(err) = fleet.interview("autopilot", InterviewCommand::FinishGuidanceRun { run_id: run.id }) {
+            return Ok(Some(failed(anyhow::Error::new(err))));
+        }
+        Ok(None)
     }
 
     fn new_driver(&self, kind: ProtocolKind, group: usize) -> (ConversationDriver, String) {
