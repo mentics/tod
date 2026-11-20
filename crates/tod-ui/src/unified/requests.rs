@@ -1719,6 +1719,14 @@ impl Requests {
                 window,
                 cx,
             )))
+            .when_some(entry.answer.rationale.clone().filter(|r| !r.trim().is_empty()), |el, rationale| {
+                el.child(div().w_full().min_w_0().text_xs().text_color(muted).child(selectable_text(
+                    ("unified-decisions-log-rationale", entry.answer.id as u64),
+                    format!("Why: {rationale}"),
+                    window,
+                    cx,
+                )))
+            })
             .child(
                 div()
                     .flex()
@@ -1779,11 +1787,18 @@ fn kind_badge(label: &'static str) -> impl IntoElement {
 /// A log entry's times and who answered: "Asked Nov 12 14:03 · Answered
 /// 09:15 · user", in local time (see [`when_label`]).
 pub fn log_times_label(decision: &Decision, answer: &DecisionAnswer, today: chrono::NaiveDate) -> String {
+    // An answer tod or a triage agent gave for the user says so
+    // (`decision_answers.decided_by`), and not only who wrote the row.
+    let by = if answer.decided_by == tod_store::decisions::DECIDED_BY_USER {
+        answer.actor.clone()
+    } else {
+        format!("decided by {}", answer.decided_by)
+    };
     format!(
         "Asked {} · Answered {} · {}",
         when_label(decision.created_at, today),
         when_label(answer.answered_at, today),
-        answer.actor
+        by
     )
 }
 
@@ -1886,11 +1901,48 @@ mod tests {
             text: Some("this one".into()),
             actor: "user".into(),
             answered_at: answered.timestamp_millis(),
+            decided_by: tod_store::decisions::DECIDED_BY_USER.into(),
+            conversation_id: None,
+            rationale: None,
         };
         assert_eq!(
             log_times_label(&decision, &answer, answered.date_naive()),
             "Asked Nov 4 08:05 · Answered 14:32 · user"
         );
+    }
+
+    #[test]
+    fn an_answer_tod_gave_says_it_was_decided_by_tod() {
+        use chrono::TimeZone;
+        let at = chrono::Local.with_ymd_and_hms(2026, 11, 4, 14, 32, 0).single().unwrap();
+        let decision = Decision {
+            id: Uuid::new_v4(),
+            node_id: Uuid::new_v4(),
+            conversation_id: None,
+            protocol: Some("bot_silence".into()),
+            question: "Proceed?".into(),
+            options: vec!["Proceed".into()],
+            evidence: Vec::new(),
+            status: "answered".into(),
+            created_at: at.timestamp_millis(),
+            reason: "broken".into(),
+            moves: Vec::new(),
+            edits: Vec::new(),
+            blocks: Vec::new(),
+            new_evidence: String::new(),
+        };
+        let answer = DecisionAnswer {
+            id: 2,
+            decision_id: decision.id,
+            option: Some(1),
+            text: None,
+            actor: "tod".into(),
+            answered_at: at.timestamp_millis(),
+            decided_by: tod_store::decisions::DECIDED_BY_TOD.into(),
+            conversation_id: None,
+            rationale: Some("asked 3 times".into()),
+        };
+        assert!(log_times_label(&decision, &answer, at.date_naive()).ends_with("decided by tod"));
     }
 
     #[test]
