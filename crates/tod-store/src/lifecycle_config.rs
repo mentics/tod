@@ -82,10 +82,12 @@ pub fn add_delete_sandbox(conn: &Connection) -> Result<()> {
 
 /// The phases an agent works in, and so the keys a config may name: the
 /// lifecycle states that have a phase agent, and the protocols that run
-/// in the others (`implement`, `verify`, `review`, `fix`, `pr`).
-pub const PHASES: [&str; 15] = [
+/// in the others (`implement`, `verify`, `review`, `fix`, `pr`), and the
+/// guidance selector (`guidance`), which runs before `active` and review.
+pub const PHASES: [&str; 16] = [
     "proposed",
     "design",
+    "guidance",
     "planning",
     "implement",
     "verify",
@@ -130,9 +132,23 @@ pub fn fallback(phase: &str) -> Option<&'static str> {
 /// Whether a phase's gate runs checks: not the evidence evaluator's, which is
 /// one session inside `verifying` (whose checks are [`VERIFY`]'s), nor the
 /// risk reviewer's, one session inside `review` (whose checks are
-/// [`REVIEW`]'s).
+/// [`REVIEW`]'s), nor the guidance selector's, which has no gate.
 pub fn takes_checks(phase: &str) -> bool {
-    phase != VERIFY_EVALUATE && phase != REVIEW_RISK
+    phase != VERIFY_EVALUATE && phase != REVIEW_RISK && phase != GUIDANCE
+}
+
+/// The guidance selector (`tod_core::guidance`): only its model and effort
+/// are configured; unset, it runs on [`GUIDANCE_DEFAULT_MODEL`] at
+/// [`GUIDANCE_DEFAULT_EFFORT`] (find-it-first section 13: matching is
+/// Haiku's work).
+pub const GUIDANCE: &str = "guidance";
+pub const GUIDANCE_DEFAULT_MODEL: &str = "haiku";
+pub const GUIDANCE_DEFAULT_EFFORT: &str = "low";
+
+/// Whether a phase's agent takes skills: not the guidance selector, which
+/// reads none (it picks the guidance every other phase gets).
+pub fn takes_skills(phase: &str) -> bool {
+    phase != GUIDANCE
 }
 
 /// The last lifecycle state (`done`, which has no agent and so no entry in
@@ -267,6 +283,12 @@ pub fn set_skills(conn: &Connection, node_id: Uuid, config: &Skills) -> Result<(
     for (phase, names) in config {
         if !is_phase(phase) {
             bail!("{phase} is not a lifecycle phase ({})", PHASES.join(", "));
+        }
+        if !takes_skills(phase) && names.iter().any(|n| !n.trim().is_empty()) {
+            bail!(
+                "{phase} takes no skills: the guidance selector only picks the guidance the other phases get; \
+                 set its model and effort instead"
+            );
         }
         let mut list: Vec<String> = Vec::new();
         // Blanks and repeats within one group are dropped; a break must follow
@@ -518,6 +540,9 @@ pub fn set_checks(conn: &Connection, node_id: Uuid, config: &Checks) -> Result<(
             bail!("{phase} is not a lifecycle phase ({})", PHASES.join(", "));
         }
         if !takes_checks(phase) && !list.is_empty() {
+            if phase == GUIDANCE {
+                bail!("{phase} runs no checks: the guidance selector has no gate");
+            }
             bail!("{phase} runs no checks: its gate is `verifying`'s, so put them under `{VERIFY}`");
         }
         let mut out = Vec::new();

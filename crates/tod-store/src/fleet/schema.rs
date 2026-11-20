@@ -687,7 +687,13 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         conn.execute_batch(&crate::journey_changes::send_backs_triggers_sql())?;
         conn.pragma_update(None, "user_version", 103)?;
     }
-    // 104 is guidance selection's (find-it-first item 7, built alongside).
+    if version < 104 {
+        // The project guidance selected for each node, and the runs that
+        // selected it (`crate::guidance`): synced, journaled.
+        conn.execute_batch(crate::guidance::CREATE_TABLE)?;
+        conn.execute_batch(&crate::journey_changes::guidance_triggers_sql())?;
+        conn.pragma_update(None, "user_version", 104)?;
+    }
     if version < 105 {
         // Two reviewers per review round (find-it-first 6h): which reviewer
         // recorded each finding, and on a review conversation which reviewer
@@ -766,6 +772,8 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     conn.execute_batch(&crate::journey_changes::phase_events_triggers_sql())?;
     conn.execute_batch(crate::send_back::CREATE_TABLE)?;
     conn.execute_batch(&crate::journey_changes::send_backs_triggers_sql())?;
+    conn.execute_batch(crate::guidance::CREATE_TABLE)?;
+    conn.execute_batch(&crate::journey_changes::guidance_triggers_sql())?;
     ensure_turn_attachments(conn)?;
     // Added to the v73 step after stores had passed it, so it is made sure of
     // here, like the rest (`conversations.skill_group`).

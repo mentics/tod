@@ -17,6 +17,7 @@ mod changeset;
 mod journey;
 mod skills;
 mod doc_sync;
+mod guidance;
 mod incoming;
 mod learn;
 mod lifecycle;
@@ -72,6 +73,7 @@ NOUNS:
     pr                     Opening and driving a node's pull request
     verdicts               What verification found for each obligation of a node
     incoming               Changes a node inherits, and the verdict that resolves them
+    guidance               The project's skills, files, lenses and checks a node's change needs
     learn                  A node's retrospective, stored once per pass
     lifecycle              Send a node back to the phase that got it wrong; the operator's moves
     secrets                Run a command with stored secrets, without seeing them
@@ -106,6 +108,7 @@ const NOUNS: &[(&str, &str)] = &[
     ("pr", crate::pr::USAGE),
     ("verdicts", crate::verdicts::USAGE),
     ("incoming", crate::incoming::USAGE),
+    ("guidance", crate::guidance::USAGE),
     ("learn", crate::learn::USAGE),
     ("lifecycle", crate::lifecycle::USAGE),
     ("secrets", crate::secrets::USAGE),
@@ -354,6 +357,7 @@ fn run_with(args: &[String], env: operator::Env) -> anyhow::Result<String> {
         "pr" => pr::run(invocation),
         "verdicts" => verdicts::run(invocation),
         "incoming" => incoming::run(invocation),
+        "guidance" => guidance::run(invocation, env),
         "learn" => learn::run(invocation),
         "lifecycle" => lifecycle::run(invocation),
         "secrets" => secrets::run(invocation),
@@ -367,7 +371,7 @@ fn run_with(args: &[String], env: operator::Env) -> anyhow::Result<String> {
         "journey" => journey::run(invocation),
         "skills" => skills::run(invocation),
         other => anyhow::bail!(
-            "unknown noun `{other}` (expected: node, obligations, content, plan, questions, memory, interview, visual-design, capabilities, changeset, tests, review, pr, verdicts, incoming, learn, lifecycle, secrets, db, environment, decisions, phase, wait, batch, journey, skills)"
+            "unknown noun `{other}` (expected: node, obligations, content, plan, questions, memory, interview, visual-design, capabilities, changeset, tests, review, pr, verdicts, incoming, guidance, learn, lifecycle, secrets, db, environment, decisions, phase, wait, batch, journey, skills)"
         ),
     }
 }

@@ -280,6 +280,17 @@ pub enum InterviewCommand {
     /// An agent sends its node back to an earlier state
     /// (`tod-cli lifecycle send-back`, `crate::send_back::execute`).
     SendBack(crate::send_back::Request),
+    /// The app starts a guidance selection run for a node, with its own
+    /// trigger matches (`crate::guidance::start_run`).
+    StartGuidanceRun(crate::guidance::NewRun),
+    /// The guidance selector or the user selects an item of a node's
+    /// guidance (`tod-cli guidance select`/`add`, `crate::guidance::select`).
+    SelectGuidance(crate::guidance::Selection),
+    /// The user removes an item from a node's guidance
+    /// (`tod-cli guidance remove`, the task panel).
+    RemoveGuidance { node_id: Uuid, kind: String, item: String },
+    /// The app finishes a guidance selection run (`crate::guidance::finish_run`).
+    FinishGuidanceRun { run_id: Uuid },
     /// The user's "Shouldn't have asked" on a request
     /// (`crate::request_feedback`). Not offered by `tod-cli`.
     RecordRequestFeedback(crate::request_feedback::NewRequestFeedback),
@@ -1221,6 +1232,18 @@ pub fn execute(
             Ok(out)
         }
         InterviewCommand::SendBack(request) => crate::send_back::execute(conn, actor, request),
+        InterviewCommand::StartGuidanceRun(new) => {
+            let run = crate::guidance::start_run(conn, actor, new)?;
+            Ok(json!({ "run_id": run.id.to_string() }))
+        }
+        InterviewCommand::SelectGuidance(selection) => crate::guidance::select(conn, actor, selection),
+        InterviewCommand::RemoveGuidance { node_id, kind, item } => {
+            crate::guidance::remove(conn, actor, *node_id, kind, item)
+        }
+        InterviewCommand::FinishGuidanceRun { run_id } => {
+            let run = crate::guidance::finish_run(conn, actor, *run_id)?;
+            Ok(json!({ "run_id": run.id.to_string(), "added": run.added, "dropped": run.dropped }))
+        }
         InterviewCommand::RecordRequestFeedback(feedback) => {
             let id = crate::request_feedback::RequestFeedbackRepo::new(conn).record(feedback)?;
             Ok(json!({ "id": id.to_string() }))

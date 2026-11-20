@@ -21,6 +21,7 @@ use tod_store::outline::repos::plan_steps::STATUS_BLOCKED;
 use tod_store::outline::{Capability, OutlineMutation};
 use tod_store::settings::InterviewContextSettings;
 
+mod guidance;
 mod lost_work;
 mod push_failure;
 mod quiet_resume;
@@ -860,6 +861,7 @@ fn a_restart_reopens_the_conversation_in_progress() {
 
     let mut pilot = autopilot(&fx, Budget::default());
     pilot.run(&fx.fleet, &mut agent).unwrap();
+    // Picked up again: its opening already carries its guidance.
     let first = pilot.state().steps.first().unwrap();
     assert_eq!(first.step, "implementation");
     assert_eq!(first.conversation_id, Some(id));
@@ -902,7 +904,9 @@ fn a_requested_fresh_session_starts_a_new_conversation_instead_of_reopening() {
     // start a new session again.
     assert!(!AutopilotState::load(&fx.root, fx.node).unwrap().fresh_session);
     pilot.run(&fx.fleet, &mut agent).unwrap();
-    let first = pilot.state().steps.first().unwrap();
+    // The guidance selector goes first: the new session's opening carries it.
+    assert_eq!(pilot.state().steps[0].step, "guidance");
+    let first = pilot.state().steps.iter().find(|s| s.step != "guidance").unwrap();
     assert_eq!(first.step, "implementation");
     assert_ne!(first.conversation_id, Some(id), "the earlier conversation was not reopened");
     let turns = fx.fleet.read(|conn| ConversationRepo::new(conn).turns(id)).unwrap();
@@ -963,7 +967,8 @@ fn stopping_mid_turn_keeps_the_conversation_for_the_next_run() {
     let outcome = pilot.run_with(&fx.fleet, &mut agent, &mut StopMidTurn(false)).unwrap();
     assert_eq!(outcome, Outcome::Stopped { reason: "stop".into() });
     let current = pilot.state().current.clone().expect("the conversation stays current");
-    assert_eq!(current.protocol, "implementation");
+    // The first turn is the guidance selector's, ahead of implementation.
+    assert_eq!(current.protocol, "guidance");
 
     // The next run reopens it and carries on to the end.
     let mut pilot = autopilot(&fx, Budget::default());
@@ -1256,7 +1261,7 @@ fn the_evidence_evaluator_audits_verification_and_stops_when_stuck() {
         "{outcome:?} {steps:?}"
     );
     assert_eq!(lifecycle::current_state(&fx.fleet, fx.node).unwrap(), "verifying");
-    assert_eq!(steps, ["verification", "evaluate", "verification", "evaluate"], "{steps:?}");
+    assert_eq!(steps, ["guidance", "verification", "evaluate", "verification", "evaluate"], "{steps:?}");
     // The evaluator was given the verdicts with their method.
     let log = agent.log.lock().unwrap();
     let audit = log
@@ -1286,7 +1291,7 @@ fn the_evidence_evaluator_certifies_and_the_node_moves_on() {
     let mut pilot = autopilot(&fx, Budget::default());
     let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
     let steps: Vec<_> = pilot.state().steps.iter().map(|s| s.step.clone()).collect();
-    assert_eq!(&steps[..3], ["verification", "evaluate", "advance"], "{outcome:?} {steps:?}");
+    assert_eq!(&steps[..4], ["guidance", "verification", "evaluate", "advance"], "{outcome:?} {steps:?}");
     let events = fx
         .fleet
         .read(|conn| tod_store::phase::PhaseRepo::new(conn).list_for_node(fx.node))
@@ -3010,7 +3015,8 @@ fn the_loop_counters_survive_a_restart_mid_loop() {
     let (fx, _agent, pilot, outcome) = verify_run(
         0,
         Arc::new(|_, due| due.to_vec()),
-        Budget { max_sessions: 9, ..Budget::default() },
+        // Two of them are the guidance selector's.
+        Budget { max_sessions: 11, ..Budget::default() },
     );
     assert!(matches!(outcome, Outcome::BudgetExhausted { .. }), "{outcome:?} {:?}", pilot.state().steps);
     let saved = AutopilotState::load(&fx.root, fx.node).unwrap();
@@ -3703,7 +3709,7 @@ fn pr_draft_feedback_is_reviewed_and_fixed_before_it_is_pushed() {
     // The stay's opening turn, then the change, tod's review (which finds
     // something), the fix, the review that comes back clean, and only then
     // the push and the answers. Nothing is reviewed after the push.
-    assert_eq!(steps, ["pr", "pr:change", "review", "fix", "review", "pr:push"], "{outcome:?}");
+    assert_eq!(steps, ["pr", "pr:change", "guidance", "review", "fix", "review", "pr:push"], "{outcome:?}");
     assert_eq!(feed.posts.load(std::sync::atomic::Ordering::SeqCst), 0, "nothing is posted on the pull request");
     // The clean review recorded the head that was pushed.
     let head = git_in(&dir, &["rev-parse", "HEAD"]);
@@ -3759,7 +3765,11 @@ fn a_head_tod_pushed_after_a_clean_review_is_not_flagged() {
     linked_to_prs(&fx, "pr_draft", &["https://github.com/acme/app/pull/42"]);
     let mut agent = branch_agent(&fx, &dir, &feed, edit_and_commit);
     let outcome = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO).run(&fx.fleet, &mut agent).unwrap();
-    assert_eq!(steps_of(&turn_labels(&agent)), ["pr", "pr:change", "review", "fix", "review", "pr:push"], "{outcome:?}");
+    assert_eq!(
+        steps_of(&turn_labels(&agent)),
+        ["pr", "pr:change", "guidance", "review", "fix", "review", "pr:push"],
+        "{outcome:?}"
+    );
     let pushes = pr_pushes(&fx);
     assert_eq!(pushes.first().map(|p| p.0.as_str()), Some("baseline"), "{pushes:?}");
     assert!(
@@ -3809,8 +3819,8 @@ fn an_unexpected_head_is_recorded_and_reviewed_at_once() {
     let outcome = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO).run(&fx.fleet, &mut agent).unwrap();
     let steps = steps_of(&turn_labels(&agent));
     assert_eq!(
-        steps.get(..2),
-        Some(&["pr".to_string(), "review".to_string()][..]),
+        steps.get(..3),
+        Some(&["pr".to_string(), "guidance".to_string(), "review".to_string()][..]),
         "reviewed at once, before the feedback: {steps:?} {outcome:?}"
     );
     let unreviewed = fx
@@ -3865,7 +3875,7 @@ fn a_conversation_commit_on_a_pr_branch_is_reviewed_before_it_is_pushed() {
     let mut agent = branch_agent(&fx, &dir, &feed, edit_and_commit);
     let outcome = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO).run(&fx.fleet, &mut agent).unwrap();
     let steps = steps_of(&turn_labels(&agent));
-    assert_eq!(steps, ["pr", "review", "fix", "review", "pr:push"], "{outcome:?}");
+    assert_eq!(steps, ["pr", "guidance", "review", "fix", "review", "pr:push"], "{outcome:?}");
     let head = git_in(&dir, &["rev-parse", "HEAD"]);
     assert_eq!(*feed.pushed.lock().unwrap(), head, "pushed once the review was clean");
     assert!(pr_pushes(&fx).iter().all(|(verdict, _)| verdict != "unreviewed"), "{:?}", pr_pushes(&fx));
@@ -3914,7 +3924,10 @@ fn a_pending_question_about_one_check_does_not_stop_the_review_after_the_agents_
     let mut agent = branch_agent(&fx, &dir, &feed, change_once);
     let outcome = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO).run(&fx.fleet, &mut agent).unwrap();
     let steps = steps_of(&turn_labels(&agent));
-    assert!(steps.starts_with(&["pr".to_string(), "pr:change".to_string(), "review".to_string()]), "{steps:?} / {outcome:?}");
+    assert!(
+        steps.starts_with(&["pr".to_string(), "pr:change".to_string(), "guidance".to_string(), "review".to_string()]),
+        "{steps:?} / {outcome:?}"
+    );
     assert_eq!(unrelated_decisions(&fx).iter().filter(|d| d.status == "pending").count(), 1, "the question stands");
 }
 
@@ -4021,7 +4034,7 @@ fn findings_just_posted_are_read_back_as_threads_not_sent_by_name() {
         steps_of(&turn_labels(&agent))
     );
     let steps = steps_of(&turn_labels(&agent));
-    assert_eq!(steps, ["pr", "review", "pr:change", "review", "pr:push"], "{outcome:?}");
+    assert_eq!(steps, ["pr", "guidance", "review", "pr:change", "review", "pr:push"], "{outcome:?}");
 }
 
 /// Like [`OwnReviewFeed`], but the pull request's head moves on every read

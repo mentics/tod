@@ -93,6 +93,8 @@ pub(crate) struct TaskHeader {
     /// The latest review's coverage in one line (lenses covered, saturation
     /// pass owed), or why it could not be read; `None` when never reviewed.
     pub coverage_label: Option<String>,
+    /// The node's guidance selection and what the user may add.
+    pub guidance: crate::unified::panels::guidance::GuidanceView,
 }
 
 impl TaskHeader {
@@ -172,6 +174,7 @@ fn load(fleet: &FleetStore, node_id: Uuid) -> TaskHeader {
         Ok(latest) => latest.map(|latest| latest.summary_label()),
         Err(err) => Some(format!("Coverage could not be read: {err:#}")),
     };
+    header.guidance = crate::unified::panels::guidance::GuidanceView::load(fleet, node_id);
     header
 }
 
@@ -646,6 +649,132 @@ impl TaskPanel {
                     .child(self.artifact_link("unified-task-journey", "Journey".into(), PanelKind::Journey(node_id), cx)),
             )
             .into_any_element()
+    }
+
+    /// The Guidance section: each selected item with its reason and Remove,
+    /// and Add listing what may still be added. Nothing before a selection
+    /// has run or anything is selected.
+    fn render_guidance(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        use crate::unified::panels::guidance::{add_label, row_text};
+        let view = &self.header.guidance;
+        if let Some(error) = &view.error {
+            return Some(
+                selectable_text_colored("unified-task-guidance-error", error.clone(), style::color::danger(), window, cx)
+                    .into_any_element(),
+            );
+        }
+        if !view.has_run && view.live.is_empty() {
+            return None;
+        }
+        let weak = cx.weak_entity();
+        let addable = view.addable.clone();
+        let add = (!addable.is_empty()).then(|| {
+            Button::new("unified-task-guidance-add")
+                .label("Add…")
+                .ghost()
+                .compact()
+                .dropdown_caret(true)
+                .dropdown_menu(move |mut popup, _, _| {
+                    for (kind, item) in &addable {
+                        let (weak, kind, item) = (weak.clone(), kind.clone(), item.clone());
+                        popup = popup.item(PopupMenuItem::new(add_label(&kind, &item)).on_click(move |_, _, cx| {
+                            let _ = weak.update(cx, |this: &mut TaskPanel, cx| this.change_guidance(true, &kind, &item, cx));
+                        }));
+                    }
+                    popup
+                })
+        });
+        let rows: Vec<AnyElement> = view
+            .rows()
+            .into_iter()
+            .enumerate()
+            .map(|(i, g)| {
+                let (kind, item) = (g.kind.clone(), g.item.clone());
+                div()
+                    .flex()
+                    .items_start()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(selectable_text(("unified-task-guidance-row", i), row_text(g), window, cx)),
+                    )
+                    .child(
+                        Button::new(("unified-task-guidance-remove", i))
+                            .label("Remove")
+                            .ghost()
+                            .compact()
+                            .on_click(cx.listener(move |this, _, _, cx| this.change_guidance(false, &kind, &item, cx))),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(style::text_dense_label(div()).child("Guidance"))
+                        .children(add),
+                )
+                .when(view.live.is_empty(), |el| {
+                    el.child(style::text_muted(div()).child("Nothing selected."))
+                })
+                .children(rows)
+                .into_any_element(),
+        )
+    }
+
+    /// The user's Add or Remove on the Guidance section, recorded as a
+    /// journey `UserAction` with the section as presented, then written off
+    /// the UI thread; a failure is said on the runner line.
+    fn change_guidance(&mut self, add: bool, kind: &str, item: &str, cx: &mut Context<Self>) {
+        use crate::unified::panels::guidance::{add_id, remove_id};
+        use tod_store::interview::{ACTOR_USER, InterviewCommand};
+        let node = self.node_id;
+        let id = if add { add_id(kind, item) } else { remove_id(kind, item) };
+        crate::ui::journey::record_action(
+            cx,
+            Focus::Node(node),
+            id,
+            crate::ui::journey::Source::Click,
+            "task_panel",
+            self.header.guidance.presented(),
+        );
+        let command = if add {
+            InterviewCommand::SelectGuidance(tod_store::guidance::Selection {
+                node_id: node,
+                conversation_id: None,
+                kind: kind.to_string(),
+                item: item.to_string(),
+                applies: true,
+                reason: "Added by the user.".to_string(),
+            })
+        } else {
+            InterviewCommand::RemoveGuidance { node_id: node, kind: kind.to_string(), item: item.to_string() }
+        };
+        let fleet = self.fleet.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { fleet.interview(ACTOR_USER, command).map_err(anyhow::Error::from) })
+                .await;
+            let _ = this.update(cx, |this: &mut TaskPanel, cx| {
+                if let Err(err) = result {
+                    this.runner.cloud_note = Some(format!("Could not change the guidance: {err:#}"));
+                    this.runner.cloud_failed = true;
+                }
+                this.pending_refresh = true;
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Re-read the lifecycle state and attention off the UI thread.
@@ -1819,6 +1948,7 @@ impl Render for TaskPanel {
         let identity = self.render_identity(window, cx);
         let pr_controls = self.pr_controls.clone();
         let artifacts = self.render_artifacts(cx);
+        let guidance = self.render_guidance(window, cx);
         let runner = self.render_runner_line(window, cx);
         let requests = self.render_requests(cx);
         let drawer = self.render_answered_drawer(window, cx);
@@ -1843,6 +1973,7 @@ impl Render for TaskPanel {
                     .child(identity)
                     .child(pr_controls)
                     .child(artifacts)
+                    .children(guidance)
                     .children(runner),
             ))
             // Requests scroll; the drawer stays at the bottom.

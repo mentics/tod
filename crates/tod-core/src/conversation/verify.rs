@@ -110,7 +110,7 @@ impl Protocol for VerificationProtocol {
         let role_doc = state_lifecycle_doc(&manifest, VERIFYING)?;
         let cwd = self.cwd(env)?;
         let working_dir = PathBuf::from(cwd.path_text());
-        let skills = crate::skills_context::for_group(fleet, node_id, "verify", &cwd, env.skill_group())?;
+        let skills = crate::skills_context::for_work(fleet, node_id, "verify", &cwd, env.skill_group())?;
         let fixes = fleet.read(|conn| crate::phase::evidence_fixes(conn, node_id))?;
         let message = build_verify_message(
             env.media,

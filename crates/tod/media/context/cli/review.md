@@ -62,7 +62,9 @@ another.
   with `--reason` saying why the lens does not apply to this change.
 - `--file`: a changed file the entry covers. `--read`: a file you read for it
   (the project's review guidance, a skill it routes to, code a lens needed).
-  Both repeat.
+  Both repeat. A selected skill or file whose text is not in your opening
+  must be named under `--read` (a skill by its name, a file by its path)
+  before `done` is accepted.
 
 `done` records that the review is finished. It only works inside a review
 conversation; until a turn records it, the app sends the review back to you.

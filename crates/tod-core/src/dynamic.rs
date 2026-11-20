@@ -144,6 +144,10 @@ pub enum DynamicBlock {
     /// with its before and after text, the node it was made on, and how it
     /// reached this one.
     IncomingChanges,
+    /// What the guidance selector chooses from (pre-rendered by
+    /// `crate::guidance`): the change or the design, the candidates, the
+    /// project's routing table, the lenses, and what is selected so far.
+    GuidanceSelection,
     /// What a conversation is about: its kind, path, title, and (by kind) its
     /// full text, its obligations and plan steps, or the top-level nodes.
     Focus,
@@ -183,6 +187,7 @@ pub struct DynamicContext<'a> {
     pub working_dir: Option<&'a Path>,
     pub focus: Option<&'a FocusSelection>,
     pub incoming: &'a [IncomingChangeItem],
+    pub guidance: &'a str,
     pub environment: &'a str,
     pub skills: &'a str,
     pub pull_requests: &'a str,
@@ -512,6 +517,12 @@ fn render_block(block: DynamicBlock, ctx: &DynamicContext<'_>, out: &mut String)
             for item in ctx.incoming {
                 out.push_str(&incoming_change_lines(item));
             }
+        }
+
+        DynamicBlock::GuidanceSelection => {
+            out.push_str("\n## Guidance to select from\n\n");
+            out.push_str(ctx.guidance.trim());
+            out.push('\n');
         }
 
         DynamicBlock::Focus => {

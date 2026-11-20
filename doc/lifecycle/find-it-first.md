@@ -719,6 +719,24 @@ use what exists:
   request. That keeps work in a cloud sandbox from being lost. After that,
   only the pull request agent pushes.
 
+**Items 7 and 15 are built (2026-11-19).** The store is `tod_store::guidance`
+(schema v104). The app's trigger matching and the selector's material are in
+`tod_core::guidance`, and the selector is the `guidance` protocol
+(`conversation/guidance.rs`, haiku at low effort unless the lifecycle config
+key `guidance` sets them). The CLI is `tod-cli guidance`. The task panel has a
+Guidance section with Remove and Add. Some of it differs from the plan:
+
+- The predicted selection runs lazily, before the first work session after
+  design is certified, not as a step on the way into `active`.
+- The selection goes into the Skills block (`skills_context::for_work`),
+  which keeps the recipes' cache order. It does not have a block of its own.
+- The selector loops only while a lens is not recorded either way.
+- A `pr_draft` review owes an actual selection once per stay, as `review`
+  does.
+- Selector sessions count toward the run's session budget.
+- A selected file that is missing at inlining time fails the session as an
+  agent failure. No supervisor-specific handling was added.
+
 | # | Item | Files | Done when |
 |---|---|---|---|
 | 1 | Review prompts: remove the discouraging and delta-only text; whole change every round; lenses; variant analysis; saturation pass; evidence audit | `surface/review.md`, `surface/review-on-pr.md`, `state/review.md` | The surface asks for all of 6a–6f; context tests pass |

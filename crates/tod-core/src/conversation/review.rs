@@ -148,7 +148,7 @@ impl Protocol for ReviewProtocol {
             Some(Reviewer::Risk) => tod_store::lifecycle_config::REVIEW_RISK,
             _ => tod_store::lifecycle_config::REVIEW,
         };
-        let skills = crate::skills_context::for_group(fleet, node_id, key, &cwd, env.skill_group())?;
+        let skills = crate::skills_context::for_work(fleet, node_id, key, &cwd, env.skill_group())?;
         // With the pull request open (`pr_draft`, `pr_review`) the review runs
         // on its local head, and the app posts what it records there when
         // that head reaches the pull request unreviewed

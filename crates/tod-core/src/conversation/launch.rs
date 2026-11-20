@@ -31,6 +31,7 @@ pub fn role_for(kind: ProtocolKind) -> AgentRole {
         | ProtocolKind::Phase
         | ProtocolKind::Evaluate
         | ProtocolKind::Incoming
+        | ProtocolKind::Guidance
         | ProtocolKind::Pr => AgentRole::Default,
     }
 }
@@ -61,6 +62,7 @@ pub fn phase_for(
             _ => lifecycle_config::REVIEW.to_string(),
         },
         ProtocolKind::Fix => "fix".to_string(),
+        ProtocolKind::Guidance => lifecycle_config::GUIDANCE.to_string(),
         ProtocolKind::Pr => match state()?.as_str() {
             "pr_draft" => "pr_draft".to_string(),
             "pr_review" => "pr_review".to_string(),
@@ -120,10 +122,18 @@ pub fn try_for_focus(
         let configured = fleet
             .read(|conn| lifecycle_config::resolve_agent(conn, node, phase))
             .map_err(|err| err.context(format!("reading node {node}'s Lifecycle config for the {phase} phase")))?;
-        if let Some((model, _)) = configured.model {
+        // The guidance selector only matches descriptions against a change
+        // summary: unless its key says otherwise, it runs on the small model
+        // at low effort, whatever the node's Agent capability says.
+        let (default_model, default_effort) = if phase == lifecycle_config::GUIDANCE {
+            (Some(lifecycle_config::GUIDANCE_DEFAULT_MODEL), Some(lifecycle_config::GUIDANCE_DEFAULT_EFFORT))
+        } else {
+            (None, None)
+        };
+        if let Some(model) = configured.model.map(|(m, _)| m).or(default_model.map(str::to_string)) {
             options.model = coerce_model(options.platform, &model);
         }
-        if let Some((effort, _)) = configured.effort {
+        if let Some(effort) = configured.effort.map(|(e, _)| e).or(default_effort.map(str::to_string)) {
             options.effort = coerce_effort(options.platform, &effort);
         }
     }
@@ -417,6 +427,47 @@ mod tests {
         let launch = risk();
         assert_eq!((launch.model.as_str(), launch.effort.as_str()), ("opus", "high"));
         assert_eq!(resolve(&store, &settings(), focus, ProtocolKind::Review).model, "sonnet");
+        drop(store);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The guidance selector runs on haiku at low effort whatever the node's
+    /// Agent capability says, unless its own lifecycle-config key sets them.
+    #[test]
+    fn the_guidance_selector_defaults_to_haiku_at_low_effort() {
+        use tod_store::lifecycle_config::{Agents, GUIDANCE, PhaseAgent};
+        let (root, store, node) = store_with_node();
+        store
+            .enqueue_outline(OutlineMutation::EnableCapabilities {
+                node_id: node,
+                capabilities: vec![Capability::Agent, Capability::LifecycleConfig, Capability::Lifecycle],
+            })
+            .unwrap();
+        store
+            .enqueue(FleetMutation::UpsertNodeAgent {
+                node_id: node.to_string(),
+                platform: None,
+                model: Some("opus".into()),
+                effort: Some("high".into()),
+            })
+            .unwrap();
+        store.writer().flush().unwrap();
+        store.reload_if_stale().ok();
+        assert_eq!(phase_for(&store, Focus::Node(node), ProtocolKind::Guidance, None).as_deref(), Some(GUIDANCE));
+        let at = |kind| resolve(&store, &settings(), Focus::Node(node), kind);
+        let guidance = at(ProtocolKind::Guidance);
+        assert_eq!((guidance.model.as_str(), guidance.effort.as_str()), ("haiku", "low"));
+        // Every other kind keeps the node's own.
+        let implement = at(ProtocolKind::Implementation);
+        assert_eq!((implement.model.as_str(), implement.effort.as_str()), ("opus", "high"));
+        // The key's own model wins; the effort it leaves unset stays low.
+        let agents: Agents =
+            [(GUIDANCE.to_string(), PhaseAgent { model: Some("sonnet".into()), effort: None })].into();
+        store.enqueue_outline(OutlineMutation::SetNodeLifecycleAgents { node_id: node, agents }).unwrap();
+        store.writer().flush().unwrap();
+        store.reload_if_stale().ok();
+        let guidance = at(ProtocolKind::Guidance);
+        assert_eq!((guidance.model.as_str(), guidance.effort.as_str()), ("sonnet", "low"));
         drop(store);
         let _ = std::fs::remove_dir_all(&root);
     }
