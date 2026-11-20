@@ -89,6 +89,7 @@ fn phase_label(phase: &str) -> &'static str {
     match phase {
         "proposed" => "Proposed",
         "design" => "Design",
+        "guidance" => "Guidance selector",
         "planning" => "Planning",
         "implement" => "Implement",
         "verify" => "Verify",
@@ -116,6 +117,11 @@ fn phase_blurb(phase: &str) -> Option<&'static str> {
         "fix" => Some(
             "For the separate agent that fixes what the review found, then is reviewed again. \
              Optional: leave it empty and the fix still runs; add project-specific ways to fix.",
+        ),
+        "guidance" => Some(
+            "The short session that picks which of the project's skills, files, lenses and checks a \
+             task's change needs, before the work and again at review. It takes no skills; it runs on \
+             haiku at low effort unless set here.",
         ),
         "verify_evaluate" => Some(
             "For the independent agent that audits verification's evidence (with independent \
@@ -580,7 +586,9 @@ impl LifecycleConfigEditor {
                 } else {
                     all_checks.insert(phase.to_string(), checks);
                 }
-                skills.insert(phase.to_string(), names);
+                if lifecycle_config::takes_skills(phase) {
+                    skills.insert(phase.to_string(), names);
+                }
                 if agent.is_empty() {
                     agents.remove(phase);
                 } else {
@@ -775,22 +783,29 @@ impl LifecycleConfigEditor {
                     cx.stop_propagation();
                 }
             }))
-            .child(
-                div()
-                    .text_xs()
-                    .font_semibold()
-                    .child(format!("Skills for {}", phase_label(form.phase))),
-            )
-            .child(Input::new(&form.skills))
+            .when(lifecycle_config::takes_skills(form.phase), |el| {
+                el.child(
+                    div()
+                        .text_xs()
+                        .font_semibold()
+                        .child(format!("Skills for {}", phase_label(form.phase))),
+                )
+                .child(Input::new(&form.skills))
+            })
+            .when(!lifecycle_config::takes_skills(form.phase), |el| {
+                el.child(div().text_xs().font_semibold().child(phase_label(form.phase)))
+            })
             .when_some(phase_blurb(form.phase), |el, blurb| {
                 el.child(div().text_xs().text_color(cx.theme().muted_foreground).child(blurb))
             })
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child("Used in this order. Leave empty to give this node and what is below it no skills for the phase."),
-            )
+            .when(lifecycle_config::takes_skills(form.phase), |el| {
+                el.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Used in this order. Leave empty to give this node and what is below it no skills for the phase."),
+                )
+            })
             .child(div().text_xs().font_semibold().child("Model and effort"))
             .child(
                 h_flex()

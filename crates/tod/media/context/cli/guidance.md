@@ -7,7 +7,7 @@ put, text and all, into every implement, verify, review and fix session of
 the task.
 
 ```
-tod-cli --data-root <DATA_ROOT> guidance list    [<NODE>]
+tod-cli --data-root <DATA_ROOT> guidance list    [<NODE>] [--all]
 tod-cli --data-root <DATA_ROOT> guidance select  [<NODE>] --kind skill|file|lens|check --item <ITEM> --reason <TEXT> [--not-applying]
 tod-cli --data-root <DATA_ROOT> guidance add     <NODE> --kind skill|file|lens|check --item <ITEM> [--reason <TEXT>]
 tod-cli --data-root <DATA_ROOT> guidance remove  <NODE> --kind skill|file|lens|check --item <ITEM>

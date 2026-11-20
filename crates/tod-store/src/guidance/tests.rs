@@ -274,3 +274,31 @@ fn unread_for_review_counts_inlined_and_read_items() {
     .unwrap();
     assert!(unread_for_review(&fx.conn, review, fx.node).unwrap().is_empty());
 }
+
+/// A store already past v104 (another branch's step merged first) skips the
+/// v104 step; the tables and their journey triggers are made sure of anyway.
+#[test]
+fn a_store_past_the_guidance_version_still_gets_its_tables_and_triggers() {
+    let dir = tod_test_util::scratch_dir(format!("tod-guidance-later-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("tod.db");
+    let conn = schema::open_writer_connection(&path).unwrap();
+    conn.execute_batch(
+        "DROP TABLE node_guidance; DROP TABLE node_guidance_runs;",
+    )
+    .unwrap();
+    // At the current version every step is skipped, as the v104 one is at v105.
+    let later = schema::CURRENT_USER_VERSION;
+    conn.pragma_update(None, "user_version", later).unwrap();
+    drop(conn);
+    let conn = schema::open_writer_connection(&path).unwrap();
+    let count = |sql: &str| conn.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap();
+    assert_eq!(
+        count("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name IN ('node_guidance', 'node_guidance_runs')"),
+        2
+    );
+    assert_eq!(
+        count("SELECT count(*) FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'trg_journey_node_guidance%'"),
+        6
+    );
+}

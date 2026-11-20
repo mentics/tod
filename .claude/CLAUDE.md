@@ -747,6 +747,33 @@ fingerprint of the files, committed or not) and sends failures to the Fix protoc
 findings (in a phase-agent state the failing gate re-runs the phase agent instead, with the output in its gate status), bounded by `review_round_limit`. A check may be scoped (`dir`, `changed`, `pattern`): it applies only when that part of the tree changed on the branch, and is otherwise `skipped`, not in the gate. `tod-cli` cannot set them: the app runs the
 command, so only the user configures one.
 
+**Guidance** (`tod_store::guidance`, tables `node_guidance` and
+`node_guidance_runs`, schema v104; `tod_core::guidance`;
+`doc/lifecycle/find-it-first.md` section 12) is the part of the project's own
+instructions a node's change needs: skills, always-read files (`REVIEW.md`,
+a submodule's `CLAUDE.md`), the review lenses and the checks. Each item is
+stored with its reason. Before an Implement, Verify, Review or Fix session in
+a codebase, the autopilot's `select_guidance` runs a selection when one is
+owed (`guidance::due`):
+
+- **predicted**, against the design, once design is certified;
+- **actual**, against the change, on each stay in review;
+- **grown**, when the change's directories outgrow those of the last
+  selection.
+
+The app first matches each SKILL.md's `applies_to {paths, terms}` itself,
+with no model. The `guidance` protocol's selector session (haiku at low
+effort unless the lifecycle config key `guidance` sets them; it takes no
+skills) then picks from the rest with `tod-cli guidance select`, and must
+record every lens one way or the other. The selection is recorded before the
+next session's opening is built. `skills_context::for_work` inlines the
+selected text into that opening, and every reviewer gets the same text.
+`review done` is refused while a selected item was neither inlined nor listed
+under `--read`. Only the selector and the user select; only the user adds or
+removes, in the task panel's Guidance section or with `tod-cli guidance
+add|remove`. An item the user removed is not selected again until the user
+adds it back.
+
 **Groups** (`Capability::Groups`, `tod_store::groups`, table `node_groups`)
 has one setting, `by_lifecycle`. The node tree then shows the node's children
 under a header per lifecycle state, in lifecycle order, made only while a child

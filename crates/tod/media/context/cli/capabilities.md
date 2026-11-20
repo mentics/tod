@@ -31,7 +31,10 @@ wherever that node came from.
 and effort it runs with, for the node and everything below it. `<PHASE>` is one
 of proposed, design, planning, implement, verify, verify_evaluate, review,
 fix, pr, pr_draft, pr_review, merged, released, learn (`verify_evaluate` is
-the evaluator of verification's evidence; unset, it takes `verify`'s). `--skills` replaces that phase's list
+the evaluator of verification's evidence; unset, it takes `verify`'s), or
+guidance (the session that selects the project's guidance for a task: it
+takes `--model` and `--effort` only, and runs on haiku at low effort unless
+set). `--skills` replaces that phase's list
 (`--skills ''` means none, even where an ancestor sets some). `--model` and
 `--effort` set that phase's (`--model ''` unsets one, so an ancestor's, the
 node's Agent capability, or the settings apply again); each resolves on its own
