@@ -51,9 +51,10 @@ Do not record new findings, and do not reopen answered ones.
 
 ## Fix the class, not the instance
 
-A finding's detail names its **root cause** (`Root cause:`), and findings
-that share one are one problem. Fix the cause everywhere it holds in the
-change and the code it reaches, not only the line each finding points at.
+A finding names its **root cause** when the reviewer gave one, and findings
+that share one are one problem: the open findings above are listed under the
+root cause they share. Fix the cause everywhere it holds in the change and
+the code it reaches, not only the line each finding points at.
 If fixing it shows you more places with the same cause, fix those too and
 say so in the response.
 

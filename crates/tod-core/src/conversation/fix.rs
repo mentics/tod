@@ -23,7 +23,7 @@ use super::implement::{
 use super::problems::or_report;
 use super::protocol::{Next, Protocol, ProtocolEnv, RunNotice, Stop, TurnContext, cap_or_stall};
 use crate::agent_context::{ImplementRequest, NodeSelection, build_fix_message};
-use crate::dynamic::review_finding_lines;
+use crate::dynamic::review_findings_lines;
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use tod_store::conversation::ProtocolKind;
@@ -156,9 +156,7 @@ impl Protocol for FixProtocol {
             return Ok(String::new());
         }
         let mut out = String::from("# Open review findings now\n\n");
-        for finding in &open {
-            out.push_str(&review_finding_lines(finding));
-        }
+        out.push_str(&review_findings_lines(&open));
         Ok(out)
     }
 
@@ -242,9 +240,7 @@ fn continuation_message(open: &[ReviewFinding], tests: Option<&TestRun>) -> Stri
         n => format!("{n} review findings are still open. Resolve them now, in this turn.\n\n"),
     };
     if !open.is_empty() {
-        for finding in open {
-            out.push_str(&review_finding_lines(finding));
-        }
+        out.push_str(&review_findings_lines(open));
         out.push_str(
             "\nEach one is yours to resolve: fix it and respond `fixed` with a \
              pointer to the change, or, if it is not a problem after all, \
@@ -338,6 +334,7 @@ mod tests {
                                 line: Some(i as i64 + 1),
                                 summary: format!("Finding {i}"),
                                 detail: Some("Empty input panics.".into()),
+                                root_cause: None,
                             },
                         },
                     )

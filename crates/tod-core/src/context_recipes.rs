@@ -693,6 +693,24 @@ missing"),
     /// `tod-cli` syntax is documented once, under `cli/`. A surface doc that
     /// spells out a command drifts from the reference the moment the command
     /// changes.
+    /// The review surface sweeps exactly tod's lenses (`tod_store::review::LENSES`,
+    /// the list the coverage check reads), in order and by the slug the
+    /// coverage record names, and the `review` noun's fragment lists them all.
+    #[test]
+    fn the_review_surface_sweeps_exactly_the_lenses_coverage_checks() {
+        let Some(root) = context_root() else { return };
+        let surface = std::fs::read_to_string(root.join("surface/review.md")).unwrap();
+        let cli = std::fs::read_to_string(root.join("cli/review.md")).unwrap();
+        let lenses = tod_store::review::LENSES;
+        for (i, lens) in lenses.iter().enumerate() {
+            let entry = format!("{}. **{}** (`{}`)", i + 1, lens.title, lens.slug);
+            assert!(surface.contains(&entry), "surface/review.md lacks `{entry}`");
+            assert!(cli.contains(&format!("`{}`", lens.slug)), "cli/review.md does not list `{}`", lens.slug);
+        }
+        let next = format!("\n{}. **", lenses.len() + 1);
+        assert!(!surface.contains(&next), "surface/review.md lists a lens the coverage check does not know");
+    }
+
     #[test]
     fn tod_cli_syntax_appears_only_under_cli() {
         let Some(root) = context_root() else { return };

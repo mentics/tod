@@ -114,6 +114,7 @@ pub const SYNCED_TABLES: &[&str] = &[
     "node_groups",
     "obligation_verdicts",
     "review_findings",
+    "review_coverage",
     "node_subtree_archives",
     "decisions",
     "decision_answers",

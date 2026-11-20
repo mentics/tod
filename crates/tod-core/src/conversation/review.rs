@@ -17,28 +17,25 @@ use super::protocol::{Next, Protocol, ProtocolEnv, Stop, TurnContext, cap_or_sta
 use crate::agent_context::{ImplementRequest, NodeSelection, build_review_message, build_review_on_pr_message};
 use crate::process_bundle::{ProcessManifest, TodInstallPaths, state_role_doc};
 use anyhow::{Context, Result};
-use serde_json::{Value, json};
 use std::path::PathBuf;
 use rusqlite::Connection;
 use tod_store::conversation::{ConversationRepo, Focus, ProtocolKind};
 use tod_store::fleet::provision::resolve_launch_cwd;
 use tod_store::outline::EXTRA_CONTENT_DETAILS;
 use tod_store::outline::repos::NodeRepo;
-use tod_store::review::{FINDING_DECLINED, FINDING_OUT_OF_SCOPE, NewFinding, ReviewRepo};
+use tod_store::review::{
+    CoveragePass, CoverageResult, FINDING_DECLINED, FINDING_OUT_OF_SCOPE, NewCoverage, NewFinding,
+    ReviewRepo,
+};
 use uuid::Uuid;
 
 /// The lifecycle state whose role doc says how review is done.
 const REVIEW: &str = "review";
 
-/// The report `tod-cli review done` records.
-pub fn done_report() -> Value {
-    json!({ "review": "done" })
-}
-
-/// Whether `report` says the review is finished.
-pub fn is_done_report(report: &Value) -> bool {
-    report.get("review").and_then(Value::as_str) == Some("done")
-}
+/// The report `tod-cli review done` records, and the test for it. They live
+/// with the coverage check that guards recording it
+/// (`tod_store::review::coverage::record_done`).
+pub use tod_store::review::{done_report, is_done_report};
 
 /// Whether the node's review conversation last reported the review finished.
 /// A review started again reports nothing until it finishes too, so this stays
@@ -242,8 +239,9 @@ fn continuation_message() -> String {
     "The review is not recorded as finished. Finish reviewing the change now, \
      in this turn.\n\n\
      Record every finding you have not recorded yet through the `review` noun, \
-     then record the review done. If there is nothing more to find, record it \
-     done now.\n\n\
+     and the coverage of every lens and the saturation pass, then record the \
+     review done; until the coverage is complete, recording it done says what \
+     is missing. If there is nothing more to find, record it done now.\n\n\
      Your reply, when you stop, is at most a sentence or two, or nothing: the \
      user already sees every finding."
         .to_string()
@@ -251,8 +249,9 @@ fn continuation_message() -> String {
 
 /// Plays the review agent for `--agent mock`: the first turn records one
 /// finding and stops without finishing, so the app's loop sends it back; the
-/// next records the review done — like [`super::verify::mock_turn`], a review
-/// takes one continuation.
+/// next sweeps every lens, makes the saturation pass, and records the review
+/// done through the same check `tod-cli review done` runs — like
+/// [`super::verify::mock_turn`], a review takes one continuation.
 pub fn mock_turn(
     access: &impl super::mock::Access,
     node_id: Uuid,
@@ -278,17 +277,50 @@ pub fn mock_turn(
                 line: Some(1),
                 summary: "Mock finding — the mock agent reads no code.".to_string(),
                 detail: Some("Recorded by `--agent mock` to exercise the review pane.".to_string()),
+                root_cause: Some("The mock agent reads no code.".to_string()),
             },
         })?;
         return Ok(String::new());
     }
-    access.interview(
-        tod_store::interview::InterviewCommand::RecordConversationReport {
-            conversation_id,
-            body: done_report(),
-        },
-    )?;
+    let mine: Vec<Uuid> = access.read(|conn| {
+        Ok(ReviewRepo::new(conn)
+            .list_for_node(node_id)?
+            .into_iter()
+            .filter(|f| f.conversation_id == Some(conversation_id))
+            .map(|f| f.id)
+            .collect())
+    })?;
+    for lens in tod_store::review::LENSES {
+        // The finding the first turn recorded is the obligations lens's.
+        let result = if lens.slug == "obligations" && !mine.is_empty() {
+            CoverageResult::Findings(mine.clone())
+        } else {
+            CoverageResult::None
+        };
+        record_mock_coverage(access, conversation_id, CoveragePass::Lens(lens.slug.to_string()), result)?;
+    }
+    record_mock_coverage(access, conversation_id, CoveragePass::Saturation, CoverageResult::None)?;
+    access.interview(tod_store::interview::InterviewCommand::RecordReviewDone { conversation_id })?;
     Ok(String::new())
+}
+
+fn record_mock_coverage(
+    access: &impl super::mock::Access,
+    conversation_id: Uuid,
+    pass: CoveragePass,
+    result: CoverageResult,
+) -> Result<()> {
+    access.interview(tod_store::interview::InterviewCommand::RecordReviewCoverage {
+        conversation_id,
+        entry: NewCoverage {
+            pass,
+            files: vec!["src/lib.rs".to_string()],
+            checked: Some("Nothing: the mock agent reads no code.".to_string()),
+            result,
+            read: Vec::new(),
+        },
+    })?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -297,6 +329,7 @@ mod tests {
     use crate::conversation::protocol::CONTINUATION_CAP;
     use crate::interview::test_support::fixture;
     use crate::media::MediaPaths;
+    use serde_json::{Value, json};
     use tod_store::conversation::Focus;
 
     fn decide(report: Option<Value>, continuations: u32, progressed: bool) -> Next {

@@ -1410,6 +1410,7 @@ mod tests {
                     line: Some(3),
                     summary: "Unchecked unwrap".into(),
                     detail: None,
+                    root_cause: None,
                 },
             )
             .unwrap();

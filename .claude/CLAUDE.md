@@ -414,7 +414,13 @@ counts), since the final state alone reads as a clean run. `review.rs` is the co
 for a node in `review` (the autopilot's Review step): the agent records each
 finding through `tod-cli review` (`tod_store::review`, on the node, not the
 conversation) and loops until it records `review done`; it replaces the old
-`review` on-entry turn, and the task panel lists the findings. `fix.rs`
+`review` on-entry turn, and the task panel lists the findings. The store
+refuses `review done` (`review::coverage::record_done`) until the
+conversation's coverage record (`review_coverage`, schema v99) has an entry
+for every required lens (`review::LENSES`, `coverage::required_lenses`) and a
+saturation pass that found nothing after its last finding; the findings panel
+shows that record. A finding may carry a root cause, and the Fix session sees
+findings that share one grouped together. `fix.rs`
 resolves them (the autopilot's Fix step): given the open findings, the agent answers each `fixed` or
 `rejected` with a note — `tod-cli` refuses it the user's answers — and loops
 until none is open and a test run is green. The `review` → `pr` gate is app-checked

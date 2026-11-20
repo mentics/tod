@@ -282,6 +282,16 @@ pub enum InterviewCommand {
         conversation_id: Option<Uuid>,
         finding: crate::review::NewFinding,
     },
+    /// Record one entry of a review conversation's coverage: a lens it swept,
+    /// or its saturation pass (`crate::review::coverage`).
+    RecordReviewCoverage {
+        conversation_id: Uuid,
+        entry: crate::review::NewCoverage,
+    },
+    /// Record a review conversation finished; refused, naming what is
+    /// missing, until its coverage is complete
+    /// (`crate::review::coverage::record_done`).
+    RecordReviewDone { conversation_id: Uuid },
     /// Link a pull request to a node, once `tod-cli pr open` has created it
     /// (`crate::github::NodePrRepo::add`: the Ticket capability's
     /// `linked_prs`).
@@ -1182,6 +1192,17 @@ pub fn execute(
             let finding =
                 crate::review::ReviewRepo::new(conn).add(*node_id, *conversation_id, finding)?;
             Ok(json!({ "id": finding.id.to_string(), "seq": finding.seq }))
+        }
+        InterviewCommand::RecordReviewCoverage {
+            conversation_id,
+            entry,
+        } => {
+            let entry = crate::review::coverage::add(conn, *conversation_id, entry)?;
+            Ok(json!({ "id": entry.id.to_string() }))
+        }
+        InterviewCommand::RecordReviewDone { conversation_id } => {
+            let turn_seq = crate::review::coverage::record_done(conn, *conversation_id)?;
+            Ok(json!({ "turn_seq": turn_seq }))
         }
         InterviewCommand::RecordNodePr {
             node_id,

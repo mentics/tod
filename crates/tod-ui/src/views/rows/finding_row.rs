@@ -161,6 +161,20 @@ pub fn finding_row<A: From<FindingRowEvent> + 'static>(
             cx,
         )));
     }
+    if let Some(cause) = finding.root_cause.as_deref().filter(|c| !c.trim().is_empty()) {
+        body = body.child(
+            h_flex()
+                .gap(style::space::INLINE)
+                .items_start()
+                .child(style::text_dense_label(div()).flex_shrink_0().child("Root cause"))
+                .child(style::text_dense(div()).min_w_0().child(selectable_text(
+                    format!("review-finding-root-cause-{id}"),
+                    cause.trim().to_string(),
+                    window,
+                    cx,
+                ))),
+        );
+    }
     if let Some(detail) = &finding.detail {
         body = body.child(style::text_dense_muted(div()).child(selectable_text(
             format!("review-finding-detail-{id}"),

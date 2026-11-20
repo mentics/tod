@@ -6,11 +6,40 @@
 //! response, whichever review found it. The agent records findings through
 //! `tod-cli review`; the user (or an agent addressing them) responds with a
 //! status and a note. Spec: `doc/conversation/protocols.md` §4c.
+//!
+//! Findings that share a **root cause** (the assumption or pattern that made
+//! them possible) carry it in the same words, so the fix covers the class
+//! ([`group_by_root_cause`]). What each review round checked, lens by lens, is
+//! its [`coverage`].
 
 use crate::outline::uuid_blob::{blob_to_uuid_sql, now_ms, uuid_to_blob};
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
+
+pub mod coverage;
+
+pub use coverage::{
+    CoverageEntry, CoverageGaps, CoveragePass, CoverageResult, LatestCoverage, Lens, NewCoverage,
+    done_report, is_done_report, lens, required_lenses,
+};
+
+/// tod's review lenses, in the order a review sweeps them
+/// (`doc/lifecycle/find-it-first.md` 6c): the one list the review surface
+/// (`surface/review.md`) and the coverage check read.
+pub const LENSES: [Lens; 11] = [
+    Lens { slug: "obligations", title: "Obligations" },
+    Lens { slug: "data-assumptions", title: "Data assumptions" },
+    Lens { slug: "external-systems", title: "External systems" },
+    Lens { slug: "persisted-results", title: "Persisted results" },
+    Lens { slug: "interactions", title: "Interactions" },
+    Lens { slug: "reach", title: "Reach" },
+    Lens { slug: "data-writes", title: "Data writes" },
+    Lens { slug: "concurrency", title: "Concurrency and cancellation" },
+    Lens { slug: "error-paths", title: "Error paths" },
+    Lens { slug: "tests", title: "Tests" },
+    Lens { slug: "verification-evidence", title: "Verification evidence" },
+];
 
 /// Not yet responded to.
 pub const FINDING_OPEN: &str = "open";
@@ -79,6 +108,9 @@ pub struct ReviewFinding {
     pub pr_thread: Option<String>,
     /// When it was posted on the pull request; `None` until then.
     pub pr_posted_at: Option<i64>,
+    /// The assumption or pattern that made it possible, in the same words
+    /// for every finding that shares it (`tod-cli review add --root-cause`).
+    pub root_cause: Option<String>,
 }
 
 impl ReviewFinding {
@@ -107,6 +139,8 @@ pub struct NewFinding {
     pub summary: String,
     #[serde(default)]
     pub detail: Option<String>,
+    #[serde(default)]
+    pub root_cause: Option<String>,
 }
 
 pub const CREATE_TABLE: &str = "
@@ -127,13 +161,14 @@ pub const CREATE_TABLE: &str = "
         updated_at      INTEGER NOT NULL,
         pr_thread       TEXT,
         pr_posted_at    INTEGER,
+        root_cause      TEXT,
         UNIQUE (node_id, seq)
     );
     CREATE INDEX IF NOT EXISTS idx_review_findings_node ON review_findings(node_id, seq);
 ";
 
 const COLUMNS: &str = "id, node_id, conversation_id, seq, severity, file, line, summary, detail, \
-     status, response, created_at, updated_at, pr_thread, pr_posted_at";
+     status, response, created_at, updated_at, pr_thread, pr_posted_at, root_cause";
 
 /// The `pr_thread` and `pr_posted_at` columns (idempotent, no schema bump: the
 /// sync copies only the columns both sides have).
@@ -147,6 +182,54 @@ pub fn add_pr_columns(conn: &Connection) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The `root_cause` column (schema v99; idempotent, like [`add_pr_columns`]).
+pub fn add_root_cause_column(conn: &Connection) -> Result<()> {
+    let has = conn
+        .prepare("SELECT 1 FROM pragma_table_info('review_findings') WHERE name = 'root_cause'")?
+        .exists([])?;
+    if !has {
+        conn.execute_batch("ALTER TABLE review_findings ADD COLUMN root_cause TEXT")?;
+    }
+    Ok(())
+}
+
+/// A root cause as findings are matched on it: case, and runs of whitespace,
+/// do not tell two apart.
+fn root_cause_key(cause: &str) -> String {
+    cause.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+
+/// Findings that share a root cause, or one finding without one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FindingGroup<'a> {
+    /// The cause as the group's first finding words it.
+    pub root_cause: Option<&'a str>,
+    pub findings: Vec<&'a ReviewFinding>,
+}
+
+/// `findings` grouped by root cause, in the order each group's first finding
+/// comes; a finding with no root cause is a group of its own. A fixer sees
+/// the class, not only its instances.
+pub fn group_by_root_cause(findings: &[ReviewFinding]) -> Vec<FindingGroup<'_>> {
+    let mut groups: Vec<(Option<String>, FindingGroup<'_>)> = Vec::new();
+    for finding in findings {
+        let cause = finding
+            .root_cause
+            .as_deref()
+            .map(str::trim)
+            .filter(|c| !c.is_empty());
+        let key = cause.map(root_cause_key);
+        if let Some(key) = &key
+            && let Some((_, group)) = groups.iter_mut().find(|(k, _)| k.as_ref() == Some(key))
+        {
+            group.findings.push(finding);
+            continue;
+        }
+        groups.push((key, FindingGroup { root_cause: cause, findings: vec![finding] }));
+    }
+    groups.into_iter().map(|(_, group)| group).collect()
 }
 
 /// `raw` as one of `allowed`, case-insensitively.
@@ -193,6 +276,11 @@ impl<'a> ReviewRepo<'a> {
             .as_deref()
             .map(str::trim)
             .filter(|d| !d.is_empty());
+        let root_cause = finding
+            .root_cause
+            .as_deref()
+            .map(str::trim)
+            .filter(|c| !c.is_empty());
         let seq: i64 = self.conn.query_row(
             "SELECT COALESCE(MAX(seq), 0) + 1 FROM review_findings WHERE node_id = ?1",
             params![uuid_to_blob(node_id)],
@@ -203,8 +291,8 @@ impl<'a> ReviewRepo<'a> {
         self.conn.execute(
             "INSERT INTO review_findings
              (id, node_id, conversation_id, seq, severity, file, line, summary, detail,
-              status, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'open', ?10, ?10)",
+              status, created_at, updated_at, root_cause)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'open', ?10, ?10, ?11)",
             params![
                 uuid_to_blob(id),
                 uuid_to_blob(node_id),
@@ -216,6 +304,7 @@ impl<'a> ReviewRepo<'a> {
                 summary,
                 detail,
                 now,
+                root_cause,
             ],
         )?;
         self.get(id)?.context("finding vanished after insert")
@@ -362,6 +451,7 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReviewFinding> {
         updated_at: row.get(12)?,
         pr_thread: row.get(13)?,
         pr_posted_at: row.get(14)?,
+        root_cause: row.get(15)?,
     })
 }
 
@@ -402,6 +492,7 @@ mod tests {
             line: Some(12),
             summary: summary.into(),
             detail: Some("Empty input panics.".into()),
+            root_cause: None,
         }
     }
 
@@ -484,6 +575,37 @@ mod tests {
         assert_eq!(repo.find_by_pr_thread(fx.node, "PRRT_1").unwrap().map(|f| f.id), Some(a));
         let b = repo.get(b).unwrap().unwrap();
         assert!(b.pr_posted_at.is_some() && b.pr_thread.is_none());
+    }
+
+    #[test]
+    fn findings_are_grouped_by_their_root_cause() {
+        let fx = setup();
+        let repo = ReviewRepo::new(&fx.conn);
+        let with_cause = |summary: &str, cause: Option<&str>| NewFinding {
+            root_cause: cause.map(str::to_string),
+            ..finding(summary)
+        };
+        repo.add(fx.node, None, &with_cause("a", Some("  The id is treated as unique ")))
+            .unwrap();
+        repo.add(fx.node, None, &with_cause("b", None)).unwrap();
+        repo.add(fx.node, None, &with_cause("c", Some("the id is treated  as UNIQUE")))
+            .unwrap();
+        repo.add(fx.node, None, &with_cause("d", Some(" "))).unwrap();
+        let findings = repo.list_for_node(fx.node).unwrap();
+        assert_eq!(findings[0].root_cause.as_deref(), Some("The id is treated as unique"));
+        assert_eq!(findings[3].root_cause, None);
+        let groups: Vec<(Option<&str>, Vec<&str>)> = group_by_root_cause(&findings)
+            .into_iter()
+            .map(|g| (g.root_cause, g.findings.iter().map(|f| f.summary.as_str()).collect()))
+            .collect();
+        assert_eq!(
+            groups,
+            [
+                (Some("The id is treated as unique"), vec!["a", "c"]),
+                (None, vec!["b"]),
+                (None, vec!["d"]),
+            ]
+        );
     }
 
     /// Findings belong to the node: deleting the conversation that recorded

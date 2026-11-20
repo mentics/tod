@@ -1139,6 +1139,7 @@ pub fn record_findings(fleet: &FleetStore, node: Uuid, failed: &[&CheckRun]) -> 
                         if run.dir.is_empty() { String::new() } else { format!(", run in `{}`", run.dir) },
                         run.output
                     )),
+                    root_cause: None,
                 },
             },
         )?;

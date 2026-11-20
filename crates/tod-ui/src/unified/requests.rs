@@ -1648,6 +1648,19 @@ impl Requests {
                 window,
                 cx,
             ));
+        if let Some(cause) = finding
+            .as_ref()
+            .and_then(|f| f.root_cause.as_deref())
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+        {
+            card = card.child(div().w_full().min_w_0().text_xs().child(selectable_text(
+                SharedString::from(format!("unified-decisions-finding-root-cause-{}", item.id)),
+                format!("Root cause: {cause}"),
+                window,
+                cx,
+            )));
+        }
         if let Some(finding) = finding {
             card = card.child(div().flex().flex_wrap().gap_1().children(
                 [(FINDING_FIXED, "Fixed"), (FINDING_OUT_OF_SCOPE, "Out of scope"), (FINDING_DECLINED, "Declined")]
