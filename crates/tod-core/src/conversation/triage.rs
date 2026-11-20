@@ -322,7 +322,7 @@ pub fn mock_turn(access: &impl super::mock::Access, _node_id: Uuid, conversation
             })?;
         }
     } else if status == tod_store::decisions::DECISION_ANSWERED {
-        let has_lesson = access.read(|conn| Ok(!tod_store::lessons::for_decision(conn, decision.id)?.is_empty()))?;
+        let has_lesson = access.read(|conn| tod_store::lessons::triage_lesson_exists(conn, decision.id))?;
         if !has_lesson {
             let by_triage = access.read(|conn| {
                 Ok(DecisionRepo::new(conn)

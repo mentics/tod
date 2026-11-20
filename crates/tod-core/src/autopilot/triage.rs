@@ -106,7 +106,7 @@ impl Autopilot {
                 for d in DecisionRepo::new(conn).list_for_node(node)? {
                     let Some(conversation) = d.triage_conversation_id else { continue };
                     if d.status != DECISION_ANSWERED
-                        || !tod_store::lessons::for_decision(conn, d.id)?.is_empty()
+                        || !tod_store::lessons::triage_lesson_exists(conn, d.id)?
                         || notes.iter().any(|n| n.kind == KIND_NOTE && n.title == no_lesson_title(&d))
                     {
                         continue;
@@ -124,7 +124,7 @@ impl Autopilot {
             {
                 return Ok(Some(outcome));
             }
-            let recorded = fleet.read(|conn| Ok(!tod_store::lessons::for_decision(conn, decision.id)?.is_empty()))?;
+            let recorded = fleet.read(|conn| tod_store::lessons::triage_lesson_exists(conn, decision.id))?;
             if !recorded {
                 let lifecycle = lifecycle::current_state(fleet, node)?;
                 let entry = TimelineEntry::new(

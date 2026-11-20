@@ -1,10 +1,25 @@
 //! Improvement lessons (schema v112; `doc/requests/design.md` 11.1): what went
 //! wrong or took longer than it should have, and what would have prevented
 //! it, recorded where it was learned so a later process review can group them
-//! by target and cause. Synced and journaled. Step 7 writes the triage ones
-//! ([`record_triage_lesson`]); the send-back, incident and ladder writers, the
-//! user's highlights, the `tod-cli lessons` noun and the process review are
-//! step 8's.
+//! by target and cause. Synced and journaled.
+//!
+//! The writers, every one mechanical (no model), each idempotent per source
+//! event through the lesson's `event_key` ([`record_once`]):
+//!
+//! - triage ([`record_triage_lesson`]): the one reflection a closed request gets;
+//! - send-back ([`record_dispute_lesson`]): every send-back and dispute, made
+//!   when it is and revised when its resolution is written;
+//! - ladder ([`record_quick_fix_escalation`], [`record_fixer_failure`]): a
+//!   quick fix that had to escalate, a configured fixer that failed;
+//! - incident ([`record_tool_incident`]): a `tool_broken` incident opening and
+//!   resolving (a tod bug candidate);
+//! - user ([`Op::Add`], and [`migrate_request_feedback`] for the "Shouldn't have
+//!   asked" clicks of before): the user's own words.
+//!
+//! The process review (`tod_core::process_review`) reads them: a run groups the
+//! new ones (`run_node_id`, `grouped_at`), and what it acted on is marked
+//! `applied` with the commit or node that did ([`Op::Apply`]). `tod-cli lessons`
+//! lists them, declines one and shows the measures ([`crate::lesson_stats`]).
 //!
 //! A lesson belongs to a node (an incident's, to the node that met it), so it
 //! is journaled and synced with it; its other links are optional.
@@ -77,12 +92,40 @@ pub const CREATE_TABLE: &str = "
                             CHECK (status IN ('new','grouped','applied','declined')),
         applied_ref     TEXT NOT NULL DEFAULT '',
         created_at      INTEGER NOT NULL,
-        updated_at      INTEGER NOT NULL
+        updated_at      INTEGER NOT NULL,
+        event_key       TEXT NOT NULL DEFAULT '',
+        run_node_id     BLOB,
+        grouped_at      INTEGER
     );
     CREATE INDEX IF NOT EXISTS idx_improvement_lessons_node ON improvement_lessons(node_id, created_at);
     CREATE INDEX IF NOT EXISTS idx_improvement_lessons_decision ON improvement_lessons(decision_id);
     CREATE INDEX IF NOT EXISTS idx_improvement_lessons_status ON improvement_lessons(status, created_at);
 ";
+
+/// Schema v113: the columns v112's table did not have (`event_key`, which
+/// makes each writer idempotent per source event; the process-review run a
+/// lesson was grouped into), the unique index on the key, and the rows of the
+/// retired `request_feedback`. Idempotent, so it is also run on every open.
+pub fn ensure_columns(conn: &Connection) -> Result<()> {
+    let has = |column: &str| -> Result<bool> {
+        Ok(conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('improvement_lessons') WHERE name = ?1",
+            params![column],
+            |row| row.get(0),
+        )?)
+    };
+    for (column, ddl) in [("event_key", "TEXT NOT NULL DEFAULT ''"), ("run_node_id", "BLOB"), ("grouped_at", "INTEGER")] {
+        if !has(column)? {
+            conn.execute_batch(&format!("ALTER TABLE improvement_lessons ADD COLUMN {column} {ddl};"))?;
+        }
+    }
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_improvement_lessons_event
+             ON improvement_lessons(event_key) WHERE event_key <> '';
+         CREATE INDEX IF NOT EXISTS idx_improvement_lessons_run ON improvement_lessons(run_node_id);",
+    )?;
+    Ok(())
+}
 
 /// One recorded lesson.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,6 +145,11 @@ pub struct Lesson {
     pub applied_ref: String,
     pub created_at: i64,
     pub updated_at: i64,
+    /// The source event it was written for (empty for a lesson without one).
+    pub event_key: String,
+    /// The process-review node that took it in.
+    pub run_node_id: Option<Uuid>,
+    pub grouped_at: Option<i64>,
 }
 
 /// A lesson as a writer gives it.
@@ -126,7 +174,7 @@ pub struct NewLesson {
 }
 
 const COLUMNS: &str = "id, node_id, source, decision_id, conversation_id, send_back_id, incident_id, category, \
-     target, summary, user_quote, status, applied_ref, created_at, updated_at";
+     target, summary, user_quote, status, applied_ref, created_at, updated_at, event_key, run_node_id, grouped_at";
 
 fn blob_opt(row: &rusqlite::Row<'_>, i: usize) -> rusqlite::Result<Option<Uuid>> {
     row.get::<_, Option<Vec<u8>>>(i)?.map(|b| blob_to_uuid_sql(&b)).transpose()
@@ -149,11 +197,42 @@ fn lesson_of(row: &rusqlite::Row<'_>) -> rusqlite::Result<Lesson> {
         applied_ref: row.get(12)?,
         created_at: row.get(13)?,
         updated_at: row.get(14)?,
+        event_key: row.get(15)?,
+        run_node_id: blob_opt(row, 16)?,
+        grouped_at: row.get(17)?,
     })
 }
 
 /// Record a lesson. Every writer goes through here.
 pub fn record(conn: &Connection, new: &NewLesson) -> Result<Lesson> {
+    insert(conn, new, "")
+}
+
+/// Record a lesson for the source event `event_key` (`send_back:<id>`,
+/// `ladder:quick_fix:<id>`, ...), once: `None` when one was already written
+/// for it, so a writer that runs twice for the same event adds nothing.
+pub fn record_once(conn: &Connection, new: &NewLesson, event_key: &str) -> Result<Option<Lesson>> {
+    if event_key.trim().is_empty() {
+        bail!("an event key is blank");
+    }
+    if by_event(conn, event_key)?.is_some() {
+        return Ok(None);
+    }
+    Ok(Some(insert(conn, new, event_key)?))
+}
+
+/// The lesson written for `event_key`.
+pub fn by_event(conn: &Connection, event_key: &str) -> Result<Option<Lesson>> {
+    Ok(conn
+        .query_row(
+            &format!("SELECT {COLUMNS} FROM improvement_lessons WHERE event_key = ?1"),
+            params![event_key],
+            lesson_of,
+        )
+        .optional()?)
+}
+
+fn insert(conn: &Connection, new: &NewLesson, event_key: &str) -> Result<Lesson> {
     if !SOURCES.contains(&new.source.as_str()) {
         bail!("unknown lesson source `{}` (expected {})", new.source, SOURCES.join("|"));
     }
@@ -169,8 +248,8 @@ pub fn record(conn: &Connection, new: &NewLesson) -> Result<Lesson> {
     conn.execute(
         "INSERT INTO improvement_lessons
              (id, node_id, source, decision_id, conversation_id, send_back_id, incident_id, category,
-              target, summary, user_quote, status, applied_ref, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'new', '', ?12, ?12)",
+              target, summary, user_quote, status, applied_ref, created_at, updated_at, event_key)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'new', '', ?12, ?12, ?13)",
         params![
             uuid_to_blob(id),
             uuid_to_blob(new.node_id),
@@ -184,6 +263,7 @@ pub fn record(conn: &Connection, new: &NewLesson) -> Result<Lesson> {
             summary,
             new.user_quote.trim(),
             now,
+            event_key,
         ],
     )?;
     get(conn, id)?.ok_or_else(|| anyhow::anyhow!("lesson vanished after insert"))
@@ -208,48 +288,9 @@ pub fn for_decision(conn: &Connection, decision: Uuid) -> Result<Vec<Lesson>> {
     Ok(rows)
 }
 
-/// A triage reflection: the one lesson triage records when a request it read
-/// closes (`doc/requests/design.md` 8.7). The only writer of a triage lesson,
-/// so step 8 (which routes lessons to targets and the process review) has one
-/// place to extend. The request's closing is what it learns from: its
-/// `category`, what `summary` says went wrong or right, and the user's own
-/// `user_quote` when they said something about it.
-pub fn record_triage_lesson(
-    conn: &Connection,
-    decision: Uuid,
-    conversation: Uuid,
-    category: &str,
-    summary: &str,
-    user_quote: &str,
-) -> Result<Lesson> {
-    // step 8: set `target` from the category and the request's reason (a
-    // context fragment, the brief guidance, a role doc), and group.
-    if !TRIAGE_CATEGORIES.contains(&category) {
-        bail!("unknown category `{category}` (expected {})", TRIAGE_CATEGORIES.join("|"));
-    }
-    let Some(found) = crate::decisions::DecisionRepo::new(conn).get(decision)? else {
-        bail!("decision {decision} not found");
-    };
-    if found.triage_conversation_id != Some(conversation) {
-        bail!("decision {decision} is not the request this triage session read");
-    }
-    if crate::decisions::is_open(&found.status) {
-        bail!("the request is still open: reflect once it is answered");
-    }
-    if !for_decision(conn, decision)?.is_empty() {
-        bail!("a lesson was already recorded for this request");
-    }
-    record(
-        conn,
-        &NewLesson {
-            node_id: found.node_id,
-            source: SOURCE_TRIAGE.to_string(),
-            decision_id: Some(decision),
-            conversation_id: Some(conversation),
-            category: category.to_string(),
-            summary: summary.to_string(),
-            user_quote: user_quote.to_string(),
-            ..Default::default()
-        },
-    )
-}
+
+mod writers;
+pub use writers::*;
+
+#[cfg(test)]
+mod tests;

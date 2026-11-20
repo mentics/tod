@@ -190,6 +190,10 @@ pub fn upsert(conn: &Connection, fix: &QuickFix) -> Result<()> {
             fix.finished_at,
         ],
     )?;
+    // A climb up the ladder is a lesson (`doc/requests/design.md` 11.1).
+    if fix.outcome == OUTCOME_ESCALATED {
+        crate::lessons::record_quick_fix_escalation(conn, fix)?;
+    }
     Ok(())
 }
 

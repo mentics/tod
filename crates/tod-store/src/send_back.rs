@@ -710,19 +710,10 @@ fn record_move(conn: &Connection, m: &Mover<'_>) -> Result<Value> {
         format!("Sent back from {from} by the {sender}")
     };
     TimelineRepo::new(conn).record(&TimelineEntry::new(node, KIND_SEND_BACK, to, title, false, detail(&row)))?;
-    record_dispute_lesson(conn, &row)?;
+    crate::lessons::record_dispute_lesson(conn, &row)?;
     Ok(json!({ "outcome": OUTCOME_MOVED, "from": from, "to": to, "id": row.id }))
 }
 
-/// The hook where a dispute or send-back becomes a lesson for the
-/// self-improvement loop (`doc/requests/design.md` 11.1, source `send_back`:
-/// "an earlier phase was unclear or wrong", written from its reason and, once
-/// settled, its resolution). Called when a send-back is made and again when a
-/// dispute is resolved (`row.resolution_kind` set).
-// step 8: write an `improvement_lessons` row here. Nothing is recorded yet.
-fn record_dispute_lesson(_conn: &Connection, _row: &SendBack) -> Result<()> {
-    Ok(())
-}
 
 /// A request to settle a dispute (`tod-cli lifecycle resolve-dispute`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -875,7 +866,7 @@ fn settle(conn: &Connection, dispute: &SendBack, kind: &str, note: &str, state: 
     settled.resolution_kind = kind.to_string();
     settled.resolution = note.to_string();
     settled.resolved_at = Some(now);
-    record_dispute_lesson(conn, &settled)?;
+    crate::lessons::record_dispute_lesson(conn, &settled)?;
     // The dispute this one carried up is settled the way it was: its own
     // phase agent's note, then the phase that settled it.
     if kind != RESOLUTION_PASSED_UP
@@ -890,7 +881,7 @@ fn settle(conn: &Connection, dispute: &SendBack, kind: &str, note: &str, state: 
         up.resolution_kind = kind.to_string();
         up.resolution = combined;
         up.resolved_at = Some(now);
-        record_dispute_lesson(conn, &up)?;
+        crate::lessons::record_dispute_lesson(conn, &up)?;
     }
     Ok(())
 }

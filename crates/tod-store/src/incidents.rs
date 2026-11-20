@@ -605,6 +605,11 @@ fn observe_classified(
         )?;
     }
     conn.execute("DELETE FROM incident_sightings WHERE signature = ?1", params![c.signature])?;
+    // A tool of tod's own broken on several nodes is a tod bug candidate: a
+    // lesson (`doc/requests/design.md` 11.1), mechanical.
+    if c.kind == Kind::ToolBroken {
+        crate::lessons::record_tool_incident(conn, incident.id, other, &c.summary, &c.signature, "opened", 2)?;
+    }
     let incident = get(conn, incident.id)?;
     Ok(Observed { verdict: Verdict::Parked, attempt: attempts, incident, opened: true })
 }
@@ -780,6 +785,20 @@ pub fn resolve(conn: &Connection, incident: Uuid, now: i64) -> Result<()> {
              next_probe_at = NULL WHERE id = ?1",
         params![uuid_to_blob(incident), now],
     )?;
+    if found.kind == Kind::ToolBroken {
+        let held = members(conn, incident)?;
+        if let Some(first) = found.samples.first().map(|s| s.node).or_else(|| held.first().map(|m| m.node_id)) {
+            crate::lessons::record_tool_incident(
+                conn,
+                incident,
+                first,
+                &found.summary,
+                &found.signature,
+                "resolved",
+                held.len(),
+            )?;
+        }
+    }
     if let Some(decision) = found.escalation_decision
         && decision_pending(conn, decision)
     {

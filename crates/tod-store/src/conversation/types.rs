@@ -145,6 +145,7 @@ str_enum!(
         SmallReview => "small_review",
         Incident => "incident",
         Triage => "triage",
+        ProcessReview => "process_review",
     }
 );
 

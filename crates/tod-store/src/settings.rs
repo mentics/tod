@@ -114,6 +114,63 @@ fn default_quick_fix_turns() -> u32 {
     DEFAULT_QUICK_FIX_TURNS
 }
 
+/// The process review (`doc/requests/design.md` 11.2,
+/// `doc/lifecycle/self-improvement.md`): how often tod's daemon groups the new
+/// improvement lessons into a node of its own.
+pub const DEFAULT_PROCESS_REVIEW_EVERY_HOURS: u32 = 24;
+pub const DEFAULT_PROCESS_REVIEW_MIN_LESSONS: u32 = 10;
+
+fn default_process_review_every_hours() -> u32 {
+    DEFAULT_PROCESS_REVIEW_EVERY_HOURS
+}
+
+fn default_process_review_min_lessons() -> u32 {
+    DEFAULT_PROCESS_REVIEW_MIN_LESSONS
+}
+
+/// `process_review` in `tod.yml`. The review runs only when `parent` names a
+/// node: its output is a node per run under it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessReviewSettings {
+    /// The slug (or UUID) of the node every run's node is made under. Unset:
+    /// the process review does not run.
+    #[serde(default)]
+    pub parent: Option<String>,
+    /// A review is due once this many hours passed since the last one (and at
+    /// least one lesson is new).
+    #[serde(default = "default_process_review_every_hours")]
+    pub every_hours: u32,
+    /// A review is due as soon as this many lessons are new, whenever the
+    /// last one ran.
+    #[serde(default = "default_process_review_min_lessons")]
+    pub min_lessons: u32,
+}
+
+impl Default for ProcessReviewSettings {
+    fn default() -> Self {
+        Self {
+            parent: None,
+            every_hours: default_process_review_every_hours(),
+            min_lessons: default_process_review_min_lessons(),
+        }
+    }
+}
+
+impl ProcessReviewSettings {
+    pub fn validate(&self) -> Result<()> {
+        if self.parent.as_deref().is_some_and(|p| p.trim().is_empty()) {
+            bail!("process_review.parent is blank: name the parent node's slug, or leave it out");
+        }
+        if self.every_hours == 0 {
+            bail!("process_review.every_hours must be at least 1");
+        }
+        if self.min_lessons == 0 {
+            bail!("process_review.min_lessons must be at least 1");
+        }
+        Ok(())
+    }
+}
+
 /// How the lifecycle runner judges a phase done
 /// (`doc/lifecycle/phase-agents.md`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1198,6 +1255,9 @@ pub struct TodSettings {
     /// What makes a pull request ready, and how the babysitter gets it there.
     #[serde(default)]
     pub pr_readiness: PrReadinessSettings,
+    /// How often lessons are grouped into a process-review node, and where.
+    #[serde(default)]
+    pub process_review: ProcessReviewSettings,
     /// How long idle connections to cloud sandboxes stay open.
     #[serde(default)]
     pub sandbox_idle: SandboxIdleSettings,
@@ -1241,6 +1301,7 @@ impl Default for TodSettings {
             lifecycle: LifecycleSettings::default(),
             visual_design: VisualDesignSettings::default(),
             pr_readiness: PrReadinessSettings::default(),
+            process_review: ProcessReviewSettings::default(),
             sandbox_idle: SandboxIdleSettings::default(),
             credentials_file_only: false,
             branch_template: default_branch_template(),
@@ -1413,6 +1474,7 @@ impl TodSettings {
         }
         self.journeys.validate()?;
         self.pr_readiness.validate()?;
+        self.process_review.validate()?;
         crate::branch_name::validate_template(&self.branch_template)?;
         Ok(())
     }
@@ -1696,6 +1758,11 @@ mod tests {
                 draft_blind: Vec::new(),
                 known_repos: Vec::new(),
                 unrelated_checks: Vec::new(),
+            },
+            process_review: ProcessReviewSettings {
+                parent: Some("process-improvements".into()),
+                every_hours: 12,
+                min_lessons: 4,
             },
             sandbox_idle: SandboxIdleSettings::default(),
             credentials_file_only: true,

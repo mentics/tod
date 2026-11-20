@@ -341,6 +341,9 @@ pub enum InterviewCommand {
     /// its answer, escalation, conversions, the user's in-chat settlement, or
     /// the closing reflection.
     Triage(crate::triage::Op),
+    /// A write of the improvement lessons (`crate::lessons`): the user's own
+    /// words, declining one, marking some applied.
+    Lessons(crate::lessons::Op),
     /// Record an open code review finding on a node (`crate::review`).
     AddReviewFinding {
         node_id: Uuid,
@@ -560,6 +563,7 @@ pub fn execute(
             | InterviewCommand::PhaseReject { .. }
             | InterviewCommand::SendBack(_)
             | InterviewCommand::Triage(_)
+            | InterviewCommand::Lessons(_)
     ) &&crate::phase::certifier_for_actor(conn, actor)?.1 == crate::phase::CERTIFIER_INDEPENDENT
     {
         bail!(
@@ -1337,6 +1341,7 @@ pub fn execute(
         }
         InterviewCommand::Incident(op) => crate::incidents::run_op(conn, op),
         InterviewCommand::Triage(op) => crate::triage::run_op(conn, actor, op),
+        InterviewCommand::Lessons(op) => crate::lessons::run_op(conn, actor, op),
         InterviewCommand::FileSuggestion(new) => crate::suggestions::file_json(conn, new),
         InterviewCommand::SetSuggestionDuplicates { id, duplicates, checked, note } => {
             crate::suggestions::set_duplicates(conn, *id, duplicates, *checked, note)?;

@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 112;
+pub const CURRENT_USER_VERSION: i32 = 113;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -764,6 +764,14 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         conn.execute_batch(&crate::journey_changes::lessons_triggers_sql())?;
         conn.pragma_update(None, "user_version", 112)?;
     }
+    if version < 113 {
+        // Lessons and the process review (`doc/lifecycle/self-improvement.md`):
+        // the lessons' event key and run link, and the rows of the retired
+        // `request_feedback` as lessons (the table stays).
+        crate::lessons::ensure_columns(conn)?;
+        crate::lessons::migrate_request_feedback(conn)?;
+        conn.pragma_update(None, "user_version", 113)?;
+    }
     // Other branches (the task panel) numbered their own steps 66–67 at the
     // same time as 66–70 above, so a store may be past a version without
     // having these. Every one is idempotent: make sure of them all.
@@ -867,6 +875,7 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     // Idempotent, so a store that skipped 112 still has them.
     crate::decisions::ensure_triage(conn)?;
     conn.execute_batch(crate::lessons::CREATE_TABLE)?;
+    crate::lessons::ensure_columns(conn)?;
     conn.execute_batch(&crate::journey_changes::lessons_triggers_sql())?;
     crate::sync::install(conn)?;
     // Idempotent and cheap — keeps the gate criteria catalog's wording in

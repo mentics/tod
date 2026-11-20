@@ -21,6 +21,7 @@ pub mod failure_signature;
 pub mod done_close;
 pub mod environment;
 pub mod groups;
+pub mod lesson_stats;
 pub mod lessons;
 pub mod lifecycle_config;
 pub mod environment_presets;
