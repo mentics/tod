@@ -106,6 +106,14 @@ fn default_review_round_limit() -> u32 {
     DEFAULT_REVIEW_ROUND_LIMIT
 }
 
+/// The most turns a quick fix (`doc/requests/design.md` section 5) gets on
+/// one failing check before it escalates to the Fix protocol.
+pub const DEFAULT_QUICK_FIX_TURNS: u32 = 3;
+
+fn default_quick_fix_turns() -> u32 {
+    DEFAULT_QUICK_FIX_TURNS
+}
+
 /// How the lifecycle runner judges a phase done
 /// (`doc/lifecycle/phase-agents.md`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,6 +128,11 @@ pub struct LifecycleSettings {
     /// Running the node again starts a fresh set of rounds.
     #[serde(default = "default_review_round_limit")]
     pub review_round_limit: u32,
+    /// The most turns a quick fix gets on one failing check
+    /// (`lifecycle.quick_fix_turns`; at least 1) before the check goes to the
+    /// Fix protocol.
+    #[serde(default = "default_quick_fix_turns")]
+    pub quick_fix_turns: u32,
     /// How each repository ships (`doc/lifecycle/repo-profiles.md`). The
     /// first entry that matches a pull request's repository applies; a
     /// repository nothing matches uses [`RepoProfile::Release`].
@@ -132,6 +145,7 @@ impl Default for LifecycleSettings {
         Self {
             independent_evaluation: default_independent_evaluation(),
             review_round_limit: default_review_round_limit(),
+            quick_fix_turns: default_quick_fix_turns(),
             repo_profiles: Vec::new(),
         }
     }
@@ -493,6 +507,12 @@ pub struct PrReadinessSettings {
     /// CI checks with a command that fixes them mechanically.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub check_fixes: Vec<CiCheckFix>,
+    /// CI checks (names as GitHub shows them) whose failure goes to the pull
+    /// request agent at once, with no quick fix first: the per-check switch
+    /// for a check whose quick fixes usually fail
+    /// (`tod_core::quick_fix`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skip_quick_fix: Vec<String>,
     /// The ask comments (lowercase) of bots a node was told to go on without
     /// and so are no longer in `bots`: comments holding them are still tod's
     /// own asks, never feedback. Never saved.
@@ -661,6 +681,7 @@ impl Default for PrReadinessSettings {
             review_schedule: ReviewSchedule::default(),
             max_infra_reruns: default_max_infra_reruns(),
             check_fixes: Vec::new(),
+            skip_quick_fix: Vec::new(),
             waived_asks: Vec::new(),
             own_review: OwnReviewState::default(),
             draft_blind: Vec::new(),
@@ -1656,6 +1677,7 @@ mod tests {
             lifecycle: LifecycleSettings {
                 independent_evaluation: false,
                 review_round_limit: 8,
+                quick_fix_turns: 2,
                 repo_profiles: vec![RepoProfileSetting { repo: "acme/infra".into(), profile: RepoProfile::Merge }],
             },
             visual_design: VisualDesignSettings {
@@ -1667,6 +1689,7 @@ mod tests {
                 max_rounds: 4,
                 max_infra_reruns: 3,
                 check_fixes: vec![CiCheckFix { check: "lint".into(), fix: "cargo fmt".into() }],
+                skip_quick_fix: vec!["e2e".into()],
                 review_schedule: ReviewSchedule { start_hour: 9, ..ReviewSchedule::default() },
                 waived_asks: Vec::new(),
                 own_review: OwnReviewState::default(),

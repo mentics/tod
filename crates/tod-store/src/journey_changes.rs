@@ -64,6 +64,9 @@
 //!   it), created by [`guidance_triggers_sql`] in the v104 migration.
 //! - `node_suggestions` (`tod_store::suggestions`, out-of-scope work filed on
 //!   a node), created by [`suggestions_triggers_sql`] in the v109 migration.
+//! - `node_quick_fixes` (`tod_store::quick_fixes`, each quick-fix attempt on a
+//!   failing check), created by [`quick_fixes_triggers_sql`] in the v110
+//!   migration.
 //! - `node_files_locations` (`tod_store::fleet::repos::files_location`, the
 //!   worktree or sandbox made for each node), created by
 //!   [`files_locations_triggers_sql`] in the v75 migration.
@@ -457,6 +460,12 @@ pub fn guidance_triggers_sql() -> String {
 /// place (duplicates found, accepted, dismissed).
 pub fn suggestions_triggers_sql() -> String {
     simple_id_triggers("node_suggestions")
+}
+
+/// Triggers for `node_quick_fixes` (`crate::quick_fixes`): attempts updated in
+/// place (the session started, the outcome known).
+pub fn quick_fixes_triggers_sql() -> String {
+    simple_id_triggers("node_quick_fixes")
 }
 
 /// Triggers for a table shaped `(id BLOB PRIMARY KEY, node_id BLOB, ...)`.

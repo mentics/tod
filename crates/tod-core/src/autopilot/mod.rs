@@ -24,6 +24,7 @@
 //! conversation that was in progress instead of starting another.
 
 mod github_wait;
+mod quick_fix;
 pub use github_wait::{
     GithubCheck, PUSH_WAIT_SPEC, PushRetrier, branch_push_failed, push_retry_delay_ms, branch_push_ok, check_github, check_now, github_look_failed, look_failed_next_look, read_wait_spec,
     retry_delay_ms,
@@ -631,6 +632,7 @@ impl Autopilot {
         loops.review_rounds = 0;
         loops.check_rounds = 0;
         loops.checks_sent = None;
+        loops.quick_fix_tried.clear();
         loops.pr_rounds = 0;
         loops.pr_unchanged = 0;
         loops.pr_housekeeping_rounds = 0;
@@ -1110,9 +1112,13 @@ impl Autopilot {
             }));
         }
         if round.clear() {
-            if self.state.loops.check_rounds != 0 || self.state.loops.checks_sent.is_some() {
+            if self.state.loops.check_rounds != 0
+                || self.state.loops.checks_sent.is_some()
+                || !self.state.loops.quick_fix_tried.is_empty()
+            {
                 self.state.loops.check_rounds = 0;
                 self.state.loops.checks_sent = None;
+                self.state.loops.quick_fix_tried.clear();
                 self.save()?;
             }
             return Ok(ChecksStep::Proceed);
@@ -1140,7 +1146,23 @@ impl Autopilot {
         if crate::phase::has_phase_agent(lifecycle) {
             return Ok(ChecksStep::Proceed);
         }
-        crate::checks::record_findings(fleet, node, &failed)?;
+        // Rung 1 of the escalation ladder: a cheap quick fix on each failing
+        // check before the Fix protocol is asked; green ones need no Fix and no
+        // new review round.
+        let quick = match self.quick_fix_checks(fleet, agent, hook, lifecycle, &round.fingerprint, &failed)? {
+            Ok(quick) => quick,
+            Err(outcome) => return Ok(ChecksStep::Stop(outcome)),
+        };
+        if quick.still_failing.is_empty() {
+            // The quick fix's commit gets one cheap reviewer in `pr_draft`; no
+            // Fix turn and no review round follow.
+            if let Some(outcome) = self.small_review_and_push(fleet, agent, hook, lifecycle)? {
+                return Ok(ChecksStep::Stop(outcome));
+            }
+            return Ok(ChecksStep::Fixed);
+        }
+        let remaining: Vec<&tod_store::check_runs::CheckRun> = quick.still_failing.iter().collect();
+        crate::checks::record_findings_with_notes(fleet, node, &remaining, &quick.notes)?;
         if let Some(outcome) = self.converse(fleet, agent, hook, ProtocolKind::Fix, None)? {
             return Ok(ChecksStep::Stop(outcome));
         }
@@ -1633,6 +1655,20 @@ impl Autopilot {
             }
             if self.run_ci_fixers(fleet, &live, &settings, phase_key)? {
                 continue;
+            }
+            self.resolve_ci_quick_fixes(fleet, &live)?;
+            match self.run_ci_quick_fixes(fleet, agent, hook, &live, &settings, phase_key)? {
+                quick_fix::CiQuick::Nothing => {}
+                quick_fix::CiQuick::Worked => {
+                    for p in &live {
+                        pr_readiness::forget_snapshot(&p.pr);
+                    }
+                    continue;
+                }
+                quick_fix::CiQuick::Stop(outcome) => {
+                    hook.waiting(None, None);
+                    return Ok(Some(outcome));
+                }
             }
             match self.update_branches(fleet, hook, feed.as_ref(), &live, before_review)? {
                 BranchUpdate::None => {}
@@ -2999,7 +3035,10 @@ impl Autopilot {
             Some(at) => (at, change.changed),
             None => {
                 hook.working_on("the change the pull request's feedback needs, committed for tod's review before it is pushed");
-                let reopen = self.pr_reopen_with(fleet, live, crate::conversation::pr::change_message(live))?;
+                let reopen = {
+                    let addendum = self.quick_fix_addendum(fleet, live)?;
+                    self.pr_reopen_with(fleet, live, format!("{}{addendum}", crate::conversation::pr::change_message(live)))?
+                };
                 if let Some(outcome) = self.pr_turn(fleet, agent, hook, reopen, phase_key)? {
                     return Ok(Some(outcome));
                 }
@@ -3334,7 +3373,8 @@ impl Autopilot {
                 .latest_for_focus_with_protocol(Focus::Node(node), ProtocolKind::Pr)?;
             Ok(conversation.filter(|c| since.is_none_or(|since| c.created_at >= since)))
         })?;
-        Ok(conversation.map(|c| (c.id, crate::conversation::pr::work_message(live))))
+        let addendum = self.quick_fix_addendum(fleet, live)?;
+        Ok(conversation.map(|c| (c.id, format!("{}{addendum}", crate::conversation::pr::work_message(live)))))
     }
 
     /// [`Self::pr_reopen`], sent `message`. With no pull request conversation

@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 109;
+pub const CURRENT_USER_VERSION: i32 = 110;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -739,6 +739,13 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         conn.execute_batch(&crate::journey_changes::suggestions_triggers_sql())?;
         conn.pragma_update(None, "user_version", 109)?;
     }
+    if version < 110 {
+        // Quick-fix attempts, one per try at a failing check before the Fix
+        // protocol (`crate::quick_fixes`): synced, journaled.
+        conn.execute_batch(crate::quick_fixes::CREATE_TABLE)?;
+        conn.execute_batch(&crate::journey_changes::quick_fixes_triggers_sql())?;
+        conn.pragma_update(None, "user_version", 110)?;
+    }
     // Other branches (the task panel) numbered their own steps 66–67 at the
     // same time as 66–70 above, so a store may be past a version without
     // having these. Every one is idempotent: make sure of them all.
@@ -834,6 +841,8 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     // Pull request heads and whether tod's review cleared them (v102).
     crate::pr_pushes::ensure_mechanical(conn)?;
     conn.execute_batch(&crate::journey_changes::pr_pushes_triggers_sql())?;
+    conn.execute_batch(crate::quick_fixes::CREATE_TABLE)?;
+    conn.execute_batch(&crate::journey_changes::quick_fixes_triggers_sql())?;
     crate::sync::install(conn)?;
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that

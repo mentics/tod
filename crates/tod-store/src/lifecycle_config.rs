@@ -83,8 +83,11 @@ pub fn add_delete_sandbox(conn: &Connection) -> Result<()> {
 /// The phases an agent works in, and so the keys a config may name: the
 /// lifecycle states that have a phase agent, and the protocols that run
 /// in the others (`implement`, `verify`, `review`, `fix`, `pr`), and the
-/// guidance selector (`guidance`), which runs before `active` and review.
-pub const PHASES: [&str; 16] = [
+/// guidance selector (`guidance`), which runs before `active` and review, and
+/// the two cheap sessions of the escalation ladder (`doc/requests/design.md`
+/// sections 5 and 4.2): the quick fix of one failing check (`quick_fix`) and
+/// the small-change review of its commit in `pr_draft` (`small_review`).
+pub const PHASES: [&str; 18] = [
     "proposed",
     "design",
     "guidance",
@@ -95,6 +98,8 @@ pub const PHASES: [&str; 16] = [
     "review",
     "review_risk",
     "fix",
+    "quick_fix",
+    "small_review",
     "pr",
     "pr_draft",
     "pr_review",
@@ -134,7 +139,37 @@ pub fn fallback(phase: &str) -> Option<&'static str> {
 /// risk reviewer's, one session inside `review` (whose checks are
 /// [`REVIEW`]'s), nor the guidance selector's, which has no gate.
 pub fn takes_checks(phase: &str) -> bool {
-    phase != VERIFY_EVALUATE && phase != REVIEW_RISK && phase != GUIDANCE
+    phase != VERIFY_EVALUATE && phase != REVIEW_RISK && !agent_only(phase)
+}
+
+/// The quick fix (`tod_core::conversation::quick_fix`): one cheap session on
+/// one failing check, before the Fix protocol. Only its model and effort are
+/// configured; unset, it runs on [`QUICK_FIX_DEFAULT_MODEL`] at
+/// [`QUICK_FIX_DEFAULT_EFFORT`] (`doc/requests/design.md` section 5).
+pub const QUICK_FIX: &str = "quick_fix";
+
+/// The small-change review in `pr_draft` of a quick fix's commit: one cheap
+/// reviewer, the diff only. Only its model and effort are configured.
+pub const SMALL_REVIEW: &str = "small_review";
+
+/// What the cheap sessions run on unless their key says otherwise.
+pub const CHEAP_DEFAULT_MODEL: &str = "haiku";
+pub const CHEAP_DEFAULT_EFFORT: &str = "low";
+pub const QUICK_FIX_DEFAULT_MODEL: &str = CHEAP_DEFAULT_MODEL;
+pub const QUICK_FIX_DEFAULT_EFFORT: &str = CHEAP_DEFAULT_EFFORT;
+
+/// Whether a phase key names a session that has no gate and takes no skills,
+/// only a model and effort: the guidance selector, the quick fix and the
+/// small-change review.
+pub fn agent_only(phase: &str) -> bool {
+    phase == GUIDANCE || phase == QUICK_FIX || phase == SMALL_REVIEW
+}
+
+/// The model and effort a phase's session runs on when no node sets them:
+/// the cheap tier for the sessions that are matching or small work
+/// (`doc/requests/design.md` section 6).
+pub fn default_agent(phase: &str) -> Option<(&'static str, &'static str)> {
+    agent_only(phase).then_some((CHEAP_DEFAULT_MODEL, CHEAP_DEFAULT_EFFORT))
 }
 
 /// The guidance selector (`tod_core::guidance`): only its model and effort
@@ -148,7 +183,7 @@ pub const GUIDANCE_DEFAULT_EFFORT: &str = "low";
 /// Whether a phase's agent takes skills: not the guidance selector, which
 /// reads none (it picks the guidance every other phase gets).
 pub fn takes_skills(phase: &str) -> bool {
-    phase != GUIDANCE
+    !agent_only(phase)
 }
 
 /// The last lifecycle state (`done`, which has no agent and so no entry in
@@ -286,8 +321,8 @@ pub fn set_skills(conn: &Connection, node_id: Uuid, config: &Skills) -> Result<(
         }
         if !takes_skills(phase) && names.iter().any(|n| !n.trim().is_empty()) {
             bail!(
-                "{phase} takes no skills: the guidance selector only picks the guidance the other phases get; \
-                 set its model and effort instead"
+                "{phase} takes no skills: the guidance selector, the quick fix and the small-change review run \
+                 on a model and effort only; set those instead"
             );
         }
         let mut list: Vec<String> = Vec::new();
@@ -444,6 +479,12 @@ pub struct Check {
     /// fixer's own output added.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub fix: String,
+    /// Skip rung 1 for this check: when it fails and no fix command cured it,
+    /// the Fix protocol is sent for it at once, with no quick fix first
+    /// (`doc/requests/design.md` section 5). For a check whose quick fixes
+    /// usually fail (`tod_store::quick_fixes::failure_rate`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub skip_quick_fix: bool,
 }
 
 impl Check {
@@ -549,8 +590,8 @@ pub fn set_checks(conn: &Connection, node_id: Uuid, config: &Checks) -> Result<(
             bail!("{phase} is not a lifecycle phase ({})", PHASES.join(", "));
         }
         if !takes_checks(phase) && !list.is_empty() {
-            if phase == GUIDANCE {
-                bail!("{phase} runs no checks: the guidance selector has no gate");
+            if agent_only(phase) {
+                bail!("{phase} runs no checks: it has no gate");
             }
             bail!("{phase} runs no checks: its gate is `verifying`'s, so put them under `{VERIFY}`");
         }
@@ -570,6 +611,7 @@ pub fn set_checks(conn: &Connection, node_id: Uuid, config: &Checks) -> Result<(
                 pattern: check.pattern.split_whitespace().collect::<Vec<_>>().join(" "),
                 setup: check.setup.trim().to_string(),
                 fix: check.fix.trim().to_string(),
+                skip_quick_fix: check.skip_quick_fix,
             });
         }
         clean.insert(phase.clone(), out);

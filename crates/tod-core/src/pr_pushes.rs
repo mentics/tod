@@ -164,6 +164,30 @@ pub fn record_mechanical(fleet: &FleetStore, node: Uuid, pr: &NodePr, previous: 
     Ok(())
 }
 
+/// Records that the commit `head` of a quick fix (`doc/requests/design.md`
+/// section 5) reached the pull request `pr` after the small-change review
+/// (`crate::conversation::small_review`, conversation `review`) found nothing
+/// wrong with it. It is recorded as a [`VERDICT_MECHANICAL`] head, so no
+/// further review is owed (`pr_draft_review::owed` exempts a head that moved
+/// only by such pushes); the protocol and conversation say what reviewed it.
+pub fn record_small_reviewed(fleet: &FleetStore, node: Uuid, pr: &NodePr, previous: Option<String>, head: &str, lifecycle: &str, review: Uuid) -> Result<()> {
+    let push = PrPush {
+        id: Uuid::new_v4(),
+        node_id: node,
+        pr: pr_label(pr),
+        head: head.to_string(),
+        previous,
+        verdict: VERDICT_MECHANICAL.to_string(),
+        lifecycle: lifecycle.to_string(),
+        conversation_id: Some(review),
+        protocol: Some(ProtocolKind::SmallReview.as_str().to_string()),
+        seen_at: now_ms(),
+    };
+    fleet.enqueue(FleetMutation::RecordPrPush { push: Box::new(push), note: None })?;
+    fleet.writer().flush()?;
+    Ok(())
+}
+
 /// The failed note an unreviewed push leaves in the node's Activity.
 fn note_for(push: &PrPush, url: &str) -> TimelineEntry {
     let from = push.previous.as_deref().map(short).unwrap_or("unknown");

@@ -43,6 +43,7 @@ pub mod path_util;
 pub mod paths;
 pub mod phase;
 pub mod pr_pushes;
+pub mod quick_fixes;
 pub mod request_feedback;
 pub mod sandbox_http;
 pub mod send_back;

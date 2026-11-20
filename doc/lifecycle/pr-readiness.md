@@ -872,3 +872,26 @@ outcomes:
 
 The agent's own turn answers the reviews before it, so one review is acted on
 once; a new push or a newer review reopens it.
+
+### Quick fix of a CI check and the small review
+
+After the configured fixer (above) and before the pull request agent, a failing
+CI check gets one **quick fix** (`Autopilot::run_ci_quick_fixes`; see
+`doc/lifecycle/checks.md`, "Quick fix"): one turn in the node's checkout, only
+on the pull request's own head, once per check and head, never again for a
+check whose quick fix escalated in this stay, and never for a check named in
+`pr_readiness.skip_quick_fix`. Its outcome is read from the pull request on a
+later look (`resolve_ci_quick_fixes`): the check no longer failing on the
+commit's head is `succeeded`; still failing, or no commit, is `escalated`, and
+the pull request agent's next message carries the quick fix's notes
+(`quick_fix_addendum`).
+
+In `pr_draft` the quick fix's commit gets the **small review**
+(`small_review_and_push`, protocol `small_review`): one reviewer, Haiku at low
+effort (lifecycle config key `small_review`), reading the commit's diff only.
+No finding: tod pushes the commit itself and records its head as a mechanical
+push whose protocol is `small_review`
+(`pr_pushes::record_small_reviewed`), so `pr_draft_review::owed` asks for no
+further review. A finding: the commit stays unpushed and its findings stay
+open, and the full review takes it as any unpushed commit of a conversation
+(`pr_pushes::held_for`). In `pr_review` nothing is pushed by the quick fix.

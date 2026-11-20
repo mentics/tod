@@ -83,6 +83,8 @@ struct CheckRow {
     pattern: Entity<InputState>,
     setup: Entity<InputState>,
     fix: Entity<InputState>,
+    /// Kept as stored: not editable here, set with `tod-cli capabilities`.
+    skip_quick_fix: bool,
 }
 
 /// The label a phase is shown under.
@@ -311,6 +313,7 @@ impl LifecycleConfigEditor {
             pattern: input("files (e.g. *.py)", &check.pattern, cx),
             setup: input("setup, once per worktree (e.g. install dependencies)", &check.setup, cx),
             fix: input("fix, run when it fails; tod commits the result (e.g. cargo fmt)", &check.fix, cx),
+            skip_quick_fix: check.skip_quick_fix,
         }
     }
 
@@ -581,6 +584,7 @@ impl LifecycleConfigEditor {
                     pattern: scope[2].clone().unwrap_or_default(),
                     setup: field(&row.setup).unwrap_or_default(),
                     fix: field(&row.fix).unwrap_or_default(),
+                    skip_quick_fix: row.skip_quick_fix,
                 }),
                 (label, None) => {
                     self.error = Some(format!("the check `{}` has no command", label.unwrap_or_default()));

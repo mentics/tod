@@ -21,7 +21,9 @@ pub mod phase;
 pub mod pr;
 pub mod problems;
 pub mod protocol;
+pub mod quick_fix;
 pub mod review;
+pub mod small_review;
 pub mod verify;
 
 #[cfg(test)]

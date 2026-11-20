@@ -224,6 +224,12 @@ pub struct LoopCounters {
     /// fix agent for: failing again on the same files means it changed nothing.
     #[serde(default)]
     pub checks_sent: Option<String>,
+    /// The checks (their `quick_fixes::check_key`) a quick fix was tried on
+    /// since the failing checks last all passed: each gets one attempt there,
+    /// a failure after the Fix protocol went to work on it is not tried again
+    /// (`doc/requests/design.md` section 5).
+    #[serde(default)]
+    pub quick_fix_tried: Vec<String>,
     /// Times the app reopened the node's implementation because its code was
     /// lost ([`crate::lost_work`]); once is the repair, again means the rebuilt
     /// work is gone too and the run stops for the user.

@@ -141,6 +141,8 @@ str_enum!(
         Phase => "phase",
         Evaluate => "evaluate",
         Guidance => "guidance",
+        QuickFix => "quick_fix",
+        SmallReview => "small_review",
     }
 );
 

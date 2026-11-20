@@ -173,3 +173,29 @@ last one did is not recorded again, so a runner polling a waiting gate does not
 fill the list. A node's stays come from the phase changes the timeline
 recorded (the phase chip's are marked "(user)"); a node older than the
 timeline shows everything under its current phase.
+
+## Quick fix: rung 1, before Fix
+
+After a configured fixer has failed or is absent, and before the Fix
+protocol, a failing check of tod's own gets one **quick fix**
+(`Autopilot::quick_fix_checks`, protocol `quick_fix`,
+`tod_core::conversation::quick_fix`; spec `doc/requests/design.md` section 5).
+It is a small session on Haiku at low effort (lifecycle config key `quick_fix`
+overrides) that is given one failing thing and nothing else: the check's label,
+command and output tail, the part of the branch's diff that touches the files
+the output names, and the phase's checks as the repository's usual commands.
+It gets no obligations, plan or design, may edit files and run that check's
+command, and may not touch obligations, the plan or decisions
+(`settled::check_conversation_agent`, `decisions ask`).
+
+It has `lifecycle.quick_fix_turns` turns (default 3). After each, tod reruns
+only that check (`checks::run_one`): green is success, tod commits the work and
+goes on with no Fix turn and no new review round. A session that changed
+nothing, or the last turn failing, is an escalation: the check becomes a
+finding for the full Fix protocol, whose opening carries the quick fix's notes
+(`checks::record_findings_with_notes`). Every attempt and outcome
+(`succeeded` / `escalated`) is recorded per check in `node_quick_fixes`
+(schema v110, `tod_store::quick_fixes`, with per-check failure rates). A check
+tried once is not tried again until the checks are clear. A check whose
+`skip_quick_fix` is set (`lifecycle_config::Check`) goes straight to Fix.
+In `pr_draft` the commit gets a small review (`doc/lifecycle/pr-readiness.md`).

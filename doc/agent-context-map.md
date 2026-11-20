@@ -374,3 +374,10 @@ and `render_inherited_context` is the only place that renders it.
 **Role docs may name a `tod-cli` noun in prose.** The prose says *which* noun
 applies, and the `cli/` fragment says how to call it. Command tables are what
 is banned.
+
+## Quick fix and small review
+
+| Surface | Stance | Fragments | Dynamic blocks | Why |
+|---|---|---|---|---|
+| `quick_fix` | `stance/bounded-session` | `surface/quick-fix` | working directory, the failing check (label, command, output tail, the diff of the files it names, the phase's usual commands) | One failing thing and nothing else: no obligations, plan, design or `cli/` noun. Edits files and runs the check's command. |
+| `small_review` | `stance/bounded-session` | `cli/intro`, `cli/review`, `surface/small-review` | data root, working directory, the commit's diff | One cheap reviewer for a quick fix's commit; records findings only. |

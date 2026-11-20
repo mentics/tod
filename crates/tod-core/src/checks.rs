@@ -1062,6 +1062,70 @@ pub fn run_stale_notifying(fleet: &FleetStore, node: Uuid, state: &str, on_work:
     Ok(round)
 }
 
+/// Run only the check `command` (run in `dir`) of `state`'s configured
+/// checks again, against the files as they are now, and record its run: what
+/// tod does after a quick fix (`doc/requests/design.md` section 5), so no other
+/// check is run for it. A check that no longer applies to the files is
+/// `Skipped`. An error when `state` has no such check configured. Git, Docker
+/// or a sandbox may be involved: never call it on the UI thread.
+pub fn run_one(fleet: &FleetStore, node: Uuid, state: &str, dir: &str, command: &str) -> Result<CheckRun> {
+    let key = phase_key(state).with_context(|| format!("the {state} state has no checks"))?;
+    let checks = fleet.read(|conn| configured(conn, node, state))?;
+    let want = clean_dir(dir);
+    let check = checks
+        .iter()
+        .find(|c| clean_dir(&c.dir) == want && c.command == command)
+        .with_context(|| format!("no check `{command}` (in `{want}`) is configured for the {state} state"))?;
+    let cwd = tod_store::fleet::provision::resolve_launch_cwd(fleet, &node.to_string())
+        .with_context(|| format!("find the files to run the {state} check in"))?;
+    let tree = Tree::new(&cwd)?;
+    let clean_head = tree.clean_head()?;
+    let assessment = assess(&tree, check)?;
+    let mut ran: Vec<tod_store::node_timeline::CommandResult> = Vec::new();
+    let (verdict, output) = if assessment.applicable {
+        let at = cwd.join(&want);
+        match ensure_setup(fleet, node, key, &want, &at, check)? {
+            Some(setup) if setup.verdict != Verdict::Passed => (setup.verdict, setup.output),
+            _ => run_command(&at, check, &assessment.files),
+        }
+    } else {
+        (Verdict::Skipped, format!("nothing changed in {}", check.scope()))
+    };
+    let run = CheckRun {
+        node_id: node,
+        phase: key.to_string(),
+        dir: want,
+        command: check.command.clone(),
+        label: check.label.clone(),
+        fingerprint: assessment.fingerprint,
+        verdict,
+        output,
+        ran_at: tod_store::check_runs::now(),
+        tree_key: clean_head.as_deref().map(|head| tree_key(head, check)).unwrap_or_default(),
+    };
+    fleet.enqueue(tod_store::fleet::FleetMutation::RecordCheckRun(Box::new(run.clone())))?;
+    fleet.writer().flush()?;
+    if run.verdict != Verdict::Skipped {
+        ran.push(tod_store::node_timeline::CommandResult {
+            name: run_name(&run),
+            command: run.command.clone(),
+            verdict: run.verdict.as_str().to_string(),
+            output: run.output.clone(),
+        });
+        let entry = tod_store::node_timeline::TimelineEntry::new(
+            node,
+            tod_store::node_timeline::KIND_CHECKS,
+            state,
+            format!("Ran {} again after a quick fix", ran[0].name),
+            ran[0].is_failure(),
+            serde_json::to_string(&ran)?,
+        );
+        fleet.enqueue(tod_store::fleet::FleetMutation::RecordTimeline(Box::new(entry)))?;
+        fleet.writer().flush()?;
+    }
+    Ok(run)
+}
+
 /// A check failed and has a configured `fix`: run it (committing what it
 /// changed as tod's own mechanical commit, [`crate::fixer`]) and run only
 /// this check again. Returns the verdict and output to record, and the
@@ -1168,6 +1232,17 @@ fn slug(name: &str) -> String {
     slug.trim_matches('-').to_string()
 }
 
+/// The paragraph a finding carries when a quick fix tried its check first.
+fn quick_fix_note(notes: &[(String, String)], name: &str) -> String {
+    match notes.iter().find(|(n, _)| n == name) {
+        Some((_, text)) => format!(
+            "\n\nA quick fix (a small, cheap session limited to this one check) was tried first and did not make it pass. What it did and left undone:\n{}",
+            if text.trim().is_empty() { "(it recorded nothing)" } else { text.trim() }
+        ),
+        None => String::new(),
+    }
+}
+
 /// The summary of the finding a failing check becomes.
 pub fn finding_summary(name: &str) -> String {
     format!("Check `{name}` fails")
@@ -1179,6 +1254,13 @@ pub fn finding_summary(name: &str) -> String {
 /// and a new finding would answer a fix the agent has not made). Returns how
 /// many findings were added.
 pub fn record_findings(fleet: &FleetStore, node: Uuid, failed: &[&CheckRun]) -> Result<usize> {
+    record_findings_with_notes(fleet, node, failed, &[])
+}
+
+/// [`record_findings`], with what a quick fix that tried a check first did and
+/// left undone (`notes`: the check's [`run_name`] and the notes), added to that
+/// check's finding, so the Fix session's opening carries it.
+pub fn record_findings_with_notes(fleet: &FleetStore, node: Uuid, failed: &[&CheckRun], notes: &[(String, String)]) -> Result<usize> {
     let open: Vec<String> = fleet.read(|conn| {
         Ok(tod_store::review::ReviewRepo::new(conn)
             .list_for_node(node)?
@@ -1209,7 +1291,7 @@ pub fn record_findings(fleet: &FleetStore, node: Uuid, failed: &[&CheckRun]) -> 
                         run.command,
                         if run.dir.is_empty() { String::new() } else { format!(", run in `{}`", run.dir) },
                         run.output
-                    )),
+                    ) + &quick_fix_note(notes, &run_name(run))),
                     root_cause: None,
                 },
             },

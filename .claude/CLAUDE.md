@@ -216,6 +216,19 @@ guidance for efficiency, never enforced, and ships with the app (shaped to move
 to the data root someday, not editable now). Each `run` must name a real
 `<noun> <verb>` (`tod_cli::doc_sync` checks); syntax stays in `cli/<noun>.md`.
 
+**Quick fix** (`doc/lifecycle/checks.md`, `tod_core::conversation::quick_fix`,
+`tod_store::quick_fixes`, schema v110). Rung 1 of the escalation ladder: after a
+configured fixer fails or is absent and before Fix, a failing check of tod's own
+(`Autopilot::quick_fix_checks`) or a failing CI check in `pr_draft`/`pr_review`
+(`run_ci_quick_fixes`) gets one narrow Haiku/low session (lifecycle config key
+`quick_fix`; `lifecycle.quick_fix_turns` turns, default 3) given only that
+failure; tod reruns only that check (`checks::run_one`) and on green there is no
+Fix and no new review round. Otherwise the check goes to Fix with the quick
+fix's notes. Each attempt is recorded per check; `Check::skip_quick_fix` and
+`pr_readiness.skip_quick_fix` skip it. In `pr_draft` the commit gets a small
+review (`small_review`, Haiku/low, diff only); clean, tod pushes it and records
+it as a mechanical head (`pr_pushes::record_small_reviewed`).
+
 **PR babysitter** (`doc/lifecycle/pr-readiness.md`). In `pr` the PR agent
 opens the draft (or reviews the one a move back left) and certifies the `pr`
 phase itself, which `pr → pr_draft` checks; the certificate counts only for

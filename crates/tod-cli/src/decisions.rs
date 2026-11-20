@@ -337,6 +337,15 @@ fn ask(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
     }
     let new_evidence = args.get("--new-evidence").unwrap_or("").trim().to_string();
     let (conversation_id, mut protocol) = asking_conversation(inv)?;
+    // A quick fix and a small review are cheap sessions on one failing thing:
+    // a question is not theirs to ask. They end their turn saying what they could
+    // not do, and the app hands the failure on to the Fix protocol.
+    if matches!(protocol.as_deref(), Some("quick_fix" | "small_review")) {
+        anyhow::bail!(
+            "refused: a {} session may not ask the user anything. End your turn saying what you could not do and why: the app hands it on.",
+            protocol.as_deref().unwrap_or_default().replace('_', " ")
+        );
+    }
     // The orchestrator filing one of the app's own stop questions is not
     // an agent that may be repeating itself.
     let mut guard_reask = true;

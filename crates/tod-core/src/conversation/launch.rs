@@ -32,6 +32,8 @@ pub fn role_for(kind: ProtocolKind) -> AgentRole {
         | ProtocolKind::Evaluate
         | ProtocolKind::Incoming
         | ProtocolKind::Guidance
+        | ProtocolKind::QuickFix
+        | ProtocolKind::SmallReview
         | ProtocolKind::Pr => AgentRole::Default,
     }
 }
@@ -63,6 +65,8 @@ pub fn phase_for(
         },
         ProtocolKind::Fix => "fix".to_string(),
         ProtocolKind::Guidance => lifecycle_config::GUIDANCE.to_string(),
+        ProtocolKind::QuickFix => lifecycle_config::QUICK_FIX.to_string(),
+        ProtocolKind::SmallReview => lifecycle_config::SMALL_REVIEW.to_string(),
         ProtocolKind::Pr => match state()?.as_str() {
             "pr_draft" => "pr_draft".to_string(),
             "pr_review" => "pr_review".to_string(),
@@ -125,10 +129,11 @@ pub fn try_for_focus(
         // The guidance selector only matches descriptions against a change
         // summary: unless its key says otherwise, it runs on the small model
         // at low effort, whatever the node's Agent capability says.
-        let (default_model, default_effort) = if phase == lifecycle_config::GUIDANCE {
-            (Some(lifecycle_config::GUIDANCE_DEFAULT_MODEL), Some(lifecycle_config::GUIDANCE_DEFAULT_EFFORT))
-        } else {
-            (None, None)
+        // The quick fix and the small review are the cheap rungs too
+        // (`lifecycle_config::default_agent`).
+        let (default_model, default_effort) = match lifecycle_config::default_agent(phase) {
+            Some((model, effort)) => (Some(model), Some(effort)),
+            None => (None, None),
         };
         if let Some(model) = configured.model.map(|(m, _)| m).or(default_model.map(str::to_string)) {
             options.model = coerce_model(options.platform, &model);

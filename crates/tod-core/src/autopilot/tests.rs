@@ -55,6 +55,8 @@ struct FakeAgent {
     /// Every fix turn first writes this file (its path and content): the
     /// change that makes a configured check pass.
     fix_writes: Option<(PathBuf, String)>,
+    /// Every quick fix turn first writes this file (its path and content).
+    quick_fix_writes: Option<(PathBuf, String)>,
     /// Every node turn, in order: its protocol and what it was sent.
     log: Arc<std::sync::Mutex<Vec<(ProtocolKind, String)>>>,
     /// Called with what a pull request turn was sent, before the mock plays
@@ -83,6 +85,7 @@ impl FakeAgent {
             review_played: std::sync::atomic::AtomicUsize::new(0),
             review_fails: std::sync::atomic::AtomicUsize::new(0),
             fix_writes: None,
+            quick_fix_writes: None,
             log: Default::default(),
             pr_hook: None,
         }
@@ -259,6 +262,16 @@ impl FakeAgent {
                         .map(|c| c.protocol))
                 })?;
                 if protocol == Some(tod_store::conversation::ProtocolKind::Fix) {
+                    std::fs::write(path, content)?;
+                }
+            }
+            if let Some((path, content)) = &self.quick_fix_writes {
+                let protocol = self.fleet.read(|conn| {
+                    Ok(tod_store::conversation::ConversationRepo::new(conn)
+                        .get(conversation.parse()?)?
+                        .map(|c| c.protocol))
+                })?;
+                if protocol == Some(tod_store::conversation::ProtocolKind::QuickFix) {
                     std::fs::write(path, content)?;
                 }
             }
@@ -3415,6 +3428,86 @@ fn a_failing_check_goes_to_the_fix_agent_as_a_finding_and_a_change_reruns_it() {
     assert!(!rounds[1].failed);
     // And gate checks are there, each phase change too.
     assert!(timeline.iter().any(|e| e.kind == tod_store::node_timeline::KIND_GATE), "{timeline:#?}");
+}
+
+const OK_FILE_CHECK: &str = "test -f ok.txt || { echo 'ok.txt is missing'; exit 1; }";
+
+fn quick_fixes_of(fx: &Fixture) -> Vec<tod_store::quick_fixes::QuickFix> {
+    fx.fleet.read(|conn| tod_store::quick_fixes::list_for_node(conn, fx.node)).unwrap()
+}
+
+#[test]
+fn a_quick_fix_that_makes_the_check_pass_needs_no_fix_turn() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    let workspace = with_check(&fx, "review", "ok file", OK_FILE_CHECK);
+    let mut agent = FakeAgent::new(&fx.fleet);
+    agent.quick_fix_writes = Some((workspace.join("ok.txt"), "fixed".into()));
+    let mut pilot = autopilot(&fx, Budget::default());
+    let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
+    assert_eq!(outcome, Outcome::Done, "{:#?}", pilot.state().steps);
+    let steps = &pilot.state().steps;
+    assert_eq!(steps.iter().filter(|s| s.step == "quick_fix").count(), 1, "{steps:#?}");
+    assert!(steps.iter().all(|s| s.step != "fix_checks"), "{steps:#?}");
+    assert!(openings(&fx, ProtocolKind::Fix).iter().all(|(_, o)| !o.contains("Check `ok file` fails")), "no Fix session for the check");
+    let rows = quick_fixes_of(&fx);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].outcome, tod_store::quick_fixes::OUTCOME_SUCCEEDED);
+    assert_eq!(rows[0].check_name, "ok file");
+    assert!(!rows[0].head.is_empty(), "the quick fix is committed");
+    // The quick fix was given the one failure, not the node's obligations.
+    let opening = openings(&fx, ProtocolKind::QuickFix).into_iter().next().expect("a quick fix opening").1;
+    assert!(opening.contains("ok.txt is missing"), "{opening}");
+}
+
+#[test]
+fn a_quick_fix_that_fails_goes_to_fix_with_its_notes_and_is_recorded_escalated() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    let workspace = with_check(&fx, "review", "ok file", OK_FILE_CHECK);
+    let mut agent = FakeAgent::new(&fx.fleet);
+    agent.fix_writes = Some((workspace.join("ok.txt"), "fixed".into()));
+    let mut pilot = autopilot(&fx, Budget::default());
+    let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
+    assert_eq!(outcome, Outcome::Done, "{:#?}", pilot.state().steps);
+    let rows = quick_fixes_of(&fx);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].outcome, tod_store::quick_fixes::OUTCOME_ESCALATED);
+    let steps = &pilot.state().steps;
+    assert_eq!(steps.iter().filter(|s| s.step == "fix_checks").count(), 1, "{steps:#?}");
+    let fixes = openings(&fx, ProtocolKind::Fix);
+    assert!(fixes.iter().any(|(_, o)| o.contains("A quick fix") && o.contains("did not make it pass")), "{fixes:?}");
+}
+
+#[test]
+fn a_check_that_skips_quick_fixes_goes_straight_to_fix() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    let workspace = with_check(&fx, "review", "ok file", OK_FILE_CHECK);
+    fx.fleet
+        .enqueue_outline(OutlineMutation::SetNodeLifecycleChecks {
+            node_id: fx.node,
+            checks: [(
+                "review".to_string(),
+                vec![tod_store::lifecycle_config::Check {
+                    label: "ok file".into(),
+                    command: OK_FILE_CHECK.into(),
+                    skip_quick_fix: true,
+                    ..Default::default()
+                }],
+            )]
+            .into(),
+        })
+        .unwrap();
+    fx.fleet.writer().flush().unwrap();
+    let mut agent = FakeAgent::new(&fx.fleet);
+    agent.fix_writes = Some((workspace.join("ok.txt"), "fixed".into()));
+    let mut pilot = autopilot(&fx, Budget::default());
+    let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
+    assert_eq!(outcome, Outcome::Done, "{:#?}", pilot.state().steps);
+    assert!(quick_fixes_of(&fx).is_empty());
+    assert!(openings(&fx, ProtocolKind::QuickFix).is_empty());
+    assert!(!openings(&fx, ProtocolKind::Fix).is_empty());
 }
 
 #[test]

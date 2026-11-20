@@ -58,6 +58,15 @@ pub fn check_conversation_agent(
     let Some(conversation) = ConversationRepo::new(conn).get(conversation_id)? else {
         bail!("conversation {conversation_id} not found");
     };
+    // A quick fix and a small review work on one failing thing: edit files, run
+    // the check, or review a diff. Obligations and the plan are not theirs, however
+    // far along the node is.
+    if matches!(conversation.protocol, ProtocolKind::QuickFix | ProtocolKind::SmallReview) {
+        bail!(
+            "refused: a {} session edits files and nothing else; obligations, the plan and decisions are not its to change",
+            conversation.protocol.as_str().replace('_', " ")
+        );
+    }
     if let OutlineMutation::UpdateObligationCodeOnly { obligation_id, .. } = mutation {
         return check_code_only(conn, Some(&conversation), *obligation_id);
     }

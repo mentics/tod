@@ -605,10 +605,34 @@ pub const GUIDANCE: ContextRecipe = ContextRecipe {
     ],
 };
 
+/// The quick fix (`crate::conversation::quick_fix`, `ProtocolKind::QuickFix`,
+/// `doc/requests/design.md` section 5): one failing check and the part of the
+/// diff that touches the files its output names, for a cheap session that
+/// edits files and runs that check. No obligations, plan or design, and no
+/// `tod-cli` noun: it has nothing to record.
+pub const QUICK_FIX: ContextRecipe = ContextRecipe {
+    name: "quick fix",
+    situational: false,
+    layers: &["stance/bounded-session", "surface/quick-fix"],
+    blocks: &[DynamicBlock::WorkingDirectory, DynamicBlock::QuickFixTarget],
+};
+
+/// The small-change review (`crate::conversation::small_review`): one cheap
+/// reviewer reading a quick fix's diff and nothing else. Findings go through
+/// the `review` noun, as a review's do.
+pub const SMALL_REVIEW: ContextRecipe = ContextRecipe {
+    name: "small review",
+    situational: false,
+    layers: &["stance/bounded-session", "cli/intro", "cli/review", "surface/small-review"],
+    blocks: &[DynamicBlock::DataRoot, DynamicBlock::WorkingDirectory, DynamicBlock::SmallReviewDiff],
+};
+
 /// Every registered surface.
 pub const ALL_RECIPES: &[ContextRecipe] = &[
     INCOMING_CHANGES,
     GUIDANCE,
+    QUICK_FIX,
+    SMALL_REVIEW,
     CONVERSATION,
     CHAT,
     VISUAL_DESIGN,
@@ -995,6 +1019,8 @@ missing"),
             | DynamicBlock::WorkHistory
             | DynamicBlock::IncomingChanges
             | DynamicBlock::GuidanceSelection
+            | DynamicBlock::QuickFixTarget
+            | DynamicBlock::SmallReviewDiff
             | DynamicBlock::VisualDesign => 5,
         }
     }

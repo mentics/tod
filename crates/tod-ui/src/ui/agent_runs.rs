@@ -1464,5 +1464,7 @@ fn kind_label(kind: ProtocolKind) -> &'static str {
         ProtocolKind::OnEntry => "on entry",
         ProtocolKind::Incoming => "incoming check",
         ProtocolKind::Guidance => "guidance selection",
+        ProtocolKind::QuickFix => "quick fix",
+        ProtocolKind::SmallReview => "small review",
     }
 }
