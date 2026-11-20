@@ -15,8 +15,23 @@
 //!
 //! **Who may send a node back.** The sessions whose work is judging another
 //! phase's: a phase agent, an evaluator, a verification, a review (the code
-//! review and the review of the pull request) and a fix session ([`SENDERS`]).
-//! The target must be earlier than the node's state and before `pr_review`.
+//! review and the review of the pull request) and a fix session ([`SENDERS`]),
+//! and an implementation session, for a dispute only (below). The target must
+//! be earlier than the node's state and before `pr_review`.
+//!
+//! **Disputes** (`doc/requests/design.md` 10.3). A send-back that names
+//! obligations (`--obligation`) and does not go to `verifying` is a dispute:
+//! an agent past the phase that wrote an obligation finds it wrong or unclear
+//! and returns the node to that phase ([`dispute_target`]: `design` for a
+//! design obligation, `proposed` for a requirement). Obligations are changed
+//! only by the phase that wrote them, so this is the only way an agent in a
+//! later state gets one changed. The receiving phase agent settles it with
+//! [`resolve`]: it **fixed** the obligation, **upheld** it (with a
+//! clarification), or **passed it up** (`design` to `proposed`, carrying the
+//! chain: a send-back of its own whose `parent_id` is the dispute). The
+//! resolution is kept on the row, and the phase that disputed it sees both
+//! when the node comes forward ([`render_for_opening`]). A phase with an open
+//! dispute cannot be certified by an agent ([`open_dispute_into`]).
 //!
 //! **Guard rails** ([`guard`]). A send-back is refused, recorded as
 //! `stopped`, and the run stops for the user (`NeedsHuman::SendBackLoop` in
@@ -42,7 +57,8 @@ use crate::decisions::{EVIDENCE_KINDS, EvidenceRef};
 use crate::interview::short_id;
 use crate::lifecycle_reset::VerdictScope;
 use crate::node_timeline::{KIND_SEND_BACK, TimelineEntry, TimelineRepo};
-use crate::outline::repos::NodeRepo;
+use crate::outline::repos::obligations::NodeObligation;
+use crate::outline::repos::{NodeRepo, ObligationRepo};
 use crate::outline::uuid_blob::{blob_to_uuid_sql, now_ms, uuid_to_blob};
 use crate::settings::VALID_LIFECYCLE_STATES;
 use anyhow::{Result, bail};
@@ -82,14 +98,63 @@ pub const CREATE_TABLE: &str = "
         outcome         TEXT NOT NULL CHECK (outcome IN ('moved', 'stopped')),
         stop_why        TEXT NOT NULL DEFAULT '',
         earlier         TEXT NOT NULL DEFAULT '[]',
-        created_at      INTEGER NOT NULL
+        created_at      INTEGER NOT NULL,
+        resolution_kind TEXT NOT NULL DEFAULT '',
+        resolution      TEXT NOT NULL DEFAULT '',
+        resolved_at     INTEGER,
+        parent_id       BLOB
     );
     CREATE INDEX IF NOT EXISTS idx_node_send_backs_node ON node_send_backs(node_id, created_at);
     CREATE INDEX IF NOT EXISTS idx_node_send_backs_conversation ON node_send_backs(conversation_id, turn_seq);
 ";
 
-/// The protocols whose sessions may send a node back.
-pub const SENDERS: [ProtocolKind; 5] = [
+/// The dispute was fixed: the obligation was changed or removed.
+pub const RESOLUTION_FIXED: &str = "fixed";
+/// The dispute was upheld: the obligation stands, with a clarification.
+pub const RESOLUTION_UPHELD: &str = "upheld";
+/// The design phase passed the dispute up to `proposed`.
+pub const RESOLUTION_PASSED_UP: &str = "passed_up";
+/// What [`resolve`] accepts.
+pub const RESOLUTIONS: [&str; 3] = [RESOLUTION_FIXED, RESOLUTION_UPHELD, RESOLUTION_PASSED_UP];
+
+/// `resolution_kind`, `resolution`, `resolved_at` and `parent_id` (schema
+/// v108). Idempotent.
+pub fn add_dispute_columns(conn: &Connection) -> Result<()> {
+    let has = |column: &str| -> Result<bool> {
+        Ok(conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('node_send_backs') WHERE name = ?1",
+            params![column],
+            |row| row.get(0),
+        )?)
+    };
+    for (column, ddl) in [
+        ("resolution_kind", "TEXT NOT NULL DEFAULT ''"),
+        ("resolution", "TEXT NOT NULL DEFAULT ''"),
+        ("resolved_at", "INTEGER"),
+        ("parent_id", "BLOB"),
+    ] {
+        if !has(column)? {
+            conn.execute_batch(&format!("ALTER TABLE node_send_backs ADD COLUMN {column} {ddl};"))?;
+        }
+    }
+    Ok(())
+}
+
+/// The phase that must settle a dispute of an obligation written in `phase`
+/// (`node_obligations.phase`): `design` for a design obligation, `proposed`
+/// for a requirement. `None` for one with no recorded phase.
+pub fn dispute_target(phase: &str) -> Option<&'static str> {
+    match phase {
+        "design" => Some("design"),
+        "requirements" => Some("proposed"),
+        _ => None,
+    }
+}
+
+/// The protocols whose sessions may send a node back. An implementation
+/// session only for a dispute (see the module docs).
+pub const SENDERS: [ProtocolKind; 6] = [
+    ProtocolKind::Implementation,
     ProtocolKind::Phase,
     ProtocolKind::Evaluate,
     ProtocolKind::Verification,
@@ -98,14 +163,16 @@ pub const SENDERS: [ProtocolKind; 5] = [
 ];
 
 /// The error for a session (or none) that may not send a node back.
-pub const WHO_MAY: &str = "only a phase agent, an evaluator, or a verification, review or fix session \
-    may send a task back (`tod-cli lifecycle send-back`); anyone else asks the user with `tod-cli decisions ask`";
+pub const WHO_MAY: &str = "only a phase agent, an evaluator, or an implementation, verification, review or fix \
+    session may send a task back (`tod-cli lifecycle send-back`; an implementation session only to dispute an \
+    obligation); anyone else asks the user with `tod-cli decisions ask`";
 
 /// What kind of session a protocol's is, in words.
 pub fn sender_noun(protocol: &str) -> &'static str {
     match protocol {
         "phase" => "phase agent",
         "evaluate" => "evaluator",
+        "implementation" => "implementation session",
         "verification" => "verification session",
         "review" => "review session",
         "fix" => "fix session",
@@ -148,11 +215,30 @@ pub struct SendBack {
     /// oldest first.
     pub earlier: Vec<String>,
     pub created_at: i64,
+    /// How a dispute was settled ([`RESOLUTIONS`]); empty while open (and for
+    /// a send-back that is not a dispute).
+    pub resolution_kind: String,
+    /// The receiving phase agent's note on it.
+    pub resolution: String,
+    pub resolved_at: Option<i64>,
+    /// The dispute this one passes up (`design` to `proposed`).
+    pub parent_id: Option<Uuid>,
 }
 
 impl SendBack {
     pub fn moved(&self) -> bool {
         self.outcome == OUTCOME_MOVED
+    }
+
+    /// A send-back that names obligations and does not go to `verifying`
+    /// (whose obligations are the verdicts to reopen).
+    pub fn is_dispute(&self) -> bool {
+        !self.obligations.is_empty() && self.to_state != "verifying"
+    }
+
+    /// A dispute the receiving phase has not settled yet.
+    pub fn is_open_dispute(&self) -> bool {
+        self.moved() && self.is_dispute() && self.resolution_kind.is_empty()
     }
 
     /// Who sent it, in words ("the review session").
@@ -162,13 +248,14 @@ impl SendBack {
 }
 
 const COLUMNS: &str = "id, node_id, conversation_id, protocol, turn_seq, from_state, to_state, reason, \
-    evidence, obligations, digest, outcome, stop_why, earlier, created_at";
+    evidence, obligations, digest, outcome, stop_why, earlier, created_at, resolution_kind, resolution, resolved_at, parent_id";
 
 fn map_row(row: &Row<'_>) -> rusqlite::Result<SendBack> {
     let conversation: Option<Vec<u8>> = row.get(2)?;
     let evidence: String = row.get(8)?;
     let obligations: String = row.get(9)?;
     let earlier: String = row.get(13)?;
+    let parent: Option<Vec<u8>> = row.get(18)?;
     let json_err = |i: usize, e: serde_json::Error| {
         rusqlite::Error::FromSqlConversionFailure(i, rusqlite::types::Type::Text, Box::new(e))
     };
@@ -188,6 +275,10 @@ fn map_row(row: &Row<'_>) -> rusqlite::Result<SendBack> {
         stop_why: row.get(12)?,
         earlier: serde_json::from_str(&earlier).map_err(|e| json_err(13, e))?,
         created_at: row.get(14)?,
+        resolution_kind: row.get(15)?,
+        resolution: row.get(16)?,
+        resolved_at: row.get(17)?,
+        parent_id: parent.as_deref().map(blob_to_uuid_sql).transpose()?,
     })
 }
 
@@ -202,7 +293,7 @@ impl<'a> SendBackRepo<'a> {
 
     fn insert(&self, row: &SendBack) -> Result<()> {
         self.conn.execute(
-            &format!("INSERT INTO node_send_backs ({COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"),
+            &format!("INSERT INTO node_send_backs ({COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)"),
             params![
                 uuid_to_blob(row.id),
                 uuid_to_blob(row.node_id),
@@ -219,9 +310,25 @@ impl<'a> SendBackRepo<'a> {
                 row.stop_why,
                 serde_json::to_string(&row.earlier)?,
                 row.created_at,
+                row.resolution_kind,
+                row.resolution,
+                row.resolved_at,
+                row.parent_id.map(uuid_to_blob),
             ],
         )?;
         Ok(())
+    }
+
+    /// One send-back by id.
+    pub fn get(&self, id: Uuid) -> Result<Option<SendBack>> {
+        Ok(self
+            .conn
+            .query_row(
+                &format!("SELECT {COLUMNS} FROM node_send_backs WHERE id = ?1"),
+                params![uuid_to_blob(id)],
+                map_row,
+            )
+            .optional()?)
     }
 
     /// Every send-back of `node`, oldest first.
@@ -393,25 +500,32 @@ fn rank(state: &str) -> Option<usize> {
     VALID_LIFECYCLE_STATES.iter().position(|s| *s == state)
 }
 
-/// Carry out an agent's send-back as `actor`, or record that the guard
-/// refused it. Returns `{"outcome": "moved", "from", "to"}` or
-/// `{"outcome": "stopped", "why"}`; a refusal is not an error, so its row is
-/// kept (the caller tells the agent).
-pub fn execute(conn: &Connection, actor: &str, request: &Request) -> Result<Value> {
-    let Some(conversation) = ConversationRepo::new(conn).get(request.conversation_id)? else {
-        bail!("conversation {} not found: {WHO_MAY}", request.conversation_id);
+/// The session `actor` writes as: the conversation, which must be the one
+/// the request names, and its node.
+fn session(conn: &Connection, actor: &str, conversation_id: Uuid) -> Result<(crate::conversation::Conversation, Uuid)> {
+    let Some(conversation) = ConversationRepo::new(conn).get(conversation_id)? else {
+        bail!("conversation {conversation_id} not found: {WHO_MAY}");
     };
     let named = crate::conversation::actor_conversation(actor)
         .or_else(|| crate::conversation::agent_actor_conversation(actor));
     if named.is_some_and(|id| id != conversation.id) {
         bail!("conversation {} is not the one writing ({actor})", conversation.id);
     }
-    if !SENDERS.contains(&conversation.protocol) {
-        bail!("a {} session may not send a task back: {WHO_MAY}", conversation.protocol.as_str());
-    }
     let Some(node) = conversation.focus.node_id() else {
         bail!("conversation {} is not about a node", conversation.id);
     };
+    Ok((conversation, node))
+}
+
+/// Carry out an agent's send-back as `actor`, or record that the guard
+/// refused it. Returns `{"outcome": "moved", "from", "to"}` or
+/// `{"outcome": "stopped", "why"}`; a refusal is not an error, so its row is
+/// kept (the caller tells the agent).
+pub fn execute(conn: &Connection, actor: &str, request: &Request) -> Result<Value> {
+    let (conversation, node) = session(conn, actor, request.conversation_id)?;
+    if !SENDERS.contains(&conversation.protocol) {
+        bail!("a {} session may not send a task back: {WHO_MAY}", conversation.protocol.as_str());
+    }
     let reason = request.reason.trim();
     if reason.is_empty() {
         bail!("a send-back needs a reason: what is wrong, and why it is that phase's to fix");
@@ -434,19 +548,27 @@ pub fn execute(conn: &Connection, actor: &str, request: &Request) -> Result<Valu
             bail!("unknown evidence kind `{}` (expected {})", evidence.kind, EVIDENCE_KINDS.join("|"));
         }
     }
+    let dispute = !request.obligations.is_empty() && to != "verifying";
+    if conversation.protocol == ProtocolKind::Implementation && !dispute {
+        bail!(
+            "an implementation session sends a task back only to dispute an obligation (--obligation, to the \
+             phase that wrote it); for anything else record the step blocked or ask the user"
+        );
+    }
     let verdicts = crate::verification::VerdictRepo::new(conn).latest_for_node(node)?;
-    for obligation in &request.obligations {
-        let exists = conn
-            .prepare("SELECT 1 FROM node_obligations WHERE id = ?1")?
-            .exists(params![uuid_to_blob(*obligation)])?;
-        if !exists {
-            bail!("obligation {} not found", short_id(*obligation));
-        }
-        if to == "verifying" && !verdicts.get(obligation).is_some_and(|v| v.is_verified()) {
+    let obligations = ObligationRepo::new(conn);
+    for id in &request.obligations {
+        let Some(obligation) = obligations.get(*id)? else {
+            bail!("obligation {} not found", short_id(*id));
+        };
+        if to == "verifying" && !verdicts.get(id).is_some_and(|v| v.is_verified()) {
             bail!(
                 "obligation {} is not verified on this task, so there is no verdict to reopen",
-                short_id(*obligation)
+                short_id(*id)
             );
+        }
+        if dispute {
+            check_disputable(&obligation, node, to)?;
         }
     }
     if to == "verifying" && request.obligations.is_empty() {
@@ -455,30 +577,97 @@ pub fn execute(conn: &Connection, actor: &str, request: &Request) -> Result<Valu
              only their verdicts are reopened"
         );
     }
+    record_move(
+        conn,
+        &Mover {
+            conversation: &conversation,
+            node,
+            from: &from,
+            to,
+            reason,
+            evidence: &request.evidence,
+            obligations: &request.obligations,
+            parent_id: None,
+        },
+    )
+}
 
+/// Whether `obligation` may be disputed with a send-back to `to`: it is this
+/// node's, an agent's (the user's are changed by the user alone), and `to` is
+/// the phase that wrote it ([`dispute_target`]).
+fn check_disputable(obligation: &NodeObligation, node: Uuid, to: &str) -> Result<()> {
+    let short = short_id(obligation.id);
+    if obligation.node_id != node {
+        bail!("obligation {short} belongs to another node: a dispute names this node's own obligations");
+    }
+    if obligation.user_owned() {
+        bail!(
+            "obligation {short} is the user's ({}): an agent cannot dispute it. If it looks wrong, ask the user \
+             with `tod-cli decisions ask`, proposing the change with --edit-obligation",
+            obligation.authority
+        );
+    }
+    let Some(target) = dispute_target(&obligation.phase) else {
+        bail!(
+            "obligation {short} has no recorded phase of origin (`{}`), so there is no phase to send it back to; \
+             ask the user with `tod-cli decisions ask`",
+            obligation.phase
+        );
+    };
+    if target != to {
+        bail!(
+            "obligation {short} was written in {} (its phase is `{}`): a dispute of it goes to `{target}`, not `{to}`",
+            if target == "proposed" { "the requirements" } else { "design" },
+            obligation.phase
+        );
+    }
+    Ok(())
+}
+
+/// A move back and everything recorded about it.
+struct Mover<'a> {
+    conversation: &'a crate::conversation::Conversation,
+    node: Uuid,
+    from: &'a str,
+    to: &'a str,
+    reason: &'a str,
+    evidence: &'a [EvidenceRef],
+    obligations: &'a [Uuid],
+    /// The dispute this one passes up.
+    parent_id: Option<Uuid>,
+}
+
+/// The guard, the move, the row and the activity entry of a validated
+/// send-back: `{"outcome": "moved", ...}` or `{"outcome": "stopped", ...}`.
+fn record_move(conn: &Connection, m: &Mover<'_>) -> Result<Value> {
+    let (node, from, to) = (m.node, m.from, m.to);
     let digest = work_digest(conn, node)?;
     let turn_seq: i64 = conn.query_row(
         "SELECT COALESCE(MAX(seq), 0) FROM conversation_turns WHERE conversation_id = ?1",
-        params![uuid_to_blob(conversation.id)],
+        params![uuid_to_blob(m.conversation.id)],
         |row| row.get(0),
     )?;
-    let stop = guard(conn, node, &from, to, &digest)?;
+    let stop = guard(conn, node, from, to, &digest)?;
     let mut row = SendBack {
         id: Uuid::now_v7(),
         node_id: node,
-        conversation_id: Some(conversation.id),
-        protocol: conversation.protocol.as_str().to_string(),
+        conversation_id: Some(m.conversation.id),
+        protocol: m.conversation.protocol.as_str().to_string(),
         turn_seq,
-        from_state: from.clone(),
+        from_state: from.to_string(),
         to_state: to.to_string(),
-        reason: reason.to_string(),
-        evidence: request.evidence.clone(),
-        obligations: request.obligations.clone(),
+        reason: m.reason.to_string(),
+        evidence: m.evidence.to_vec(),
+        obligations: m.obligations.to_vec(),
         digest,
         outcome: OUTCOME_MOVED.to_string(),
         stop_why: String::new(),
         earlier: Vec::new(),
         created_at: 0,
+        resolution_kind: String::new(),
+        resolution: String::new(),
+        resolved_at: None,
+        parent_id: m.parent_id,
     };
     let sender = row.sender();
     if let Some((why, earlier)) = stop {
@@ -488,11 +677,11 @@ pub fn execute(conn: &Connection, actor: &str, request: &Request) -> Result<Valu
         row.created_at = now_ms();
         SendBackRepo::new(conn).insert(&row)?;
         let title = format!("The {sender} asked to send it back to {to}; stopped for you");
-        TimelineRepo::new(conn).record(&TimelineEntry::new(node, KIND_SEND_BACK, &from, title, true, detail(&row)))?;
+        TimelineRepo::new(conn).record(&TimelineEntry::new(node, KIND_SEND_BACK, from, title, true, detail(&row)))?;
         return Ok(json!({ "outcome": OUTCOME_STOPPED, "why": why, "id": row.id }));
     }
 
-    let moved_reason = format!("sent back by the {sender}: {reason}");
+    let moved_reason = format!("sent back by the {sender}: {}", m.reason);
     apply_move(
         conn,
         &Move {
@@ -501,15 +690,201 @@ pub fn execute(conn: &Connection, actor: &str, request: &Request) -> Result<Valu
             by_user: false,
             reason: Some(&moved_reason),
             keep_decision: None,
-            verdicts: if to == "verifying" { VerdictScope::Only(&request.obligations) } else { VerdictScope::All },
+            verdicts: if to == "verifying" { VerdictScope::Only(m.obligations) } else { VerdictScope::All },
         },
     )?;
     // At or after the phase change, so the activity shows it heading the new stay.
     row.created_at = now_ms();
     SendBackRepo::new(conn).insert(&row)?;
-    let title = format!("Sent back from {from} by the {sender}");
+    let title = if row.is_dispute() {
+        format!("Disputed from {from} by the {sender}")
+    } else {
+        format!("Sent back from {from} by the {sender}")
+    };
     TimelineRepo::new(conn).record(&TimelineEntry::new(node, KIND_SEND_BACK, to, title, false, detail(&row)))?;
+    record_dispute_lesson(conn, &row)?;
     Ok(json!({ "outcome": OUTCOME_MOVED, "from": from, "to": to, "id": row.id }))
+}
+
+/// The hook where a dispute or send-back becomes a lesson for the
+/// self-improvement loop (`doc/requests/design.md` 11.1, source `send_back`:
+/// "an earlier phase was unclear or wrong", written from its reason and, once
+/// settled, its resolution). Called when a send-back is made and again when a
+/// dispute is resolved (`row.resolution_kind` set).
+// step 8: write an `improvement_lessons` row here. Nothing is recorded yet.
+fn record_dispute_lesson(_conn: &Connection, _row: &SendBack) -> Result<()> {
+    Ok(())
+}
+
+/// A request to settle a dispute (`tod-cli lifecycle resolve-dispute`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Resolution {
+    /// The conversation whose agent (the receiving phase's) settles it.
+    pub conversation_id: Uuid,
+    /// The dispute; `None` for the open one sent to the node's current state.
+    #[serde(default)]
+    pub send_back: Option<Uuid>,
+    /// One of [`RESOLUTIONS`].
+    pub kind: String,
+    /// Why: what was changed, how the obligation is meant, or the note passed
+    /// up with it.
+    pub note: String,
+}
+
+/// The open dispute sent to `node`'s current state, if any: what its phase
+/// agent has to settle before it can certify the phase.
+pub fn open_dispute_into(conn: &Connection, node: Uuid, state: &str) -> Result<Option<SendBack>> {
+    let since: i64 = conn
+        .query_row(
+            "SELECT updated_at FROM node_lifecycle WHERE node_id = ?1",
+            params![uuid_to_blob(node)],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    Ok(SendBackRepo::new(conn)
+        .list_for_node(node)?
+        .into_iter()
+        .rev()
+        .find(|s| s.is_open_dispute() && s.to_state == state && s.created_at >= since))
+}
+
+/// Settle a dispute as `actor`, the receiving phase's agent: fixed (an
+/// obligation was changed or removed), upheld (it stands, with the note's
+/// clarification), or passed up (`design` to `proposed`, as a send-back of its
+/// own that carries the chain). Returns `{"outcome": ...}`: `moved` and
+/// `stopped` for a pass-up, as for a send-back, else the resolution kind.
+pub fn resolve(conn: &Connection, actor: &str, request: &Resolution) -> Result<Value> {
+    let (conversation, node) = session(conn, actor, request.conversation_id)?;
+    if conversation.protocol != ProtocolKind::Phase {
+        bail!(
+            "only the phase agent of the state a dispute was sent to settles it: a {} session may not",
+            conversation.protocol.as_str()
+        );
+    }
+    let kind = request.kind.trim();
+    if !RESOLUTIONS.contains(&kind) {
+        bail!("`{kind}` is not a resolution (expected one of {})", RESOLUTIONS.join(", "));
+    }
+    let note = request.note.trim();
+    if note.is_empty() {
+        bail!("a resolution needs a note: what was changed, how the obligation is meant, or why it is passed up");
+    }
+    let Some(state) = NodeRepo::new(conn).get_lifecycle(node)? else {
+        bail!("node {node} has no lifecycle");
+    };
+    let repo = SendBackRepo::new(conn);
+    let dispute = match request.send_back {
+        Some(id) => repo.get(id)?.ok_or_else(|| anyhow::anyhow!("send-back {} not found", short_id(id)))?,
+        None => open_dispute_into(conn, node, &state)?.ok_or_else(|| {
+            anyhow::anyhow!("no dispute is open for `{state}`: nothing was sent back to it with obligations named")
+        })?,
+    };
+    if dispute.node_id != node || !dispute.is_open_dispute() {
+        bail!("send-back {} is not an open dispute of this task", short_id(dispute.id));
+    }
+    if dispute.to_state != state {
+        bail!(
+            "dispute {} was sent to `{}`, and the task is in `{state}`: its phase agent settles it",
+            short_id(dispute.id),
+            dispute.to_state
+        );
+    }
+
+    if kind == RESOLUTION_PASSED_UP {
+        if state != "design" {
+            bail!("only the design phase passes a dispute up (to `proposed`, which reads the ticket)");
+        }
+        let chain = format!("{}\n\nPassed up by the design agent: {note}", dispute.reason);
+        let moved = record_move(
+            conn,
+            &Mover {
+                conversation: &conversation,
+                node,
+                from: &state,
+                to: "proposed",
+                reason: &chain,
+                evidence: &dispute.evidence,
+                obligations: &dispute.obligations,
+                parent_id: Some(dispute.id),
+            },
+        )?;
+        if moved["outcome"] == OUTCOME_MOVED {
+            settle(conn, &dispute, RESOLUTION_PASSED_UP, note, &state)?;
+        }
+        return Ok(moved);
+    }
+
+    if kind == RESOLUTION_FIXED {
+        let obligations = ObligationRepo::new(conn);
+        let mut changed = false;
+        for id in &dispute.obligations {
+            match obligations.get(*id)? {
+                None => changed = true,
+                Some(_) => {
+                    let updated: i64 = conn.query_row(
+                        "SELECT updated_at FROM node_obligations WHERE id = ?1",
+                        params![uuid_to_blob(*id)],
+                        |row| row.get(0),
+                    )?;
+                    changed |= updated > dispute.created_at;
+                }
+            }
+        }
+        if !changed {
+            bail!(
+                "none of the disputed obligations was changed or removed since it was disputed, so it is not \
+                 `fixed`: change one, or resolve it as `upheld` with a note on how it is meant"
+            );
+        }
+    }
+    settle(conn, &dispute, kind, note, &state)?;
+    Ok(json!({ "outcome": kind, "id": dispute.id }))
+}
+
+/// Record how `dispute` was settled, and settle the dispute it was passed up
+/// from with the same outcome.
+fn settle(conn: &Connection, dispute: &SendBack, kind: &str, note: &str, state: &str) -> Result<()> {
+    let now = now_ms();
+    conn.execute(
+        "UPDATE node_send_backs SET resolution_kind = ?1, resolution = ?2, resolved_at = ?3 WHERE id = ?4",
+        params![kind, note, now, uuid_to_blob(dispute.id)],
+    )?;
+    let title = match kind {
+        RESOLUTION_FIXED => format!("Dispute fixed in {state}"),
+        RESOLUTION_UPHELD => format!("Dispute upheld in {state}"),
+        _ => format!("Dispute passed up from {state}"),
+    };
+    TimelineRepo::new(conn).record(&TimelineEntry::new(
+        dispute.node_id,
+        KIND_SEND_BACK,
+        state,
+        title,
+        false,
+        note.to_string(),
+    ))?;
+    let mut settled = dispute.clone();
+    settled.resolution_kind = kind.to_string();
+    settled.resolution = note.to_string();
+    settled.resolved_at = Some(now);
+    record_dispute_lesson(conn, &settled)?;
+    // The dispute this one carried up is settled the way it was: its own
+    // phase agent's note, then the phase that settled it.
+    if kind != RESOLUTION_PASSED_UP
+        && let Some(parent) = dispute.parent_id.map(|id| SendBackRepo::new(conn).get(id)).transpose()?.flatten()
+    {
+        let combined = format!("{}\n\nSettled in {state} ({kind}): {note}", parent.resolution);
+        conn.execute(
+            "UPDATE node_send_backs SET resolution_kind = ?1, resolution = ?2, resolved_at = ?3 WHERE id = ?4",
+            params![kind, combined.trim(), now, uuid_to_blob(parent.id)],
+        )?;
+        let mut up = parent.clone();
+        up.resolution_kind = kind.to_string();
+        up.resolution = combined;
+        up.resolved_at = Some(now);
+        record_dispute_lesson(conn, &up)?;
+    }
+    Ok(())
 }
 
 /// The activity's text for a send-back.
@@ -529,20 +904,89 @@ fn detail(row: &SendBack) -> String {
     text.trim_end().to_string()
 }
 
+/// The obligations a send-back names, with their words and who stands
+/// behind them, one line each.
+fn render_obligations(conn: &Connection, sent: &SendBack, text: &mut String) -> Result<()> {
+    for obligation in &sent.obligations {
+        match ObligationRepo::new(conn).get(*obligation)? {
+            Some(o) => text.push_str(&format!(
+                "- [{}] {}{}\n",
+                short_id(*obligation),
+                o.body,
+                if o.authority == crate::outline::repos::obligations::AUTHORITY_AGENT {
+                    String::new()
+                } else {
+                    format!(" ({})", o.authority)
+                }
+            )),
+            None => text.push_str(&format!("- [{}] (deleted since)\n", short_id(*obligation))),
+        }
+    }
+    Ok(())
+}
+
+/// A dispute and the chain it came up through, oldest first: who disputed it
+/// from where, why, and what each phase on the way said.
+fn render_chain(conn: &Connection, sent: &SendBack, text: &mut String) -> Result<()> {
+    let mut chain = vec![sent.clone()];
+    while let Some(parent) = chain.last().and_then(|s| s.parent_id) {
+        match SendBackRepo::new(conn).get(parent)? {
+            Some(p) => chain.push(p),
+            None => break,
+        }
+    }
+    chain.reverse();
+    for link in &chain {
+        text.push_str(&format!(
+            "\nThe {} disputed it from `{}` to `{}`:\n\n{}\n",
+            link.sender(),
+            link.from_state,
+            link.to_state,
+            link.reason
+        ));
+    }
+    Ok(())
+}
+
 /// The section a phase's opening starts with when a send-back brought the
 /// node there: what was wrong, the evidence, the state it came from, and
-/// which kind of session sent it. Empty when none did.
+/// which kind of session sent it. For a dispute, the chain it came up
+/// through and what the phase is to do with it. Otherwise, when the node
+/// comes forward into a phase that had disputed an obligation and it was
+/// settled meanwhile, that dispute and how it was settled. Empty when none.
 pub fn render_for_opening(conn: &Connection, node: Uuid) -> Result<String> {
     let Some(sent) = SendBackRepo::new(conn).latest_into_stay(node)? else {
-        return Ok(String::new());
+        return render_settled_dispute(conn, node);
     };
-    let mut text = format!(
-        "## Sent back\n\nThe {} sent this task back from `{}` to `{}`. Start from this cause, not from scratch:\n\n{}\n",
-        sent.sender(),
-        sent.from_state,
-        sent.to_state,
-        sent.reason
-    );
+    let mut text = if sent.is_dispute() {
+        let mut text = format!(
+            "## Dispute\n\nThe {} sent this task back from `{}` to `{}` to dispute the obligations below, which this \
+             phase wrote. Settle it before you certify the phase: fix the obligation (change or remove it), or \
+             uphold it (keep it, and say how it is meant, sharpening its wording if that would have spared the \
+             dispute)",
+            sent.sender(),
+            sent.from_state,
+            sent.to_state,
+        );
+        text.push_str(if sent.to_state == "design" {
+            ", or pass it up to `proposed` when it only restates a requirement. Record how you settled it with the \
+             dispute resolution command.\n"
+        } else {
+            ". You alone read the ticket: compare the chain with it. If the ticket itself is in doubt, ask the user \
+             a real question (what the ticket says, what the code shows). Record how you settled it with the \
+             dispute resolution command.\n"
+        });
+        render_chain(conn, &sent, &mut text)?;
+        text
+    } else {
+        format!(
+            "## Sent back\n\nThe {} sent this task back from `{}` to `{}`. Start from this cause, not from scratch:\n\n{}\n",
+            sent.sender(),
+            sent.from_state,
+            sent.to_state,
+            sent.reason
+        )
+    };
     if !sent.evidence.is_empty() {
         text.push_str("\nEvidence:\n");
         for evidence in &sent.evidence {
@@ -551,20 +995,49 @@ pub fn render_for_opening(conn: &Connection, node: Uuid) -> Result<String> {
     }
     if !sent.obligations.is_empty() {
         text.push_str("\nObligations named:\n");
-        for obligation in &sent.obligations {
-            let body: Option<String> = conn
-                .query_row(
-                    "SELECT body FROM node_obligations WHERE id = ?1",
-                    params![uuid_to_blob(*obligation)],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            match body {
-                Some(body) => text.push_str(&format!("- [{}] {}\n", short_id(*obligation), body)),
-                None => text.push_str(&format!("- [{}] (deleted since)\n", short_id(*obligation))),
-            }
-        }
+        render_obligations(conn, &sent, &mut text)?;
     }
+    Ok(text)
+}
+
+/// The dispute the node's current state raised, once its phase settled it and
+/// the node came forward: the dispute, how it was settled and the note, so
+/// the agent sees why the obligation reads as it does. The latest such
+/// dispute, while the node is in the stay that followed its settling.
+fn render_settled_dispute(conn: &Connection, node: Uuid) -> Result<String> {
+    let Some(state) = NodeRepo::new(conn).get_lifecycle(node)? else {
+        return Ok(String::new());
+    };
+    let since: i64 = conn
+        .query_row(
+            "SELECT updated_at FROM node_lifecycle WHERE node_id = ?1",
+            params![uuid_to_blob(node)],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    let Some(sent) = SendBackRepo::new(conn)
+        .list_for_node(node)?
+        .into_iter()
+        .rev()
+        .find(|s| s.moved() && s.is_dispute() && s.from_state == state && s.parent_id.is_none())
+    else {
+        return Ok(String::new());
+    };
+    let Some(_resolved_at) = sent.resolved_at.filter(|at| *at <= since) else {
+        return Ok(String::new());
+    };
+    let how = match sent.resolution_kind.as_str() {
+        RESOLUTION_FIXED => "fixed: the obligation was changed or removed",
+        RESOLUTION_UPHELD => "upheld: the obligation stands",
+        _ => "passed up and settled",
+    };
+    let mut text = format!(
+        "## Dispute settled\n\nYou sent this task back from `{}` to dispute the obligations below. It was {how}:\n\n{}\n\nWhat you disputed:\n\n{}\n",
+        sent.from_state, sent.resolution, sent.reason
+    );
+    text.push_str("\nObligations named (as they read now):\n");
+    render_obligations(conn, &sent, &mut text)?;
     Ok(text)
 }
 

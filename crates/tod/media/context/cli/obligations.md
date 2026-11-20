@@ -39,8 +39,17 @@ a refactor, a rename), so a unit test or reading the code verifies it;
 design phase agent (in `design`) and the user may set or clear it; every other
 agent is refused.
 
-Past `planning` the app refuses every obligation change from an agent, with one
-exception: a verification session may `update <id> --acts-in merged|released
+Who may change an obligation is set by who stands behind it (its
+**authority**) and by the phase that wrote it. Listings show `(user)` for one
+the user wrote or edited and `(approved)` for one the user confirmed; an
+agent's own show nothing. You may never change, move or delete a user or
+approved obligation, in any state. An agent's own may be changed by an agent
+only until the phase that wrote it is done: a requirement (`--phase
+requirements`) through `proposed`, a design obligation through `design`. From
+`planning` on the app refuses every agent change to it, and the refusal says to
+send the node back with `lifecycle send-back --obligation <ID> --reason <WHY>`
+to dispute it (to `proposed` for a requirement, `design` for a design
+obligation), so the phase that wrote it settles it. There is one exception: a verification session may `update <id> --acts-in merged|released
 --reason <TEXT>` on an obligation of its own node (in `verifying`) that acts in
 an earlier state, to hand it to the phase that can show it true. The `--reason`
 (at least 15 characters) is required and is kept with the change: say why nothing in the checkout can
@@ -57,10 +66,11 @@ with its earlier wording. With `--node` and `--by` it restores every listed
 deletion by that party, newest first, so they return to their original order. A
 restore is recorded like any other edit, so it can itself be restored.
 
-Past `planning` the obligations are settled: on a node whose lifecycle
-state is later than `planning`, an agent's `add`, `update`, `move`, `delete`
-and `restore` are refused (the user's own edits, and a freeform conversation
-the user directs, are not). Propose the change with `decisions ask` instead,
+Once the phase that wrote an obligation is done, or when the user stands
+behind it, an agent's `add`, `update`, `move`, `delete` and `restore` on it are
+refused (the user's own edits, and a freeform conversation the user directs,
+are not). For an agent's own obligation, dispute it with a send-back; for a
+user or approved one, propose the change with `decisions ask` instead,
 quoting the obligation's id, its current text, the text you propose, and why;
 if the user approves, they make it.
 

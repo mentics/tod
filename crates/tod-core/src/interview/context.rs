@@ -715,7 +715,7 @@ mod tests {
         assert!(!changes.contains(&short_id(short_lived)), "{changes}");
         assert!(
             changes.contains(&format!(
-                "+ [{}] requirement: Newly required.",
+                "+ [{}] requirement (written by the user: not yours to change): Newly required.",
                 short_id(added)
             )),
             "{changes}"

@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 105;
+pub const CURRENT_USER_VERSION: i32 = 108;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -703,6 +703,16 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         crate::review::add_reviewer_columns(conn)?;
         conn.pragma_update(None, "user_version", 105)?;
     }
+    if version < 108 {
+        // Requests design step 3 (`doc/requests/design.md` section 10):
+        // who stands behind each obligation (`node_obligations.authority`),
+        // and a send-back's resolution and the dispute it passes up
+        // (`crate::send_back::add_dispute_columns`). Synced (sync copies the
+        // columns both sides have); both tables are journaled already.
+        crate::outline::repos::obligations::add_authority(conn)?;
+        crate::send_back::add_dispute_columns(conn)?;
+        conn.pragma_update(None, "user_version", 108)?;
+    }
     // Other branches (the task panel) numbered their own steps 66–67 at the
     // same time as 66–70 above, so a store may be past a version without
     // having these. Every one is idempotent: make sure of them all.
@@ -771,6 +781,8 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     crate::phase::ensure_table(conn)?;
     conn.execute_batch(&crate::journey_changes::phase_events_triggers_sql())?;
     conn.execute_batch(crate::send_back::CREATE_TABLE)?;
+    crate::send_back::add_dispute_columns(conn)?;
+    crate::outline::repos::obligations::add_authority(conn)?;
     conn.execute_batch(&crate::journey_changes::send_backs_triggers_sql())?;
     conn.execute_batch(crate::guidance::CREATE_TABLE)?;
     conn.execute_batch(&crate::journey_changes::guidance_triggers_sql())?;

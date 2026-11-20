@@ -49,6 +49,7 @@ pub fn snapshot(conn: &Connection, entity: Entity, id: Uuid) -> Result<Option<En
                     ordinal: o.ordinal,
                     visual_design_path: o.visual_design_path,
                     code_only: o.code_only,
+                    authority: o.authority,
                 })
         }
         Entity::PlanStep => {
@@ -146,7 +147,8 @@ pub fn classify(mutation: &OutlineMutation) -> Option<(ActionKind, Entity, Uuid)
         | M::UpdateObligationSection { obligation_id, .. }
         | M::UpdateObligationPhase { obligation_id, .. }
         | M::UpdateObligationActsIn { obligation_id, .. }
-        | M::UpdateObligationCodeOnly { obligation_id, .. } => {
+        | M::UpdateObligationCodeOnly { obligation_id, .. }
+        | M::SetObligationAuthority { obligation_id, .. } => {
             (Edit, Entity::Obligation, *obligation_id)
         }
         M::UpdatePlanStepBody { step_id, .. }
@@ -342,6 +344,35 @@ fn direct_actor(writer_actor: &str) -> ActionActor {
     }
 }
 
+/// An obligation the user created or edited is the user's from then on
+/// (`node_obligations.authority`, `doc/requests/design.md` 10.1): no agent
+/// changes it afterwards. Writing it new, or rewording it, always makes it
+/// `user` (an approval covered the old words); any other edit (section,
+/// phase, where it acts, code-only) only claims one an agent wrote.
+fn stamp_user_authority(conn: &Connection, obligation_id: Uuid, mutation: &OutlineMutation) -> Result<()> {
+    use crate::outline::repos::obligations::{AUTHORITY_AGENT, AUTHORITY_USER};
+    use OutlineMutation as M;
+    let rewrites = matches!(mutation, M::CreateObligation { .. } | M::UpdateObligationBody { .. });
+    let edits = matches!(
+        mutation,
+        M::UpdateObligationSection { .. }
+            | M::UpdateObligationPhase { .. }
+            | M::UpdateObligationActsIn { .. }
+            | M::UpdateObligationCodeOnly { .. }
+    );
+    if !rewrites && !edits {
+        return Ok(());
+    }
+    let repo = ObligationRepo::new(conn);
+    let Some(current) = repo.get(obligation_id)? else {
+        return Ok(());
+    };
+    if current.authority == AUTHORITY_USER || (!rewrites && current.authority != AUTHORITY_AGENT) {
+        return Ok(());
+    }
+    repo.update_authority(obligation_id, AUTHORITY_USER)
+}
+
 /// What applying a mutation produced: the `DeleteNode` archive, if any, and
 /// the action row, when one was recorded.
 #[derive(Debug, Clone, Copy, Default)]
@@ -383,6 +414,9 @@ pub(super) fn apply_recorded(
     }
     let before = snapshot(conn, rec.entity, rec.entity_id)?;
     let archive_id = mutation.execute(conn, media_root)?;
+    if rec.actor == ActionActor::User && rec.reverses.is_none() {
+        stamp_user_authority(conn, rec.entity_id, mutation)?;
+    }
     let after = snapshot(conn, rec.entity, rec.entity_id)?;
     // Enabling what is already enabled, or setting what is already set,
     // changed nothing a conversation could show or reverse.

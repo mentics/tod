@@ -203,12 +203,20 @@ fn edit_preview(decision: &Decision) -> Option<String> {
     }
     let mut out = if decision.conversation_id.is_some() {
         String::from(
-            "Answering edits the obligations as your own change (listed in the asking conversation's change set, where it can be reversed):",
+            "Answering changes the obligations as your own decision (listed in the asking conversation's change set, where it can be reversed):",
         )
     } else {
-        String::from("Answering edits the obligations as your own change:")
+        String::from("Answering changes the obligations as your own decision:")
     };
     for edit in &decision.edits {
+        if edit.affirm {
+            out.push_str(&format!(
+                "\n\n**Option {}** approves obligation {} as it stands (it becomes yours: no agent changes it)",
+                edit.option,
+                tod_store::interview::short_id(edit.obligation_id)
+            ));
+            continue;
+        }
         out.push_str(&format!(
             "\n\n**Option {}** changes obligation {}",
             edit.option,
@@ -1917,6 +1925,7 @@ mod tests {
             obligation_id: Uuid::new_v4(),
             body: "uses the in-memory comparison".into(),
             was: Some("uses last_synced_at".into()),
+            affirm: false,
         });
         let text = edit_preview(&decision).unwrap();
         assert!(text.contains("Option 2"), "{text}");

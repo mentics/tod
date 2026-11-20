@@ -160,8 +160,14 @@ pub struct ArchivedObligation {
     pub phase: String,
     #[serde(default = "default_archived_acts_in")]
     pub acts_in: String,
+    #[serde(default = "default_archived_authority")]
+    pub authority: String,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+fn default_archived_authority() -> String {
+    crate::outline::repos::obligations::AUTHORITY_AGENT.to_string()
 }
 
 /// Archives written before phase-tagging existed deserialize their obligations
@@ -431,7 +437,7 @@ fn snapshot_node(conn: &Connection, node_id: Uuid) -> Result<ArchivedNode> {
     let mut obligations = Vec::new();
     {
         let mut stmt = conn.prepare(
-            "SELECT id, kind, ordinal, section, body, phase, acts_in, created_at, updated_at
+            "SELECT id, kind, ordinal, section, body, phase, acts_in, created_at, updated_at, authority
              FROM node_obligations WHERE node_id = ?1 ORDER BY kind, ordinal",
         )?;
         let rows = stmt.query_map(params![uuid_to_blob(node_id)], |row| {
@@ -446,6 +452,7 @@ fn snapshot_node(conn: &Connection, node_id: Uuid) -> Result<ArchivedNode> {
                 acts_in: row.get(6)?,
                 created_at: row.get(7)?,
                 updated_at: row.get(8)?,
+                authority: row.get(9)?,
             })
         })?;
         for row in rows {
@@ -851,8 +858,8 @@ fn restore_node(conn: &Connection, archived: &ArchivedNode) -> Result<()> {
     }
     for obl in &archived.obligations {
         conn.execute(
-            "INSERT OR IGNORE INTO node_obligations (id, node_id, kind, ordinal, section, body, phase, acts_in, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT OR IGNORE INTO node_obligations (id, node_id, kind, ordinal, section, body, phase, acts_in, created_at, updated_at, authority)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 uuid_to_blob(obl.id),
                 blob,
@@ -864,6 +871,7 @@ fn restore_node(conn: &Connection, archived: &ArchivedNode) -> Result<()> {
                 obl.acts_in,
                 obl.created_at,
                 obl.updated_at,
+                obl.authority,
             ],
         )?;
     }

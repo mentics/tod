@@ -7,7 +7,10 @@
 //! implementation's), and, once it is back at `verifying` or earlier, the
 //! `verified` verdicts. Phase certificates need nothing here: they only
 //! count within the stay that recorded them (`crate::phase`), and a node
-//! that leaves a state starts a new stay when it comes back.
+//! that leaves a state starts a new stay when it comes back. They are
+//! suspended, never deleted: when the node comes forward and the inputs a
+//! suspended certificate covers still digest the same, it is restored with no
+//! agent (`crate::phase::restore_suspended`).
 //!
 //! [`rework_after_user_move`] is the other half, for the user's own move (the
 //! phase chip, `tod-cli lifecycle set`, a request's answer): back at `active`

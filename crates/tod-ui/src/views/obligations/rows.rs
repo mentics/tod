@@ -145,6 +145,11 @@ pub enum ListAction {
     },
     /// Dragged an obligation to a new place in the list.
     Drop(ItemDropped),
+    /// The user approves an agent's obligation as it stands: it becomes
+    /// theirs (`authority` `approved`), so no agent changes it.
+    Approve {
+        obligation_id: Uuid,
+    },
     /// Add an obligation below the selected one (what `n` does).
     CreateBelow,
     /// Delete the selection (what Del does).
@@ -191,11 +196,41 @@ pub fn obligation_actions(item: &ObligationItem, host: &RowHost<ListAction>) -> 
         })
         .menu_only()
     };
-    vec![
-        action("edit", "Edit", ListAction::StartEdit { obligation_id }),
-        action("add-below", "Add below", ListAction::CreateBelow),
-        action("delete", "Delete", ListAction::DeleteSelected),
-    ]
+    let mut actions = vec![action("edit", "Edit", ListAction::StartEdit { obligation_id })];
+    if can_approve(&item.obligation) {
+        actions.push(action("approve", "Approve", ListAction::Approve { obligation_id }));
+    }
+    actions.push(action("add-below", "Add below", ListAction::CreateBelow));
+    actions.push(action("delete", "Delete", ListAction::DeleteSelected));
+    actions
+}
+
+/// Whether the row menu offers **Approve**: an obligation an agent wrote
+/// and the user has not yet stood behind. Editing it makes it theirs too.
+pub fn can_approve(obligation: &NodeObligation) -> bool {
+    !obligation.user_owned()
+}
+
+/// The menu as presented for `obligation`, for the journey's `UserAction`
+/// record (what was on offer when the user chose).
+pub fn presented_menu(obligation: &NodeObligation) -> tod_journey::Presented {
+    let entry = |id: &str, label: &str| tod_journey::PresentedAction {
+        id: id.to_string(),
+        label: label.to_string(),
+        primary: false,
+        disabled: false,
+    };
+    let mut actions = vec![entry("edit", "Edit")];
+    if can_approve(obligation) {
+        actions.push(entry("approve", "Approve"));
+    }
+    actions.push(entry("add-below", "Add below"));
+    actions.push(entry("delete", "Delete"));
+    tod_journey::Presented {
+        actions,
+        focused: Some(obligation.id.to_string()),
+        notices: vec![format!("authority: {}", obligation.authority)],
+    }
 }
 
 /// Render one obligation for the item list.
@@ -237,14 +272,21 @@ fn trailing_badges(item: &ObligationItem) -> Option<AnyElement> {
         .code_only
         .as_ref()
         .map(|_| style::badge(div()).child("code-only").into_any_element());
-    match (standing, code_only) {
-        (None, None) => None,
-        (Some(one), None) | (None, Some(one)) => Some(one),
-        (Some(standing), Some(code_only)) => Some(
+    // Unobtrusive: only an obligation someone stands behind carries one.
+    let authority = match item.obligation.authority.as_str() {
+        "user" => Some("yours"),
+        "approved" => Some("approved"),
+        _ => None,
+    }
+    .map(|label| style::badge(div()).child(label).into_any_element());
+    let badges: Vec<AnyElement> = [authority, code_only, standing].into_iter().flatten().collect();
+    match badges.len() {
+        0 => None,
+        1 => badges.into_iter().next(),
+        _ => Some(
             gpui_component::h_flex()
                 .gap_1()
-                .child(code_only)
-                .child(standing)
+                .children(badges)
                 .into_any_element(),
         ),
     }
@@ -258,5 +300,41 @@ fn standing_badge(standing: &str) -> AnyElement {
         style::text_error(badge).into_any_element()
     } else {
         badge.into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn obligation(authority: &str) -> NodeObligation {
+        NodeObligation {
+            id: Uuid::from_u128(7),
+            node_id: Uuid::nil(),
+            kind: KIND_REQUIREMENT.to_string(),
+            ordinal: 1,
+            section: None,
+            body: "Export as CSV".to_string(),
+            phase: "requirements".to_string(),
+            acts_in: "active".to_string(),
+            visual_design_path: None,
+            code_only: None,
+            authority: authority.to_string(),
+        }
+    }
+
+    /// Approve is on offer for an obligation the user has not yet stood
+    /// behind, and the journey sees the menu as it was presented.
+    #[test]
+    fn approve_is_offered_only_for_an_agents_obligation() {
+        assert!(can_approve(&obligation("agent")));
+        assert!(!can_approve(&obligation("user")));
+        assert!(!can_approve(&obligation("approved")));
+        let ids = |ob: &NodeObligation| {
+            presented_menu(ob).actions.into_iter().map(|a| a.id).collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&obligation("agent")), ["edit", "approve", "add-below", "delete"]);
+        assert_eq!(ids(&obligation("approved")), ["edit", "add-below", "delete"]);
+        assert_eq!(presented_menu(&obligation("agent")).notices, ["authority: agent"]);
     }
 }

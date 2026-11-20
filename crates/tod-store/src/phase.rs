@@ -630,6 +630,18 @@ impl<'a> PhaseRepo<'a> {
             }
         }
         let current = self.current_state(node_id)?;
+        if kind != PHASE_REJECT
+            && certifier != CERTIFIER_USER
+            && current.as_deref() == Some(state)
+            && let Some(dispute) = crate::send_back::open_dispute_into(self.conn, node_id, state)?
+        {
+            bail!(
+                "`{state}` cannot be recorded {kind}: dispute {} is open (sent here from `{}`). Settle it first \
+                 with `tod-cli lifecycle resolve-dispute` (fixed, upheld or passed up, with a note)",
+                short_id(dispute.id),
+                dispute.from_state
+            );
+        }
         let Some(snapshot) = phase_inputs(self.conn, node_id, state)? else {
             bail!("`{state}` has no phase to certify");
         };
@@ -797,6 +809,64 @@ impl<'a> PhaseRepo<'a> {
     }
 }
 
+/// Give the node's current phase its **suspended** certificate back, with no
+/// agent (`doc/requests/design.md` 10.4). A move back never deletes
+/// certificates: each only stops counting for a stay that is not the one it
+/// was recorded in. When the node comes forward into a phase whose latest
+/// certificate (from an earlier stay) covers inputs that still digest the
+/// same, that certificate is restored: a new `certify` in this stay, by the
+/// original certifier, noting where it came from. Not `pr` (whose
+/// certificate counts only for its stay) or `verifying` (audited afresh), and
+/// not a phase the node was sent back to (its agent reruns, so a dispute
+/// target is always worked). Returns `{"restored": bool, ...}`.
+pub fn restore_suspended(conn: &Connection, node_id: Uuid) -> Result<Value> {
+    let repo = PhaseRepo::new(conn);
+    let none = |why: &str| Ok(serde_json::json!({ "restored": false, "why": why }));
+    let Some(state) = repo.current_state(node_id)? else {
+        return none("no lifecycle");
+    };
+    if !["proposed", "design", "planning"].contains(&state.as_str()) {
+        return none("this phase's certificate is not restored");
+    }
+    let Some(since) = repo.stay_started_at(node_id)? else {
+        return none("no stay");
+    };
+    if !repo.events_in_stay(node_id, &state)?.is_empty() {
+        return none("the phase already has events in this stay");
+    }
+    if crate::send_back::SendBackRepo::new(conn).latest_into_stay(node_id)?.is_some() {
+        return none("the node was sent back here: its agent reruns");
+    }
+    let Some(latest) = repo
+        .list_for_node(node_id)?
+        .into_iter()
+        .rev()
+        .find(|e| e.state == state && e.created_at < since)
+    else {
+        return none("no earlier certificate");
+    };
+    if latest.kind != PHASE_CERTIFY {
+        return none("the latest earlier event is not a certificate");
+    }
+    if repo.current_digest(node_id, &state)?.as_deref() != Some(latest.digest.as_str()) {
+        return none("what it covers changed");
+    }
+    let body = format!(
+        "Restored: the certificate recorded {} still covers exactly these inputs. {}",
+        latest.created_at, latest.body
+    );
+    let event = repo.record(node_id, &state, PHASE_CERTIFY, latest.conversation_id, &latest.certifier, &body)?;
+    crate::node_timeline::TimelineRepo::new(conn).record(&crate::node_timeline::TimelineEntry::new(
+        node_id,
+        crate::node_timeline::KIND_NOTE,
+        &state,
+        format!("The {state} certificate from before was restored: nothing it covers changed"),
+        false,
+        String::new(),
+    ))?;
+    Ok(serde_json::json!({ "restored": true, "state": state, "event": event.id }))
+}
+
 /// Who a phase event is from, given the writer's actor: the user; an
 /// Evaluate conversation (independent); or any other agent (self). Returns
 /// `(conversation_id, certifier)`.
@@ -902,6 +972,84 @@ mod tests {
             .current_digest(fx.node, state)
             .unwrap()
             .unwrap()
+    }
+
+    /// A move back suspends a certificate: when the node comes forward to the
+    /// phase and what it covers is unchanged, it is back with no agent.
+    #[test]
+    fn a_suspended_certificate_comes_back_when_nothing_it_covers_changed() {
+        let fx = setup("proposed");
+        obligation(&fx, Uuid::new_v4(), 0, "Export as CSV");
+        certify(&fx, "proposed");
+        age(&fx);
+        set_state(&fx, "design");
+        age(&fx);
+        // Sent back and forward again: a new stay in `proposed`.
+        set_state(&fx, "proposed");
+        let repo = PhaseRepo::new(&fx.conn);
+        assert!(matches!(repo.certificate_status(fx.node, "proposed").unwrap(), CertificateStatus::None));
+        let out = restore_suspended(&fx.conn, fx.node).unwrap();
+        assert_eq!(out["restored"], true, "{out}");
+        let CertificateStatus::Current(event) = repo.certificate_status(fx.node, "proposed").unwrap() else {
+            panic!("the certificate should count again");
+        };
+        assert!(event.body.starts_with("Restored:"), "{}", event.body);
+        assert_eq!(event.certifier, CERTIFIER_USER);
+        // Once only.
+        assert_eq!(restore_suspended(&fx.conn, fx.node).unwrap()["restored"], false);
+        let note = crate::node_timeline::TimelineRepo::new(&fx.conn)
+            .list(fx.node)
+            .unwrap()
+            .into_iter()
+            .any(|e| e.kind == crate::node_timeline::KIND_NOTE && e.title.contains("restored"));
+        assert!(note, "the activity says so");
+    }
+
+    #[test]
+    fn a_suspended_certificate_stays_suspended_when_what_it_covers_changed() {
+        let fx = setup("proposed");
+        let id = Uuid::new_v4();
+        obligation(&fx, id, 0, "Export as CSV");
+        certify(&fx, "proposed");
+        age(&fx);
+        set_state(&fx, "design");
+        age(&fx);
+        ObligationRepo::new(&fx.conn).update_body(id, "Export as JSON").unwrap();
+        set_state(&fx, "proposed");
+        let out = restore_suspended(&fx.conn, fx.node).unwrap();
+        assert_eq!(out["restored"], false, "{out}");
+        assert!(matches!(
+            PhaseRepo::new(&fx.conn).certificate_status(fx.node, "proposed").unwrap(),
+            CertificateStatus::None
+        ));
+    }
+
+    #[test]
+    fn a_phase_the_node_was_sent_back_to_is_never_restored() {
+        let fx = setup("proposed");
+        obligation(&fx, Uuid::new_v4(), 0, "Export as CSV");
+        certify(&fx, "proposed");
+        age(&fx);
+        set_state(&fx, "design");
+        age(&fx);
+        let review = ConversationRepo::new(&fx.conn)
+            .create(Focus::Node(fx.node), crate::conversation::ProtocolKind::Review, None, None, None)
+            .unwrap();
+        // Review is a sender; the node is in `design`, so send it back to `proposed`.
+        crate::send_back::execute(
+            &fx.conn,
+            crate::interview::ACTOR_AGENT,
+            &crate::send_back::Request {
+                conversation_id: review.id,
+                to: "proposed".into(),
+                reason: "the requirement is unclear".into(),
+                evidence: Vec::new(),
+                obligations: Vec::new(),
+            },
+        )
+        .unwrap();
+        let out = restore_suspended(&fx.conn, fx.node).unwrap();
+        assert_eq!(out["restored"], false, "{out}");
     }
 
     #[test]

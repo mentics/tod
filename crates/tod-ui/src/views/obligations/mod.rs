@@ -1310,6 +1310,39 @@ impl ObligationsView {
             .collect()
     }
 
+    /// The row menu's **Approve**: the obligation becomes the user's
+    /// (`approved`), as the user's own change. Recorded in the journey with
+    /// the menu as it was presented (`doc/requests/design.md` 10.1).
+    fn approve(&mut self, obligation_id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(node_id), Some(obligation)) =
+            (self.node_id, self.items.iter().find(|o| o.id == obligation_id).cloned())
+        else {
+            return;
+        };
+        if !rows::can_approve(&obligation) {
+            return;
+        }
+        crate::ui::journey::record_action(
+            cx,
+            tod_store::conversation::Focus::Node(node_id),
+            "approve_obligation",
+            crate::ui::journey::Source::Click,
+            "obligations_panel",
+            rows::presented_menu(&obligation),
+        );
+        let mutation = OutlineMutation::SetObligationAuthority {
+            obligation_id,
+            authority: tod_store::outline::repos::obligations::AUTHORITY_APPROVED.to_string(),
+        };
+        self.write_then(vec![mutation], window, cx, |this, result, window, cx| {
+            if let Err(err) = result {
+                crate::ui::toast::error_toast(window, cx, format!("Approve failed: {err}"));
+            }
+            this.reload(window, cx);
+            this.focus_list(window, cx);
+        });
+    }
+
     fn delete_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let ids = self.selected_obligations();
         if ids.is_empty() {
@@ -1506,6 +1539,9 @@ impl ObligationsView {
                 }
                 ListAction::AddSection { phase, kind } => {
                     self.add_section(&phase, kind, window, cx);
+                }
+                ListAction::Approve { obligation_id } => {
+                    self.approve(obligation_id, window, cx);
                 }
                 ListAction::CreateBelow => {
                     self.on_create_below(&ItemListCreateBelow, window, cx);
@@ -1994,6 +2030,7 @@ mod tests {
                 acts_in: "active".to_string(),
                 visual_design_path: None,
                 code_only: None,
+                authority: "agent".to_string(),
             })
             .collect()
     }

@@ -56,8 +56,8 @@
 //! - `review_coverage` (`tod_store::review::coverage`; insert-only, the
 //!   record is append-only), created by [`review_coverage_triggers_sql`] in
 //!   the v99 migration.
-//! - `node_send_backs` (`tod_store::send_back`; insert-only, a record of
-//!   what happened), created by [`send_backs_triggers_sql`] in the v103
+//! - `node_send_backs` (`tod_store::send_back`; inserted, and updated when a
+//!   dispute is resolved), created by [`send_backs_triggers_sql`] in the v103
 //!   migration step that creates the table.
 //! - `node_guidance`, `node_guidance_runs` (`tod_store::guidance`, the
 //!   project guidance selected for each node and the runs that selected
@@ -427,14 +427,18 @@ pub fn review_coverage_triggers_sql() -> String {
     )
 }
 
-/// Trigger for `node_send_backs` (`crate::send_back`): append-only, so
-/// insert only.
+/// Triggers for `node_send_backs` (`crate::send_back`): rows are inserted,
+/// and a dispute's resolution is written onto its row (schema v108).
 pub fn send_backs_triggers_sql() -> String {
     format!(
         "
         CREATE TRIGGER IF NOT EXISTS trg_journey_node_send_backs_insert AFTER INSERT ON node_send_backs BEGIN
             INSERT INTO journey_changes (node_id, tbl, row_id, op, at)
             VALUES (NEW.node_id, 'node_send_backs', hex(NEW.id), 'insert', {NOW});
+        END;
+        CREATE TRIGGER IF NOT EXISTS trg_journey_node_send_backs_update AFTER UPDATE ON node_send_backs BEGIN
+            INSERT INTO journey_changes (node_id, tbl, row_id, op, at)
+            VALUES (NEW.node_id, 'node_send_backs', hex(NEW.id), 'update', {NOW});
         END;
         "
     )

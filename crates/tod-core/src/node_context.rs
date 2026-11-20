@@ -178,8 +178,15 @@ pub fn obligation_line(o: &NodeObligation) -> String {
         .as_deref()
         .map(|reason| format!(" code-only ({reason})"))
         .unwrap_or_default();
+    // Only when someone stands behind it: the user's or approved obligations
+    // are not an agent's to change (`tod_store::conversation::settled`).
+    let authority = if o.user_owned() {
+        format!(" ({} by the user: not yours to change)", if o.authority == "approved" { "approved" } else { "written" })
+    } else {
+        String::new()
+    };
     format!(
-        "[{}] {}{acts_in}{code_only}{section}: {}{visual_design}",
+        "[{}] {}{acts_in}{code_only}{authority}{section}: {}{visual_design}",
         short_id(o.id),
         o.kind,
         one_line(&o.body)
@@ -664,6 +671,7 @@ mod tests {
             acts_in: "active".into(),
             visual_design_path: None,
             code_only: None,
+            authority: "agent".into(),
         }
     }
 

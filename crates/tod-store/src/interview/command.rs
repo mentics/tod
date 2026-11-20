@@ -280,6 +280,13 @@ pub enum InterviewCommand {
     /// An agent sends its node back to an earlier state
     /// (`tod-cli lifecycle send-back`, `crate::send_back::execute`).
     SendBack(crate::send_back::Request),
+    /// The phase agent a dispute was sent to settles it
+    /// (`tod-cli lifecycle resolve-dispute`, `crate::send_back::resolve`).
+    ResolveDispute(crate::send_back::Resolution),
+    /// The app gives a phase its suspended certificate back when what it
+    /// covers is unchanged since the node left the phase
+    /// (`crate::phase::restore_suspended`).
+    RestoreCertificate { node_id: Uuid },
     /// The app starts a guidance selection run for a node, with its own
     /// trigger matches (`crate::guidance::start_run`).
     StartGuidanceRun(crate::guidance::NewRun),
@@ -1158,7 +1165,13 @@ pub fn execute(
                         None => None,
                     };
                     for (obligation_id, body) in decisions.pending_edits(&found, *option)? {
-                        let mutation = OutlineMutation::UpdateObligationBody { obligation_id, body };
+                        let mutation = match body {
+                            Some(body) => OutlineMutation::UpdateObligationBody { obligation_id, body },
+                            None => OutlineMutation::SetObligationAuthority {
+                                obligation_id,
+                                authority: crate::outline::repos::obligations::AUTHORITY_APPROVED.to_string(),
+                            },
+                        };
                         match asking {
                             Some(conversation_id) => {
                                 let turn_seq = conversations.max_user_seq(conversation_id)?;
@@ -1232,6 +1245,8 @@ pub fn execute(
             Ok(out)
         }
         InterviewCommand::SendBack(request) => crate::send_back::execute(conn, actor, request),
+        InterviewCommand::ResolveDispute(resolution) => crate::send_back::resolve(conn, actor, resolution),
+        InterviewCommand::RestoreCertificate { node_id } => crate::phase::restore_suspended(conn, *node_id),
         InterviewCommand::StartGuidanceRun(new) => {
             let run = crate::guidance::start_run(conn, actor, new)?;
             Ok(json!({ "run_id": run.id.to_string() }))

@@ -114,9 +114,10 @@ Ask the user only when the choice is a real one: the obligation's own wording
 is ambiguous, or it can be shown true here but you doubt it should be.
 
 If verifying shows the work must also do something no obligation states, do
-not add an obligation: past `planning` they change only with the user's
-approval. Propose it with `decisions ask`, quoting the obligation you would
-add and why; the user adds it if they agree.
+not add an obligation: they change only through the phase that wrote them
+(a dispute: send the task back with `lifecycle send-back --obligation`), or with
+the user's approval. Propose a missing one with `decisions ask`, quoting the
+obligation you would add and why; the user adds it if they agree.
 
 The app reads the verdicts and the plan steps, not your reply — a finding
 that is only in your reply is lost. A `failed` step's note is what the

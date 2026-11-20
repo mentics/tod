@@ -56,6 +56,15 @@ it (the same move on unchanged work, or a third to the same state), the run
 stops for the user with your reasons. If the block at the end of this
 message says this task was sent back here, start from that cause.
 
+When what is wrong is one of that phase's obligations, name it in the
+send-back: that makes it a dispute, and the phase that wrote the obligation
+settles it. If the message opens with a **Dispute**, a later phase disputed an
+obligation this phase wrote: settle it with the dispute resolution in the
+`lifecycle` commands (fixed, upheld with a note on how it is meant, or, from
+`design`, passed up to `proposed`). You cannot finish the phase while the
+dispute is open. If it says a dispute you raised was **settled**, read how, and
+go on from the obligation as it now stands.
+
 ## Finishing the phase
 
 When the phase's **Done when** checklist holds, finish it with the `phase`

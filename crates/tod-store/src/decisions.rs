@@ -104,6 +104,12 @@ pub struct OptionEdit {
     /// answering is refused.
     #[serde(default)]
     pub was: Option<String>,
+    /// Picking the option approves the obligation as it stands
+    /// (`--affirm-obligation`, `doc/requests/design.md` 10.1) instead of
+    /// changing its text: it becomes the user's (`approved`), so no agent
+    /// changes or removes it. `body` is empty then.
+    #[serde(default)]
+    pub affirm: bool,
 }
 
 /// The first lifecycle state a decision's option may not move a node into:
@@ -422,12 +428,39 @@ impl<'a> DecisionRepo<'a> {
         }
         let mut edits: Vec<OptionEdit> = Vec::new();
         for e in &decision.edits {
+            let flag = if e.affirm { "--affirm-obligation" } else { "--edit-obligation" };
             if e.option < 1 || e.option > options.len() as i64 {
                 bail!(
-                    "--edit-obligation names option {}, but the decision has {} option(s)",
+                    "{flag} names option {}, but the decision has {} option(s)",
                     e.option,
                     options.len()
                 );
+            }
+            if e.affirm {
+                let short = crate::interview::short_id(e.obligation_id);
+                let Some(current) = crate::outline::repos::ObligationRepo::new(self.conn).get(e.obligation_id)? else {
+                    bail!("--affirm-obligation: obligation {short} does not exist");
+                };
+                if current.node_id != node_id {
+                    bail!("--affirm-obligation: obligation {short} belongs to another node");
+                }
+                if current.user_owned() {
+                    bail!(
+                        "--affirm-obligation: obligation {short} is already the user's ({}); there is nothing to approve",
+                        current.authority
+                    );
+                }
+                if edits.iter().any(|x| x.option == e.option && x.obligation_id == e.obligation_id) {
+                    bail!("option {} edits or approves obligation {short} twice", e.option);
+                }
+                edits.push(OptionEdit {
+                    option: e.option,
+                    obligation_id: e.obligation_id,
+                    body: String::new(),
+                    was: None,
+                    affirm: true,
+                });
+                continue;
             }
             let body = e.body.trim();
             if body.is_empty() {
@@ -460,6 +493,7 @@ impl<'a> DecisionRepo<'a> {
                 obligation_id: e.obligation_id,
                 body: body.to_string(),
                 was: Some(current.body),
+                affirm: false,
             });
         }
         let mut blocks: Vec<Uuid> = Vec::new();
@@ -739,8 +773,10 @@ impl<'a> DecisionRepo<'a> {
     /// obligations as they are now: each must still exist on the node and
     /// still read as it did when the question was asked (or already read as
     /// the new text). Returns the edits still to make, as mutations to run as
-    /// the user. Fails, naming the obligation, when one no longer fits.
-    pub fn pending_edits(&self, decision: &Decision, option: Option<i64>) -> Result<Vec<(Uuid, String)>> {
+    /// the user: `(obligation, Some(new text))`, or `(obligation, None)` to
+    /// approve it (`--affirm-obligation`). Fails, naming the obligation, when
+    /// one no longer fits.
+    pub fn pending_edits(&self, decision: &Decision, option: Option<i64>) -> Result<Vec<(Uuid, Option<String>)>> {
         let Some(option) = option else { return Ok(Vec::new()) };
         let mut out = Vec::new();
         for edit in decision.edits_for(option) {
@@ -750,6 +786,12 @@ impl<'a> DecisionRepo<'a> {
             };
             if current.node_id != decision.node_id {
                 bail!("obligation {short} is no longer on this node, so this option's edit to it cannot be made");
+            }
+            if edit.affirm {
+                if !current.user_owned() {
+                    out.push((edit.obligation_id, None));
+                }
+                continue;
             }
             if current.body.trim() == edit.body.trim() {
                 continue;
@@ -763,7 +805,7 @@ impl<'a> DecisionRepo<'a> {
                     );
                 }
             }
-            out.push((edit.obligation_id, edit.body.clone()));
+            out.push((edit.obligation_id, Some(edit.body.clone())));
         }
         Ok(out)
     }

@@ -10,10 +10,19 @@ directly to one task:
 They are ordered within their kind, and that order is meaningful: it is the
 order shown to the user in the app.
 
-Obligations are the user's. Once a task is past `planning`, you never add,
-change, move, or delete one yourself, even when the code or a reviewer
-disagrees with it: ask the user, quoting the change you propose and why, and
-the user makes it if they agree. When the question is a choice between
+Obligations are the user's to stand behind. Each carries an **authority**:
+`agent` (an agent wrote it), `user` (the user wrote or edited it) or
+`approved` (the user confirmed it as it stands). You never change, move, or
+delete a user or approved obligation, in any state, even when the code or a
+reviewer disagrees with it: ask the user, quoting the change you propose and
+why, and the user makes it if they agree. An obligation of an agent's own may
+be changed by an agent only until the phase that wrote it is done: a
+requirement through `proposed`, a design obligation through `design`. From
+`planning` on, you do not edit it either. If you find one wrong or unclear
+after that (building, verifying, reviewing, fixing), **dispute** it: send the
+task back to the phase that wrote it, naming the obligation and why, and that
+phase's agent fixes it, upholds it with a clarification, or (design only) passes
+it up to `proposed`. Then you carry on from the corrected obligation. When the question is a choice between
 approaches and an obligation names the one an option replaces, put that
 obligation's new text on the option itself (see the decisions commands):
 answering then makes the edit as the user's own, so you never have to ask

@@ -175,6 +175,27 @@ was sent before and the obligations, plan and design are unchanged since
 since the user last acted on the node (`send_back::user_acted_at`: a move,
 request or answer of theirs). Anyone else gets an error naming who may.
 
+**Obligation authority and disputes** (`node_obligations.authority`, schema
+v108: `agent`, `user`, `approved`). The user's create, edit, or an answer's
+`--edit-obligation` stamps `user`; `--affirm-obligation` on `decisions ask`
+and the obligations panel's Approve (a journey `UserAction`) stamp `approved`.
+`tod_store::conversation::settled` is the rule: an agent never changes a
+user or approved obligation, in any state; an agent obligation only in the
+phase that wrote it (a requirement through `proposed`, a design obligation
+through `design`), never from `planning` on. The refusal says to **dispute**:
+`lifecycle send-back --obligation <id>` (repeatable) to the introducing phase
+(`send_back::dispute_target`), which an implementation session may now do too,
+and only for a dispute. The receiving phase agent settles it with
+`lifecycle resolve-dispute` (fixed, upheld, or from `design` passed up to
+`proposed`, the chain kept by `node_send_backs.parent_id`), and cannot certify
+or record ready while one is open (`PhaseRepo::record`). The disputing phase
+sees the resolution when the node comes forward (`render_for_opening`).
+Certificates are suspended by a move back, never deleted: when the node comes
+forward and a suspended certificate's digest still matches what it covers, the
+autopilot restores it with no agent (`phase::restore_suspended`, noted in the
+Activity). `send_back::record_dispute_lesson` is the empty hook where a
+dispute will become a lesson (step 8).
+
 **Usual actions** (`tod_core::usual_actions`, `media/context/cli/usual-actions.yml`).
 The phase agent's and the evaluator's opening ends with the `tod-cli` commands
 that role usually runs in that state (and, for the phase agent, with independent
