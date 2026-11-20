@@ -41,6 +41,34 @@ names no package manager; whatever the project declares is run.
   its reason with that: probably missing dependencies, and to set a Setup
   command on the check (`checks::missing_dependencies_hint`).
 
+## Fix: a command that repairs a failing check
+
+A check may carry a **fix** (`Check::fix`, "fix" in the editor and the YAML;
+blank means none): a command that repairs what the check finds mechanically (a
+formatter, a lint autofix). When the check fails, tod runs the fix in the same
+directory (`tod_core::fixer::run_fix`, from `checks::run_stale_notifying`),
+commits what it changed as **its own mechanical commit** (subject
+`tod: fix <check>`, no hooks, a submodule pointer never included), and runs
+**only that check again** on the new tree.
+
+- If it passes there is no Fix protocol turn, no finding, and no new round of
+  review: a change a tool made is not reviewed. In `review` or earlier, a
+  round of review that was done before the commit is recorded as covering the
+  new head too (`pr_draft_review::record_review_phase_heads`), so the pull
+  request's first head is not read as unreviewed; the node's lifecycle state
+  is untouched, so `lifecycle_next` does not send it round Review again.
+- A fix that fails, changes nothing, or leaves the check failing hands the
+  failure on as it was, with what the fixer did added to the output and shown
+  in the Activity's "fix for ..." entry: the agent (Fix protocol) takes it from
+  there. Nothing is hidden.
+- If the tree already held uncommitted work that is not the fixer's, the fix's
+  changes are left uncommitted (committing them would put someone else's change
+  in a commit marked mechanical).
+- The fix does not enter the check's fingerprint: changing it does not make
+  the check stale.
+- CI checks have the same in the project's `pr_readiness.check_fixes`
+  (`doc/lifecycle/pr-readiness.md`, "Mechanical failures").
+
 ## What runs, and when
 
 - **Where**: the node's Files directory (this machine, a dev container, or its

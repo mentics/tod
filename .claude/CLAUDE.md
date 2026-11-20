@@ -237,6 +237,19 @@ schema v102) as baseline, reviewed, tod's own push (`AutopilotState::tod_pushed`
 or **unreviewed**: a failed Activity note, and in `pr_draft` tod reviews that
 head at once. Commits a conversation made and did not push are adopted as a
 change awaiting review (`PrChange::held`) and pushed by the PR agent once clean.
+**Mechanical failures** (`doc/lifecycle/pr-readiness.md`, "Mechanical
+failures"): a job cancelled, timed out or lost to its runner is rerun through
+GitHub by tod, no agent turn, at most `max_infra_reruns` per check and head
+(a pass on rerun is noted as a flake); a failing check that the base branch's
+latest run fails the same way is waived by tod itself (a decision answered
+`decided_by = 'tod'`, with a rationale, shown "decided by tod" in the task
+panel's Answered drawer; the agent's `checks unrelated` claim is only checked
+by that comparison and refused back as work when unconfirmed); a check with a
+configured `fix` (`pr_readiness.check_fixes`, `Check::fix` for tod's own checks)
+is fixed, committed as tod's own mechanical commit
+(`tod_core::fixer`, `pr_pushes::VERDICT_MECHANICAL`, exempt from review) and
+only that check run again. A silent bot, after `max_asks`, is gone on without
+by tod the same way unless its `on_silence` is `ask`.
 The task panel warns when a PR is open while tod's review of its head or its
 checks are not clear (`PrFacts::ready_warning`); tod never marks one ready then. The same assessment answers the `pr →
 approved` criteria (`pr-approved.up-to-date`, `.threads-resolved`,

@@ -267,6 +267,12 @@ again, and the new answer is sent to the runner as new input and logged as a
 new entry, leaving the old one in place. Nothing is reversed; the runner is
 told about the change and decides how to adjust.
 
+An entry tod answered itself (`decision_answers.decided_by = 'tod'`: a silent
+review bot gone on without, a pre-existing failure waived) reads "decided by
+tod" where a user's answer shows the actor, with the rationale (what was tried
+or compared) in a "Why:" line below the answer. A triage agent's answer will
+read "decided by triage" the same way.
+
 ## Request feedback
 
 Every request can be marked as a bad question or one that should not have
