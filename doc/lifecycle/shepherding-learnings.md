@@ -57,6 +57,29 @@ it. Check after any send-back that it converges: it did (one send-back).
   feature that only unifies when `tod-store` is built too); use
   `-p tod-agent -p tod-store`.
 
+## Seen while supervising five nodes (2026-11-20)
+
+- **Usage limit stops every running node at once.** A 5-hour plan limit
+  ("You've hit your 5-hour limit") fails each live run as `agent_failed`; nothing
+  is wrong with the nodes. `runner resume` each one when the window resets.
+- **Review/design oscillation (ENG-3557).** Three send-backs over one claim (a
+  partial index) ran past the loop guard because each carried different reasons.
+  It ended in a user decision; watch for the same claim being sent back twice.
+- **Diverged origin branch (ENG-3038).** The node's branch was recreated from
+  main in the container instead of from the existing `origin/<branch>` that an
+  earlier run left, so the push was refused. Non-destructive fix: `git merge -s
+  ours origin/<branch>` in the node's worktree, then `runner resume`. Gap: tod
+  should create it from the origin branch, as the design says.
+- **Two leases, one branch (ENG-3094).** A node leased a second worktree 10
+  minutes after its first, still holding the branch, so `switch` failed ("already
+  used by worktree"). Fix: `git switch --detach` in the idle one (check the branch
+  equals origin first), switch the other onto the branch, resume. Gap: reuse the
+  first lease.
+- **Stale `needs_human` outcome (ENG-3559).** The outcome kept saying a decision
+  was pending after every decision was answered, so the runner did not resume.
+- **No `timeout` on macOS, and `$T` does not word-split in zsh.** Call the
+  deployed `tod-cli` (`target/dev-fast/tod-cli`) by full path.
+
 ## Process pitfalls
 
 - `ledger.py next` leases any due node in scope, and the scope already holds
