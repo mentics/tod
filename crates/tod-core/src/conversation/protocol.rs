@@ -93,7 +93,7 @@ pub fn hand_back_for_pending_decision(turn: &TurnContext<'_>) -> Result<Option<N
     let pending = turn
         .env
         .fleet
-        .read(|conn| tod_store::decisions::DecisionRepo::new(conn).list_pending_for_node(node_id))?;
+        .read(|conn| tod_store::decisions::DecisionRepo::new(conn).list_open_for_node(node_id))?;
     let waiting = pending
         .iter()
         .any(|d| d.conversation_id == Some(turn.env.conversation_id));
@@ -290,6 +290,7 @@ pub fn protocol_for(kind: ProtocolKind) -> &'static dyn Protocol {
         ProtocolKind::QuickFix => &super::quick_fix::QuickFixProtocol,
         ProtocolKind::SmallReview => &super::small_review::SmallReviewProtocol,
         ProtocolKind::Incident => &super::incident::IncidentProtocol,
+        ProtocolKind::Triage => &super::triage::TriageProtocol,
         ProtocolKind::Phase => &super::phase::PhaseProtocol,
         ProtocolKind::Evaluate => &super::phase::EvaluateProtocol,
         ProtocolKind::Chat => &ChatProtocol,

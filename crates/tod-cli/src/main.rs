@@ -19,6 +19,7 @@ mod skills;
 mod doc_sync;
 mod guidance;
 mod suggest;
+mod triage;
 mod incoming;
 mod learn;
 mod lifecycle;
@@ -82,6 +83,7 @@ NOUNS:
     db                     Log in to the user's databases through their machine, without seeing the login
     environment            Variables and credentials defined for this work; ask the user for one
     decisions              What the user answers: ask, list, show
+    triage                 A triage session answers, escalates or converts the one request it reads
     phase                  Whether a node's lifecycle phase is done: status, ready, certify, reject
     wait                   What a node waits on between sessions: a time, an event, a check
     batch                  Run many commands in one call; the reply lists only the failures
@@ -119,6 +121,7 @@ const NOUNS: &[(&str, &str)] = &[
     ("access", crate::access::USAGE),
     ("environment", crate::environment::USAGE),
     ("decisions", crate::decisions::USAGE),
+    ("triage", crate::triage::USAGE),
     ("phase", crate::phase::USAGE),
     ("wait", crate::wait::USAGE),
     ("batch", crate::batch::USAGE),
@@ -398,6 +401,7 @@ fn run_with(args: &[String], env: operator::Env) -> anyhow::Result<String> {
         "secrets" => secrets::run(invocation),
         "environment" => environment::run(invocation),
         "decisions" => decisions::run_with(invocation, env),
+        "triage" => triage::run(invocation),
         "runner" if operator => runner::run(invocation, env),
         "stats" if operator => stats::run(invocation, env),
         "phase" => phase::run(invocation),
@@ -406,7 +410,7 @@ fn run_with(args: &[String], env: operator::Env) -> anyhow::Result<String> {
         "journey" => journey::run(invocation),
         "skills" => skills::run(invocation),
         other => anyhow::bail!(
-            "unknown noun `{other}` (expected: node, obligations, content, plan, questions, memory, interview, visual-design, capabilities, changeset, tests, review, pr, verdicts, incoming, guidance, suggest, learn, lifecycle, secrets, db, environment, decisions, phase, wait, batch, journey, skills)"
+            "unknown noun `{other}` (expected: node, obligations, content, plan, questions, memory, interview, visual-design, capabilities, changeset, tests, review, pr, verdicts, incoming, guidance, suggest, learn, lifecycle, secrets, db, environment, decisions, triage, phase, wait, batch, journey, skills)"
         ),
     }
 }

@@ -234,7 +234,7 @@ fn answer_with_reopen(
 mod tests {
     use super::*;
     use crate::interview::test_support::{Fixture, fixture};
-    use tod_store::decisions::{DECISION_ANSWERED, NewDecision, OptionEdit, OptionMove};
+    use tod_store::decisions::{DECISION_ANSWERED, DECISION_PENDING, NewDecision, OptionEdit, OptionMove};
     use tod_store::outline::OutlineMutation;
     use tod_store::outline::repos::plan_steps::{STATUS_PENDING, STATUS_READY, STATUS_VERIFIED};
 

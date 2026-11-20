@@ -25,6 +25,7 @@
 
 mod github_wait;
 mod quick_fix;
+mod triage;
 pub use github_wait::{
     GithubCheck, PUSH_WAIT_SPEC, PushRetrier, branch_push_failed, push_retry_delay_ms, branch_push_ok, check_github, check_now, github_look_failed, look_failed_next_look, read_wait_spec,
     retry_delay_ms,
@@ -800,6 +801,11 @@ impl Autopilot {
             if let Some(outcome) = self.incident_step(fleet, agent, hook)? {
                 return Ok(outcome);
             }
+            // A request an agent filed is read by triage before anything below
+            // decides the run must stop for the user.
+            if let Some(outcome) = self.triage_step(fleet, agent, hook)? {
+                return Ok(outcome);
+            }
             let lifecycle = lifecycle::current_state(fleet, self.node)?;
             if lifecycle == "done" {
                 return Ok(Outcome::Done);
@@ -1565,6 +1571,10 @@ impl Autopilot {
             if let Some(limit) = self.over_budget() {
                 hook.waiting(None, None);
                 return Ok(Some(Outcome::BudgetExhausted { limit }));
+            }
+            if let Some(outcome) = self.triage_step(fleet, agent, hook)? {
+                hook.waiting(None, None);
+                return Ok(Some(outcome));
             }
             let mut pending = fleet
                 .read(|conn| Ok(DecisionRepo::new(conn).list_pending_for_node(self.node)?))?
@@ -3682,8 +3692,9 @@ impl Autopilot {
         };
         // The guidance selector (a one-turn Haiku matcher, `crate::guidance`)
         // is part of the work it selects for, not a session of its own
-        // against the run's budget.
-        if kind != ProtocolKind::Guidance {
+        // against the run's budget; neither is a triage session, which reads
+        // one request the work filed.
+        if kind != ProtocolKind::Guidance && kind != ProtocolKind::Triage {
             self.state.sessions += 1;
         }
         if let Err(err) = driver.send(fleet, agent, &message) {

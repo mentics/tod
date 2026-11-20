@@ -205,6 +205,8 @@ mod tests {
                 new_evidence: String::new(),
                 brief: Default::default(),
                 error_signature: String::new(),
+                triage_conversation_id: None,
+                asked: None,
                 edits: Vec::new(),
             },
             answers: vec![DecisionAnswer {

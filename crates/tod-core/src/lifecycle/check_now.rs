@@ -93,7 +93,7 @@ pub fn check_now(fleet: &FleetStore, node: Uuid, data_root: &std::path::Path) ->
     // The babysitter also stops short of the gate while a decision is open.
     if held.is_none() && matches!(from.as_str(), "pr_draft" | "pr_review") {
         let pending = fleet
-            .read(|conn| Ok(tod_store::decisions::DecisionRepo::new(conn).list_pending_for_node(node)?))?
+            .read(|conn| Ok(tod_store::decisions::DecisionRepo::new(conn).list_open_for_node(node)?))?
             .len();
         if pending > 0 {
             held = Some(format!("{pending} decision(s) are waiting for an answer"));

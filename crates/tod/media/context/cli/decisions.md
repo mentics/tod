@@ -16,12 +16,17 @@ Inside a conversation `--node` defaults to the node it is about, and an ask
 is filed under that conversation and its protocol. Decision ids may be given
 in full or as the 8-character prefix listings show.
 
-`ask` records a pending decision:
+`ask` records a decision. One with reason `intent`, `missing_rule`, `conflict`,
+`risk` or `other` is read by a triage session first, which answers it, converts
+it or hands it to the user with a brief; `access`, `broken` and `capability`
+go straight to the user. Either way, end your turn after asking: the answer
+reaches you. It is filed as follows:
 
 - The question is one positional argument — quote it. It is the whole request
-  as the user reads it: the ask on the first line, a blank line, then the
-  background (see "Wording a request" in how you work here). Options go in
-  `--option`, never in the question text.
+  as the user reads it: state what you need decided, then the facts it rests
+  on, plainly, and put your recommendation first among the options. A triage
+  session words what the user reads (see "Wording what you ask" in how you
+  work here). Options go in `--option`, never in the question text.
 - `--option`: repeatable, in the order they should be offered to the user
   (numbered 1, 2, 3 … in the task panel). The user can always answer in
   their own words instead. With none, the question asks for free text.

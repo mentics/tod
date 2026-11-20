@@ -61,6 +61,9 @@ pub fn check_conversation_agent(
     // A quick fix and a small review work on one failing thing: edit files, run
     // the check, or review a diff. Obligations and the plan are not theirs, however
     // far along the node is.
+    if conversation.protocol == ProtocolKind::Triage {
+        bail!("refused: a triage session edits nothing; it answers, escalates or converts the request it reads (`tod-cli triage`)");
+    }
     if matches!(conversation.protocol, ProtocolKind::QuickFix | ProtocolKind::SmallReview) {
         bail!(
             "refused: a {} session edits files and nothing else; obligations, the plan and decisions are not its to change",

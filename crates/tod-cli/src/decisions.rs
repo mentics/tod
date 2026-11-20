@@ -373,6 +373,7 @@ fn ask(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
             guard_reask,
             new_evidence,
             brief,
+            ..Default::default()
         },
     })?;
     if let Some(parked) = result.get("parked_on") {
@@ -402,6 +403,8 @@ fn decision_json(d: &Decision) -> serde_json::Value {
         "options": d.options,
         "evidence": d.evidence.iter().map(|e| serde_json::json!({"kind": e.kind, "id": e.id.to_string()})).collect::<Vec<_>>(),
         "status": d.status,
+        "triage_conversation_id": d.triage_conversation_id.map(|id| id.to_string()),
+        "asked": d.asked.as_ref().map(|a| serde_json::json!({"question": a.question, "options": a.options})),
         "reason": d.reason,
         "moves": d.moves.iter().map(|m| serde_json::json!({"option": m.option, "to": m.to})).collect::<Vec<_>>(),
         "edits": d.edits.iter().map(|e| serde_json::json!({"option": e.option, "obligation_id": e.obligation_id.to_string(), "body": e.body})).collect::<Vec<_>>(),
@@ -460,7 +463,7 @@ fn list(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
         if all {
             repo.list_for_node(node)
         } else {
-            repo.list_pending_for_node(node)
+            repo.list_open_for_node(node)
         }
     })?;
     if inv.json {
@@ -498,6 +501,9 @@ fn show(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
                     "option": a.option,
                     "text": a.text,
                     "actor": a.actor,
+                    "decided_by": a.decided_by,
+                    "rationale": a.rationale,
+                    "conversation_id": a.conversation_id.map(|id| id.to_string()),
                     "answered_at": a.answered_at,
                 })
             })

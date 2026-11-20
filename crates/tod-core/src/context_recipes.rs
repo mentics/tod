@@ -637,6 +637,17 @@ pub const INCIDENT: ContextRecipe = ContextRecipe {
     blocks: &[DynamicBlock::DataRoot, DynamicBlock::IncidentSamples],
 };
 
+/// Triage (`crate::conversation::triage`, `ProtocolKind::Triage`,
+/// `doc/lifecycle/triage.md`): one agent request, read by a fresh session that
+/// answers it, escalates it with a brief, or converts it. Its own stance: it
+/// decides alone on its first turn and talks with the user afterwards.
+pub const TRIAGE: ContextRecipe = ContextRecipe {
+    name: "triage",
+    situational: false,
+    layers: &["stance/triage-session", "cli/intro", "cli/triage", "surface/triage"],
+    blocks: &[DynamicBlock::DataRoot, DynamicBlock::WorkingDirectory, DynamicBlock::TriageRequest],
+};
+
 /// Every registered surface.
 pub const ALL_RECIPES: &[ContextRecipe] = &[
     INCOMING_CHANGES,
@@ -644,6 +655,7 @@ pub const ALL_RECIPES: &[ContextRecipe] = &[
     QUICK_FIX,
     SMALL_REVIEW,
     INCIDENT,
+    TRIAGE,
     CONVERSATION,
     CHAT,
     VISUAL_DESIGN,
@@ -1033,6 +1045,7 @@ missing"),
             | DynamicBlock::QuickFixTarget
             | DynamicBlock::SmallReviewDiff
             | DynamicBlock::IncidentSamples
+            | DynamicBlock::TriageRequest
             | DynamicBlock::VisualDesign => 5,
         }
     }

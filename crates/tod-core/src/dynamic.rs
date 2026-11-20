@@ -159,6 +159,10 @@ pub enum DynamicBlock {
     /// The incident an investigation is about (pre-rendered by
     /// `crate::incident`): its signature, summary and samples.
     IncidentSamples,
+    /// The one request a triage session reads (pre-rendered by
+    /// `crate::conversation::triage`): the request, the asking session's last
+    /// turns, the task's state, obligations, design and answered requests.
+    TriageRequest,
     /// What a conversation is about: its kind, path, title, and (by kind) its
     /// full text, its obligations and plan steps, or the top-level nodes.
     Focus,
@@ -205,6 +209,8 @@ pub struct DynamicContext<'a> {
     pub change_diff: &'a str,
     /// What the incident investigation is about (pre-rendered).
     pub incident: &'a str,
+    /// What a triage session reads (pre-rendered).
+    pub triage: &'a str,
     pub environment: &'a str,
     pub skills: &'a str,
     pub pull_requests: &'a str,
@@ -556,6 +562,11 @@ fn render_block(block: DynamicBlock, ctx: &DynamicContext<'_>, out: &mut String)
         DynamicBlock::IncidentSamples => {
             out.push_str("\n## The incident\n\n");
             out.push_str(ctx.incident.trim());
+            out.push('\n');
+        }
+        DynamicBlock::TriageRequest => {
+            out.push_str("\n## The request\n\n");
+            out.push_str(ctx.triage.trim());
             out.push('\n');
         }
 

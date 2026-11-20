@@ -570,6 +570,13 @@ fn render_answers_since(conn: &Connection, node_id: Uuid, since: i64, sending: &
             );
         }
         let _ = writeln!(out, "\n- Question: {}\n  Answer: {given}", decision.question.lines().next().unwrap_or(""));
+        if answer.decided_by == tod_store::decisions::DECIDED_BY_TRIAGE {
+            let _ = writeln!(
+                out,
+                "  Decided by triage, which read your request before the user did (the user may still change it): {}",
+                one_line(answer.rationale.as_deref().unwrap_or("no rationale recorded"))
+            );
+        }
         if !decision.blocks.is_empty() {
             let steps: Vec<String> = decision.blocks.iter().map(|id| short_id(*id)).collect();
             let _ = writeln!(out, "  It held up plan steps [{}], which are open again.", steps.join(", "));

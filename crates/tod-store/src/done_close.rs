@@ -45,7 +45,7 @@ pub fn close(conn: &Connection, node: Uuid, at: i64) -> Result<usize> {
 pub fn sweep(conn: &Connection, at: i64) -> Result<Vec<Uuid>> {
     let mut stmt = conn.prepare(
         "SELECT l.node_id FROM node_lifecycle l WHERE l.state = 'done' AND (
-           EXISTS (SELECT 1 FROM decisions d WHERE d.node_id = l.node_id AND d.status = 'pending')
+           EXISTS (SELECT 1 FROM decisions d WHERE d.node_id = l.node_id AND d.status IN ('pending','triage'))
            OR EXISTS (SELECT 1 FROM run_state r WHERE r.node_id = l.node_id AND r.phase <> 'done'))",
     )?;
     let nodes: Vec<Uuid> = stmt

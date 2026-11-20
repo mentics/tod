@@ -87,11 +87,12 @@ pub fn add_delete_sandbox(conn: &Connection) -> Result<()> {
 /// the two cheap sessions of the escalation ladder (`doc/requests/design.md`
 /// sections 5 and 4.2): the quick fix of one failing check (`quick_fix`) and
 /// the small-change review of its commit in `pr_draft` (`small_review`).
-pub const PHASES: [&str; 19] = [
+pub const PHASES: [&str; 20] = [
     "proposed",
     "design",
     "guidance",
     "incident",
+    "triage",
     "planning",
     "implement",
     "verify",
@@ -158,6 +159,15 @@ pub const SMALL_REVIEW: &str = "small_review";
 /// configured; it runs on the cheap tier unless its key says otherwise.
 pub const INCIDENT: &str = "incident";
 
+/// Triage (`tod_core::conversation::triage`, `doc/lifecycle/triage.md`): one
+/// session per request an agent files, which answers it, escalates it or
+/// converts it. Only its model and effort are configured; unset, it runs on
+/// [`TRIAGE_DEFAULT_MODEL`] at [`TRIAGE_DEFAULT_EFFORT`]: a judgment about
+/// whether to interrupt a person is worth more than the cheap tier's matching.
+pub const TRIAGE: &str = "triage";
+pub const TRIAGE_DEFAULT_MODEL: &str = "sonnet";
+pub const TRIAGE_DEFAULT_EFFORT: &str = "low";
+
 /// What the cheap sessions run on unless their key says otherwise.
 pub const CHEAP_DEFAULT_MODEL: &str = "haiku";
 pub const CHEAP_DEFAULT_EFFORT: &str = "low";
@@ -168,13 +178,16 @@ pub const QUICK_FIX_DEFAULT_EFFORT: &str = CHEAP_DEFAULT_EFFORT;
 /// only a model and effort: the guidance selector, the quick fix and the
 /// small-change review.
 pub fn agent_only(phase: &str) -> bool {
-    phase == GUIDANCE || phase == QUICK_FIX || phase == SMALL_REVIEW || phase == INCIDENT
+    phase == GUIDANCE || phase == QUICK_FIX || phase == SMALL_REVIEW || phase == INCIDENT || phase == TRIAGE
 }
 
 /// The model and effort a phase's session runs on when no node sets them:
 /// the cheap tier for the sessions that are matching or small work
 /// (`doc/requests/design.md` section 6).
 pub fn default_agent(phase: &str) -> Option<(&'static str, &'static str)> {
+    if phase == TRIAGE {
+        return Some((TRIAGE_DEFAULT_MODEL, TRIAGE_DEFAULT_EFFORT));
+    }
     agent_only(phase).then_some((CHEAP_DEFAULT_MODEL, CHEAP_DEFAULT_EFFORT))
 }
 

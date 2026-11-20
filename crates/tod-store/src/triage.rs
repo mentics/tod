@@ -33,7 +33,8 @@ use uuid::Uuid;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Op {
-    /// The app started the session that reads `decision`.
+    /// The app started the session that reads `decision`, making its
+    /// conversation (a task-focused triage one) when `conversation` is new.
     Start { decision: Uuid, conversation: Uuid },
     Answer {
         decision: Uuid,
@@ -113,9 +114,25 @@ pub fn run_op(conn: &Connection, actor: &str, op: &Op) -> Result<Value> {
     let decisions = DecisionRepo::new(conn);
     match op {
         Op::Start { decision, conversation } => {
-            let found = ConversationRepo::new(conn).get(*conversation)?;
-            if found.is_none_or(|c| c.protocol != ProtocolKind::Triage) {
-                bail!("conversation {conversation} is not a triage session");
+            let target = decisions.get(*decision)?.ok_or_else(|| anyhow::anyhow!("decision {decision} not found"))?;
+            let conversations = ConversationRepo::new(conn);
+            match conversations.get(*conversation)? {
+                Some(found) if found.protocol != ProtocolKind::Triage => {
+                    bail!("conversation {conversation} is not a triage session");
+                }
+                Some(_) => {}
+                // The session is made here, about the request's task, so the
+                // link and the row are one write.
+                None => {
+                    conversations.create_with_id(
+                        *conversation,
+                        crate::conversation::Focus::Node(target.node_id),
+                        ProtocolKind::Triage,
+                        None,
+                        None,
+                        None,
+                    )?;
+                }
             }
             decisions.link_triage(*decision, *conversation)?;
             Ok(json!({ "decision": decision.to_string() }))

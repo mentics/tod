@@ -131,6 +131,8 @@ mod tests {
             new_evidence: String::new(),
             brief,
             error_signature: String::new(),
+            triage_conversation_id: None,
+            asked: None,
         }
     }
 

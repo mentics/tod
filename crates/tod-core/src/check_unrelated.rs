@@ -496,6 +496,8 @@ mod tests {
             new_evidence: String::new(),
             brief: Default::default(),
             error_signature: String::new(),
+            triage_conversation_id: None,
+            asked: None,
         };
         assert_eq!(key_of(&d), Some((c.pr.clone(), c.check.clone(), c.head.clone())));
         // A check whose name has quotes and parentheses still round-trips.

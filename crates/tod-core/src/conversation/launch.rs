@@ -35,6 +35,7 @@ pub fn role_for(kind: ProtocolKind) -> AgentRole {
         | ProtocolKind::QuickFix
         | ProtocolKind::SmallReview
         | ProtocolKind::Incident
+        | ProtocolKind::Triage
         | ProtocolKind::Pr => AgentRole::Default,
     }
 }
@@ -69,6 +70,7 @@ pub fn phase_for(
         ProtocolKind::QuickFix => lifecycle_config::QUICK_FIX.to_string(),
         ProtocolKind::SmallReview => lifecycle_config::SMALL_REVIEW.to_string(),
         ProtocolKind::Incident => lifecycle_config::INCIDENT.to_string(),
+        ProtocolKind::Triage => lifecycle_config::TRIAGE.to_string(),
         ProtocolKind::Pr => match state()?.as_str() {
             "pr_draft" => "pr_draft".to_string(),
             "pr_review" => "pr_review".to_string(),
