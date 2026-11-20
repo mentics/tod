@@ -7,8 +7,11 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
-/// The crates the daemon is compiled from, relative to this one.
-const SOURCES: &[&str] = &[".", "../tod-agentd", "../tod-core", "../tod-store", "../tod-agent"];
+/// The crates the daemon is compiled from, relative to this one, and
+/// `tod-cli`, whose source hash `tod-core` compiles in (`CLI_BUILD_STAMP`):
+/// a daemon from before a `tod-cli` change would refuse its agents' turns
+/// once restarted, so that change is a new daemon build too.
+const SOURCES: &[&str] = &[".", "../tod-agentd", "../tod-core", "../tod-store", "../tod-agent", "../tod-cli"];
 
 fn main() {
     let here = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
