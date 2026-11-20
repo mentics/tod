@@ -263,6 +263,10 @@ pub enum InterviewCommand {
         node_id: Uuid,
         state: String,
         fixes: Vec<String>,
+        /// In `verifying` only: the obligations whose verdicts the evidence
+        /// evaluator withdraws, so verification rules on them again.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        reopen: Vec<Uuid>,
     },
     /// The user's "Shouldn't have asked" on a request
     /// (`crate::request_feedback`). Not offered by `tod-cli`.
@@ -324,6 +328,13 @@ pub enum InterviewCommand {
         conversation_id: Option<Uuid>,
         status: String,
         evidence: String,
+        /// How it was reached (`verification::VERDICT_METHODS`); required
+        /// for `verified`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        method: Option<String>,
+        /// What was run.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ran: Option<String>,
     },
     /// Withdraw what verification confirmed on a node whose code changed
     /// since (`PlanStepRepo::reopen_verification`).
@@ -1154,6 +1165,7 @@ pub fn execute(
             node_id,
             state,
             fixes,
+            reopen,
         } => {
             let fixes: Vec<&str> = fixes
                 .iter()
@@ -1163,8 +1175,22 @@ pub fn execute(
             if fixes.is_empty() {
                 bail!("a rejection needs at least one fix");
             }
+            if !reopen.is_empty() && state != crate::phase::VERIFYING {
+                bail!("only a rejection of `verifying` reopens verdicts");
+            }
             let body = serde_json::to_string(&fixes)?;
-            record_phase(conn, actor, *node_id, state, crate::phase::PHASE_REJECT, &body)
+            // Recorded over the evidence as it was judged, before the
+            // reopening changes it: the same evidence rejected again is how
+            // the run sees it is stuck.
+            let mut out =
+                record_phase(conn, actor, *node_id, state, crate::phase::PHASE_REJECT, &body)?;
+            if !reopen.is_empty() {
+                let why = format!("Evidence evaluator: {}", fixes.join("; "));
+                let reopened = crate::verification::VerdictRepo::new(conn)
+                    .reopen_these(*node_id, reopen, &why)?;
+                out["reopened"] = json!(reopened);
+            }
+            Ok(out)
         }
         InterviewCommand::RecordRequestFeedback(feedback) => {
             let id = crate::request_feedback::RequestFeedbackRepo::new(conn).record(feedback)?;
@@ -1225,6 +1251,8 @@ pub fn execute(
             conversation_id,
             status,
             evidence,
+            method,
+            ran,
         } => {
             let verdict = crate::verification::VerdictRepo::new(conn).record(
                 *node_id,
@@ -1232,6 +1260,10 @@ pub fn execute(
                 *conversation_id,
                 status,
                 evidence,
+                &crate::verification::VerdictHow {
+                    method: method.clone(),
+                    ran: ran.clone(),
+                },
             )?;
             Ok(json!({ "id": verdict.id, "status": verdict.status }))
         }

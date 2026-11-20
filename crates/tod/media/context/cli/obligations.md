@@ -6,8 +6,8 @@ as the 8-character prefix shown in listings.
 ```
 tod-cli --data-root <DATA_ROOT> obligations list       [--node <UUID>] [--search <TEXT>] [--kind requirement|constraint] [--inherited]
 tod-cli --data-root <DATA_ROOT> obligations show       <ID>
-tod-cli --data-root <DATA_ROOT> obligations add        --node <UUID> --kind requirement|constraint --body <TEXT> --phase requirements|design [--acts-in design|active|verifying|merged|released] [--section <NAME>] [--after <ID>] [--before]
-tod-cli --data-root <DATA_ROOT> obligations update     <ID> [--body <TEXT>] [--section <NAME>] [--phase requirements|design|unknown] [--acts-in design|active|verifying|merged|released] [--reason <TEXT>]
+tod-cli --data-root <DATA_ROOT> obligations add        --node <UUID> --kind requirement|constraint --body <TEXT> --phase requirements|design [--acts-in design|active|verifying|merged|released] [--code-only <REASON>] [--section <NAME>] [--after <ID>] [--before]
+tod-cli --data-root <DATA_ROOT> obligations update     <ID> [--body <TEXT>] [--section <NAME>] [--phase requirements|design|unknown] [--acts-in design|active|verifying|merged|released] [--code-only <REASON> | --live] [--reason <TEXT>]
 tod-cli --data-root <DATA_ROOT> obligations move       <ID> --node <UUID>
 tod-cli --data-root <DATA_ROOT> obligations delete     <ID>
 tod-cli --data-root <DATA_ROOT> obligations deleted    --node <UUID> [--by user|agent|<SESSION>]
@@ -31,6 +31,13 @@ An obligation has two phases, set by two flags: `--phase` is the state it was
 The obligations concepts say how to set each. `--acts-in` is left off when it
 is `active`. Listings show it as `acts-in=<state>` when it is not. Inside an interview, an agent's `add` always writes its own session's phase —
 `--phase` there only matters when running `add` outside an interview.
+
+Every obligation is **live**: verification has to show it in the running work.
+`--code-only <REASON>` marks one that only the code can show (a pure function,
+a refactor, a rename), so a unit test or reading the code verifies it;
+`--live` clears the mark. Listings show it as `code-only (<reason>)`. Only the
+design phase agent (in `design`) and the user may set or clear it; every other
+agent is refused.
 
 Past `planning` the app refuses every obligation change from an agent, with one
 exception: a verification session may `update <id> --acts-in merged|released

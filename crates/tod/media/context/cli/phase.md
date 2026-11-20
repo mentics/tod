@@ -7,7 +7,7 @@ state the node is in now; there is no option to name another.
 tod-cli --data-root <DATA_ROOT> phase status  [--node <NODE_UUID>]
 tod-cli --data-root <DATA_ROOT> phase ready   [--node <NODE_UUID>]
 tod-cli --data-root <DATA_ROOT> phase certify [--node <NODE_UUID>] --note <TEXT>
-tod-cli --data-root <DATA_ROOT> phase reject  [--node <NODE_UUID>] --fix <TEXT> (repeatable)
+tod-cli --data-root <DATA_ROOT> phase reject  [--node <NODE_UUID>] --fix <TEXT> (repeatable) [--reopen <OBLIGATION_ID>] (repeatable)
 ```
 
 Inside a conversation `--node` defaults to the node it is about.
@@ -28,3 +28,6 @@ Inside a conversation `--node` defaults to the node it is about.
 - `reject --fix`: send the phase back to its agent with the fixes it must
   make, one per `--fix`. Use this for anything an agent can fix confidently;
   ask the user (`decisions ask`) only for what no agent can settle.
+  In `verifying`, `--reopen` withdraws an obligation's verdict, so
+  verification has to rule on it again; name each verdict whose evidence
+  falls short.

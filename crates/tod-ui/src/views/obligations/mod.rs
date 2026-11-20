@@ -207,6 +207,9 @@ pub struct ObligationsView {
     /// Each obligation's standing — its verdict, else whether a plan step
     /// satisfies it — which the status filter goes by.
     standing: HashMap<Uuid, String>,
+    /// How each current verdict was reached (`live`, `unit`, ...), shown
+    /// beside the standing; not part of the filter.
+    methods: HashMap<Uuid, String>,
     /// The standings the list shows; empty shows every obligation.
     filter: StatusFilter,
     editing_id: Option<Uuid>,
@@ -309,6 +312,7 @@ impl ObligationsView {
             struck: HashSet::new(),
             change_markers: HashMap::new(),
             standing: HashMap::new(),
+            methods: HashMap::new(),
             filter: StatusFilter::default(),
             editing_id: None,
             draft_id: None,
@@ -459,16 +463,20 @@ impl ObligationsView {
             .fleet
             .list_obligations_for_node(node_id)
             .unwrap_or_default();
-        self.standing = self
+        (self.standing, self.methods) = self
             .fleet
             .read(|conn| {
                 let steps = PlanStepRepo::new(conn);
                 let mut standing = HashMap::new();
+                let mut methods = HashMap::new();
                 for s in VerdictRepo::new(conn).standings(node_id)? {
                     let planned = !steps.list_steps_for_obligation(s.obligation.id)?.is_empty();
                     standing.insert(s.obligation.id, s.listing_status(planned).to_string());
+                    if let Some(method) = s.verdict.as_ref().and_then(|v| v.method.clone()) {
+                        methods.insert(s.obligation.id, method);
+                    }
                 }
-                Ok(standing)
+                Ok((standing, methods))
             })
             .unwrap_or_default();
         let mut struck = HashSet::new();
@@ -665,6 +673,7 @@ impl ObligationsView {
                         struck: self.struck.contains(&id),
                         marker: self.change_markers.get(&id).copied(),
                         standing: self.standing.get(&id).cloned(),
+                        method: self.methods.get(&id).cloned(),
                         obligation,
                     },
                 ));
@@ -1984,6 +1993,7 @@ mod tests {
                 phase: "requirements".to_string(),
                 acts_in: "active".to_string(),
                 visual_design_path: None,
+                code_only: None,
             })
             .collect()
     }

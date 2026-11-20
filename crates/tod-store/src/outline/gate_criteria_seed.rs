@@ -295,6 +295,14 @@ pub const GATE_CRITERIA: &[GateCriterionSeed] = &[
         sort_order: 0,
     },
     GateCriterionSeed {
+        id_str: "a1000003-0003-4003-8003-00000000000c",
+        from_state: "verifying",
+        to_state: "review",
+        slug: crate::outline::repos::gate::VERIFYING_REVIEW_EVIDENCE_CERTIFIED_SLUG,
+        label: "Verification's evidence audited and certified by an independent evaluator?",
+        sort_order: 1,
+    },
+    GateCriterionSeed {
         id_str: "a1000003-0003-4003-8003-000000000001",
         from_state: "verifying",
         to_state: "review",

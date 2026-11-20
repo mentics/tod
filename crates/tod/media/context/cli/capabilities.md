@@ -29,8 +29,9 @@ wherever that node came from.
 
 `lifecycle-config` sets the skills the agent for a phase uses, and the model
 and effort it runs with, for the node and everything below it. `<PHASE>` is one
-of proposed, design, planning, implement, verify, review, fix, pr, pr_draft,
-pr_review, merged, released, learn. `--skills` replaces that phase's list
+of proposed, design, planning, implement, verify, verify_evaluate, review,
+fix, pr, pr_draft, pr_review, merged, released, learn (`verify_evaluate` is
+the evaluator of verification's evidence; unset, it takes `verify`'s). `--skills` replaces that phase's list
 (`--skills ''` means none, even where an ancestor sets some). `--model` and
 `--effort` set that phase's (`--model ''` unsets one, so an ancestor's, the
 node's Agent capability, or the settings apply again); each resolves on its own

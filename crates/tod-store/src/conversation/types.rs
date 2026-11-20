@@ -201,6 +201,10 @@ pub enum EntitySnapshot {
         acts_in: String,
         ordinal: i32,
         visual_design_path: Option<String>,
+        /// Why it is checked in the code alone; `None` (live) in snapshots
+        /// taken before the marker.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code_only: Option<String>,
     },
     PlanStep {
         node_id: Uuid,

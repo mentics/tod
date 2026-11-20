@@ -92,6 +92,7 @@ fn phase_label(phase: &str) -> &'static str {
         "planning" => "Planning",
         "implement" => "Implement",
         "verify" => "Verify",
+        "verify_evaluate" => "Verify: evidence evaluator",
         "review" => "Review (finds problems)",
         "fix" => "Fix (resolves the review's findings)",
         "pr" => "Pull request",
@@ -115,6 +116,10 @@ fn phase_blurb(phase: &str) -> Option<&'static str> {
         "fix" => Some(
             "For the separate agent that fixes what the review found, then is reviewed again. \
              Optional: leave it empty and the fix still runs; add project-specific ways to fix.",
+        ),
+        "verify_evaluate" => Some(
+            "For the independent agent that audits verification's evidence (with independent \
+             evaluation on). Left unset, it uses Verify's skills, model and effort.",
         ),
         _ => None,
     }
@@ -800,7 +805,8 @@ impl LifecycleConfigEditor {
                     .text_color(cx.theme().muted_foreground)
                     .child("What the agent for this phase runs with, over the node's Agent capability and the settings. Leave one empty to inherit it."),
             )
-            .child(div().text_xs().font_semibold().child("Checks"))
+            .when(lifecycle_config::takes_checks(form.phase), |el| {
+                el.child(div().text_xs().font_semibold().child("Checks"))
             .children(form.checks.iter().enumerate().map(|(i, row)| {
                 v_flex()
                     .gap_1()
@@ -848,6 +854,7 @@ impl LifecycleConfigEditor {
                  committed or not, and hand those files to the command as $TOD_CHANGED_FILES, one per line. \
                  With none listed here, the inherited checks apply.",
             ))
+            })
             .child(
                 h_flex()
                     .gap_2()

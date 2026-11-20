@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 98;
+pub const CURRENT_USER_VERSION: i32 = 100;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -653,6 +653,12 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         // Obligation edits an option carries (`crate::decisions::OptionEdit`).
         crate::decisions::add_option_edits(conn)?;
         conn.pragma_update(None, "user_version", 98)?;
+    }
+    if version < 100 {
+        // Verifying rework: an obligation may be marked code-only (with the
+        // reason), and a verdict records how it was checked and what ran.
+        migrate_v99_to_v100(conn)?;
+        conn.pragma_update(None, "user_version", 100)?;
     }
     // Other branches (the task panel) numbered their own steps 66–67 at the
     // same time as 66–70 above, so a store may be past a version without
@@ -1826,6 +1832,32 @@ fn migrate_v43_to_v44(conn: &Connection) -> Result<()> {
 /// exercised, kept as a history (`crate::verification`).
 fn migrate_v48_to_v49(conn: &Connection) -> Result<()> {
     conn.execute_batch(crate::verification::CREATE_TABLE)?;
+    Ok(())
+}
+
+/// `node_obligations.code_only` (the reason an obligation is checked in the
+/// code alone; NULL means live), and `obligation_verdicts.method` / `ran`
+/// (how a verdict was reached and what was run). Idempotent.
+fn migrate_v99_to_v100(conn: &Connection) -> Result<()> {
+    let has_column = |table: &str, column: &str| -> Result<bool> {
+        Ok(conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info(?1) WHERE name = ?2",
+            rusqlite::params![table, column],
+            |row| row.get(0),
+        )?)
+    };
+    if !has_column("node_obligations", "code_only")? {
+        conn.execute_batch("ALTER TABLE node_obligations ADD COLUMN code_only TEXT;")?;
+    }
+    if !has_column("obligation_verdicts", "method")? {
+        conn.execute_batch(
+            "ALTER TABLE obligation_verdicts ADD COLUMN method TEXT
+                 CHECK (method IS NULL OR method IN ('live', 'local-data', 'static', 'unit'));",
+        )?;
+    }
+    if !has_column("obligation_verdicts", "ran")? {
+        conn.execute_batch("ALTER TABLE obligation_verdicts ADD COLUMN ran TEXT;")?;
+    }
     Ok(())
 }
 

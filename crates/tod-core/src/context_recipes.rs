@@ -395,6 +395,43 @@ pub const EVALUATE: ContextRecipe = ContextRecipe {
     blocks: PHASE.blocks,
 };
 
+/// The independent audit of verification's evidence (`verifying`): the
+/// evaluator, given every verdict with its method, what ran, and its
+/// evidence, plus the nouns that read them.
+pub const EVALUATE_VERIFYING: ContextRecipe = ContextRecipe {
+    name: "verification evidence evaluation",
+    situational: false,
+    layers: &[
+        "stance/autonomous-session",
+        "domain/outline",
+        "domain/obligations",
+        "domain/lifecycle",
+        "domain/plan",
+        "cli/intro",
+        "cli/obligations",
+        "cli/plan",
+        "cli/verdicts",
+        "cli/tests",
+        "cli/decisions",
+        "cli/phase",
+        "surface/evaluate",
+    ],
+    blocks: &[
+        DynamicBlock::Databases,
+        DynamicBlock::DataRoot,
+        DynamicBlock::PullRequests,
+        DynamicBlock::Node,
+        DynamicBlock::NodeProcessFields,
+        DynamicBlock::NodeObligations {
+            note: "This node's own — judge the evidence for each against it.",
+        },
+        DynamicBlock::ObligationVerdicts,
+        DynamicBlock::AncestorContext,
+        DynamicBlock::Plan,
+        DynamicBlock::ConfiguredSkills,
+    ],
+};
+
 /// An autonomous fleet run: a state agent launched into a worktree to work a
 /// node on its own. Until now this got the state role doc and nothing else —
 /// no domain model and no `tod-cli` reference, despite its role docs telling
@@ -550,6 +587,7 @@ pub const ALL_RECIPES: &[ContextRecipe] = &[
     FIX_SESSION,
     PHASE,
     EVALUATE,
+    EVALUATE_VERIFYING,
     FLEET_AUTONOMOUS,
     INTERVIEW_AGENT,
 ];

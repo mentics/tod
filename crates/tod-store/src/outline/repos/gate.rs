@@ -45,6 +45,14 @@ pub const VERIFYING_REVIEW_PLAN_VERIFIED_SLUG: &str = "verifying-review.plan-ste
 pub const VERIFYING_REVIEW_OBLIGATIONS_VERIFIED_SLUG: &str =
     "verifying-review.obligations-verified";
 
+/// `verifying` → `review`: with independent evaluation on, a current
+/// `verifying` certificate (`crate::phase`): an independent evaluator audited
+/// the obligations' verdicts and their evidence, and nothing changed since.
+/// Passes with independent evaluation off, or when no obligation is owed a
+/// verdict. App-answered.
+pub const VERIFYING_REVIEW_EVIDENCE_CERTIFIED_SLUG: &str =
+    "verifying-review.evidence-certified";
+
 /// `review` → `approved`: the node's review conversation recorded the review
 /// finished (`tod-cli review done`). The app answers this one itself
 /// (`tod_core::gate::derived`); it never goes to an agent.
@@ -124,6 +132,7 @@ pub fn phase_certified_slug(from_state: &str) -> Option<&'static str> {
         "proposed" => Some(PROPOSED_DESIGN_PHASE_CERTIFIED_SLUG),
         "design" => Some(DESIGN_PLANNING_PHASE_CERTIFIED_SLUG),
         "planning" => Some(PLANNING_READY_PHASE_CERTIFIED_SLUG),
+        "verifying" => Some(VERIFYING_REVIEW_EVIDENCE_CERTIFIED_SLUG),
         "pr" => Some(PR_PR_DRAFT_PHASE_CERTIFIED_SLUG),
         "merged" => Some(MERGED_RELEASED_PHASE_CERTIFIED_SLUG),
         "released" => Some(RELEASED_LEARN_PHASE_CERTIFIED_SLUG),
@@ -144,6 +153,7 @@ pub const DERIVED_CRITERION_SLUGS: &[&str] = &[
     ACTIVE_VERIFYING_PLAN_IMPLEMENTED_SLUG,
     VERIFYING_REVIEW_OBLIGATIONS_VERIFIED_SLUG,
     VERIFYING_REVIEW_PLAN_VERIFIED_SLUG,
+    VERIFYING_REVIEW_EVIDENCE_CERTIFIED_SLUG,
     REVIEW_APPROVED_REVIEW_DONE_SLUG,
     REVIEW_APPROVED_FINDINGS_ANSWERED_SLUG,
     PR_PR_DRAFT_PR_OPEN_SLUG,

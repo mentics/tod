@@ -14,7 +14,7 @@
 //! evaluator judges what it did.
 
 use crate::conversation::review::review_recorded_done;
-use crate::phase::{PhaseStanding, PhaseStep, has_phase_agent};
+use crate::phase::{EvidenceAudit, PhaseStanding, PhaseStep, evidence_audit, has_phase_agent};
 use anyhow::Result;
 use rusqlite::Connection;
 use tod_store::outline::repos::PlanStepRepo;
@@ -55,6 +55,9 @@ pub struct Standing {
     /// (`PhaseStanding::marker`), so a phase step that did something does
     /// not read as one that did nothing.
     pub phase_marker: String,
+    /// In `verifying`: where the independent audit of verification's
+    /// evidence stands (`crate::phase::evidence_audit`).
+    pub evidence: EvidenceAudit,
 }
 
 /// The recommended next step.
@@ -76,8 +79,8 @@ pub enum NextStep {
     GateCheck,
     /// The state's phase agent has work to do (`crate::phase`).
     Phase,
-    /// The phase agent recorded its phase ready: an independent session
-    /// judges it.
+    /// The phase agent recorded its phase ready, or verification finished
+    /// with its evidence not yet audited: an independent session judges it.
     Evaluate,
 }
 
@@ -112,7 +115,13 @@ impl Standing {
         } else {
             None
         };
+        let evidence = if lifecycle == "verifying" {
+            evidence_audit(conn, node_id)?
+        } else {
+            EvidenceAudit::NotNeeded
+        };
         Ok(Self {
+            evidence,
             phase: phase.as_ref().map(PhaseStanding::step),
             phase_marker: phase.map(|p| p.marker).unwrap_or_default(),
             lifecycle: lifecycle.to_string(),
@@ -149,7 +158,9 @@ impl Standing {
             && (self.unverified() > 0
                 // A failed obligation with no failed step to carry it back
                 // is verification's to finish, not implementation's.
-                || (self.obligations_failed > 0 && self.steps_failed == 0))
+                || (self.obligations_failed > 0 && self.steps_failed == 0)
+                // The evidence evaluator sent the evidence back.
+                || self.evidence == EvidenceAudit::Rejected)
     }
 }
 
@@ -161,11 +172,18 @@ pub fn next_step(standing: &Standing) -> Option<NextStep> {
         "active" if standing.plan_steps == 0 => None,
         "active" if standing.steps_open > 0 => Some(NextStep::Implement),
         "active" if standing.steps_need_user > 0 => None,
-        "verifying" if standing.plan_steps == 0 && standing.obligations_unchecked == 0 => {
+        "verifying"
+            if standing.plan_steps == 0
+                && standing.obligations_unchecked == 0
+                && standing.evidence.settled() =>
+        {
             Some(NextStep::GateCheck)
         }
         "verifying" if standing.verification_due() => Some(NextStep::Verify),
         "verifying" if standing.steps_failed > 0 => Some(NextStep::FixFailed),
+        // Verification is done and nothing failed: its evidence is audited
+        // before the gate (independent evaluation on).
+        "verifying" if standing.evidence == EvidenceAudit::Due => Some(NextStep::Evaluate),
         "review" if !standing.review_done => Some(NextStep::Review),
         "review" if standing.open_findings > 0 => Some(NextStep::Fix),
         // Findings answered, but by the fixer: another review of the fixed
@@ -236,6 +254,33 @@ mod tests {
         s.obligations_unchecked = 1;
         assert!(s.verification_due());
         assert_eq!(next_step(&s), Some(NextStep::Verify));
+    }
+
+    /// With independent evaluation on, finished verification is audited
+    /// before the gate; a rejection sends verification back to work.
+    #[test]
+    fn verifying_evidence_is_audited_before_the_gate() {
+        let mut s = standing("verifying");
+        s.evidence = EvidenceAudit::Due;
+        assert_eq!(next_step(&s), Some(NextStep::Evaluate));
+        // Not while verification still owes a verdict.
+        s.obligations_unchecked = 1;
+        assert_eq!(next_step(&s), Some(NextStep::Verify));
+        s.obligations_unchecked = 0;
+        s.evidence = EvidenceAudit::Rejected;
+        assert!(s.verification_due());
+        assert_eq!(next_step(&s), Some(NextStep::Verify));
+        s.evidence = EvidenceAudit::Certified;
+        assert_eq!(next_step(&s), Some(NextStep::GateCheck));
+        // A node with no plan is audited too.
+        let mut s = Standing {
+            plan_steps: 0,
+            evidence: EvidenceAudit::Due,
+            ..standing("verifying")
+        };
+        assert_eq!(next_step(&s), Some(NextStep::Evaluate));
+        s.evidence = EvidenceAudit::NotNeeded;
+        assert_eq!(next_step(&s), Some(NextStep::GateCheck));
     }
 
     #[test]
@@ -324,12 +369,13 @@ mod tests {
             .update_status(step, STATUS_VERIFIED, None, None)
             .unwrap();
         VerdictRepo::new(&conn)
-            .record(node, obligation, None, "verified", "Saw it work.")
+            .record(node, obligation, None, "verified", "Saw it work.", &tod_store::verification::VerdictHow::method("live"))
             .unwrap();
 
         let before = Standing::load(&conn, node, "verifying").unwrap();
         assert_eq!(before.unverified(), 0);
-        assert_eq!(next_step(&before), Some(NextStep::GateCheck));
+        // Verified, so the evidence goes to the independent evaluator.
+        assert_eq!(next_step(&before), Some(NextStep::Evaluate));
 
         steps
             .reopen_verification(node, "A fix changed it.")

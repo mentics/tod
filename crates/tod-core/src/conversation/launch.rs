@@ -55,7 +55,13 @@ pub fn phase_for(fleet: &FleetStore, focus: Focus, kind: ProtocolKind) -> Option
             "pr_review" => "pr_review".to_string(),
             _ => "pr".to_string(),
         },
-        ProtocolKind::Phase | ProtocolKind::Evaluate => state()?,
+        ProtocolKind::Phase => state()?,
+        // The evidence evaluator in `verifying` has a key of its own, which
+        // falls back to `verify`'s (`lifecycle_config::fallback`).
+        ProtocolKind::Evaluate => match state()?.as_str() {
+            "verifying" => lifecycle_config::VERIFY_EVALUATE.to_string(),
+            other => other.to_string(),
+        },
         ProtocolKind::Outline
         | ProtocolKind::Chat
         | ProtocolKind::VisualDesign
@@ -280,6 +286,68 @@ mod tests {
         assert_eq!(at(ProtocolKind::Implementation).model, "default");
         // Chat is not a phase.
         assert_eq!(at(ProtocolKind::Chat).model, "sonnet");
+        drop(store);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The evaluator of verification's evidence runs under its own key,
+    /// `verify_evaluate`, and takes `verify`'s settings for whatever its own
+    /// leaves unset.
+    #[test]
+    fn the_verifying_evaluator_has_its_own_key_that_falls_back_to_verify() {
+        use tod_store::lifecycle_config::{Agents, PhaseAgent, VERIFY_EVALUATE};
+        let (root, store, node) = store_with_node();
+        store
+            .enqueue_outline(OutlineMutation::EnableCapabilities {
+                node_id: node,
+                capabilities: vec![Capability::LifecycleConfig, Capability::Lifecycle],
+            })
+            .unwrap();
+        store.writer().flush().unwrap();
+        let conn = tod_store::fleet::schema::open_writer_connection(store.writer().db_path()).unwrap();
+        tod_store::outline::repos::NodeRepo::new(&conn).set_lifecycle(node, "verifying").unwrap();
+        store.reload_if_stale().ok();
+        assert_eq!(
+            phase_for(&store, Focus::Node(node), ProtocolKind::Evaluate).as_deref(),
+            Some(VERIFY_EVALUATE)
+        );
+        assert_eq!(
+            phase_for(&store, Focus::Node(node), ProtocolKind::Verification).as_deref(),
+            Some("verify")
+        );
+        let set = |agents: Agents| {
+            store.enqueue_outline(OutlineMutation::SetNodeLifecycleAgents { node_id: node, agents }).unwrap();
+            store.writer().flush().unwrap();
+            store.reload_if_stale().ok();
+        };
+        let at = |kind| resolve(&store, &settings(), Focus::Node(node), kind);
+        // Only `verify` set: the evaluator runs with it.
+        set([("verify".to_string(), PhaseAgent { model: Some("sonnet".into()), effort: Some("high".into()) })].into());
+        let evaluate = at(ProtocolKind::Evaluate);
+        assert_eq!((evaluate.model.as_str(), evaluate.effort.as_str()), ("sonnet", "high"));
+        // Its own model wins; the effort it leaves unset is still `verify`'s.
+        set([
+            ("verify".to_string(), PhaseAgent { model: Some("sonnet".into()), effort: Some("high".into()) }),
+            (VERIFY_EVALUATE.to_string(), PhaseAgent { model: Some("opus".into()), effort: None }),
+        ]
+        .into());
+        let evaluate = at(ProtocolKind::Evaluate);
+        assert_eq!((evaluate.model.as_str(), evaluate.effort.as_str()), ("opus", "high"));
+        let verify = at(ProtocolKind::Verification);
+        assert_eq!(verify.model, "sonnet");
+        // Skills fall back the same way.
+        store
+            .enqueue_outline(OutlineMutation::SetNodeLifecycleConfig {
+                node_id: node,
+                skills: [("verify".to_string(), vec!["drive-the-app".to_string()])].into(),
+            })
+            .unwrap();
+        store.writer().flush().unwrap();
+        let skills = store
+            .read(|conn| tod_store::lifecycle_config::resolve(conn, node, VERIFY_EVALUATE))
+            .unwrap()
+            .unwrap();
+        assert_eq!(skills.skills, ["drive-the-app"]);
         drop(store);
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -23,7 +23,8 @@ use tod_store::outline::{
     ACTIVE_VERIFYING_PLAN_IMPLEMENTED_SLUG, GateCriterion, OUTCOME_FAIL, OUTCOME_PASS, PLANNING_READY_REQUIREMENTS_TRACEABLE_SLUG,
     READY_ACTIVE_ACTION_CONFIG_SLUG,
     REVIEW_APPROVED_FINDINGS_ANSWERED_SLUG, REVIEW_APPROVED_REVIEW_DONE_SLUG,
-    VERIFYING_REVIEW_OBLIGATIONS_VERIFIED_SLUG, VERIFYING_REVIEW_PLAN_VERIFIED_SLUG,
+    VERIFYING_REVIEW_EVIDENCE_CERTIFIED_SLUG, VERIFYING_REVIEW_OBLIGATIONS_VERIFIED_SLUG,
+    VERIFYING_REVIEW_PLAN_VERIFIED_SLUG,
 };
 
 pub use tod_store::outline::{
@@ -43,7 +44,7 @@ use tod_store::outline::{
 };
 use tod_store::phase::{CertificateStatus, PhaseRepo};
 use tod_store::review::ReviewRepo;
-use tod_store::verification::{ObligationStanding, VerdictRepo};
+use tod_store::verification::{ObligationStanding, VerdictRepo, method_proves_live};
 use uuid::Uuid;
 
 /// The app's verdict on one derived criterion.
@@ -84,6 +85,9 @@ pub fn evaluate_derived_criterion(
         }
         VERIFYING_REVIEW_OBLIGATIONS_VERIFIED_SLUG => {
             obligations_verified_outcome(conn, node_id).map(Some)
+        }
+        VERIFYING_REVIEW_EVIDENCE_CERTIFIED_SLUG => {
+            evidence_certified_outcome(conn, node_id).map(Some)
         }
         REVIEW_APPROVED_REVIEW_DONE_SLUG => review_done_outcome(conn, node_id).map(Some),
         REVIEW_APPROVED_FINDINGS_ANSWERED_SLUG => {
@@ -440,6 +444,11 @@ fn plan_verified_outcome(conn: &Connection, node_id: Uuid, state: &str) -> Resul
 /// no obligations of its own passes — there is nothing it promised. One that
 /// only a later phase's step delivers is checked in that phase instead
 /// (see [`plan_verified_outcome`]).
+///
+/// A `verified` verdict counts only if its method could show the obligation
+/// holds: `unit` and `static` show what the code's author believed, so they
+/// verify only an obligation marked code-only; a live one needs `live` or
+/// `local-data` (`tod_store::verification::method_proves_live`).
 fn obligations_verified_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutcome> {
     let standings: Vec<_> = VerdictRepo::new(conn)
         .standings(node_id)?
@@ -455,7 +464,19 @@ fn obligations_verified_outcome(conn: &Connection, node_id: Uuid) -> Result<Deri
         .filter(|s| s.is_unchecked())
         .map(line)
         .collect();
-    if failed.is_empty() && unchecked.is_empty() {
+    let not_live: Vec<String> = standings
+        .iter()
+        .filter(|s| s.obligation.code_only.is_none())
+        .filter_map(|s| {
+            let verdict = s.verdict.as_ref().filter(|v| v.is_verified())?;
+            match verdict.method.as_deref() {
+                Some(method) if method_proves_live(method) => None,
+                Some(method) => Some(format!("{} (verified by `{method}`)", line(s))),
+                None => Some(format!("{} (verified with no method)", line(s))),
+            }
+        })
+        .collect();
+    if failed.is_empty() && unchecked.is_empty() && not_live.is_empty() {
         return Ok(DerivedOutcome {
             outcome: OUTCOME_PASS,
             detail: match standings.len() {
@@ -480,7 +501,38 @@ fn obligations_verified_outcome(conn: &Connection, node_id: Uuid) -> Result<Deri
             unchecked.join("; ")
         ));
     }
+    if !not_live.is_empty() {
+        parts.push(format!(
+            "{} verified without exercising the running work: {}. A unit test or reading \
+             the code is not evidence for a live obligation: verify it `live` or with \
+             `local-data`, or have it marked code-only in design.",
+            not_live.len(),
+            not_live.join("; ")
+        ));
+    }
     Ok(fail(parts.join(" ")))
+}
+
+/// With independent evaluation on, an independent evaluator certified
+/// verification's evidence (`tod_store::phase::VERIFYING`), and no obligation
+/// or verdict changed since.
+fn evidence_certified_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutcome> {
+    use crate::phase::{EvidenceAudit, evidence_audit};
+    use tod_store::phase::VERIFYING;
+    if !crate::phase::independent_evaluation_at(conn) {
+        return Ok(pass("Independent evaluation is off: verification's evidence is not audited."));
+    }
+    Ok(match evidence_audit(conn, node_id)? {
+        EvidenceAudit::NotNeeded => pass("No obligation is owed a verdict here: nothing to audit."),
+        EvidenceAudit::Certified => phase_certified_outcome(conn, node_id, VERIFYING)?,
+        EvidenceAudit::Rejected => fail(
+            "the evidence evaluator sent the evidence back; verification has its fixes to make",
+        ),
+        EvidenceAudit::Due => match PhaseRepo::new(conn).certificate_status(node_id, VERIFYING)? {
+            CertificateStatus::Stale { changed, .. } => fail(stale_certificate_detail(&changed)),
+            _ => fail("the evidence evaluator has not audited verification's evidence yet"),
+        },
+    })
 }
 
 /// The node's latest review recorded itself finished and came back clean.
@@ -1294,6 +1346,8 @@ mod tests {
                         conversation_id: None,
                         status: status.into(),
                         evidence: "Drove the app and looked.".into(),
+                        method: Some("live".into()),
+                        ran: None,
                     },
                 )
                 .unwrap();
@@ -1316,6 +1370,118 @@ mod tests {
         store.writer().flush().unwrap();
         let outcome = evaluate(&store, node, slug).unwrap();
         assert_eq!(outcome.outcome, OUTCOME_FAIL, "reimplemented since");
+    }
+
+    /// A node in `verifying` with one obligation, and a writer connection.
+    fn verifying_node_with_obligation() -> (tempfile::TempDir, FleetStore, Uuid, Uuid, Connection) {
+        let (dir, store, node) = store_with_node();
+        let conn = writer_conn(&store);
+        NodeRepo::new(&conn).set_lifecycle(node, "verifying").unwrap();
+        let obligation = Uuid::new_v4();
+        ObligationRepo::new(&conn)
+            .insert_at(obligation, node, "requirement", 0, None, "Tickets sync", "requirements")
+            .unwrap();
+        (dir, store, node, obligation, conn)
+    }
+
+    fn record_verdict(conn: &Connection, node: Uuid, obligation: Uuid, method: &str) {
+        tod_store::verification::VerdictRepo::new(conn)
+            .record(
+                node,
+                obligation,
+                None,
+                "verified",
+                "Ran the sync: 3 tickets listed.",
+                &tod_store::verification::VerdictHow::method(method),
+            )
+            .unwrap();
+    }
+
+    /// A unit test or reading the code does not verify a live obligation;
+    /// it does verify one marked code-only.
+    #[test]
+    fn a_live_obligation_is_not_verified_by_a_unit_test() {
+        let slug = VERIFYING_REVIEW_OBLIGATIONS_VERIFIED_SLUG;
+        let (_dir, store, node, obligation, conn) = verifying_node_with_obligation();
+        for method in ["unit", "static"] {
+            record_verdict(&conn, node, obligation, method);
+            let outcome = evaluate(&store, node, slug).unwrap();
+            assert_eq!(outcome.outcome, OUTCOME_FAIL, "{method}");
+            assert!(
+                outcome.detail.contains("Tickets sync")
+                    && outcome.detail.contains(&format!("verified by `{method}`"))
+                    && outcome.detail.contains("code-only"),
+                "{}",
+                outcome.detail
+            );
+        }
+        ObligationRepo::new(&conn)
+            .update_code_only(obligation, Some("a pure function"))
+            .unwrap();
+        let outcome = evaluate(&store, node, slug).unwrap();
+        assert_eq!(outcome.outcome, OUTCOME_PASS, "{}", outcome.detail);
+        ObligationRepo::new(&conn).update_code_only(obligation, None).unwrap();
+        record_verdict(&conn, node, obligation, "local-data");
+        let outcome = evaluate(&store, node, slug).unwrap();
+        assert_eq!(outcome.outcome, OUTCOME_PASS, "{}", outcome.detail);
+    }
+
+    /// With independent evaluation on (the default), the gate needs the
+    /// evidence evaluator's current certificate: a rejection fails it, and
+    /// a verdict recorded after the certificate makes it stale.
+    #[test]
+    fn verification_evidence_needs_a_current_independent_certificate() {
+        use tod_store::phase::{
+            CERTIFIER_INDEPENDENT, PHASE_CERTIFY, PHASE_REJECT, PhaseRepo, VERIFYING,
+        };
+        let slug = VERIFYING_REVIEW_EVIDENCE_CERTIFIED_SLUG;
+        let (_dir, store, node, obligation, conn) = verifying_node_with_obligation();
+        record_verdict(&conn, node, obligation, "live");
+        let outcome = evaluate(&store, node, slug).unwrap();
+        assert_eq!(outcome.outcome, OUTCOME_FAIL);
+        assert!(outcome.detail.contains("not audited"), "{}", outcome.detail);
+
+        let phases = PhaseRepo::new(&conn);
+        phases
+            .record(node, VERIFYING, PHASE_REJECT, None, CERTIFIER_INDEPENDENT, r#"["no replay"]"#)
+            .unwrap();
+        let outcome = evaluate(&store, node, slug).unwrap();
+        assert_eq!(outcome.outcome, OUTCOME_FAIL);
+        assert!(outcome.detail.contains("sent the evidence back"), "{}", outcome.detail);
+        assert_eq!(
+            store.read(|c| crate::phase::evidence_fixes(c, node)).unwrap(),
+            ["no replay"]
+        );
+
+        // Verification answers it; the evaluator certifies.
+        record_verdict(&conn, node, obligation, "live");
+        assert_eq!(
+            store.read(|c| crate::phase::evidence_audit(c, node)).unwrap(),
+            crate::phase::EvidenceAudit::Due
+        );
+        phases
+            .record(node, VERIFYING, PHASE_CERTIFY, None, CERTIFIER_INDEPENDENT, "Live run shown.")
+            .unwrap();
+        let outcome = evaluate(&store, node, slug).unwrap();
+        assert_eq!(outcome.outcome, OUTCOME_PASS, "{}", outcome.detail);
+
+        // A changed verdict makes the certificate stale.
+        record_verdict(&conn, node, obligation, "local-data");
+        let outcome = evaluate(&store, node, slug).unwrap();
+        assert_eq!(outcome.outcome, OUTCOME_FAIL);
+        assert!(outcome.detail.contains("stale"), "{}", outcome.detail);
+    }
+
+    /// Verification never certifies its own evidence, and `verifying` is
+    /// never recorded ready.
+    #[test]
+    fn verification_does_not_certify_its_own_evidence() {
+        use tod_store::phase::{CERTIFIER_SELF, PHASE_CERTIFY, PHASE_READY, PhaseRepo, VERIFYING, CERTIFIER_INDEPENDENT};
+        let (_dir, _store, node, obligation, conn) = verifying_node_with_obligation();
+        record_verdict(&conn, node, obligation, "live");
+        let phases = PhaseRepo::new(&conn);
+        assert!(phases.record(node, VERIFYING, PHASE_CERTIFY, None, CERTIFIER_SELF, "Done.").is_err());
+        assert!(phases.record(node, VERIFYING, PHASE_READY, None, CERTIFIER_INDEPENDENT, "").is_err());
     }
 
     #[test]
@@ -1691,6 +1857,8 @@ mod tests {
                     conversation_id: None,
                     status: "verified".into(),
                     evidence: "Queried production after the backfill.".into(),
+                    method: Some("live".into()),
+                    ran: None,
                 },
             )
             .unwrap();

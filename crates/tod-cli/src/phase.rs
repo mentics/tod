@@ -33,6 +33,7 @@ COMMANDS:
     ready   [--node <UUID>]
     certify [--node <UUID>] --note <TEXT>
     reject  [--node <UUID>] --fix <TEXT> (repeatable, at least one)
+            [--reopen <OBLIGATION_ID>] (repeatable; verifying only)
 
 `status` shows the node's state, each gate criterion for leaving it with the
 app's verdict now, and the phase's certificate: none, current (who certified
@@ -42,7 +43,8 @@ it and their note), or stale (and what changed since).
 and the gate passes only while that is unchanged. --note is required: one line
 saying why.
 `reject` sends the phase back to its agent with the fixes it must make, one per
---fix.
+--fix. In `verifying`, --reopen withdraws an obligation's verdict, so
+verification rules on it again.
 ";
 
 pub fn run(inv: Invocation) -> anyhow::Result<String> {
@@ -223,10 +225,19 @@ fn reject(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
         anyhow::bail!("reject needs at least one --fix <TEXT>");
     }
     let state = state(inv, node_id)?;
+    let reopen = args
+        .get_all("--reopen")
+        .into_iter()
+        .map(|raw| {
+            inv.client()
+                .read(|conn| tod_store::interview::InterviewRepo::new(conn).resolve_obligation_id(raw))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let result = inv.client().interview(InterviewCommand::PhaseReject {
         node_id,
         state,
         fixes,
+        reopen,
     })?;
     ack(inv, result)
 }

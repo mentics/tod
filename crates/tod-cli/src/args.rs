@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 /// Flags that never take a value.
-const SWITCHES: &[&str] = &["--before", "--append", "--inherited", "--open", "--unchecked", "--all-open", "--all", "--fixed", "--rejected", "--full", "--stop", "--commit", "--discard"];
+const SWITCHES: &[&str] = &["--before", "--append", "--inherited", "--open", "--unchecked", "--all-open", "--all", "--fixed", "--rejected", "--full", "--stop", "--commit", "--discard", "--live"];
 
 #[derive(Default)]
 pub struct Args {
