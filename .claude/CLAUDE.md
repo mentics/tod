@@ -225,7 +225,15 @@ and answer the threads; the clean review records that head (`pr_heads`). A head
 that reaches the PR without that loop is reviewed once nothing but a person is
 left (`tod_core::pr_draft_review`), its findings posted on the PR as threads
 (`review_findings.pr_thread`); the `pr-pr_review.own-review` criterion gates on
-it. The same assessment answers the `pr →
+it. Nothing reaches the PR unreviewed (`tod_core::pr_pushes`): around every
+agent turn in `pr_draft`/`pr_review` (and when the user's conversation ends) the
+PR's head is read again, and each new one is recorded (`tod_store::pr_pushes`,
+schema v102) as baseline, reviewed, tod's own push (`AutopilotState::tod_pushed`),
+or **unreviewed**: a failed Activity note, and in `pr_draft` tod reviews that
+head at once. Commits a conversation made and did not push are adopted as a
+change awaiting review (`PrChange::held`) and pushed by the PR agent once clean.
+The task panel warns when a PR is open while tod's review of its head or its
+checks are not clear (`PrFacts::ready_warning`); tod never marks one ready then. The same assessment answers the `pr →
 approved` criteria (`pr-approved.up-to-date`, `.threads-resolved`,
 `.review-current`, `.review-score`). A branch that is only behind its base (no conflict) is never agent work:
 tod merges the base in on GitHub itself, as its Update branch button does
