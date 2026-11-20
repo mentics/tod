@@ -65,11 +65,13 @@ it. Check after any send-back that it converges: it did (one send-back).
 - **Review/design oscillation (ENG-3557).** Three send-backs over one claim (a
   partial index) ran past the loop guard because each carried different reasons.
   It ended in a user decision; watch for the same claim being sent back twice.
-- **Diverged origin branch (ENG-3038).** The node's branch was recreated from
-  main in the container instead of from the existing `origin/<branch>` that an
-  earlier run left, so the push was refused. Non-destructive fix: `git merge -s
-  ours origin/<branch>` in the node's worktree, then `runner resume`. Gap: tod
-  should create it from the origin branch, as the design says.
+- **Diverged origin branch (ENG-3038).** An earlier run of the same task had
+  pushed 29 commits to `origin/<branch>`; this run's local branch did not contain
+  them, so the push was refused (tod says so, with the rebase/merge hint:
+  `provision.rs` divergence error). `switch_to_branch` itself starts a missing
+  local branch from `origin/<branch>`, so the local branch must already have
+  existed at another commit; the cause was not traced. Non-destructive fix: `git
+  merge -s ours origin/<branch>` in the node's worktree, then `runner resume`.
 - **Two leases, one branch (ENG-3094).** A node leased a second worktree 10
   minutes after its first, still holding the branch, so `switch` failed ("already
   used by worktree"). Fix: `git switch --detach` in the idle one (check the branch
