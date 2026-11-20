@@ -95,6 +95,7 @@ fn phase_label(phase: &str) -> &'static str {
         "guidance" => "Guidance selector",
         "incident" => "Incident investigation",
         "triage" => "Request triage",
+        "process_review" => "Process review",
         "planning" => "Planning",
         "implement" => "Implement",
         "verify" => "Verify",
@@ -145,6 +146,12 @@ fn phase_blurb(phase: &str) -> Option<&'static str> {
              answers what the task's own obligations settle, converts what is not a decision, and \
              hands you the rest with a brief. It takes no skills; it runs on sonnet at low effort \
              unless set here.",
+        ),
+        "process_review" => Some(
+            "The session of each process-review run, which drafts changes to the app's context \
+             fragments, role docs, triage guidance and project skills from the new lessons, in its \
+             own task's checkout. It takes no skills; it runs on sonnet at low effort unless set \
+             here. Whether and where runs are made is `process_review` in `tod.yml`.",
         ),
         "verify_evaluate" => Some(
             "For the independent agent that audits verification's evidence (with independent \

@@ -1468,5 +1468,6 @@ fn kind_label(kind: ProtocolKind) -> &'static str {
         ProtocolKind::SmallReview => "small review",
         ProtocolKind::Incident => "incident investigation",
         ProtocolKind::Triage => "triage",
+        ProtocolKind::ProcessReview => "process review",
     }
 }
