@@ -203,6 +203,8 @@ mod tests {
                 moves: vec![],
                 blocks: vec![],
                 new_evidence: String::new(),
+                brief: Default::default(),
+                error_signature: String::new(),
                 edits: Vec::new(),
             },
             answers: vec![DecisionAnswer {

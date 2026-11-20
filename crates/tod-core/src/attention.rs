@@ -231,7 +231,7 @@ fn decision_item(decision: &Decision) -> AttentionItem {
         kind: AttentionKind::Decision,
         id: decision.id,
         node_id: decision.node_id,
-        summary: decision.question.clone(),
+        summary: crate::request_brief::headline(decision),
         options: decision.options.clone(),
         since: decision.created_at,
         reason: RequestReason::parse(&decision.reason),

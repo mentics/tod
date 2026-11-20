@@ -15,6 +15,7 @@ pub mod deferrals;
 pub mod git_identity;
 pub mod git_retries;
 pub mod decisions;
+pub mod failure_signature;
 pub mod done_close;
 pub mod environment;
 pub mod groups;

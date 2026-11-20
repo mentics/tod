@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 105;
+pub const CURRENT_USER_VERSION: i32 = 107;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -703,6 +703,14 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         crate::review::add_reviewer_columns(conn)?;
         conn.pragma_update(None, "user_version", 105)?;
     }
+    if version < 107 {
+        // The structured fields of an access, broken or capability request
+        // and the signature of its error (`crate::decisions::Brief`). Synced
+        // (sync copies the columns both sides have); `decisions` is journaled
+        // already.
+        crate::decisions::add_brief(conn)?;
+        conn.pragma_update(None, "user_version", 107)?;
+    }
     // Other branches (the task panel) numbered their own steps 66–67 at the
     // same time as 66–70 above, so a store may be past a version without
     // having these. Every one is idempotent: make sure of them all.
@@ -735,6 +743,7 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     crate::decisions::add_blocks(conn)?;
     crate::decisions::add_new_evidence(conn)?;
     crate::decisions::add_option_edits(conn)?;
+    crate::decisions::add_brief(conn)?;
     crate::review::add_pr_columns(conn)?;
     crate::review::add_root_cause_column(conn)?;
     crate::review::add_reviewer_columns(conn)?;

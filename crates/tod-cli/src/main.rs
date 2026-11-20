@@ -1215,6 +1215,49 @@ Second."), "{listed}");
 
         let _ = std::fs::remove_dir_all(root);
     }
+
+    /// The fields of an access or broken request, and the refusal of a repeat.
+    #[test]
+    fn a_structured_request_keeps_its_fields_and_a_repeat_is_refused_with_the_existing_id() {
+        let (root, node, _) = data_root();
+        let node = node.to_string();
+
+        // `broken` needs the exact error.
+        let err = cli(&root, &["decisions", "ask", "--node", &node, "--reason", "broken", "--need", "Redis is down"]).unwrap_err();
+        assert!(err.to_string().contains("--error"), "{err}");
+        // The fields belong to access, broken and capability only.
+        let err = cli(&root, &["decisions", "ask", "--node", &node, "Q?", "--option", "a", "--need", "x"]).unwrap_err();
+        assert!(err.to_string().contains("--reason access|broken|capability"), "{err}");
+
+        // The need stands in for the question; no options means the defaults.
+        let asked = cli(
+            &root,
+            &[
+                "decisions", "ask", "--node", &node, "--reason", "broken", "--need", "Redis is down",
+                "--command", "redis-cli ping", "--error", "ECONNREFUSED 10.0.0.5:6379 at 2026-11-20T10:00:00Z",
+                "--tried", "retried twice", "--tried", "other host", "--after", "I rerun the scan",
+            ],
+        )
+        .unwrap();
+        let short = asked.strip_prefix("ok ").expect("one-line ack").to_string();
+        let shown = cli(&root, &["decisions", "show", &short]).unwrap();
+        assert!(shown.contains("Redis is down") && shown.contains("1. Done, continue | 2. Do not do it"), "{shown}");
+        let json = cli(&root, &["--json", "decisions", "show", &short]).unwrap();
+        assert!(json.contains("\"command\":\"redis-cli ping\"") && json.contains("retried twice"), "{json}");
+
+        // The same failure, worded differently and at another time, is the same request.
+        let err = cli(
+            &root,
+            &[
+                "decisions", "ask", "--node", &node, "--reason", "broken", "--need", "Cache unreachable",
+                "--error", "ECONNREFUSED 10.0.0.5:6379 at 2026-11-22T08:00:00Z",
+            ],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains(&short) && err.to_string().contains("same failure"), "{err}");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
     /// Six drafts stopped on a "<bot> did not review" request the pull
     /// request agent raised despite its prompt (2026-11): the refusal is the
     /// command's.

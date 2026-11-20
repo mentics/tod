@@ -3017,12 +3017,7 @@ pub fn failure_signature(conclusion: &str, step: &str, evidence: &str) -> String
         return String::new();
     }
     let joined = format!("{}\u{1f}{step}\u{1f}{evidence}", conclusion.to_ascii_lowercase());
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for b in joined.bytes() {
-        hash ^= u64::from(b);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("{hash:016x}")
+    crate::failure_signature::hash_hex(&joined)
 }
 
 fn is_hex_run(s: &str) -> bool {
@@ -3143,7 +3138,7 @@ fn scrub_word(word: &str) -> Option<String> {
 /// single, nothing else changed (case, long paths, numbers, versions and
 /// durations all stay); then the sorted, de-duplicated set of lines, so the
 /// order and repeats of lines do not matter.
-fn normalize_failure_text(text: &str) -> String {
+pub(crate) fn normalize_failure_text(text: &str) -> String {
     normalized_failure_lines(text).join("\n")
 }
 

@@ -88,6 +88,7 @@ pub mod orchestrator_github;
 pub mod checks;
 pub mod pr_readiness;
 pub mod release_watch;
+pub mod request_brief;
 pub mod pr_actions;
 pub mod pr_choices;
 pub mod pull_requests;

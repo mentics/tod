@@ -618,7 +618,7 @@ impl Requests {
                 .collect(),
             focused: None,
             // An option that moves the node is part of what the user saw.
-            notices: std::iter::once(decision.question.clone())
+            notices: std::iter::once(tod_core::request_brief::headline(decision))
                 .chain(decision.moves.iter().map(|m| format!("option {} sends the task back to {}", m.option, m.to)))
                 .collect(),
         }
@@ -1513,16 +1513,23 @@ impl Requests {
                 }
             })
             .collect();
+        let brief = tod_core::request_brief::of(&decision);
         self.card(format!("unified-decisions-pending-{}", decision.id), cx)
             .child(capped_scroll(
                 format!("unified-decisions-question-scroll-{}", decision.id),
                 output_max_height(window),
-                selectable_markdown(
-                    SharedString::from(format!("unified-decisions-question-{}", decision.id)),
-                    decision.question.clone(),
-                    window,
-                    cx,
-                ),
+                match &brief {
+                    // Written by the app from the agent's fields
+                    // (`tod_core::request_brief`), never by a model.
+                    Some(brief) => self.render_brief(decision.id, brief, window, cx),
+                    None => selectable_markdown(
+                        SharedString::from(format!("unified-decisions-question-{}", decision.id)),
+                        decision.question.clone(),
+                        window,
+                        cx,
+                    )
+                    .into_any_element(),
+                },
             ))
             .when(!decision.new_evidence.trim().is_empty(), |el| {
                 el.child(style::text_muted(div().text_sm()).child(selectable_markdown(
@@ -1560,6 +1567,71 @@ impl Requests {
             })
             .child(footer)
             .into_any_element()
+    }
+
+    /// An access, broken or capability request, rendered from its fields:
+    /// the need first, the command in a copy block, then the error, what was
+    /// tried and what happens after.
+    fn render_brief(
+        &self,
+        decision_id: Uuid,
+        brief: &tod_core::request_brief::RequestBrief,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut col = div().flex().flex_col().gap_2().w_full().min_w_0().child(selectable_markdown(
+            SharedString::from(format!("unified-decisions-need-{decision_id}")),
+            brief.need.clone(),
+            window,
+            cx,
+        ));
+        if let Some(command) = &brief.command {
+            let copy = command.clone();
+            col = col.child(
+                div()
+                    .flex()
+                    .items_start()
+                    .gap_2()
+                    .w_full()
+                    .min_w_0()
+                    .p_2()
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .rounded(cx.theme().radius)
+                    .bg(cx.theme().muted)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .text_sm()
+                            .child(selectable_text(
+                                SharedString::from(format!("unified-decisions-command-{decision_id}")),
+                                command.clone(),
+                                window,
+                                cx,
+                            )),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!("unified-decisions-copy-command-{decision_id}")))
+                            .label("Copy")
+                            .small()
+                            .on_click(move |_, _, cx| {
+                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy.clone()));
+                            }),
+                    ),
+            );
+        }
+        let details = brief.details_markdown();
+        if !details.is_empty() {
+            col = col.child(selectable_markdown(
+                SharedString::from(format!("unified-decisions-brief-details-{decision_id}")),
+                details,
+                window,
+                cx,
+            ));
+        }
+        col.into_any_element()
     }
 
     fn render_plan_step_card(&self, item: &AttentionItem, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -1709,7 +1781,7 @@ impl Requests {
             .border_color(border)
             .child(div().text_sm().child(selectable_markdown(
                 ("unified-decisions-log-question", entry.answer.id as u64),
-                decision.question.clone(),
+                tod_core::request_brief::headline(&decision),
                 window,
                 cx,
             )))
@@ -1878,6 +1950,8 @@ mod tests {
             edits: Vec::new(),
             blocks: Vec::new(),
             new_evidence: String::new(),
+            brief: Default::default(),
+            error_signature: String::new(),
         };
         let answer = DecisionAnswer {
             id: 1,
@@ -1910,6 +1984,8 @@ mod tests {
             edits: Vec::new(),
             blocks: Vec::new(),
             new_evidence: String::new(),
+            brief: Default::default(),
+            error_signature: String::new(),
         };
         assert_eq!(edit_preview(&decision), None);
         decision.edits.push(tod_store::decisions::OptionEdit {
