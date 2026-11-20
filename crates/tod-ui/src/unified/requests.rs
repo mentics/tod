@@ -2012,6 +2012,8 @@ mod tests {
             edits: Vec::new(),
             blocks: Vec::new(),
             new_evidence: String::new(),
+            brief: Default::default(),
+            error_signature: String::new(),
         };
         let answer = DecisionAnswer {
             id: 2,

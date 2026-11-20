@@ -5470,10 +5470,14 @@ fn a_check_the_base_fails_too_is_waived_by_tod_with_no_request_and_never_stops_t
         assert_eq!(answers[0].option, Some(1));
         let why = answers[0].rationale.clone().unwrap_or_default();
         assert!(why.contains("terraform") && why.contains("main"), "{why}");
-        // The Activity says so, and carries the suggestion note step 4 will file.
+        // The Activity says so, and a ticket is suggested (never a request).
         let notes = fx.fleet.read(|conn| Ok(tod_store::node_timeline::TimelineRepo::new(conn).list(fx.node)?)).unwrap();
         assert!(notes.iter().any(|e| e.title.contains("waived by tod")), "{notes:?}");
-        assert!(notes.iter().any(|e| e.title.starts_with("Suggestion: open a ticket")), "{notes:?}");
+        assert!(notes.iter().any(|e| e.title.starts_with("Suggested a ticket")), "{notes:?}");
+        let suggested = fx.fleet.read(|conn| Ok(tod_store::suggestions::list_for_node(conn, fx.node)?)).unwrap();
+        assert_eq!(suggested.len(), 1, "{suggested:?}");
+        assert_eq!(suggested[0].filed_by, tod_store::suggestions::FILED_BY_APP);
+        assert!(suggested[0].title.contains("fails on main"), "{suggested:?}");
         // Read again and again: still one decision, still no turn.
         for _ in 0..3 {
             let outcome = run_babysitter(&fx, &mut agent);

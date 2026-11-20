@@ -299,8 +299,10 @@ pub fn settle_confirmed(
 }
 
 /// File the suggestion that follows a waived pre-existing failure: "Open a
-/// ticket: check X fails on main". For now it only writes the node's Activity
-/// note; the suggestion store does not exist yet.
+/// ticket: check X fails on main" (`crate::suggestions`, filed by the app,
+/// never blocking the node), and note it in the node's Activity. The body
+/// leaves out the base head, so a second waiver of the same check finds the
+/// open suggestion instead of filing another.
 pub fn file_pre_existing_suggestion(
     fleet: &tod_store::fleet::FleetStore,
     node: Uuid,
@@ -309,8 +311,25 @@ pub fn file_pre_existing_suggestion(
     found: &tod_store::github::BaseFailure,
 ) -> anyhow::Result<()> {
     use tod_store::node_timeline::{KIND_NOTE, TimelineEntry};
-    // step 4 wires this to tod_store::suggestions
-    let title = format!("Suggestion: open a ticket: check \"{}\" fails on {}", found.check, found.base_branch);
+    let ticket_title = format!("Check \"{}\" fails on {}", found.check, found.base_branch);
+    let body = format!(
+        "The check \"{}\" fails on {} as well as on {pr}, so the change did not cause it; tod waived it there.\n\nAcceptance criteria:\n- \"{}\" passes on {}.",
+        found.check,
+        found.base_branch,
+        found.check,
+        found.base_branch,
+    );
+    crate::suggestions::file(
+        fleet,
+        &crate::suggestions::FileRequest {
+            node,
+            title: ticket_title,
+            body,
+            conversation: None,
+            filed_by: tod_store::suggestions::FILED_BY_APP,
+        },
+    )?;
+    let title = format!("Suggested a ticket: check \"{}\" fails on {}", found.check, found.base_branch);
     let detail = format!("{pr}: {}", found.describe());
     let entry = TimelineEntry::new(node, KIND_NOTE, phase, title, false, detail);
     fleet.enqueue(tod_store::fleet::FleetMutation::RecordTimeline(Box::new(entry)))?;
