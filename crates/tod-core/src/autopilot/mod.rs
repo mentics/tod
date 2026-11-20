@@ -982,6 +982,13 @@ impl Autopilot {
             if step == NextStep::Review && stopped.is_none() {
                 self.state.loops.review_rounds += 1;
                 self.save()?;
+                // What the round reviewed, so a clean one covers the pull
+                // request's first head in `pr_draft` (`pr_draft_review::latest_review`).
+                if lifecycle == "review" && fleet.read(|conn| crate::pr_draft_review::enabled(conn, self.node))? {
+                    let cwd = tod_store::fleet::provision::resolve_launch_cwd(fleet, &self.node.to_string())
+                        .map_err(|err| err.context("finding the node's checkout, to record what tod's review covered"))?;
+                    crate::pr_draft_review::record_review_phase_heads(fleet, self.node, &cwd)?;
+                }
             }
             if stopped.is_none() {
                 let owed = match step {
@@ -2783,20 +2790,21 @@ impl Autopilot {
         // all (a replaced sandbox's), and recording it made the next look
         // read the pull request's head as unreviewed, every time.
         if changed && let Some(review) = cleared {
-            let head = pr_draft_review::local_head(&cwd).with_context(|| format!("reading the head commit in {cwd}"))?;
+            let heads = pr_draft_review::local_heads(&cwd, live)?;
             fleet.interview(
                 "autopilot",
                 InterviewCommand::RecordConversationReport {
                     conversation_id: review.id,
-                    body: pr_draft_review::heads_report(&pr_draft_review::local_heads(live, &head)),
+                    body: pr_draft_review::heads_report(&heads),
                 },
             )?;
         }
         hook.working_on("pushing the reviewed change and answering the pull request's threads");
         // What the push makes the pull request's head: tod's own push, not an
         // unreviewed one (`crate::pr_pushes`), even when GitHub shows it late.
-        let pushing = pr_draft_review::local_head(&cwd).with_context(|| format!("reading the head commit in {cwd}"))?;
-        self.remember_tod_push(pushing)?;
+        for pushing in pr_draft_review::local_heads(&cwd, live)?.into_values() {
+            self.remember_tod_push(pushing)?;
+        }
         let message = if self.state.pr_change.as_ref().is_some_and(|c| c.held) {
             crate::conversation::pr::push_held_message()
         } else {
@@ -3930,6 +3938,26 @@ fn same_failure(decision: &tod_store::decisions::Decision, check: &str, assessme
 /// Whether `question` names the pull request `number`: `#6680`,
 /// `owner/repo#6680`, `pull request 6680`, `pull/6680` or `PR 6680`, with the
 /// number ending there (`#66` is not `#6680`).
+/// Whether `node`'s run holds commits back from its pull request for tod's
+/// review ([`AutopilotState::pr_change`], with the review steps on in
+/// `pr_draft` or `pr_review`): the pull request's agent committed a change
+/// and was told not to push it, and pushes it itself once tod's review
+/// cleared it. Until then the runners' own branch pushes, at a turn or step
+/// boundary and when a run ends, leave the branch where it is, or the change
+/// reaches the pull request unreviewed (`crate::pr_pushes`). A change saved
+/// in an earlier stay, or with the node out of those states, holds nothing.
+pub fn holds_change(fleet: &FleetStore, node: Uuid) -> Result<bool> {
+    let Some(change) = AutopilotState::load(fleet.paths().root(), node)?.pr_change else {
+        return Ok(false);
+    };
+    fleet.read(|conn| {
+        let phases = PhaseRepo::new(conn);
+        let state = phases.current_state(node)?;
+        Ok(state.as_deref().is_some_and(crate::pr_draft_review::reviews_on_pr)
+            && phases.stay_started_at(node)?.is_none_or(|stay| change.started_ms >= stay))
+    })
+}
+
 pub(crate) fn request_names_pr(question: &str, number: i64) -> bool {
     let q = question.to_ascii_lowercase();
     let digits = number.to_string();

@@ -3206,6 +3206,97 @@ fn pr_draft_with_review_steps_reviews_the_clean_head_once() {
     assert_eq!(openings(&fx, ProtocolKind::Review).len(), 1, "the same head is not reviewed again");
 }
 
+/// A finished review round in `review` (before the pull request) that
+/// recorded the heads it reviewed; with `finding`, one finding of it still
+/// stands.
+fn seed_review_phase_round(fx: &Fixture, repo_heads: serde_json::Value, finding: bool) -> Uuid {
+    let id = Uuid::new_v4();
+    let conversation = |command| fx.fleet.interview(ACTOR_USER, command).unwrap();
+    conversation(InterviewCommand::CreateConversation {
+        id,
+        focus: Focus::Node(fx.node),
+        protocol: ProtocolKind::Review,
+        platform: None,
+        model: None,
+        effort: None,
+    });
+    conversation(InterviewCommand::SetConversationTransition {
+        conversation_id: id,
+        from_state: "review".into(),
+        to_state: "pr".into(),
+    });
+    if finding {
+        conversation(InterviewCommand::AddReviewFinding {
+            node_id: fx.node,
+            conversation_id: Some(id),
+            finding: tod_store::review::NewFinding {
+                severity: "low".into(),
+                file: None,
+                line: None,
+                summary: "Still standing.".into(),
+                detail: None,
+                root_cause: None,
+            },
+        });
+    }
+    conversation(InterviewCommand::RecordConversationReport {
+        conversation_id: id,
+        body: crate::conversation::review::done_report(),
+    });
+    conversation(InterviewCommand::RecordConversationReport {
+        conversation_id: id,
+        body: serde_json::json!({ "review": "done", crate::pr_draft_review::REPO_HEADS_KEY: repo_heads }),
+    });
+    std::thread::sleep(Duration::from_millis(3));
+    id
+}
+
+/// ENG-3558: the clean round in `review` reviewed exactly the change the pull
+/// request opened with, so tod's own review in `pr_draft` does not review it
+/// again; the gate counts that round for the head.
+#[test]
+fn a_clean_review_before_the_pull_request_covers_its_first_head() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    let feed = OwnReviewFeed::new(false);
+    crate::pr_readiness::set_feed_override(Some(feed.clone()));
+    with_pr_draft_review(&fx);
+    let round = seed_review_phase_round(&fx, serde_json::json!({ "acme/app": "abcdef1" }), false);
+    linked_to_prs(&fx, "pr_draft", &["https://github.com/acme/app/pull/42"]);
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let outcome = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO).run(&fx.fleet, &mut agent).unwrap();
+    // Only the seeded round: no review ran.
+    assert_eq!(openings(&fx, ProtocolKind::Review).len(), 1, "no second review of the same change: {outcome:?} {:?}", steps_of(&turn_labels(&agent)));
+    let heads = [("acme/app#42".to_string(), "abcdef1".to_string())].into();
+    let gate = fx.fleet.read(|conn| crate::pr_draft_review::gate(conn, fx.node, &heads)).unwrap();
+    assert!(gate.is_ok(), "{gate:?}");
+    assert_eq!(fx.fleet.read(|conn| crate::pr_draft_review::latest_review(conn, fx.node)).unwrap().map(|c| c.id), Some(round));
+}
+
+/// The round in `review` counts only when it came back clean and covered
+/// the pull request's repository.
+#[test]
+fn a_review_before_the_pull_request_that_left_a_finding_or_another_repository_does_not_cover_it() {
+    for (heads, finding) in [
+        (serde_json::json!({ "acme/app": "abcdef1" }), true),
+        (serde_json::json!({ "acme/top": "abcdef1", "acme/lib": "abcdef1" }), false),
+    ] {
+        let fx = setup();
+        retire_outside_criteria(&fx);
+        let feed = OwnReviewFeed::new(false);
+        crate::pr_readiness::set_feed_override(Some(feed.clone()));
+        with_pr_draft_review(&fx);
+        // The mock reviewer finds nothing on a node with a finding already.
+        a_finding_before_the_pull_request(&fx);
+        seed_review_phase_round(&fx, heads.clone(), finding);
+        linked_to_prs(&fx, "pr_draft", &["https://github.com/acme/app/pull/42"]);
+        let mut agent = FakeAgent::new(&fx.fleet);
+        let outcome = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO).run(&fx.fleet, &mut agent).unwrap();
+        // The seeded round and the review of the head.
+        assert_eq!(openings(&fx, ProtocolKind::Review).len(), 2, "{heads} {finding}: {outcome:?} {:?}", steps_of(&turn_labels(&agent)));
+    }
+}
+
 #[test]
 fn pr_draft_review_findings_are_posted_and_a_resolved_thread_declines_its_finding() {
     let fx = setup();

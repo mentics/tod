@@ -397,7 +397,13 @@ impl StepHook for Hook<'_> {
         // run-end push still reports it). At a turn too: an implement or fix turn's commits (in a submodule,
         // the parent records only their id) must not wait for the step to
         // end, with the sandbox idle-reclaimed in between.
-        if self.push_branch && boundary != Boundary::Wait {
+        // Not while a change is held for tod's review
+        // (`tod_core::autopilot::holds_change`): the pull request's agent pushes
+        // it once the review cleared it. The push when the run ends still
+        // sends it: a sandbox's unpushed commits are lost with the sandbox,
+        // and a head that reaches the pull request unreviewed is reviewed at
+        // once.
+        if self.push_branch && boundary != Boundary::Wait && !tod_core::autopilot::holds_change(fleet, self.node)? {
             // A failure stops the run with the repositories named: work that
             // cannot reach the remote is not something to carry on past.
             let _retries = tod_store::fleet::workdir::scope_retries_to_node(&self.node.to_string());

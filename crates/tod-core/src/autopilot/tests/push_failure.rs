@@ -413,3 +413,42 @@ fn a_waiting_run_says_working_once_a_push_is_needed() {
     let row = wait_row(&fx);
     assert_eq!(row.reason_kind, crate::run_state::kind::WORKING, "a real push is work: {row:?}");
 }
+
+/// A change the pull request's agent committed for tod's review is not
+/// pushed by the runner (ENG-3558: the step boundary before the review sent
+/// it to the pull request unreviewed): not at a step boundary, not when the
+/// run ends. Once the change is no longer held, the next boundary pushes as
+/// before, and a change saved in an earlier stay holds nothing.
+#[test]
+fn a_change_held_for_tod_s_review_is_not_pushed_by_the_runner() {
+    let fx = setup();
+    let outage = Outage::new(&fx);
+    lifecycle::set_lifecycle(&fx.fleet, fx.node, "pr_draft").unwrap();
+    let data_root = fx.fleet.paths().root().to_path_buf();
+    let mut state = AutopilotState::load(&data_root, fx.node).unwrap();
+    state.pr_change = Some(crate::autopilot::state::PrChange {
+        started_ms: state::now_ms(),
+        before: String::new(),
+        made_at_ms: Some(state::now_ms()),
+        changed: true,
+        conflict: false,
+        held: false,
+    });
+    state.save(&data_root, fx.node).unwrap();
+    assert!(crate::autopilot::holds_change(&fx.fleet, fx.node).unwrap());
+
+    let mut sink = |_: LocalEvent| {};
+    let mut hook = hook(&fx, &mut sink);
+    assert_eq!(run_at_step(&mut hook, &fx), None);
+    let outcome = push_at_run_end(&fx.fleet, &data_root, fx.node, Outcome::Done, false).unwrap();
+    assert_eq!(outcome, Outcome::Done);
+    assert!(!log_of(&outage.origin, "task/x").contains("the fix"), "the held change stays off the remote");
+
+    // In another state the saved change holds nothing (it was an earlier stay's).
+    lifecycle::set_lifecycle(&fx.fleet, fx.node, "pr_review").unwrap();
+    std::thread::sleep(Duration::from_millis(5));
+    lifecycle::set_lifecycle(&fx.fleet, fx.node, "pr_draft").unwrap();
+    assert!(!crate::autopilot::holds_change(&fx.fleet, fx.node).unwrap(), "a change from before this stay holds nothing");
+    assert_eq!(run_at_step(&mut hook, &fx), None);
+    assert!(log_of(&outage.origin, "task/x").contains("the fix"), "pushed once nothing holds it");
+}

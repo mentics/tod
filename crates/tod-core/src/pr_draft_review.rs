@@ -51,6 +51,17 @@ pub const STATE: &str = "pr_draft";
 /// linked pull request it reviewed, by [`pr_label`].
 pub const HEADS_KEY: &str = "pr_heads";
 
+/// The key of the report the app adds to a finished review round in
+/// `review`: the head of each repository in the node's checkout (the
+/// superproject's and every submodule's), by lowercase `owner/repo`
+/// ([`repo_heads`]). No pull request exists yet; once one does, the round
+/// covers its first head when that head is the change it reviewed
+/// ([`latest_review`]).
+pub const REPO_HEADS_KEY: &str = "repo_heads";
+
+/// The lifecycle state the code review runs in before the pull request opens.
+const REVIEW_STATE: &str = "review";
+
 /// Who the app's own writes here are attributed to.
 const ACTOR: &str = "autopilot";
 
@@ -80,12 +91,30 @@ fn is_own(conversation: &Conversation, since: Option<i64>) -> bool {
         && since.is_none_or(|since| conversation.created_at >= since)
 }
 
-/// The latest review (its first group's session) run in `pr_draft` in this stay.
+/// The latest review (its first group's session) run in `pr_draft` in this
+/// stay. With none there yet, in `pr_draft`: the `review` phase's round that
+/// brought the node here, when it is the node's latest review of all, came
+/// back clean ([`crate::conversation::review::review_passed`]) and recorded the
+/// heads it reviewed ([`REPO_HEADS_KEY`]). It reviewed exactly the change the
+/// pull request opened with, and a second full review of the same change
+/// before anything moved is waste; a head that differs from it by more than a
+/// merge of the base is still owed a review ([`owed`]).
 pub fn latest_review(conn: &Connection, node: Uuid) -> Result<Option<Conversation>> {
-    let since = PhaseRepo::new(conn).stay_started_at(node)?;
-    Ok(ConversationRepo::new(conn)
-        .latest_for_focus_with_protocol(Focus::Node(node), ProtocolKind::Review)?
-        .filter(|c| is_own(c, since)))
+    let phases = PhaseRepo::new(conn);
+    let since = phases.stay_started_at(node)?;
+    let Some(latest) = ConversationRepo::new(conn).latest_for_focus_with_protocol(Focus::Node(node), ProtocolKind::Review)? else {
+        return Ok(None);
+    };
+    if is_own(&latest, since) {
+        return Ok(Some(latest));
+    }
+    let carried = latest.from_state.as_deref() == Some(REVIEW_STATE)
+        && phases.current_state(node)?.as_deref() == Some(STATE)
+        && crate::conversation::review::review_passed(conn, node)?
+        && ConversationRepo::new(conn)
+            .latest_report(latest.id)?
+            .is_some_and(|r| r.get(REPO_HEADS_KEY).is_some() || r.get(HEADS_KEY).is_some());
+    Ok(carried.then_some(latest))
 }
 
 /// The consecutive reviews in this stay that did not come back clean, counted
@@ -205,6 +234,93 @@ pub fn reviewed_heads(conn: &Connection, conversation: Uuid) -> Result<Option<BT
         .and_then(|heads| serde_json::from_value(heads).ok()))
 }
 
+/// The head of each of `live`'s pull requests that the review `conversation`
+/// covered, by [`pr_label`]: the heads it recorded ([`reviewed_heads`]), or,
+/// for a round in `review` (run before any pull request), each pull
+/// request's repository's head it recorded ([`REPO_HEADS_KEY`]). `None` when
+/// it recorded neither, or not one of these pull requests' repositories.
+fn heads_reviewed(conn: &Connection, conversation: &Conversation, live: &[LivePr]) -> Result<Option<BTreeMap<String, String>>> {
+    if let Some(heads) = reviewed_heads(conn, conversation.id)? {
+        return Ok(Some(heads));
+    }
+    if conversation.from_state.as_deref() != Some(REVIEW_STATE) || !tod_store::review::round::done(conn, conversation.id)? {
+        return Ok(None);
+    }
+    let Some(repos) = ConversationRepo::new(conn)
+        .latest_report(conversation.id)?
+        .and_then(|r| r.get(REPO_HEADS_KEY).cloned())
+        .and_then(|heads| serde_json::from_value::<BTreeMap<String, String>>(heads).ok())
+    else {
+        return Ok(None);
+    };
+    let mut out = BTreeMap::new();
+    for p in live {
+        let key = format!("{}/{}", p.pr.owner, p.pr.repo).to_ascii_lowercase();
+        // One repository and no other is the pull request's, whatever its
+        // `origin` is called ([`repo_dir`]).
+        let head = repos.get(&key).or_else(|| (repos.len() == 1).then(|| repos.values().next()).flatten());
+        let Some(head) = head else { return Ok(None) };
+        out.insert(pr_label(&p.pr), head.clone());
+    }
+    Ok(Some(out))
+}
+
+/// Records on `node`'s latest review round in `review`, once it is done, the
+/// head of each repository in the node's checkout `cwd` ([`REPO_HEADS_KEY`]),
+/// so that round can count for the pull request's first head
+/// ([`latest_review`]). Nothing when the review steps are off in `pr_draft`
+/// or the round is not done.
+pub fn record_review_phase_heads(fleet: &FleetStore, node: Uuid, cwd: &Workdir) -> Result<()> {
+    let latest = fleet.read(|conn| {
+        if !enabled(conn, node)? {
+            return Ok(None);
+        }
+        let Some(latest) = ConversationRepo::new(conn).latest_for_focus_with_protocol(Focus::Node(node), ProtocolKind::Review)? else {
+            return Ok(None);
+        };
+        let done = latest.from_state.as_deref() == Some(REVIEW_STATE) && tod_store::review::round::done(conn, latest.id)?;
+        Ok(done.then_some(latest.id))
+    })?;
+    let Some(conversation_id) = latest else { return Ok(()) };
+    let heads = repo_heads(cwd).map_err(|err| err.context(format!("recording the heads tod's review in `review` covered, in {cwd}")))?;
+    fleet.interview(
+        ACTOR,
+        InterviewCommand::RecordConversationReport {
+            conversation_id,
+            body: json!({ "review": "done", REPO_HEADS_KEY: heads }),
+        },
+    )?;
+    Ok(())
+}
+
+/// The head of each repository in the checkout `cwd`, the superproject's and
+/// every submodule's at any depth, by lowercase `owner/repo` from its
+/// `origin` ([`repo_of`]). A repository with no `origin` it can read one
+/// from is left out.
+pub fn repo_heads(cwd: &Workdir) -> Result<BTreeMap<String, String>> {
+    let mut out = BTreeMap::new();
+    let mut dirs = vec![cwd.clone()];
+    let paths = cwd.git(&["submodule", "foreach", "--quiet", "--recursive", "echo \"$displaypath\""])?;
+    dirs.extend(paths.lines().map(str::trim).filter(|p| !p.is_empty()).map(|p| cwd.join(p)));
+    for dir in dirs {
+        let origin = dir.git(&["remote", "get-url", "origin"]).unwrap_or_default();
+        let Some(repo) = repo_of(&origin) else { continue };
+        out.insert(repo, local_head(&dir)?);
+    }
+    Ok(out)
+}
+
+/// `owner/repo`, lowercase, from a remote's URL (`git@host:owner/repo.git`,
+/// `https://host/owner/repo`, ...); `None` when it does not have both.
+fn repo_of(url: &str) -> Option<String> {
+    let url = url.trim().trim_end_matches('/');
+    let url = url.strip_suffix(".git").unwrap_or(url);
+    let mut parts = url.rsplit(['/', ':']).filter(|p| !p.is_empty());
+    let repo = parts.next()?;
+    let owner = parts.next()?;
+    Some(format!("{owner}/{repo}").to_ascii_lowercase())
+}
+
 /// Whether the findings of the review round that `latest` began (its own and
 /// its later groups') all stand dismissed: none recorded, or each one the
 /// user answered out of scope or declined. One fixed or rejected still
@@ -260,7 +376,7 @@ pub fn owed(conn: &Connection, node: Uuid, live: &[LivePr], feed: &dyn PrFeed) -
         return Ok(Owed::Review);
     };
     let current = current_heads(live);
-    match reviewed_heads(conn, latest.id)? {
+    match heads_reviewed(conn, &latest, live)? {
         None => return Ok(Owed::Review),
         Some(reviewed) if reviewed != current => {
             // A head that only merges the base in is the change already
@@ -303,8 +419,13 @@ pub fn carry_heads(fleet: &FleetStore, node: Uuid, live: &[LivePr]) -> Result<()
     let current = current_heads(live);
     let carried = fleet.read(|conn| {
         let Some(latest) = latest_review(conn, node)? else { return Ok(None) };
-        Ok(match reviewed_heads(conn, latest.id)? {
-            Some(reviewed) if reviewed != current => Some(latest.id),
+        // A round in `review` recorded no pull request's head: the one it
+        // covers is recorded on it here, even when it is the very head it
+        // reviewed.
+        let recorded = reviewed_heads(conn, latest.id)?;
+        Ok(match (recorded, heads_reviewed(conn, &latest, live)?) {
+            (Some(reviewed), _) if reviewed == current => None,
+            (_, Some(_)) => Some(latest.id),
             _ => None,
         })
     })?;
@@ -416,10 +537,24 @@ pub fn local_head(cwd: &Workdir) -> Result<String> {
     cwd.git(&["rev-parse", "HEAD"])
 }
 
-/// The heads a review of the local head `head` covers, by [`pr_label`]: every
-/// linked pull request, since the node's branch is the head of each.
-pub fn local_heads(live: &[LivePr], head: &str) -> BTreeMap<String, String> {
-    live.iter().map(|p| (pr_label(&p.pr), head.to_string())).collect()
+/// The local head of each linked pull request, by [`pr_label`]: the commit
+/// checked out in its own repository's checkout ([`repo_dir`]), which is what
+/// its push makes the pull request's head. For a pull request on a submodule
+/// that is the submodule's commit, never the superproject's, which no pull
+/// request of it ever shows.
+pub fn local_heads(cwd: &Workdir, live: &[LivePr]) -> Result<BTreeMap<String, String>> {
+    local_heads_of(cwd, live.iter().map(|p| &p.pr))
+}
+
+/// [`local_heads`] of these pull requests.
+fn local_heads_of<'a>(cwd: &Workdir, prs: impl IntoIterator<Item = &'a tod_store::github::NodePr>) -> Result<BTreeMap<String, String>> {
+    prs.into_iter()
+        .map(|pr| {
+            let dir = repo_dir(cwd, &pr.owner, &pr.repo)?;
+            let head = local_head(&dir).map_err(|err| err.context(format!("reading the head commit of {} in {dir}", pr.url)))?;
+            Ok((pr_label(pr), head))
+        })
+        .collect()
 }
 
 /// The reviews (first groups' sessions) run in `pr_draft` in this stay since
@@ -944,6 +1079,30 @@ mod tests {
         assert_ne!(pr_change_of(&cwd, &[(&pr, Some("main"))]).unwrap(), before);
         // A pull request GitHub gave no base for cannot be told.
         assert!(pr_change_of(&cwd, &[(&pr, None)]).is_err());
+
+        // What a clean review of the change records, and what tod's push
+        // makes the pull request's head: the submodule's commit, never the
+        // superproject's (ENG-3558: the superproject's was recorded, so the
+        // pull request's head read as unreviewed and was reviewed again).
+        let lib_head = git(&lib, &["rev-parse", "HEAD"]);
+        let top_head = git(&work, &["rev-parse", "HEAD"]);
+        assert_ne!(lib_head, top_head);
+        assert_eq!(local_heads_of(&cwd, [&pr]).unwrap(), BTreeMap::from([("acme/lib#7".to_string(), lib_head.clone())]));
+        // What a review in `review` records, before any pull request: every
+        // repository's head.
+        assert_eq!(
+            repo_heads(&cwd).unwrap(),
+            BTreeMap::from([("acme/lib".to_string(), lib_head), ("acme/top".to_string(), top_head)])
+        );
+    }
+
+    #[test]
+    fn a_remote_url_gives_its_owner_and_repository() {
+        assert_eq!(repo_of("git@github.com:Cofactr/flagship.git").as_deref(), Some("cofactr/flagship"));
+        assert_eq!(repo_of("https://github.com/Cofactr/flagship/").as_deref(), Some("cofactr/flagship"));
+        assert_eq!(repo_of("ssh://git@github.com/Cofactr/flagship.git").as_deref(), Some("cofactr/flagship"));
+        assert_eq!(repo_of("flagship"), None);
+        assert_eq!(repo_of(""), None);
     }
 
     fn finding(file: Option<&str>, line: Option<i64>) -> ReviewFinding {

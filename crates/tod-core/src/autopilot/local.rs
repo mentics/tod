@@ -191,7 +191,15 @@ impl LocalRun {
                         Err(err) => {
                             // The run's own error is the one shown; a push
                             // that could not even be recorded is said beside it.
-                            let pushed = if hook.push_failed { Ok(None) } else { push_branch_as(&fleet, node, PushRetrier::NextPush) };
+                            let pushed = if hook.push_failed {
+                                Ok(None)
+                            } else {
+                                match super::holds_change(&fleet, node) {
+                                    Ok(true) => Ok(None),
+                                    Ok(false) => push_branch_as(&fleet, node, PushRetrier::NextPush),
+                                    Err(err) => Err(err),
+                                }
+                            };
                             return Err(match pushed {
                                 Err(push) => err.context(format!("(and the branch push could not be recorded: {push:#})")),
                                 Ok(_) => err,
@@ -541,7 +549,10 @@ pub(crate) fn push_at_run_end(
     outcome: Outcome,
     boundary_push_failed: bool,
 ) -> Result<Outcome> {
-    if boundary_push_failed {
+    // A change held for tod's review stays off the pull request
+    // (`super::holds_change`); the checkout keeps it, and a worktree with
+    // unpushed commits is never released.
+    if boundary_push_failed || super::holds_change(fleet, node)? {
         return Ok(outcome);
     }
     let resumed = matches!(outcome, Outcome::Done | Outcome::Waiting { .. });
@@ -612,7 +623,9 @@ impl<F: FnMut(LocalEvent)> StepHook for Hook<'_, F> {
 
     fn at(&mut self, fleet: &FleetStore, boundary: Boundary) -> Result<Option<String>> {
         let mut blocked: Option<String> = None;
-        if boundary == Boundary::Step {
+        // Not while a change is held for tod's review (`super::holds_change`):
+        // the pull request's agent pushes it once the review cleared it.
+        if boundary == Boundary::Step && !super::holds_change(fleet, self.node)? {
             // Pushing can take seconds in a checkout with submodules, so a push
             // that really runs says so, and begins work for a quiet run. A step
             // boundary where the remote already has the branch says nothing

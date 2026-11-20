@@ -580,6 +580,18 @@ that shares the workspace and has no branch of its own must not push whatever
 is checked out, since `push_branch` pushes `HEAD` to its same-named branch.
 The push refuses a default branch.
 
+**A change held for tod's review is not pushed.** With the review steps on in
+`pr_draft`/`pr_review`, the pull request's agent commits its change without
+pushing, and pushes it itself once tod's review cleared it
+(`AutopilotState::pr_change`). While the run holds one
+(`tod_core::autopilot::holds_change`), the runners leave the branch alone: the
+local runner at every step boundary and when the run ends (the checkout keeps
+the commits, and a worktree with unpushed commits is never released), the
+supervisor at every turn and step boundary. The supervisor's push when its run
+ends still sends it, since a sandbox's unpushed commits are lost with the
+sandbox; a head that reaches the pull request unreviewed is reviewed at once
+(`tod_core::pr_pushes`).
+
 **Submodules.** A node's work is often in a submodule (the parent records only
 its commit id, so a parent branch alone holds none of it). The supervisor's push
 (`tod_supervisor::git::push_branch`) pushes, deepest first, the node's own branch in

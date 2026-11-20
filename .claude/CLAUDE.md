@@ -221,7 +221,12 @@ against its base differs (`pr_draft_review::pr_change`, in each pull request's
 own repository, a submodule's included; a merge of the base alone does not
 count, resolving a conflict with it always does), tod's Review → Fix → Review loop runs on the local head
 until clean (same round limit as `review`), and only then does the agent push
-and answer the threads; the clean review records that head (`pr_heads`). A head
+and answer the threads; the clean review records each pull request's head as
+its own repository has it (a submodule's commit for a pull request on one:
+`pr_draft_review::local_heads`, `pr_heads`), and until then no runner pushes the
+branch (`autopilot::holds_change`). A clean round in `review` records every
+repository's head (`repo_heads`) and covers the pull request's first head when
+it is that change (`pr_draft_review::latest_review`). Any other head
 that reaches the PR without that loop is reviewed once nothing but a person is
 left (`tod_core::pr_draft_review`), its findings posted on the PR as threads
 (`review_findings.pr_thread`); the `pr-pr_review.own-review` criterion gates on

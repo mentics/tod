@@ -667,7 +667,8 @@ impl<'a> PhaseRepo<'a> {
             .context("phase event vanished after insert")
     }
 
-    fn current_state(&self, node_id: Uuid) -> Result<Option<String>> {
+    /// The node's lifecycle state; `None` when it has no Lifecycle.
+    pub fn current_state(&self, node_id: Uuid) -> Result<Option<String>> {
         Ok(self
             .conn
             .query_row(
