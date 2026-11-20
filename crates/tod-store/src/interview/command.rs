@@ -291,6 +291,20 @@ pub enum InterviewCommand {
     RemoveGuidance { node_id: Uuid, kind: String, item: String },
     /// The app finishes a guidance selection run (`crate::guidance::finish_run`).
     FinishGuidanceRun { run_id: Uuid },
+    /// File a suggestion on a node (`tod-cli suggest ticket`, the app, triage;
+    /// `crate::suggestions::file`). Never blocks the node.
+    FileSuggestion(crate::suggestions::NewSuggestion),
+    /// Record a tracker search's result on a suggestion filed without one.
+    SetSuggestionDuplicates {
+        id: Uuid,
+        duplicates: Vec<crate::suggestions::Duplicate>,
+        checked: bool,
+        #[serde(default)]
+        note: String,
+    },
+    /// The user accepts (with the ticket created) or dismisses a suggestion
+    /// (`crate::suggestions::resolve`). Not offered by `tod-cli`.
+    ResolveSuggestion { id: Uuid, status: String, result_id: String, result_url: String },
     /// The user's "Shouldn't have asked" on a request
     /// (`crate::request_feedback`). Not offered by `tod-cli`.
     RecordRequestFeedback(crate::request_feedback::NewRequestFeedback),
@@ -1243,6 +1257,15 @@ pub fn execute(
         InterviewCommand::FinishGuidanceRun { run_id } => {
             let run = crate::guidance::finish_run(conn, actor, *run_id)?;
             Ok(json!({ "run_id": run.id.to_string(), "added": run.added, "dropped": run.dropped }))
+        }
+        InterviewCommand::FileSuggestion(new) => crate::suggestions::file_json(conn, new),
+        InterviewCommand::SetSuggestionDuplicates { id, duplicates, checked, note } => {
+            crate::suggestions::set_duplicates(conn, *id, duplicates, *checked, note)?;
+            Ok(json!({ "id": id.to_string() }))
+        }
+        InterviewCommand::ResolveSuggestion { id, status, result_id, result_url } => {
+            crate::suggestions::resolve(conn, *id, status, result_id, result_url, actor)?;
+            Ok(json!({ "id": id.to_string() }))
         }
         InterviewCommand::RecordRequestFeedback(feedback) => {
             let id = crate::request_feedback::RequestFeedbackRepo::new(conn).record(feedback)?;
