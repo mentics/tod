@@ -130,6 +130,10 @@ When more than one holds, the first of these wins (as built in
    `stopped` row, else the heartbeat's reason or the saved run. This beats a
    pending wait, so a failure is never hidden behind one. (A `starting` row
    sits here too: `Working` for 150 s, then a failure.)
+5a. Parked on an open incident (`tod_store::incidents`, `doc/lifecycle/incidents.md`)
+   → `Others`, `who` = the incident and its node count ("GitHub auth failing,
+   12 nodes"), the next probe as the next check. After the run-end check,
+   before the waits: a shared cause is not the node's own failure.
 6. A pending external wait → `Others`.
 7. Otherwise → `You::NotStarted`. Nothing is ever "idle": a node with no
    actor is a node nobody has been told to move.

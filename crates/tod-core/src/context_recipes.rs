@@ -626,6 +626,16 @@ pub const SMALL_REVIEW: ContextRecipe = ContextRecipe {
     layers: &["stance/bounded-session", "cli/intro", "cli/review", "surface/small-review"],
     blocks: &[DynamicBlock::DataRoot, DynamicBlock::WorkingDirectory, DynamicBlock::SmallReviewDiff],
 };
+/// The incident investigation (`crate::incident`, `ProtocolKind::Incident`):
+/// one failure many nodes share, with samples. One-shot, with one scoped
+/// exception `surface/incident` states: fix what can be fixed, or file one
+/// request through the `decisions` noun.
+pub const INCIDENT: ContextRecipe = ContextRecipe {
+    name: "incident investigation",
+    situational: false,
+    layers: &["stance/one-shot", "cli/intro", "cli/decisions", "surface/incident"],
+    blocks: &[DynamicBlock::DataRoot, DynamicBlock::IncidentSamples],
+};
 
 /// Every registered surface.
 pub const ALL_RECIPES: &[ContextRecipe] = &[
@@ -633,6 +643,7 @@ pub const ALL_RECIPES: &[ContextRecipe] = &[
     GUIDANCE,
     QUICK_FIX,
     SMALL_REVIEW,
+    INCIDENT,
     CONVERSATION,
     CHAT,
     VISUAL_DESIGN,
@@ -1021,6 +1032,7 @@ missing"),
             | DynamicBlock::GuidanceSelection
             | DynamicBlock::QuickFixTarget
             | DynamicBlock::SmallReviewDiff
+            | DynamicBlock::IncidentSamples
             | DynamicBlock::VisualDesign => 5,
         }
     }

@@ -341,6 +341,10 @@ journey event with a snapshot of the buttons that were on screen.
 - **Significant changes show their impact first.** Editing or removing a
   files location, disabling a capability, deleting a node: the app shows
   what would be affected and confirms; `tod-cli` refuses instead.
+- **A failure many nodes share is one incident.** Classified by signature
+  (`tod_store::incident_class`), it parks the nodes, is probed by the daemon,
+  and asks the user or an investigator once, never once per node
+  (`doc/lifecycle/incidents.md`).
 - **Nothing on the UI thread runs git, Docker, or `tod-cli`.**
 - **Every executable reports its failures to the app.**
 

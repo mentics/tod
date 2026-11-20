@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 110;
+pub const CURRENT_USER_VERSION: i32 = 111;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -746,6 +746,14 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         conn.execute_batch(&crate::journey_changes::quick_fixes_triggers_sql())?;
         conn.pragma_update(None, "user_version", 110)?;
     }
+    if version < 111 {
+        // Cross-node incidents (`crate::incidents`, `doc/lifecycle/incidents.md`):
+        // machine-local, not synced; `incident_nodes` is journaled. Version 110
+        // is the quick-fix step's, built beside this one.
+        conn.execute_batch(crate::incidents::CREATE_TABLES)?;
+        conn.execute_batch(&crate::journey_changes::incident_nodes_triggers_sql())?;
+        conn.pragma_update(None, "user_version", 111)?;
+    }
     // Other branches (the task panel) numbered their own steps 66–67 at the
     // same time as 66–70 above, so a store may be past a version without
     // having these. Every one is idempotent: make sure of them all.
@@ -806,6 +814,9 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     // The user's deferrals of nodes: machine-local, not synced, journaled.
     conn.execute_batch(crate::deferrals::CREATE_TABLE)?;
     conn.execute_batch(&crate::journey_changes::deferrals_triggers_sql())?;
+    // Idempotent, so a store that skipped 111 for a branch's 110 still has them.
+    conn.execute_batch(crate::incidents::CREATE_TABLES)?;
+    conn.execute_batch(&crate::journey_changes::incident_nodes_triggers_sql())?;
     conn.execute_batch(crate::node_problems::CREATE_TABLE)?;
     crate::node_problems::ensure_columns(conn)?;
     conn.execute_batch(&crate::journey_changes::node_problems_triggers_sql())?;

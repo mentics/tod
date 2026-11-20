@@ -87,10 +87,11 @@ pub fn add_delete_sandbox(conn: &Connection) -> Result<()> {
 /// the two cheap sessions of the escalation ladder (`doc/requests/design.md`
 /// sections 5 and 4.2): the quick fix of one failing check (`quick_fix`) and
 /// the small-change review of its commit in `pr_draft` (`small_review`).
-pub const PHASES: [&str; 18] = [
+pub const PHASES: [&str; 19] = [
     "proposed",
     "design",
     "guidance",
+    "incident",
     "planning",
     "implement",
     "verify",
@@ -152,6 +153,11 @@ pub const QUICK_FIX: &str = "quick_fix";
 /// reviewer, the diff only. Only its model and effort are configured.
 pub const SMALL_REVIEW: &str = "small_review";
 
+/// The incident investigation (`tod_core::incident`): one short session
+/// about a failure many nodes share. Only its model and effort are
+/// configured; it runs on the cheap tier unless its key says otherwise.
+pub const INCIDENT: &str = "incident";
+
 /// What the cheap sessions run on unless their key says otherwise.
 pub const CHEAP_DEFAULT_MODEL: &str = "haiku";
 pub const CHEAP_DEFAULT_EFFORT: &str = "low";
@@ -162,7 +168,7 @@ pub const QUICK_FIX_DEFAULT_EFFORT: &str = CHEAP_DEFAULT_EFFORT;
 /// only a model and effort: the guidance selector, the quick fix and the
 /// small-change review.
 pub fn agent_only(phase: &str) -> bool {
-    phase == GUIDANCE || phase == QUICK_FIX || phase == SMALL_REVIEW
+    phase == GUIDANCE || phase == QUICK_FIX || phase == SMALL_REVIEW || phase == INCIDENT
 }
 
 /// The model and effort a phase's session runs on when no node sets them:

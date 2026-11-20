@@ -58,6 +58,7 @@ pub const INCOMING_SURFACE: &str = "incoming check";
 pub const GUIDANCE_SURFACE: &str = "guidance";
 pub const QUICK_FIX_SURFACE: &str = "quick fix";
 pub const SMALL_REVIEW_SURFACE: &str = "small review";
+pub const INCIDENT_SURFACE: &str = "incident";
 
 /// Name a session, e.g. `Obligations · Ship the chat context fix · Sep 10, 2:41 PM`.
 ///

@@ -369,7 +369,36 @@ impl Runners {
         *last = (nodes, now);
     }
 
+    /// The incidents' tick (`tod_core::incident`): expire, probe, escalate, and
+    /// start the nodes released to resume (the probe node first, then the rest
+    /// a few at a time). A released node that cannot be started goes back to
+    /// being parked, counted as a failed probe, never silently dropped.
+    fn incident_pass(&self) {
+        let store = &self.inner.store;
+        if let Err(err) = tod_core::incident::tick(store) {
+            tracing::error!("the incidents' pass failed: {err:#}");
+            return;
+        }
+        let released = match tod_core::incident::take_released(store) {
+            Ok(released) => released,
+            Err(err) => {
+                tracing::error!("could not read the nodes released from an incident: {err:#}");
+                return;
+            }
+        };
+        for node in released {
+            tracing::info!(%node, "resuming a node parked on an incident");
+            if let Err(err) = self.start_auto(node) {
+                tracing::error!(%node, "could not resume a node parked on an incident: {err:#}");
+                if let Err(err) = tod_core::incident::repark(store, node) {
+                    tracing::error!(%node, "could not park it again: {err:#}");
+                }
+            }
+        }
+    }
+
     fn tick(&self) {
+        self.incident_pass();
         self.start_due();
         self.resume_stale_request_waits();
         self.adopt_cut_off_runs();

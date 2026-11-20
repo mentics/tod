@@ -105,6 +105,9 @@ pub fn plan_turn(
         Some(tod_store::conversation::ProtocolKind::SmallReview) => {
             super::small_review::mock_turn(access, node_id, conversation_id)
         }
+        Some(tod_store::conversation::ProtocolKind::Incident) => {
+            super::incident::mock_turn(access, node_id, conversation_id)
+        }
         Some(tod_store::conversation::ProtocolKind::Pr) => {
             super::pr::mock_turn(access, node_id, conversation_id, place)
         }

@@ -365,6 +365,9 @@ pub struct Facts<'a> {
     pub run: &'a RunFacts,
     /// The node's recorded background problems (`tod_store::node_problems`).
     pub problems: &'a [NodeProblem],
+    /// The open incident the node is parked on, if any
+    /// (`tod_store::incidents`): not its own failure, so not the user's.
+    pub parked: Option<&'a tod_store::incidents::Parking>,
     pub deferral: Option<Deferral>,
     pub now_ms: i64,
 }
@@ -423,6 +426,7 @@ pub fn for_nodes(
     for problem in NodeProblemRepo::new(conn).list_for_nodes(node_ids)? {
         problems.entry(problem.node_id).or_default().push(problem);
     }
+    let parked = tod_store::incidents::parking_for_nodes(conn, node_ids)?;
     let no_run = RunFacts::default();
     let no_attention = NodeAttention::default();
     let mut out = HashMap::new();
@@ -444,6 +448,7 @@ pub fn for_nodes(
             stop_answer: stop_answers.get(&node_id),
             run: inputs.runs.get(&node_id).unwrap_or(&no_run),
             problems: problems.get(&node_id).map(Vec::as_slice).unwrap_or(&[]),
+            parked: parked.get(&node_id),
             deferral: deferrals.get(&node_id).copied(),
             now_ms: inputs.now_ms,
         });
@@ -803,6 +808,27 @@ fn actor_for(facts: &Facts<'_>) -> (NextActor, i64) {
     if let Some((why, since)) = run_end(facts) {
         return (NextActor::You { why, since }, since);
     }
+    // Parked on an incident (`tod_store::incidents`): a cause shared with
+    // other nodes that tod probes and, when only the user can fix it, asks
+    // about once. Not this node's failure, so not its owner's to look at; it
+    // is before the waits, whose own failures it explains.
+    if let Some(parking) = facts.parked {
+        let wait = ExternalWait {
+            kind: WaitKind::Other,
+            who: Some(parking.who()),
+            detail: Some(format!(
+                "parked on an incident while {}; retried {} time{}, it resumes by itself when the cause is fixed",
+                if parking.operation.is_empty() { "working" } else { &parking.operation },
+                parking.probe_attempts,
+                if parking.probe_attempts == 1 { "" } else { "s" },
+            )),
+            since: parking.parked_at,
+            next_check_ms: parking.next_probe_at,
+            overdue: false,
+            retry: None,
+        };
+        return (NextActor::Others { wait }, 0);
+    }
     // A wait recorded in a stay the node has left no longer holds anything
     // (the move that ended it may not have reached this copy of the
     // database): it is ignored here and ended by the sweep.
@@ -1097,6 +1123,7 @@ mod tests {
             stop_answer: c.stop_answer.as_ref(),
             run: &c.run,
             problems: &c.problems,
+            parked: None,
             deferral: c.deferral,
             now_ms: NOW,
         })
@@ -1895,6 +1922,28 @@ mod tests {
         let NextActor::Others { wait } = &got[&waiting].actor else { panic!("not others") };
         assert_eq!(wait.kind, WaitKind::HumanReview);
         assert_eq!(wait.detail.as_deref(), Some("a review of o/r#3"));
+    }
+
+    /// A node parked on an incident is waited on by others, not the user's:
+    /// `who` names the incident and its node count, however its own wait looks.
+    #[test]
+    fn a_node_parked_on_an_incident_is_others_naming_the_incident() {
+        use tod_store::incident_class::Source;
+        let fx = fixture();
+        let a = node(&fx.conn, "a", Some("pr_draft"));
+        let b = node(&fx.conn, "b", Some("pr_draft"));
+        let error = "GitHub rejected the token (HTTP 401): it is expired, revoked, or mistyped";
+        for n in [a, b] {
+            tod_store::incidents::observe(&fx.conn, n, Source::Github, "looking at GitHub", error, NOW).unwrap();
+        }
+        let inputs = Inputs { now_ms: NOW, ..Default::default() };
+        let got = for_nodes(&fx.conn, &[a, b], &inputs).unwrap();
+        for n in [a, b] {
+            let NextActor::Others { wait } = &got[&n].actor else { panic!("{:?}", got[&n].actor) };
+            assert_eq!(wait.who.as_deref(), Some("GitHub auth failing, 2 nodes"));
+            assert!(wait.next_check_ms.is_some(), "the next probe is shown");
+            assert!(!got[&n].on_you());
+        }
     }
 
     #[test]

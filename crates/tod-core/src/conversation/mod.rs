@@ -12,6 +12,7 @@ pub mod context;
 pub mod driver;
 pub mod fix;
 pub mod guidance;
+pub mod incident;
 pub mod handoff;
 pub mod implement;
 pub mod incoming;

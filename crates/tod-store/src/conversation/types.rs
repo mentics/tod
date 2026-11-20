@@ -143,6 +143,7 @@ str_enum!(
         Guidance => "guidance",
         QuickFix => "quick_fix",
         SmallReview => "small_review",
+        Incident => "incident",
     }
 );
 

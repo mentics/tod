@@ -59,6 +59,7 @@ pub mod fuzzy;
 pub mod gate;
 pub mod guidance;
 pub mod impact;
+pub mod incident;
 pub mod incoming;
 pub mod generator;
 pub mod install;
