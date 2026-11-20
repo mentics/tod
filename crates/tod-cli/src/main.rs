@@ -85,7 +85,7 @@ NOUNS:
     environment            Variables and credentials defined for this work; ask the user for one
     decisions              What the user answers: ask, list, show
     triage                 A triage session answers, escalates or converts the one request it reads
-    lessons                What the app learned about its own process: list, stats, add, decline
+    lessons                What the app learned about its own process: list, show, add, decline
     phase                  Whether a node's lifecycle phase is done: status, ready, certify, reject
     wait                   What a node waits on between sessions: a time, an event, a check
     batch                  Run many commands in one call; the reply lists only the failures

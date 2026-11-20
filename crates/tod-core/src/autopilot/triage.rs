@@ -106,7 +106,7 @@ impl Autopilot {
                 for d in DecisionRepo::new(conn).list_for_node(node)? {
                     let Some(conversation) = d.triage_conversation_id else { continue };
                     if d.status != DECISION_ANSWERED
-                        || !tod_store::lessons::triage_lesson_exists(conn, d.id)?
+                        || tod_store::lessons::triage_lesson_exists(conn, d.id)?
                         || notes.iter().any(|n| n.kind == KIND_NOTE && n.title == no_lesson_title(&d))
                     {
                         continue;
