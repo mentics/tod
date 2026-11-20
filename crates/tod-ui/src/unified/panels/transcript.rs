@@ -170,6 +170,7 @@ fn run_label_base(c: &Conversation) -> String {
         ProtocolKind::QuickFix => "Quick fix",
         ProtocolKind::SmallReview => "Small review",
         ProtocolKind::Incident => "Investigate incident",
+        ProtocolKind::Triage => "Triage a request",
         ProtocolKind::VisualDesign => "Visual design",
         ProtocolKind::Chat => "Chat",
         ProtocolKind::Outline => "Outline",
