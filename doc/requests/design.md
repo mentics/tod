@@ -1,6 +1,6 @@
 # Requests for the user: fewer, cheaper, clearer, and self-improving
 
-Status: design, not built. 2026-11-20.
+Status: steps 1 to 8 built (lessons and process review: `doc/lifecycle/self-improvement.md`); the self-improvement view (11.4) is deferred. 2026-11-20.
 
 This replaces how a node asks the user for something today: an agent runs
 `tod-cli decisions ask`, the run stops, and the request sits in the task panel

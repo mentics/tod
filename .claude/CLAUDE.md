@@ -342,6 +342,20 @@ request. There is no "shouldn't have asked" control: highlight words and pick
 `decided_by` is `user`, `tod` or `triage`; the Answered drawer shows it and
 **Change** offers sending the task back to the phase that asked.
 
+**Lessons and process review** (`doc/lifecycle/self-improvement.md`;
+`tod_store::lessons`, `lesson_stats`, schema v113; `tod_core::process_review`).
+Triage reflections, send-backs and disputes, quick fixes that escalated, failed
+fixers, tool incidents and the user's remarks are `improvement_lessons`, written
+once each (`event_key`) by `lessons::record_*` and `Op::Lessons`; `tod-cli
+lessons` lists them and prints the measures. With `process_review.parent` set,
+the daemon's `process_review_pass` groups new lessons (`every_hours`,
+`min_lessons`) into a run node under it (a second under `project_parent` for
+project skills); the autopilot's `process_review_step` runs the
+`ProtocolKind::ProcessReview` session (lifecycle key `process_review`), which
+drafts changes as commits and marks its own run's lessons applied
+(`lessons apply --ref`). Prompts are never edited silently: the node goes
+through the lifecycle.
+
 **Permissions while unattended** (`tod_core::permission`). A permission an agent asks for that
 nobody has granted is recorded as a pending decision on the node (protocol `permission`,
 reason `access`), so it survives a restart and is answered where requests are. Answering it
