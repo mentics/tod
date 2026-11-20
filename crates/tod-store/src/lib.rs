@@ -46,6 +46,7 @@ pub mod pr_pushes;
 pub mod request_feedback;
 pub mod sandbox_http;
 pub mod send_back;
+pub mod suggestions;
 pub mod guidance;
 pub mod review;
 pub mod settings;

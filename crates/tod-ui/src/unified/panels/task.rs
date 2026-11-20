@@ -315,6 +315,8 @@ pub struct TaskPanel {
     pub(crate) requests: Entity<Requests>,
     /// The pull-request buttons under the PR links.
     pr_controls: Entity<crate::unified::panels::pr_controls::PrControls>,
+    /// The Suggestions section, below the requests.
+    suggestions: Entity<crate::unified::panels::suggestions::Suggestions>,
     _requests_subs: Vec<Subscription>,
     /// T5: whether the Answered drawer is open; kept for the session only.
     pub(crate) answered_open: bool,
@@ -418,6 +420,10 @@ impl TaskPanel {
             let fleet = fleet.clone();
             cx.new(|_| crate::unified::panels::pr_controls::PrControls::new(node_id, fleet))
         };
+        let suggestions = {
+            let fleet = fleet.clone();
+            cx.new(|cx| crate::unified::panels::suggestions::Suggestions::new(node_id, fleet, cx))
+        };
         let _requests_subs = vec![
             cx.subscribe(&requests, |_, _, event: &PanelOpenRequest, cx| cx.emit(event.clone())),
             cx.observe(&requests, |_, _, cx| cx.notify()),
@@ -429,6 +435,7 @@ impl TaskPanel {
             focus_handle,
             requests,
             pr_controls,
+            suggestions,
             _requests_subs,
             answered_open: false,
             reason_in_full: std::collections::HashSet::new(),
@@ -476,6 +483,7 @@ impl TaskPanel {
         ChangesWatch::recompute(self, node_id, cx);
         self.requests.update(cx, |requests, cx| requests.set_node(Some(node_id), cx));
         self.pr_controls.update(cx, |controls, cx| controls.set_node(node_id, cx));
+        self.suggestions.update(cx, |section, cx| section.set_node(node_id, cx));
         self.reload(cx);
     }
 
@@ -1963,6 +1971,7 @@ impl Render for TaskPanel {
         let guidance = self.render_guidance(window, cx);
         let runner = self.render_runner_line(window, cx);
         let requests = self.render_requests(cx);
+        let suggestions = self.suggestions.clone();
         let drawer = self.render_answered_drawer(window, cx);
 
         bind_request_actions(div().id("unified-task-panel"), &self.requests)
@@ -1993,7 +2002,7 @@ impl Render for TaskPanel {
                 "unified-task-requests",
                 &self.requests_scroll,
                 div().flex_1().min_h_0(),
-                div().children(requests),
+                div().children(requests).child(suggestions),
             ))
             .children(drawer)
     }

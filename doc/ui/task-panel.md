@@ -42,12 +42,14 @@ minute below it.
 │ the total. Which is correct?                             │  requests
 │  1 Round per line   2 Round the total   3 Answer…        │
 │  Not in the obligations or the repo · Shouldn't have asked│
+│ Suggestions: Add retry to webhook delivery   (ENG-3557?) │  suggestions
+│  [Accept] [Dismiss]                                      │
 ├──────────────────────────────────────────────────────────┤
 │ ▸ Answered (4)                                           │  drawer
 └──────────────────────────────────────────────────────────┘
 ```
 
-The first three lines are fixed. Only the requests scroll, and the drawer is
+The first three lines are fixed. Only the requests and suggestions scroll, and the drawer is
 anchored to the bottom of the column.
 
 ### Identity
@@ -261,6 +263,31 @@ options, the answer field); Enter activates a stop and Ctrl+Enter opens a
 link as a Ctrl+click would. The number keys answer the top request whenever
 it has options. Every answer records a journey `UserAction` with a
 `Presented` snapshot of the choices shown.
+
+### Suggestions
+
+Below the requests, in the same scrolling area, the task's **suggestions**
+(`tod_store::suggestions`, `doc/requests/design.md` section 9): out-of-scope
+work an agent (`tod-cli suggest ticket`), triage or the app itself filed,
+most often a follow-up ticket. It is not a request. It never makes the task
+`You` (`tod_core::next_actor` does not read it), never stops the runner, and
+stays at `done`, so nothing here ever needs an answer to go on. Nothing shows
+when there are none.
+
+Each open suggestion is a block: its title, the ticket text exactly as it will
+be created (description and acceptance criteria), the tickets already in the
+tracker that look like it ("ENG-3557 looks like this: ..."; or, in muted text,
+why they were not checked: no Linear key for the task, a failed search), and
+two buttons. **Accept** creates the ticket exactly as written in Linear, in the
+team of the task's own ticket (or the nearest ancestor's), off the UI thread,
+and records its id on the suggestion; if that fails (no ticket to take the team
+from, no key, Linear refuses), the error is said under the suggestion and it
+stays open. **Dismiss** records that it was declined. Both record a journey
+`UserAction` (`suggestion_accept:<id>`, `suggestion_dismiss:<id>`) with the
+buttons as presented. A decided suggestion shows as one muted line ("Accepted
+as ENG-4001: ...", "Dismissed: ...").
+
+The text, duplicates and errors are selectable.
 
 ### Answered drawer
 

@@ -128,6 +128,18 @@ from the task panel's requests and runner menu, in a terminal handoff.
 There is no conversation view and no lifecycle panel any more, and no
 Implement, Verify, Review or Advance button anywhere.
 
+**Suggestions** (`tod_store::suggestions`, table `node_suggestions`, schema v109;
+`doc/requests/design.md` section 9): out-of-scope work, most often a follow-up
+ticket, is filed with `tod-cli suggest ticket` (or by triage, or by the app:
+`tod_core::suggestions::file`, which searches Linear for likely duplicates
+first, mechanically and off the UI thread, and says so when it cannot) and
+shown in the task panel's Suggestions section below the requests: Accept
+creates the ticket exactly as written (`tod_core::suggestions::accept`),
+Dismiss records the decline. A suggestion is never a request: it never makes
+a node `You`, never stops a runner, and outlives `done`. Asking a decision
+"should we open a follow-up ticket?" is refused by `tod-cli decisions ask`
+(`tod_core::follow_up_request`), which points at `suggest ticket`.
+
 **Gates are app checks; no agent evaluates one** (`tod_core::phase::settle_gate`,
 over the derived criteria in `tod_core::gate::derived`). They are checked in
 two places: the autopilot's `gate` step, which moves the node on when the gate

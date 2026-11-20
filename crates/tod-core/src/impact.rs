@@ -29,6 +29,7 @@ pub const IGNORED_TABLES: &[&str] = &[
     "waits",
     "node_events",
     "node_timeline",
+    "node_suggestions",
     "pr_pushes",
     "node_requests",
     "run_state",

@@ -18,6 +18,7 @@ mod journey;
 mod skills;
 mod doc_sync;
 mod guidance;
+mod suggest;
 mod incoming;
 mod learn;
 mod lifecycle;
@@ -74,6 +75,7 @@ NOUNS:
     verdicts               What verification found for each obligation of a node
     incoming               Changes a node inherits, and the verdict that resolves them
     guidance               The project's skills, files, lenses and checks a node's change needs
+    suggest                Out-of-scope work worth doing, filed as a suggestion that never blocks
     learn                  A node's retrospective, stored once per pass
     lifecycle              Send a node back to the phase that got it wrong; the operator's moves
     secrets                Run a command with stored secrets, without seeing them
@@ -109,6 +111,7 @@ const NOUNS: &[(&str, &str)] = &[
     ("verdicts", crate::verdicts::USAGE),
     ("incoming", crate::incoming::USAGE),
     ("guidance", crate::guidance::USAGE),
+    ("suggest", crate::suggest::USAGE),
     ("learn", crate::learn::USAGE),
     ("lifecycle", crate::lifecycle::USAGE),
     ("secrets", crate::secrets::USAGE),
@@ -389,6 +392,7 @@ fn run_with(args: &[String], env: operator::Env) -> anyhow::Result<String> {
         "verdicts" => verdicts::run(invocation),
         "incoming" => incoming::run(invocation),
         "guidance" => guidance::run(invocation, env),
+        "suggest" => suggest::run(invocation),
         "learn" => learn::run(invocation),
         "lifecycle" => lifecycle::run(invocation),
         "secrets" => secrets::run(invocation),
@@ -402,7 +406,7 @@ fn run_with(args: &[String], env: operator::Env) -> anyhow::Result<String> {
         "journey" => journey::run(invocation),
         "skills" => skills::run(invocation),
         other => anyhow::bail!(
-            "unknown noun `{other}` (expected: node, obligations, content, plan, questions, memory, interview, visual-design, capabilities, changeset, tests, review, pr, verdicts, incoming, guidance, learn, lifecycle, secrets, db, environment, decisions, phase, wait, batch, journey, skills)"
+            "unknown noun `{other}` (expected: node, obligations, content, plan, questions, memory, interview, visual-design, capabilities, changeset, tests, review, pr, verdicts, incoming, guidance, suggest, learn, lifecycle, secrets, db, environment, decisions, phase, wait, batch, journey, skills)"
         ),
     }
 }

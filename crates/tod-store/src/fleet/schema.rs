@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 107;
+pub const CURRENT_USER_VERSION: i32 = 109;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -710,6 +710,13 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         // already.
         crate::decisions::add_brief(conn)?;
         conn.pragma_update(None, "user_version", 107)?;
+    }
+    if version < 109 {
+        // Suggestions: out-of-scope work filed on a node without blocking it
+        // (`crate::suggestions`): synced, journaled.
+        conn.execute_batch(crate::suggestions::CREATE_TABLE)?;
+        conn.execute_batch(&crate::journey_changes::suggestions_triggers_sql())?;
+        conn.pragma_update(None, "user_version", 109)?;
     }
     // Other branches (the task panel) numbered their own steps 66–67 at the
     // same time as 66–70 above, so a store may be past a version without

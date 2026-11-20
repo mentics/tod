@@ -62,6 +62,8 @@
 //! - `node_guidance`, `node_guidance_runs` (`tod_store::guidance`, the
 //!   project guidance selected for each node and the runs that selected
 //!   it), created by [`guidance_triggers_sql`] in the v104 migration.
+//! - `node_suggestions` (`tod_store::suggestions`, out-of-scope work filed on
+//!   a node), created by [`suggestions_triggers_sql`] in the v109 migration.
 //! - `node_files_locations` (`tod_store::fleet::repos::files_location`, the
 //!   worktree or sandbox made for each node), created by
 //!   [`files_locations_triggers_sql`] in the v75 migration.
@@ -445,6 +447,12 @@ pub fn send_backs_triggers_sql() -> String {
 /// (selected again, removed, a run finished).
 pub fn guidance_triggers_sql() -> String {
     format!("{}{}", simple_id_triggers("node_guidance"), simple_id_triggers("node_guidance_runs"))
+}
+
+/// Triggers for `node_suggestions` (`crate::suggestions`): rows updated in
+/// place (duplicates found, accepted, dismissed).
+pub fn suggestions_triggers_sql() -> String {
+    simple_id_triggers("node_suggestions")
 }
 
 /// Triggers for a table shaped `(id BLOB PRIMARY KEY, node_id BLOB, ...)`.

@@ -200,6 +200,166 @@ pub fn assign_to_viewer_if_unassigned(api_key: &str, identifier: &str) -> Result
     Ok(true)
 }
 
+const DUPLICATES_QUERY: &str = "query Duplicates($filter: IssueFilter) { issues(first: 40, filter: $filter) { nodes { identifier title url } } }";
+const TEAM_QUERY: &str = "query Team($id: String!) { issue(id: $id) { team { id } } }";
+const CREATE_ISSUE_MUTATION: &str = "mutation CreateIssue($teamId: String!, $title: String!, $description: String!) { issueCreate(input: { teamId: $teamId, title: $title, description: $description }) { success issue { identifier url } } }";
+
+/// Words too common to say what a ticket is about.
+const STOP_WORDS: &[&str] = &[
+    "the", "and", "for", "with", "from", "that", "this", "when", "then", "into", "make", "add", "fix", "use",
+    "not", "are", "should", "could", "would", "have", "has", "its", "ticket", "follow", "followup", "issue",
+];
+
+/// Most search terms taken from a title.
+pub const MAX_TERMS: usize = 6;
+/// Most likely duplicates kept.
+pub const MAX_DUPLICATES: usize = 5;
+
+/// The words of `title` worth searching for: lowercase, at least three
+/// letters or digits, not a stop word, each once, the longest first, at most
+/// [`MAX_TERMS`].
+pub fn title_terms(title: &str) -> Vec<String> {
+    let mut terms: Vec<String> = Vec::new();
+    for word in title.split(|c: char| !c.is_alphanumeric()) {
+        let word = word.to_lowercase();
+        if word.chars().count() >= 3 && !STOP_WORDS.contains(&word.as_str()) && !terms.contains(&word) {
+            terms.push(word);
+        }
+    }
+    // Stable, so equal lengths keep the title's order.
+    terms.sort_by_key(|t| std::cmp::Reverse(t.chars().count()));
+    terms.truncate(MAX_TERMS);
+    terms
+}
+
+/// The tickets in `hits` that share enough of `title`'s terms to be the same
+/// work, best match first: at least half of its terms, and at least two when
+/// it has two or more. Pure; the tracker search only narrows `hits`.
+pub fn rank_duplicates(title: &str, hits: &[crate::suggestions::Duplicate]) -> Vec<crate::suggestions::Duplicate> {
+    let terms = title_terms(title);
+    if terms.is_empty() {
+        return Vec::new();
+    }
+    let needed = terms.len().min(2);
+    let mut scored: Vec<(usize, &crate::suggestions::Duplicate)> = hits
+        .iter()
+        .filter_map(|hit| {
+            let theirs = hit.title.to_lowercase();
+            let shared = terms.iter().filter(|t| theirs.contains(t.as_str())).count();
+            (shared >= needed && shared * 2 >= terms.len()).then_some((shared, hit))
+        })
+        .collect();
+    scored.sort_by_key(|(shared, _)| std::cmp::Reverse(*shared));
+    scored.into_iter().take(MAX_DUPLICATES).map(|(_, hit)| hit.clone()).collect()
+}
+
+/// Tickets whose titles may be the same work as `title`: a search by its
+/// terms, then [`rank_duplicates`]. No match is an empty list, a failed
+/// search an error.
+pub fn find_duplicates(api_key: &str, title: &str) -> Result<Vec<crate::suggestions::Duplicate>, LinearError> {
+    let terms = title_terms(title);
+    if terms.is_empty() {
+        return Ok(Vec::new());
+    }
+    let filter = serde_json::json!({
+        "or": terms.iter().map(|t| serde_json::json!({ "title": { "containsIgnoreCase": t } })).collect::<Vec<_>>()
+    });
+    let data = post_graphql(api_key, DUPLICATES_QUERY, serde_json::json!({ "filter": filter }))?;
+    let hits: Vec<crate::suggestions::Duplicate> = data
+        .pointer("/issues/nodes")
+        .and_then(|v| v.as_array())
+        .map(|nodes| {
+            nodes
+                .iter()
+                .filter_map(|n| {
+                    Some(crate::suggestions::Duplicate {
+                        id: n.get("identifier")?.as_str()?.to_string(),
+                        title: n.get("title")?.as_str()?.to_string(),
+                        url: n.get("url").and_then(|u| u.as_str()).unwrap_or_default().to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(rank_duplicates(title, &hits))
+}
+
+/// A ticket created in Linear.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatedIssue {
+    pub identifier: String,
+    pub url: String,
+}
+
+/// Creates a ticket with exactly this `title` and `description` in the team
+/// that `sibling` (an existing ticket's identifier, such as the node's own)
+/// belongs to.
+pub fn create_issue_in_team_of(
+    api_key: &str,
+    sibling: &str,
+    title: &str,
+    description: &str,
+) -> Result<CreatedIssue, LinearError> {
+    let data = post_graphql(api_key, TEAM_QUERY, serde_json::json!({ "id": sibling }))?;
+    let team_id = data
+        .pointer("/issue/team/id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| LinearError::NotFound(sibling.to_string()))?
+        .to_string();
+    let data = post_graphql(
+        api_key,
+        CREATE_ISSUE_MUTATION,
+        serde_json::json!({ "teamId": team_id, "title": title, "description": description }),
+    )?;
+    let created = data.pointer("/issueCreate").filter(|c| c.get("success").and_then(|s| s.as_bool()) == Some(true));
+    let issue = created
+        .and_then(|c| c.get("issue"))
+        .filter(|i| !i.is_null())
+        .ok_or_else(|| LinearError::Api("Linear did not create the ticket".into()))?;
+    let identifier = issue.get("identifier").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    if identifier.is_empty() {
+        return Err(LinearError::Api("Linear created a ticket but returned no identifier".into()));
+    }
+    Ok(CreatedIssue { identifier, url: issue.get("url").and_then(|v| v.as_str()).unwrap_or_default().to_string() })
+}
+
+#[cfg(test)]
+mod duplicate_tests {
+    use super::*;
+    use crate::suggestions::Duplicate;
+
+    fn dup(id: &str, title: &str) -> Duplicate {
+        Duplicate { id: id.into(), title: title.into(), url: String::new() }
+    }
+
+    #[test]
+    fn terms_are_the_distinctive_words() {
+        assert_eq!(title_terms("Add a retry for the webhook delivery"), ["delivery", "webhook", "retry"]);
+        assert!(title_terms("Fix the add").is_empty());
+    }
+
+    #[test]
+    fn ranks_by_shared_terms_and_drops_weak_matches() {
+        let hits = [
+            dup("ENG-1", "Webhook delivery retry with backoff"),
+            dup("ENG-2", "Delivery address validation"),
+            dup("ENG-3", "Retry webhook delivery on 5xx"),
+            dup("ENG-4", "Unrelated billing page"),
+        ];
+        let got = rank_duplicates("Add a retry for the webhook delivery", &hits);
+        let ids: Vec<&str> = got.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(ids, ["ENG-1", "ENG-3"]);
+    }
+
+    #[test]
+    fn a_one_term_title_needs_that_term() {
+        let hits = [dup("ENG-1", "Flaky tests"), dup("ENG-2", "Slow build")];
+        let got = rank_duplicates("Flaky", &hits);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, "ENG-1");
+    }
+}
+
 /// One GraphQL round trip; the response's `data`.
 fn post_graphql(
     api_key: &str,
