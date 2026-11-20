@@ -11,6 +11,7 @@ pub mod plan;
 pub mod pr_controls;
 pub use tod_core::runner_menu;
 pub mod settings;
+pub mod suggestions;
 pub mod task;
 pub mod activity_timeline;
 pub mod transcript;
