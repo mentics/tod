@@ -29,7 +29,6 @@ use tod_store::interview::{ACTOR_USER, InterviewCommand};
 use tod_store::outline::OutlineMutation;
 use tod_store::outline::repos::PlanStepRepo;
 use tod_store::outline::repos::plan_steps::STATUS_IN_PROGRESS;
-use tod_store::review::ReviewRepo;
 use uuid::Uuid;
 
 /// The answer a decision gets when the user settled it outside the app.
@@ -898,28 +897,6 @@ impl AgentRuns {
                 fleet.enqueue_outline(mutation)?;
                 fleet.writer().flush()?;
             }
-        }
-        Ok(())
-    }
-
-    /// Answer an open review finding, from outside the conversation view —
-    /// the unified task panel's `Finding` items. Mirrors
-    /// `conversation::side_pane::respond_to_finding`: a pure status write,
-    /// nothing to deliver to an agent (a fix conversation answers findings on
-    /// its own initiative instead).
-    pub fn respond_finding_on(fleet: &FleetStore, finding_id: Uuid, status: &str) -> anyhow::Result<()> {
-        let current = fleet
-            .read(|conn| ReviewRepo::new(conn).get(finding_id))?
-            .with_context(|| format!("finding {finding_id} not found"))?;
-        if current.status != status {
-            fleet.interview(
-                ACTOR_USER,
-                InterviewCommand::RespondReviewFinding {
-                    finding_id,
-                    status: status.to_string(),
-                    response: current.response.clone(),
-                },
-            )?;
         }
         Ok(())
     }

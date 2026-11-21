@@ -39,7 +39,7 @@ cause; the cause is a sub-state (`why`), not another actor.
 
 | `YouReason` | Today's source |
 |---|---|
-| `Request` | `attention` items: decisions, blocked/partial plan steps, open findings, failing criteria |
+| `Request` | `attention` items: decisions, blocked/partial plan steps (never findings: tod and the agents settle those) |
 | `Permission` | pending permission (`NeedsHuman::Permission`, the conversation's pending permission) |
 | `Failed { error }` | agent turn failed, the runner failed, **or a transient wait ran out of retries**; also anything broken that retrying cannot fix (GitHub auth failed, sandbox gone) |
 | `Stopped { reason }` | `NeedsHuman::{NoPlan, NoProgress, EvaluationStuck, PrStuck, PrBlocked}`, budget spent |
@@ -213,7 +213,7 @@ them:
 |---|---|---|
 | proposed, design, planning | requests, phase agent asked the user, evaluation stuck | |
 | active | blocked or partial steps, no plan, budget | |
-| verifying, review | findings and failures to answer, stuck run | |
+| verifying, review | failures to answer, stuck run | |
 | pr | PR not ready; the agent handed back | |
 | pr_review | `PrStuck`/`PrBlocked`, a permission, a thread the agent may not answer | human review, bot review, checks |
 | approved, merged, released | failed run, auth broken | merge, release, deploy |

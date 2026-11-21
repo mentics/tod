@@ -7,10 +7,11 @@
 //! reloads on every store change and every change to the shared
 //! [`LifecycleController`]. Each kind answers through its existing code path,
 //! never a new mutation: a decision through `AgentRuns::answer_decision`; a
-//! plan step through `AgentRuns::answer_plan_step_handoff`; a finding through
-//! `AgentRuns::respond_review_finding`. A gate criterion is not a request
-//! (`tod_core::attention` has those three sources only: gates are app checks
-//! and never hand anything to the user); the criteria last found failing show
+//! plan step through `AgentRuns::answer_plan_step_handoff`. A review finding
+//! is not a request (tod and the agents settle findings; the user reopens or
+//! rescores them in the findings panel), and neither is a gate criterion
+//! (`tod_core::attention` has two sources only: gates are app checks and
+//! never hand anything to the user); the criteria last found failing show
 //! on the runner line's Check now result; there is no way to waive one, the
 //! user moves the node on with the lifecycle dropdown. Every answer records
 //! a journey `UserAction` with a `Presented` snapshot of the choices shown.
@@ -78,7 +79,6 @@ use tod_store::interview::short_id;
 use tod_store::outline::PlanStep;
 use tod_store::outline::repos::plan_steps::HandoffReason;
 use tod_store::outline::repos::{ObligationRepo, PlanStepRepo};
-use tod_store::review::{FINDING_DECLINED, FINDING_FIXED, FINDING_OUT_OF_SCOPE, ReviewFinding, ReviewRepo};
 use uuid::Uuid;
 
 use crate::ui::panel_export::RecordText as _;
@@ -258,8 +258,6 @@ pub struct Loaded {
     pub pending: Vec<Decision>,
     /// Every plan step currently handed back to the user.
     pub handoff_steps: Vec<PlanStep>,
-    /// Every open review finding while the node is in `review`.
-    pub findings: Vec<ReviewFinding>,
     /// What the node is waiting on, oldest first.
     pub items: Vec<AttentionItem>,
     /// Oldest answer first.
@@ -296,20 +294,18 @@ pub fn send_back_target(decision: &Decision, lifecycle: Option<&str>) -> Option<
     (now > tod_core::task::model::lifecycle_rank(asked)).then_some(asked)
 }
 
-/// The conversation `item` came from: a decision's or finding's own, or the
+/// The conversation `item` came from: a decision's own, or the
 /// implement/verify conversation a plan step was handed back by.
 fn asking_conversation(
     conn: &rusqlite::Connection,
     item: &AttentionItem,
     pending: &[Decision],
-    findings: &[ReviewFinding],
 ) -> anyhow::Result<Option<Uuid>> {
     Ok(match item.kind {
         AttentionKind::Decision => pending.iter().find(|d| d.id == item.id).and_then(|d| d.conversation_id),
         AttentionKind::PlanStep => {
             crate::ui::agent_runs::latest_handoff_conversation(conn, Focus::Node(item.node_id))?.map(|c| c.id)
         }
-        AttentionKind::Finding => findings.iter().find(|f| f.id == item.id).and_then(|f| f.conversation_id),
     })
 }
 
@@ -346,17 +342,12 @@ pub fn load(fleet: &FleetStore, node_id: Uuid) -> Loaded {
                 .map(|(step, _)| step)
                 .collect();
             let lifecycle = tod_store::outline::repos::NodeRepo::new(conn).get_lifecycle_for_nodes(&[node_id])?;
-            let findings = if lifecycle.get(&node_id).map(String::as_str) == Some("review") {
-                ReviewRepo::new(conn).list_open_for_nodes(&[node_id])?
-            } else {
-                Vec::new()
-            };
             let items = tod_core::attention::for_node(conn, node_id)?.items;
 
             let mut sessions = HashMap::new();
             let conversations = ConversationRepo::new(conn);
             for item in &items {
-                let Some(conversation) = asking_conversation(conn, item, &pending, &findings)? else {
+                let Some(conversation) = asking_conversation(conn, item, &pending)? else {
                     continue;
                 };
                 let resumable = conversations
@@ -370,9 +361,6 @@ pub fn load(fleet: &FleetStore, node_id: Uuid) -> Loaded {
             let mut names = HashMap::new();
             for step in &handoff_steps {
                 names.insert(step.id, first_line(&step.body));
-            }
-            for finding in &findings {
-                names.insert(finding.id, first_line(&finding.summary));
             }
             for evidence in pending.iter().chain(log.iter().map(|e| &e.decision)).flat_map(|d| &d.evidence) {
                 if names.contains_key(&evidence.id) {
@@ -388,7 +376,7 @@ pub fn load(fleet: &FleetStore, node_id: Uuid) -> Loaded {
                 }
             }
             let lifecycle = lifecycle.get(&node_id).cloned();
-            anyhow::Ok(Loaded { pending, handoff_steps, findings, items, log, names, sessions, lifecycle })
+            anyhow::Ok(Loaded { pending, handoff_steps, items, log, names, sessions, lifecycle })
         })
         .unwrap_or_default();
     let node_ids: Vec<Uuid> = loaded
@@ -703,7 +691,6 @@ impl Requests {
                     self.answer_plan_step(&step, HandoffAnswer::Choose(action.0 - 1), Source::Keyboard, cx);
                 }
             }
-            AttentionKind::Finding => {}
         }
     }
 
@@ -953,45 +940,6 @@ impl Requests {
         });
     }
 
-    fn presented_for_finding(finding: &ReviewFinding) -> Presented {
-        Presented {
-            actions: [FINDING_FIXED, FINDING_OUT_OF_SCOPE, FINDING_DECLINED]
-                .into_iter()
-                .map(|status| PresentedAction {
-                    id: status.to_string(),
-                    label: status.to_string(),
-                    primary: status == FINDING_FIXED,
-                    disabled: false,
-                })
-                .collect(),
-            focused: None,
-            notices: vec![finding.summary.clone()],
-        }
-    }
-
-    /// Answer an open review finding.
-    pub(crate) fn answer_finding(&mut self, finding: &ReviewFinding, status: &str, source: Source, cx: &mut Context<Self>) {
-        record_action(
-            cx,
-            tod_store::conversation::Focus::Node(finding.node_id),
-            status.to_string(),
-            source,
-            JOURNEY_SURFACE,
-            Self::presented_for_finding(finding),
-        );
-        let finding_id = finding.id;
-        let status = status.to_string();
-        let fleet = self.fleet.clone();
-        off_thread(
-            cx,
-            move || AgentRuns::respond_finding_on(&fleet, finding_id, &status),
-            |this, result, cx| {
-                this.set_error("answer finding", result);
-                this.reload(cx);
-            },
-        );
-    }
-
     fn begin_freeform_edit(&mut self, decision_id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
         self.freeform_editing = Some(decision_id);
         // The one input is shared by every decision, and the panel is rebuilt
@@ -1176,7 +1124,7 @@ impl Requests {
     }
 
     /// The evidence a request points at: a decision's own evidence, or the
-    /// item a plan step, finding, or gate check is about.
+    /// item a plan step or gate check is about.
     fn item_evidence(&self, item: &AttentionItem) -> Vec<EvidenceRef> {
         match item.kind {
             AttentionKind::Decision => self
@@ -1187,7 +1135,6 @@ impl Requests {
                 .map(|d| d.evidence.clone())
                 .unwrap_or_default(),
             AttentionKind::PlanStep => vec![EvidenceRef { kind: "plan_step".into(), id: item.id }],
-            AttentionKind::Finding => vec![EvidenceRef { kind: "finding".into(), id: item.id }],
         }
     }
 
@@ -1275,12 +1222,8 @@ impl Requests {
     /// **Answered elsewhere**: the user settled this request outside the
     /// app (typically in the terminal session beside it), so it is dismissed
     /// without an answer going to the agent. Offered for the kinds whose
-    /// answer would otherwise be sent (decisions, handed-back plan steps); a
-    /// finding's own status buttons already settle it without a turn.
+    /// answer would otherwise be sent (decisions, handed-back plan steps).
     fn render_resolved_elsewhere_button(&self, item: &AttentionItem, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if item.kind == AttentionKind::Finding {
-            return None;
-        }
         let item = item.clone();
         Some(
             Button::new(SharedString::from(format!("unified-requests-elsewhere-{}", item.id)))
@@ -1326,7 +1269,6 @@ impl Requests {
             move || match kind {
                 AttentionKind::Decision => AgentRuns::resolve_decision_on(&fleet, id),
                 AttentionKind::PlanStep => AgentRuns::resolve_plan_step_on(&fleet, id),
-                AttentionKind::Finding => Ok(()),
             },
             |this, result, cx| {
                 this.set_error("dismiss the request", result);
@@ -1679,53 +1621,10 @@ impl Requests {
         card.child(self.render_footer(item, window, cx)).into_any_element()
     }
 
-    fn render_finding_card(&self, item: &AttentionItem, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let finding = self.loaded.findings.iter().find(|f| f.id == item.id).cloned();
-        let mut card = self
-            .card(format!("unified-decisions-finding-{}", item.id), cx)
-            .child(kind_badge("Finding"))
-            .child(selectable_markdown(
-                SharedString::from(format!("unified-decisions-finding-summary-{}", item.id)),
-                item.summary.clone(),
-                window,
-                cx,
-            ));
-        if let Some(cause) = finding
-            .as_ref()
-            .and_then(|f| f.root_cause.as_deref())
-            .map(str::trim)
-            .filter(|c| !c.is_empty())
-        {
-            card = card.child(div().w_full().min_w_0().text_xs().child(selectable_text(
-                SharedString::from(format!("unified-decisions-finding-root-cause-{}", item.id)),
-                format!("Root cause: {cause}"),
-                window,
-                cx,
-            )));
-        }
-        if let Some(finding) = finding {
-            card = card.child(div().flex().flex_wrap().gap_1().children(
-                [(FINDING_FIXED, "Fixed"), (FINDING_OUT_OF_SCOPE, "Out of scope"), (FINDING_DECLINED, "Declined")]
-                    .into_iter()
-                    .map(|(status, label)| {
-                        let finding = finding.clone();
-                        Button::new(SharedString::from(format!("unified-decisions-finding-{status}-{}", finding.id)))
-                            .label(label)
-                            .small()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.answer_finding(&finding, status, Source::Click, cx);
-                            }))
-                    }),
-            ));
-        }
-        card.child(self.render_footer(item, window, cx)).into_any_element()
-    }
-
     fn render_item(&self, item: &AttentionItem, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         match item.kind {
             AttentionKind::Decision => self.render_decision_card(item, window, cx),
             AttentionKind::PlanStep => self.render_plan_step_card(item, window, cx),
-            AttentionKind::Finding => self.render_finding_card(item, window, cx),
         }
     }
 

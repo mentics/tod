@@ -330,7 +330,7 @@ pub struct StaleRequestWait {
 }
 
 /// The nodes whose run row is a request wait with no request left to wait
-/// on (`attention`: pending decisions, handed-back steps, open findings).
+/// on (`attention`: pending decisions, handed-back steps).
 /// Their age (`now - since`) is the statistic that shows the fault sooner:
 /// the oldest such wait should always be about one daemon tick.
 pub fn stale_request_waits(fleet: &FleetStore) -> Result<Vec<StaleRequestWait>> {

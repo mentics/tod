@@ -121,7 +121,7 @@ impl Work {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum YouReason {
     /// Open requests (`crate::attention`): decisions, handed-back plan
-    /// steps, findings. The items themselves come from `attention`.
+    /// steps. The items themselves come from `attention`.
     ///
     /// `ended` is how the node's run ended, when it did (failed, stopped,
     /// paused, its sandbox gone): a request never hides that, since the

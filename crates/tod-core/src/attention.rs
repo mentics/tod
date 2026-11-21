@@ -7,10 +7,14 @@
 //! store), for the node tree's "needs you" filter and sort
 //! (`doc/ui/unified-view-plan.md` "W6. Attention").
 //!
-//! Three sources, each documented at its match arm below:
+//! Two sources, each documented at its match arm below:
 //! 1. pending decisions (`tod_store::decisions`);
 //! 2. plan steps handed back to the user (`partial` / `blocked`);
-//! 3. open review findings, only while the node is actually answering them.
+//!
+//! Review findings are not a source: tod and the agents settle them (review
+//! scoring, `doc/lifecycle/review-scoring.md`), and the user reopens or
+//! rescores them in the findings panel. A run that stopped on them is `You`
+//! through its stop reason.
 //!
 //! Gates are app-checked and never hand anything to the user themselves: a
 //! failing criterion goes back to a phase agent, or the user moves the node
@@ -21,8 +25,7 @@ use rusqlite::Connection;
 use std::collections::HashMap;
 use tod_store::decisions::{Decision, DecisionRepo};
 use tod_store::outline::repos::plan_steps::{HandoffReason, PlanStep};
-use tod_store::outline::repos::{NodeRepo, PlanStepRepo};
-use tod_store::review::ReviewRepo;
+use tod_store::outline::repos::PlanStepRepo;
 use uuid::Uuid;
 
 /// What kind of thing a node is waiting on the user for.
@@ -32,8 +35,6 @@ pub enum AttentionKind {
     Decision,
     /// A plan step handed back with `partial` or `blocked`.
     PlanStep,
-    /// An open review finding.
-    Finding,
 }
 
 /// Why the agent or runner could not handle the request itself
@@ -97,7 +98,7 @@ impl RequestReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttentionItem {
     pub kind: AttentionKind,
-    /// The id of the underlying row: the decision, plan step, finding, or
+    /// The id of the underlying row: the decision, plan step, or
     /// gate-check conversation.
     pub id: Uuid,
     pub node_id: Uuid,
@@ -184,39 +185,6 @@ pub fn for_nodes(conn: &Connection, node_ids: &[Uuid]) -> Result<HashMap<Uuid, N
             .push(plan_step_item(&step, updated_at));
     }
 
-    // 3. Open review findings — but only while the node is actually the
-    // user's to answer. `crate::lifecycle_next::Standing::load` only counts
-    // `open_findings` when the node's lifecycle is `review` (a `fix`
-    // conversation answers findings on the agent's own initiative from
-    // there, and once the node has moved on a finding some review handled is
-    // no longer today's business); this reuses that same rule rather than
-    // re-deciding it.
-    let lifecycles = NodeRepo::new(conn).get_lifecycle_for_nodes(node_ids)?;
-    let reviewing_nodes: Vec<Uuid> = node_ids
-        .iter()
-        .copied()
-        .filter(|id| lifecycles.get(id).map(String::as_str) == Some("review"))
-        .collect();
-    if !reviewing_nodes.is_empty() {
-        for finding in ReviewRepo::new(conn).list_open_for_nodes(&reviewing_nodes)? {
-            by_node
-                .entry(finding.node_id)
-                .or_default()
-                .push(AttentionItem {
-                    kind: AttentionKind::Finding,
-                    id: finding.id,
-                    node_id: finding.node_id,
-                    summary: finding.summary.clone(),
-                    options: Vec::new(),
-                    since: finding.created_at,
-                    // A review finding is a judgment call the reviewer flagged
-                    // for the user, not a missing rule or a conflict.
-                    reason: RequestReason::Risk,
-                    permission: false,
-                });
-        }
-    }
-
     Ok(node_ids
         .iter()
         .map(|&node| {
@@ -276,7 +244,7 @@ mod tests {
     use tod_store::fleet::schema;
     use tod_store::outline::repos::NodeRepo;
     use tod_store::outline::repos::plan_steps::{STATUS_BLOCKED, STATUS_PARTIAL};
-    use tod_store::review::NewFinding;
+    use tod_store::review::{NewFinding, ReviewRepo};
 
     struct Fixture {
         _dir: std::path::PathBuf,
@@ -404,7 +372,7 @@ mod tests {
     }
 
     #[test]
-    fn an_open_finding_counts_only_while_the_node_is_in_review() {
+    fn an_open_finding_never_counts_as_a_request() {
         let fx = fixture();
         let node = make_node(&fx.conn, "reviewed");
         ReviewRepo::new(&fx.conn)
@@ -419,16 +387,8 @@ mod tests {
             )
             .unwrap();
 
-        // Not in review yet: the finding is not the user's business.
         assert_eq!(for_node(&fx.conn, node).unwrap().count, 0);
-
         NodeRepo::new(&fx.conn).set_lifecycle(node, "review").unwrap();
-        let attention = for_node(&fx.conn, node).unwrap();
-        assert_eq!(attention.count, 1);
-        assert_eq!(attention.items[0].kind, AttentionKind::Finding);
-
-        // Moved on to `approved`: no longer today's business either.
-        NodeRepo::new(&fx.conn).set_lifecycle(node, "approved").unwrap();
         assert_eq!(for_node(&fx.conn, node).unwrap().count, 0);
     }
 

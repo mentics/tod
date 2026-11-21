@@ -99,8 +99,15 @@ Findings appear as a link on the artifact strip only when the review has
 recorded some (`Findings 3 · 2 open`); it opens the findings panel in the next
 column. Verdicts and each phase's change sets are still stored. They are
 steps toward the goal, not the goal, so they are not artifacts and are seen
-through the journey, not here. A finding the user has to answer also appears
-as a request.
+through the journey, not here. A finding is never a request: tod and the agents settle findings (review
+scoring, `doc/lifecycle/review-scoring.md`), and the user reopens or
+rescores them in the findings panel.
+
+### Guidance
+
+The Guidance section is one line, `▸ Guidance (N)` with Add, until the user
+opens it (the rows are one per selected item or lens and can run to dozens,
+which would push the runner line out of view). It starts closed each session.
 
 ### Runner
 
@@ -220,7 +227,6 @@ Each request shows:
   |---|---|
   | decision | its options, with quick keys (**1**, **2**, **3** …), or in words |
   | plan step handed back (`blocked` / `partial`) | words, or retry |
-  | review finding the user must answer | its status (fixed / rejected) and a note |
   | stuck, raised by the runner | the actions that fit what it detected |
 
 - One small footer line, never more, holding:
@@ -235,7 +241,7 @@ Each request shows:
     time (`Nov 5 14:32`), in local time, so the user can tell a question
     from this morning from one that has waited a week.
   - a **terminal** icon, when the lifecycle conversation that asked (the
-    decision's or finding's own, or the implement/verify conversation that
+    decision's own, or the implement/verify conversation that
     handed the plan step back) has an agent session:
     it continues that session in a terminal, in the agent's own CLI, for
     anything too involved to answer here. It is disabled while that
@@ -243,8 +249,7 @@ Each request shows:
   - **Answered elsewhere**, for a decision or a handed-back plan step: the
     user settled it outside the app (typically in that terminal), so it is
     dismissed without an answer going to the agent. A decision logs an
-    answer saying so; a plan step goes back to `in_progress`. A finding
-    needs none: its own status buttons already settle it without a turn.
+    answer saying so; a plan step goes back to `in_progress`.
     Once nothing else is waiting, the runner continues as it would after an
     answer (see "Runner" above), resuming the same agent session, so the
     terminal should be closed first.

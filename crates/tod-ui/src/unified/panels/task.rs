@@ -320,6 +320,10 @@ pub struct TaskPanel {
     _requests_subs: Vec<Subscription>,
     /// T5: whether the Answered drawer is open; kept for the session only.
     pub(crate) answered_open: bool,
+    /// Whether the Guidance section lists its rows. Closed by default (a
+    /// selection can run to dozens of rows, which would push the runner line
+    /// out of view); kept for the session only.
+    pub(crate) guidance_open: bool,
     /// Long runner-line texts (a stopped reason, a failure's causes) opened in
     /// full by their "Show more" (keyed by the text's element id); every other
     /// one is held to [`REASON_CLAMP_LINES`] lines so the runner buttons stay
@@ -439,6 +443,7 @@ impl TaskPanel {
             suggestions,
             _requests_subs,
             answered_open: false,
+            guidance_open: false,
             reason_in_full: std::collections::HashSet::new(),
             header_scroll: ScrollHandle::new(),
             requests_scroll: ScrollHandle::new(),
@@ -687,6 +692,8 @@ impl TaskPanel {
         if !view.has_run && view.live.is_empty() {
             return None;
         }
+        let open = self.guidance_open;
+        let count = view.live.len();
         let weak = cx.weak_entity();
         let addable = view.addable.clone();
         let add = (!addable.is_empty()).then(|| {
@@ -741,13 +748,18 @@ impl TaskPanel {
                         .flex()
                         .items_center()
                         .gap_2()
-                        .child(style::text_dense_label(div()).child("Guidance"))
+                        .child(
+                            style::text_dense_label(div().id("unified-task-guidance-toggle").cursor_pointer())
+                                .child(format!("{} Guidance ({})", if open { "▾" } else { "▸" }, count))
+                                .record_text(format!("Guidance ({count})"))
+                                .on_click(cx.listener(|this, _, _, cx| this.toggle_guidance(cx))),
+                        )
                         .children(add),
                 )
-                .when(view.live.is_empty(), |el| {
+                .when(open && view.live.is_empty(), |el| {
                     el.child(style::text_muted(div()).child("Nothing selected."))
                 })
-                .children(rows)
+                .children(open.then_some(rows).into_iter().flatten())
                 .into_any_element(),
         )
     }
@@ -1885,6 +1897,12 @@ impl TaskPanel {
         )
     }
 
+    /// Open or close the Guidance section's rows.
+    pub(crate) fn toggle_guidance(&mut self, cx: &mut Context<Self>) {
+        self.guidance_open = !self.guidance_open;
+        cx.notify();
+    }
+
     /// Open or close the Answered drawer.
     pub(crate) fn toggle_answered(&mut self, cx: &mut Context<Self>) {
         self.answered_open = !self.answered_open;
@@ -2744,6 +2762,12 @@ mod tests {
         // T5: the drawer starts closed and counts the answer; opened, Change
         // on its entry records a second answer beside the first.
         view.read_with(cx, |view, _| assert!(!view.answered_open));
+        // The Guidance rows start folded too, so the runner line stays in view.
+        view.read_with(cx, |view, _| assert!(!view.guidance_open));
+        view.update(cx, |view, cx| view.toggle_guidance(cx));
+        view.read_with(cx, |view, _| assert!(view.guidance_open));
+        view.update(cx, |view, cx| view.toggle_guidance(cx));
+        view.read_with(cx, |view, _| assert!(!view.guidance_open));
         view.update(cx, |view, cx| view.toggle_answered(cx));
         cx.update(|window, cx| {
             let _ = window.draw(cx);

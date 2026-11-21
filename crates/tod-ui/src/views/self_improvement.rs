@@ -364,7 +364,23 @@ pub fn open_self_improvement_dialog(
     fleet: Arc<FleetStore>,
     open_node: OpenNode,
 ) {
-    let view = cx.new(|cx| {
+    let view = cx.new(|cx| SelfImprovement::new(fleet, open_node, cx));
+    view.update(cx, |this, cx| this.reload(cx));
+    let handle = view.read(cx).focus_handle.clone();
+    window.open_dialog(cx, move |d, _, _| {
+        d.title("Self-improvement")
+            .w(px(1000.))
+            .overlay(true)
+            .overlay_closable(true)
+            .keyboard(true)
+            .close_button(true)
+            .child(view.clone())
+    });
+    handle.focus(window, cx);
+}
+
+impl SelfImprovement {
+    fn new(fleet: Arc<FleetStore>, open_node: OpenNode, cx: &mut Context<Self>) -> Self {
         let host = RowHost::for_entity(cx.weak_entity());
         let list = ItemList::new()
             .with_columns(columns())
@@ -382,22 +398,8 @@ pub fn open_self_improvement_dialog(
             changes: Changes::None,
             notice: None,
         }
-    });
-    view.update(cx, |this, cx| this.reload(cx));
-    let handle = view.read(cx).focus_handle.clone();
-    window.open_dialog(cx, move |d, _, _| {
-        d.title("Self-improvement")
-            .w(px(1000.))
-            .overlay(true)
-            .overlay_closable(true)
-            .keyboard(true)
-            .close_button(true)
-            .child(view.clone())
-    });
-    handle.focus(window, cx);
-}
+    }
 
-impl SelfImprovement {
     /// Read the lessons and the measures off the UI thread.
     fn reload(&mut self, cx: &mut Context<Self>) {
         self.generation += 1;
@@ -426,6 +428,12 @@ impl SelfImprovement {
             Load::Loaded(o) => build_rows(&o.sections, |key| self.list.is_collapsed(key)),
             _ => Vec::new(),
         };
+        // The cursor starts on the first lesson, not on its section's heading
+        // (where D, Enter on a node and the rest would act on nothing).
+        if self.list.cursor_key().is_none() {
+            let first = rows.iter().find(|r| r.as_item().is_some()).map(|r| r.key().to_string());
+            self.list.set_cursor_key(first);
+        }
         self.list.set_rows(rows);
     }
 
@@ -968,5 +976,56 @@ mod tests {
         let fleet = FleetStore::open(&root).unwrap();
         let err = changes_text(&fleet, Uuid::new_v4(), "--output=/x").unwrap_err();
         assert!(err.contains("not a commit id"), "{err}");
+    }
+
+    /// Opening the view puts the cursor on the first lesson, not on the
+    /// "New" heading above it, so D declines that lesson at once; on a
+    /// heading, D does nothing.
+    #[gpui::test]
+    fn the_cursor_starts_on_a_lesson_and_d_declines_it(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let fixture = crate::views::rows::fixture::Fixture::new();
+        let fleet = fixture.store.clone();
+        let node = fixture.node_id;
+        fleet
+            .interview(
+                "user",
+                InterviewCommand::Lessons(lessons::Op::Add {
+                    node,
+                    text: "the brief was long".into(),
+                    category: None,
+                    target: String::new(),
+                }),
+            )
+            .unwrap();
+        let open_node: OpenNode = Rc::new(|_, _, _| {});
+        let fleet_in = fleet.clone();
+        let (view, cx) = cx.add_window_view(move |_, cx| SelfImprovement::new(fleet_in, open_node, cx));
+        view.update(cx, |this, cx| this.reload(cx));
+        cx.run_until_parked();
+
+        view.read_with(cx, |this, _| {
+            assert!(this.list.cursor_item().is_some(), "the cursor starts on a lesson, not a heading");
+        });
+        // On a heading, D changes nothing.
+        view.update(cx, |this, cx| {
+            this.list.cursor_home();
+            assert!(this.list.cursor_item().is_none(), "row 0 is the heading");
+            let _ = cx;
+        });
+        view.update_in(cx, |this, window, cx| this.on_toggle_declined(&SelfImprovementToggleDeclined, window, cx));
+        cx.run_until_parked();
+        let status = |fleet: &FleetStore| fleet.read(|c| lessons::list(c, None, None)).unwrap()[0].status.clone();
+        assert_eq!(status(&fleet), "new");
+
+        // A fresh view starts on the lesson, and D declines it.
+        let fleet_in = fleet.clone();
+        let open_node: OpenNode = Rc::new(|_, _, _| {});
+        let (view, cx) = cx.add_window_view(move |_, cx| SelfImprovement::new(fleet_in, open_node, cx));
+        view.update(cx, |this, cx| this.reload(cx));
+        cx.run_until_parked();
+        view.update_in(cx, |this, window, cx| this.on_toggle_declined(&SelfImprovementToggleDeclined, window, cx));
+        cx.run_until_parked();
+        assert_eq!(status(&fleet), STATUS_DECLINED);
     }
 }
