@@ -492,6 +492,133 @@ fn one_lesson_is_recorded_when_a_triaged_request_closes() {
     assert!(triage_op(&fx, triage, lesson("necessary")).is_err(), "one lesson per request");
 }
 
+/// Asks a judgment request with its own question, optionally naming a cause.
+fn ask_cause(fx: &Fx, asking: Uuid, question: &str, cause: &str) -> Uuid {
+    ask_with(fx, asking, |d| {
+        d.question = question.into();
+        d.reason = "intent".into();
+        d.cause = cause.into();
+    })
+}
+
+#[test]
+fn requests_that_share_a_cause_are_read_by_one_session_and_settled_together() {
+    let fx = setup("active");
+    let asking = conversation(&fx, ProtocolKind::Implementation);
+    let a = ask_cause(&fx, asking, "Which endpoint for the importer?", "Importer endpoint ");
+    let b = ask_cause(&fx, asking, "Should the importer retry on 503?", "importer endpoint");
+    let c = ask_cause(&fx, asking, "Unrelated: name the flag?", "");
+    let d = ask_cause(&fx, asking, "Another unrelated one?", "something else");
+    let repo = DecisionRepo::new(&fx.conn);
+    assert_eq!(repo.get(a).unwrap().unwrap().cause, "importer endpoint", "the key is trimmed and lowercased");
+
+    let triage = conversation(&fx, ProtocolKind::Triage);
+    let out = run(&fx, "user", InterviewCommand::Triage(Op::Start { decision: a, conversation: triage })).unwrap();
+    assert_eq!(out["group"].as_array().unwrap().len(), 1, "only the request with the same cause joins");
+    assert_eq!(repo.get(b).unwrap().unwrap().triage_conversation_id, Some(triage));
+    assert_eq!(repo.get(c).unwrap().unwrap().triage_conversation_id, None);
+    assert_eq!(repo.get(d).unwrap().unwrap().triage_conversation_id, None);
+    assert_eq!(repo.for_triage_conversation(triage).unwrap().unwrap().id, a, "the oldest leads");
+    assert!(repo.is_triage_follower(&repo.get(b).unwrap().unwrap()).unwrap());
+    assert!(!repo.is_triage_follower(&repo.get(a).unwrap().unwrap()).unwrap());
+
+    // Triage answers the lead: the follower is answered the same way, as triage.
+    triage_op(
+        &fx,
+        triage,
+        Op::Answer { decision: a, conversation: triage, option: Some(2), text: None, rationale: "obligation 3".into() },
+    )
+    .unwrap();
+    let follower = repo.get_with_answers(b).unwrap().unwrap();
+    assert_eq!(follower.decision.status, DECISION_ANSWERED);
+    assert_eq!(follower.answers.len(), 1);
+    assert_eq!(follower.answers[0].text.as_deref(), Some("Two"));
+    assert_eq!(follower.answers[0].decided_by, DECIDED_BY_TRIAGE);
+    assert_eq!(follower.answers[0].conversation_id, Some(triage));
+    assert!(follower.answers[0].rationale.as_deref().unwrap().contains("Same cause as request"));
+    assert_eq!(status_of(&fx, c), DECISION_TRIAGE, "an unrelated request is not touched");
+}
+
+#[test]
+fn escalating_the_lead_holds_the_group_and_the_users_answer_settles_it() {
+    let fx = setup("active");
+    let asking = conversation(&fx, ProtocolKind::Implementation);
+    let a = ask_cause(&fx, asking, "Which endpoint for the importer?", "importer");
+    let b = ask_cause(&fx, asking, "Should the importer retry on 503?", "importer");
+    let triage = conversation(&fx, ProtocolKind::Triage);
+    link(&fx, a, triage);
+    triage_op(
+        &fx,
+        triage,
+        Op::Escalate { decision: a, conversation: triage, brief: "Pick the endpoint; retries follow.".into(), options: None },
+    )
+    .unwrap();
+    let repo = DecisionRepo::new(&fx.conn);
+    // Only the lead is the user's: the follower waits in triage behind it.
+    assert_eq!(repo.list_pending_for_node(fx.node).unwrap().iter().map(|d| d.id).collect::<Vec<_>>(), vec![a]);
+    assert_eq!(status_of(&fx, b), DECISION_TRIAGE);
+    assert!(repo.is_triage_follower(&repo.get(b).unwrap().unwrap()).unwrap());
+    assert_eq!(repo.list_open_for_node(fx.node).unwrap().len(), 2, "the asking agent still waits on both");
+
+    // The user picks an option on the lead (the app's answer path).
+    run(&fx, "user", InterviewCommand::AnswerDecision { decision_id: a, option: Some(1), text: None }).unwrap();
+    let follower = repo.get_with_answers(b).unwrap().unwrap();
+    assert_eq!(follower.decision.status, DECISION_ANSWERED);
+    assert_eq!(follower.answers[0].text.as_deref(), Some("One"));
+    assert_eq!(follower.answers[0].decided_by, DECIDED_BY_USER);
+}
+
+#[test]
+fn a_request_with_edits_or_moves_is_never_grouped() {
+    let fx = setup("active");
+    let asking = conversation(&fx, ProtocolKind::Implementation);
+    let ob = Uuid::new_v4();
+    ObligationRepo::new(&fx.conn)
+        .insert_at(ob, fx.node, "requirement", 1, None, "Use the old endpoint", "design")
+        .unwrap();
+    let a = ask_cause(&fx, asking, "First?", "importer");
+    let b = ask_cause(&fx, asking, "Second?", "importer");
+    let edits = ask_with(&fx, asking, |d| {
+        d.question = "Third?".into();
+        d.reason = "intent".into();
+        d.cause = "importer".into();
+        d.edits = vec![OptionEdit { option: 1, obligation_id: ob, body: "Use the new endpoint".into(), was: None, affirm: false }];
+    });
+    let moves = ask_with(&fx, asking, |d| {
+        d.question = "Fourth?".into();
+        d.reason = "intent".into();
+        d.cause = "importer".into();
+        d.moves = vec![OptionMove { option: 2, to: "design".into(), asked_in: None }];
+    });
+    let repo = DecisionRepo::new(&fx.conn);
+    let ids: Vec<Uuid> = repo.triage_group(&repo.get(a).unwrap().unwrap()).unwrap().iter().map(|d| d.id).collect();
+    assert_eq!(ids, vec![b], "the requests with edits and moves stay their own");
+    assert!(repo.triage_group(&repo.get(edits).unwrap().unwrap()).unwrap().is_empty());
+    assert!(repo.triage_group(&repo.get(moves).unwrap().unwrap()).unwrap().is_empty());
+}
+
+#[test]
+fn turning_triage_off_files_judgment_requests_straight_to_the_user() {
+    let fx = setup("active");
+    let asking = conversation(&fx, ProtocolKind::Implementation);
+    let on = ask_as(&fx, "implementation", Some(asking), "intent", true);
+    assert_eq!(status_of(&fx, on), DECISION_TRIAGE);
+    let root = Path::new(fx.conn.path().unwrap()).parent().unwrap().to_path_buf();
+    std::fs::write(root.join("tod.yml"), "lifecycle:\n  triage: false\n").unwrap();
+    assert!(!crate::decisions::triage_enabled(&fx.conn).unwrap());
+    let off = ask_with(&fx, asking, |d| {
+        d.question = "Asked with triage off?".into();
+        d.reason = "intent".into();
+    });
+    assert_eq!(status_of(&fx, off), DECISION_PENDING);
+    // A request already in triage can be handed to the user as asked.
+    DecisionRepo::new(&fx.conn).release_to_user(on).unwrap();
+    assert_eq!(status_of(&fx, on), DECISION_PENDING);
+    assert!(DecisionRepo::new(&fx.conn).release_to_user(on).is_err());
+    std::fs::write(root.join("tod.yml"), "lifecycle: [not, a, map]\n").unwrap();
+    assert!(crate::decisions::triage_enabled(&fx.conn).is_err(), "an unreadable setting is an error, not a guess");
+}
+
 #[test]
 fn a_store_from_before_triage_is_rebuilt_with_its_decisions_kept() {
     let conn = Connection::open_in_memory().unwrap();

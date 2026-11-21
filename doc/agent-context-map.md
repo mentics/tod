@@ -26,8 +26,8 @@ through **two independent channels** that know nothing about each other:
 | 4 | Phase agent | the runner, or **Work on …** beside Send, in `proposed`/`design`/`planning`/`merged`/`released`/`learn` | M + P | autonomous | yes | state role doc + `phase` |
 | 5 | Phase evaluator | the runner, or **Evaluate …**, once the phase is marked ready (independent evaluation on) | M + P | autonomous | no (judges only) | state role doc + `evaluate` |
 | 6 | Fleet autonomous run | agent launched into a worktree | P | autonomous | yes | state role doc only |
-| 7 | Interview question-maker | `interview::driver` | P | agent-to-agent | yes | role + phase + interview base |
-| 8 | Interview answer-processor | `interview::driver` | P | agent-to-agent | yes | role + phase + interview base |
+| 7 | Interview question-maker *(removed)* | `interview::driver` | P | agent-to-agent | yes | role + phase + interview base |
+| 8 | Interview answer-processor *(removed)* | `interview::driver` | P | agent-to-agent | yes | role + phase + interview base |
 | 9 | Drafting drafter *(removed)* | `drafting::driver` | P | agent-to-agent | yes | drafter doc + drafting base |
 | 10 | Drafting capture *(removed)* | `drafting::driver` | P | agent-to-agent | yes | capture doc + drafting base |
 | 11 | Conversation | Ctrl+J anywhere, `proposed`/`design` nodes, app nav (`conversation::driver`) | M | interactive | yes | `surface/conversation` (see §4) |
@@ -119,7 +119,6 @@ Nothing else may contain behavioral policy.
 | `stance/interactive-chat.md` | 2, 11 | Side panel chat with a human. Keep replies short. The selection's text is inlined — don't shell out for what you were given. |
 | `stance/autonomous-session.md` | 3, 5, 6 | Work autonomously; questions go unanswered until the turn ends. Act directly, don't ask permission, be as verbose as the work needs. Report what you did unless the surface says otherwise. |
 | `stance/one-shot.md` | 4 | Single turn, no follow-up. If you can't decide, say so in the structured reply rather than asking a question. |
-| `stance/agent-to-agent.md` | 7, 8 | Your counterpart is an agent, your input is a snapshot, your output is parsed. No conversational filler. |
 
 Confirmation policy moves out of the surface docs entirely. Where a surface
 must act without confirming, that is a *scoped exception* stated once in its
@@ -223,11 +222,8 @@ which surface it is serving.
                                                          [+ state role doc]
   dyn: DataRoot, Node, Workspace
 
-7,8 Interview agents
-  stance/agent-to-agent, domain/outline, domain/obligations, domain/plan,
-  cli/intro, cli/obligations, cli/content, cli/plan, cli/questions,
-  cli/memory, cli/interview                     [+ role + phase + interview base]
-  dyn: interview snapshot / delta (unchanged)
+7,8 Interview agents — removed with the interview workflow, and with them
+  stance/agent-to-agent.
 
 9,10 Drafting agents — removed with drafting (schema v37); the
   conversation view (surface 11) replaced them
@@ -386,5 +382,5 @@ is banned.
 
 | Surface | Stance | Fragments | Dynamic blocks | Why |
 |---|---|---|---|---|
-| `triage` | `stance/triage-session` | `cli/intro`, `cli/triage`, `surface/triage` | data root, working directory, the request (question, options, facts, the asking session's last turns, the task's state, obligations with their owner, design summary, earlier answers) | One fresh read-only session per judgment request an agent files. Decides alone on its first turn, then is the user's chat partner for the request. "Wording a request" lives in `surface/triage.md`: only triage writes the brief. No `cli/decisions` noun: it ends with a `triage` verb. |
+| `triage` | `stance/triage-session` | `cli/intro`, `cli/triage`, `surface/triage` | data root, working directory, the request (question, options, facts, the asking session's last turns, the task's state, obligations with their owner, design summary, earlier answers) | One fresh read-only session per judgment request an agent files (or per group of requests on a task that name one `--cause`: the context then lists the others, and the one verb settles them all). Decides alone on its first turn, then is the user's chat partner for the request. "Wording a request" lives in `surface/triage.md`: only triage writes the brief. No `cli/decisions` noun: it ends with a `triage` verb. |
 | `process_review` | `stance/autonomous-session` | `cli/intro`, `cli/lessons`, `surface/process-review` | data root, working directory, the grouped lessons (with the user's quotes) | Drafts changes to the process's own files from a run's lessons and marks the ones its commits address |

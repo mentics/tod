@@ -327,9 +327,12 @@ conversation (`doc/lifecycle/triage.md`):
   is confusing** from the right-click menu (`ui::selectable_text`'s
   `selectable_markdown_flaggable`). The highlighted words go into the
   request's triage session as a chat message, which opens in the drawer, and
-  triage explains them and fixes its brief. Known gap: a request with no
-  triage session (an access, broken or capability request, or one the app
-  asks itself) has no one to send the words to, so its menu has no such item.
+  triage explains them and fixes its brief. A request with no triage
+  session (an access, broken or capability request, one the app asks itself,
+  or any with triage turned off) has no one to explain it: the flag records an
+  improvement lesson (source `user`, linked to the request and the conversation
+  that asked it, the highlighted words as the remark) and the panel says it was
+  noted.
 - **Say it** in the session: "you could have worked that out from X".
 
 When a triaged request closes its session reflects once and records one

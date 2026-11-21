@@ -95,6 +95,10 @@ fn default_independent_evaluation() -> bool {
     true
 }
 
+fn default_triage() -> bool {
+    true
+}
+
 /// How many review-and-fix rounds a node gets in one stay in `review`
 /// before the run stops and asks the user.
 pub const DEFAULT_REVIEW_ROUND_LIMIT: u32 = 5;
@@ -186,6 +190,11 @@ pub struct LifecycleSettings {
     /// certifies its own phase.
     #[serde(default = "default_independent_evaluation")]
     pub independent_evaluation: bool,
+    /// A fresh, small session reads each judgment request an agent files
+    /// before the user sees it (`lifecycle.triage`, `doc/lifecycle/triage.md`).
+    /// Off: those requests go straight to the user as the agent asked them.
+    #[serde(default = "default_triage")]
+    pub triage: bool,
     /// The most review-and-fix rounds one stay in `review` runs before the
     /// run stops for the user (`lifecycle.review_round_limit`; at least 1).
     /// Running the node again starts a fresh set of rounds.
@@ -207,6 +216,7 @@ impl Default for LifecycleSettings {
     fn default() -> Self {
         Self {
             independent_evaluation: default_independent_evaluation(),
+            triage: default_triage(),
             review_round_limit: default_review_round_limit(),
             quick_fix_turns: default_quick_fix_turns(),
             repo_profiles: Vec::new(),
@@ -1709,6 +1719,7 @@ mod tests {
             journeys: JourneySettings::default(),
             lifecycle: LifecycleSettings {
                 independent_evaluation: false,
+                triage: false,
                 review_round_limit: 8,
                 quick_fix_turns: 2,
                 repo_profiles: vec![RepoProfileSetting { repo: "acme/infra".into(), profile: RepoProfile::Merge }],
@@ -1743,6 +1754,22 @@ mod tests {
         settings.save_to_path(&path).unwrap();
         let loaded = TodSettings::load_from_path(&path).unwrap();
         assert_eq!(loaded, settings);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn triage_defaults_on_and_round_trips_off() {
+        let dir = tod_test_util::scratch_dir(format!("tod-settings-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tod.yml");
+        fs::write(&path, "lifecycle: {}\n").unwrap();
+        assert!(TodSettings::load_from_path(&path).unwrap().lifecycle.triage, "a missing key means on");
+        fs::write(&path, "lifecycle:\n  triage: false\n").unwrap();
+        let mut loaded = TodSettings::load_from_path(&path).unwrap();
+        assert!(!loaded.lifecycle.triage);
+        loaded.lifecycle.triage = true;
+        loaded.save_to_path(&path).unwrap();
+        assert!(TodSettings::load_from_path(&path).unwrap().lifecycle.triage);
         let _ = fs::remove_dir_all(dir);
     }
 

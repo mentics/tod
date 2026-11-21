@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 114;
+pub const CURRENT_USER_VERSION: i32 = 115;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -845,6 +845,12 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         remove_legacy_interviews(conn)?;
         conn.pragma_update(None, "user_version", 114)?;
     }
+    if version < 115 {
+        // Requests that share a cause are read by one triage session
+        // (`decisions.cause`; `doc/lifecycle/triage.md`).
+        crate::decisions::ensure_cause(conn)?;
+        conn.pragma_update(None, "user_version", 115)?;
+    }
     // Other branches (the task panel) numbered their own steps 66–67 at the
     // same time as 66–70 above, so a store may be past a version without
     // having these. Every one is idempotent: make sure of them all.
@@ -947,6 +953,7 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     conn.execute_batch(&crate::journey_changes::quick_fixes_triggers_sql())?;
     // Idempotent, so a store that skipped 112 still has them.
     crate::decisions::ensure_triage(conn)?;
+    crate::decisions::ensure_cause(conn)?;
     conn.execute_batch(crate::lessons::CREATE_TABLE)?;
     crate::lessons::ensure_columns(conn)?;
     conn.execute_batch(&crate::journey_changes::lessons_triggers_sql())?;

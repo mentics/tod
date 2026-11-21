@@ -172,7 +172,7 @@ impl SettingsSection {
                 ClaudeAdapter,
                 MaxParallelSessions,
             ],
-            Self::Lifecycle => &[LifecycleIndependentEvaluation, LifecycleReviewRoundLimit, LifecycleRepoProfiles, PrReviewBots],
+            Self::Lifecycle => &[LifecycleIndependentEvaluation, LifecycleTriage, LifecycleReviewRoundLimit, LifecycleRepoProfiles, PrReviewBots],
             Self::AgentContext => &[ContextBudget],
             Self::Workspaces => &[
                 WorktreeBackend,
@@ -276,6 +276,8 @@ enum SettingField {
     JourneysStorageCap,
     /// `lifecycle.independent_evaluation`.
     LifecycleIndependentEvaluation,
+    /// `lifecycle.triage`.
+    LifecycleTriage,
     /// `lifecycle.review_round_limit`.
     LifecycleReviewRoundLimit,
     /// `lifecycle.repo_profiles`, as text.
@@ -331,6 +333,7 @@ impl SettingField {
             Self::JourneysMilestoneStates => "journeys-milestone-states",
             Self::JourneysStorageCap => "journeys-storage-cap",
             Self::LifecycleIndependentEvaluation => "lifecycle-independent-evaluation",
+            Self::LifecycleTriage => "lifecycle-triage",
             Self::LifecycleReviewRoundLimit => "lifecycle-review-round-limit",
             Self::LifecycleRepoProfiles => "lifecycle-repo-profiles",
             Self::PrReviewBots => "pr-review-bots",
@@ -1684,6 +1687,7 @@ impl SettingsView {
             SettingField::LifecycleIndependentEvaluation => {
                 self.toggle_lifecycle_independent_evaluation(cx)
             }
+            SettingField::LifecycleTriage => self.toggle_lifecycle_triage(cx),
             SettingField::JourneysStorageCap => {
                 let step = if delta >= 0 { 64 } else { -64 };
                 self.step_journeys_storage_cap(step, cx);
@@ -1762,6 +1766,7 @@ impl SettingsView {
             SettingField::LifecycleIndependentEvaluation => {
                 self.toggle_lifecycle_independent_evaluation(cx)
             }
+            SettingField::LifecycleTriage => self.toggle_lifecycle_triage(cx),
             _ => {
                 // Cycle/step fields: Enter bumps forward like `=`.
                 self.adjust_selected(1, cx);
@@ -1904,6 +1909,13 @@ impl SettingsView {
         self.settings.lifecycle.independent_evaluation =
             !self.settings.lifecycle.independent_evaluation;
         self.schedule_save("lifecycle.independent_evaluation", cx);
+        cx.notify();
+    }
+
+    /// Toggles "Read requests before they reach you" (`lifecycle.triage`).
+    fn toggle_lifecycle_triage(&mut self, cx: &mut Context<Self>) {
+        self.settings.lifecycle.triage = !self.settings.lifecycle.triage;
+        self.schedule_save("lifecycle.triage", cx);
         cx.notify();
     }
 
@@ -3013,6 +3025,17 @@ impl SettingsView {
                     "A fresh agent session, separate from the one that did the phase's work, judges whether each phase is done. It cannot edit; it sends fixes back to the phase agent.",
                     theme,
                     |this, cx| this.toggle_lifecycle_independent_evaluation(cx),
+                ))
+                .child(toggle_row(
+                    cx,
+                    self,
+                    SettingField::LifecycleTriage,
+                    self.settings.lifecycle.triage,
+                    false,
+                    "Triage requests before they reach you",
+                    "A small agent session reads each judgment request an agent files and answers it, converts it or hands it to you with a short brief. Off: those requests come to you as the agent asked them. Default on.",
+                    theme,
+                    |this, cx| this.toggle_lifecycle_triage(cx),
                 ))
                 .child(stepper_row(
                     cx,

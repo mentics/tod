@@ -28,7 +28,7 @@ Inside a conversation --node defaults to the node it is about, and asks are
 filed under that conversation and its protocol.
 
 COMMANDS:
-    ask   [--node <UUID>] <QUESTION> [--option <TEXT> (repeatable)] [--evidence <KIND>:<ID> (repeatable)] [--reason <KIND>] [--moves-to <N>:<STATE> (repeatable)] [--edit-obligation <N>:<OBLIGATION_ID>=<NEW_TEXT> (repeatable)] [--affirm-obligation <N>:<OBLIGATION_ID> (repeatable)] [--blocks <STEP_ID> (repeatable)] [--new-evidence <TEXT>] [--need <TEXT>] [--command <TEXT>] [--error <TEXT>] [--tried <TEXT> (repeatable)] [--after <TEXT>]
+    ask   [--node <UUID>] <QUESTION> [--option <TEXT> (repeatable)] [--evidence <KIND>:<ID> (repeatable)] [--reason <KIND>] [--moves-to <N>:<STATE> (repeatable)] [--edit-obligation <N>:<OBLIGATION_ID>=<NEW_TEXT> (repeatable)] [--affirm-obligation <N>:<OBLIGATION_ID> (repeatable)] [--blocks <STEP_ID> (repeatable)] [--new-evidence <TEXT>] [--cause <KEY>] [--need <TEXT>] [--command <TEXT>] [--error <TEXT>] [--tried <TEXT> (repeatable)] [--after <TEXT>]
     list  [--node <UUID>] [--all]
     show  <ID>
 
@@ -58,6 +58,9 @@ answered on the node, in any session and however long ago (the same question,
 the same --blocks steps, or the same --error), is refused with the existing
 request's id or its answer in the message; --new-evidence <TEXT>, what has
 changed since, lets it through.
+--cause <KEY> names what a request shares with others you ask on this node
+(the same short key on each): a triage session reads them together and one
+answer settles them all. Leave it out when the questions are separate.
 With --reason access, broken or capability the app writes the request itself
 from --need (one line), --command (the exact command to paste), --error (the
 exact error; required for broken), --tried (one attempt per flag, repeatable)
@@ -336,6 +339,7 @@ fn ask(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
         }
     }
     let new_evidence = args.get("--new-evidence").unwrap_or("").trim().to_string();
+    let cause = args.get("--cause").unwrap_or("").trim().to_string();
     let (conversation_id, mut protocol) = asking_conversation(inv)?;
     // A quick fix and a small review are cheap sessions on one failing thing:
     // a question is not theirs to ask. They end their turn saying what they could
@@ -373,6 +377,7 @@ fn ask(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
             guard_reask,
             new_evidence,
             brief,
+            cause,
             ..Default::default()
         },
     })?;

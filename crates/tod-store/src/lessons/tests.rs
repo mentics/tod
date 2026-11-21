@@ -139,3 +139,42 @@ fn a_declined_lesson_reopens_to_new_or_to_grouped_and_nothing_else_does() {
     run_op(&conn, "user", &Op::Apply { ids: vec![fresh], applied_ref: "abc1234".into() }).unwrap();
     assert!(run_op(&conn, "user", &Op::Reopen { id: fresh }).is_err());
 }
+
+#[test]
+fn a_flagged_request_is_a_user_lesson_linked_to_the_decision_and_its_asker() {
+    let (conn, node) = setup();
+    let asking = crate::conversation::ConversationRepo::new(&conn)
+        .create(crate::conversation::Focus::Node(node), crate::conversation::ProtocolKind::Implementation, None, None, None)
+        .unwrap()
+        .id;
+    let decision = crate::decisions::DecisionRepo::new(&conn)
+        .create(
+            node,
+            Some(asking),
+            Some("implementation"),
+            &crate::decisions::NewDecision {
+                question: "Should lock_timeout be raised for v2?".into(),
+                options: vec!["Yes".into(), "No".into()],
+                reason: "access".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let out = run_op(&conn, "user", &Op::FlagRequest { decision: decision.id, remark: " what is v2? ".into() }).unwrap();
+    let id: Uuid = serde_json::from_value(out["id"].clone()).unwrap();
+    let lesson = get(&conn, id).unwrap().unwrap();
+    assert_eq!(lesson.source, SOURCE_USER);
+    assert_eq!(lesson.category, CATEGORY_BRIEF_UNCLEAR);
+    assert_eq!(lesson.decision_id, Some(decision.id));
+    assert_eq!(lesson.conversation_id, Some(asking));
+    assert_eq!(lesson.node_id, node);
+    assert_eq!(lesson.user_quote, "what is v2?");
+    assert!(lesson.summary.contains("lock_timeout") && lesson.summary.contains("what is v2?"), "{}", lesson.summary);
+    assert_eq!(lesson.status, STATUS_NEW);
+    // No remark is fine; a second flag is a second lesson; a session may not flag.
+    run_op(&conn, "user", &Op::FlagRequest { decision: decision.id, remark: String::new() }).unwrap();
+    assert_eq!(for_decision(&conn, decision.id).unwrap().len(), 2);
+    let session = crate::conversation::actor_for(asking);
+    assert!(run_op(&conn, &session, &Op::FlagRequest { decision: decision.id, remark: String::new() }).is_err());
+    assert!(run_op(&conn, "user", &Op::FlagRequest { decision: Uuid::new_v4(), remark: String::new() }).is_err());
+}
