@@ -573,7 +573,6 @@ mod tests {
             actor,
             &InterviewCommand::Outline {
                 mutation,
-                target: None,
             },
         )
         .map(|_| ())

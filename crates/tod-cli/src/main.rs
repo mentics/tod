@@ -22,7 +22,7 @@ mod suggest;
 mod lessons;
 mod triage;
 mod incoming;
-mod interview;
+mod content;
 mod learn;
 mod lifecycle;
 mod node;
@@ -100,7 +100,7 @@ const NOUNS: &[(&str, &str)] = &[
     ("obligations", crate::obligations::USAGE),
     ("plan", crate::plan::USAGE),
     ("visual-design", crate::visual_design::USAGE),
-    ("content", crate::interview::CONTENT_USAGE),
+    ("content", crate::content::CONTENT_USAGE),
     ("capabilities", crate::capabilities::USAGE),
     ("changeset", crate::changeset::USAGE),
     ("tests", crate::test_runs::USAGE),
@@ -385,7 +385,7 @@ fn run_with(args: &[String], env: operator::Env) -> anyhow::Result<String> {
     match noun.as_str() {
         "node" => node::run(invocation),
         "obligations" => obligations::run(invocation),
-        "content" => interview::content(invocation),
+        "content" => content::content(invocation),
         "plan" => plan::run(invocation),
         "visual-design" => visual_design::run(invocation),
         "capabilities" => capabilities::run(invocation),
@@ -441,7 +441,7 @@ pub(crate) mod tests {
         for noun in ["questions", "memory", "interview"] {
             assert!(!help.lines().any(|line| line.trim_start().starts_with(noun)), "{noun}: {help}");
         }
-        assert_eq!(run(&["content".into(), "--help".into()]).unwrap(), crate::interview::CONTENT_USAGE.trim_end());
+        assert_eq!(run(&["content".into(), "--help".into()]).unwrap(), crate::content::CONTENT_USAGE.trim_end());
     }
 
     #[test]

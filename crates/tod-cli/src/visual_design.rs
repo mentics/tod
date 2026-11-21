@@ -80,7 +80,6 @@ fn save(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
             obligation_id: obligation.id,
             path: Some(dest_str.clone()),
         },
-        target: None,
     })?;
 
     if inv.json {
@@ -119,7 +118,6 @@ fn clear(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
             obligation_id: obligation.id,
             path: None,
         },
-        target: None,
     })?;
     Ok(format!("ok {} (cleared)", short_id(obligation.id)))
 }

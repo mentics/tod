@@ -9,7 +9,7 @@ use crate::ui::list::{ListArrowDown, ListArrowUp};
 use crate::ui::style;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
+    App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement,
     IntoElement, KeyBinding, ParentElement, Pixels, Render, SharedString, Styled, Subscription,
     Window, actions, div, px,
 };
@@ -103,10 +103,7 @@ pub fn register_settings_keyboard_bindings(cx: &mut App) {
     crate::views::databases_editor::register_keyboard_bindings(cx);
 }
 
-#[derive(Debug, Clone)]
-pub enum SettingsEvent {
-    AgentPlatformChanged(AgentPlatform),
-}
+
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SettingsFocus {
@@ -168,7 +165,6 @@ impl SettingsSection {
             Self::Agents => &[
                 Agent(AgentRole::Default),
                 Agent(AgentRole::Chat),
-                Agent(AgentRole::Interview),
                 ClaudeAdapter,
                 MaxParallelSessions,
             ],
@@ -297,7 +293,6 @@ impl SettingField {
         match self {
             Self::Agent(AgentRole::Default) => "default-agent",
             Self::Agent(AgentRole::Chat) => "chat-agent",
-            Self::Agent(AgentRole::Interview) => "interview-agent",
             Self::ClaudeAdapter => "claude-adapter",
             Self::ContextBudget => "context-budget",
             Self::WorktreeBackend => "worktree-backend",
@@ -2111,26 +2106,23 @@ impl SettingsView {
         }
         self.settings.set_platform_for(role, platform);
         self.pending_launch_select_sync = true;
-        if role == AgentRole::Interview {
-            cx.emit(SettingsEvent::AgentPlatformChanged(platform));
-        }
         self.schedule_save("platform", cx);
         cx.notify();
     }
 
     #[cfg(feature = "agent-socket")]
     pub(crate) fn cycle_agent_platform(&mut self, delta: i32, cx: &mut Context<Self>) {
-        self.cycle_platform_for(AgentRole::Interview, delta, cx);
+        self.cycle_platform_for(AgentRole::Default, delta, cx);
     }
 
     #[cfg(feature = "agent-socket")]
     pub fn set_agent_platform(&mut self, platform: AgentPlatform, cx: &mut Context<Self>) {
-        self.set_platform_for(AgentRole::Interview, platform, cx);
+        self.set_platform_for(AgentRole::Default, platform, cx);
     }
 
     #[cfg(feature = "agent-socket")]
     pub fn agent_platform(&self) -> AgentPlatform {
-        self.settings.agent_platform
+        self.settings.platform_for(AgentRole::Default)
     }
 
     fn agent_selects(&self, role: AgentRole) -> &AgentRoleSelects {
@@ -2413,7 +2405,6 @@ mod tests {
     }
 }
 
-impl EventEmitter<SettingsEvent> for SettingsView {}
 
 impl HasAppNav for SettingsView {
     fn app_nav_mut(&mut self) -> &mut AppNavMenu {
@@ -2656,7 +2647,7 @@ impl SettingsView {
                     SettingField::WorktreeBackend,
                     Self::worktree_backend_label(self.settings.worktree_backend),
                     "Worktree backend",
-                    "How interview agents provision git workspaces: Treehouse with optional Git fallback (default), Treehouse only, or Git worktree only.",
+                    "How agent workspaces are provisioned: Treehouse with optional Git fallback (default), Treehouse only, or Git worktree only.",
                     theme,
                     |this, _, cx| this.cycle_worktree_backend(-1, cx),
                     |this, _, cx| this.cycle_worktree_backend(1, cx),

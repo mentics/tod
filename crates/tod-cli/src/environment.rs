@@ -125,7 +125,7 @@ fn find(inv: &Invocation, node: Uuid, name: &str) -> anyhow::Result<Resolved> {
 }
 
 fn write(inv: &Invocation, mutation: OutlineMutation) -> anyhow::Result<()> {
-    inv.client().interview(InterviewCommand::Outline { mutation, target: None })?;
+    inv.client().interview(InterviewCommand::Outline { mutation})?;
     Ok(())
 }
 

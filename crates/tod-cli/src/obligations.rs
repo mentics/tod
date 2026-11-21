@@ -396,7 +396,6 @@ fn add(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
             body,
             phase: phase.to_string(),
         },
-        target: None,
     })?;
     if let Some(acts_in) = acts_in.filter(|a| *a != tod_store::outline::ACTS_IN_ACTIVE) {
         client.interview(InterviewCommand::Outline {
@@ -405,7 +404,6 @@ fn add(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
                 acts_in: acts_in.to_string(),
                 reason: None,
             },
-            target: None,
         })?;
     }
     if let Some(reason) = code_only {
@@ -415,7 +413,6 @@ fn add(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
                     obligation_id: id,
                     code_only: Some(reason),
                 },
-                target: None,
             })
             .map_err(|e| {
                 anyhow::anyhow!(
@@ -439,14 +436,12 @@ fn update(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
         anyhow::bail!("--body, --section, --phase, --acts-in, --code-only, and/or --live is required");
     }
     let client = inv.client();
-    let mut target = Some(id);
     if let Some(body) = body {
         client.interview(InterviewCommand::Outline {
             mutation: OutlineMutation::UpdateObligationBody {
                 obligation_id: id,
                 body: body.to_string(),
             },
-            target: target.take(),
         })?;
     }
     if let Some(section) = section {
@@ -455,7 +450,6 @@ fn update(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
                 obligation_id: id,
                 section: Some(section.to_string()).filter(|s| !s.trim().is_empty()),
             },
-            target: target.take(),
         })?;
     }
     if let Some(phase) = phase {
@@ -464,7 +458,6 @@ fn update(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
                 obligation_id: id,
                 phase: phase.to_string(),
             },
-            target: target.take(),
         })?;
     }
     if let Some(acts_in) = acts_in {
@@ -474,7 +467,6 @@ fn update(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
                 acts_in: acts_in.to_string(),
                 reason: reason.map(str::to_string),
             },
-            target: target.take(),
         })?;
     }
     if let Some(code_only) = code_only {
@@ -483,7 +475,6 @@ fn update(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
                 obligation_id: id,
                 code_only,
             },
-            target: target.take(),
         })?;
     }
     Ok(ack(id, inv.json))
@@ -497,7 +488,6 @@ fn move_to(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
             obligation_id: id,
             target_node_id: node,
         },
-        target: Some(id),
     })?;
     Ok(ack(id, inv.json))
 }
@@ -506,7 +496,6 @@ fn delete(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
     let id = resolve(inv, args.target("an obligation id")?)?;
     inv.client().interview(InterviewCommand::Outline {
         mutation: OutlineMutation::DeleteObligation { obligation_id: id },
-        target: Some(id),
     })?;
     Ok(ack(id, inv.json))
 }
@@ -569,7 +558,6 @@ fn restore(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
     for snapshot in &snapshots {
         let result = client.interview(InterviewCommand::Outline {
             mutation: OutlineMutation::RestoreObligation { rev: snapshot.rev },
-            target: Some(snapshot.obligation_id),
         });
         if let Err(err) = result {
             let done = restored

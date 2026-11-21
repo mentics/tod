@@ -344,7 +344,6 @@ fn create(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
             position,
             title,
         },
-        target: None,
     })?;
     let node = inv
         .client()
@@ -358,7 +357,6 @@ fn rename(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
     let title = args.require("--title")?.to_string();
     inv.client().interview(InterviewCommand::Outline {
         mutation: OutlineMutation::UpdateNodeTitle { node_id: id, title },
-        target: Some(id),
     })?;
     let node = inv
         .client()
@@ -398,7 +396,6 @@ fn move_node(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
             parent_id,
             ordinal,
         },
-        target: Some(id),
     })?;
     let node = inv
         .client()
@@ -416,7 +413,6 @@ fn delete(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
     refuse_deleting_locations(inv, id)?;
     inv.client().interview(InterviewCommand::Outline {
         mutation: OutlineMutation::DeleteNode { node_id: id },
-        target: Some(id),
     })?;
     Ok(ack(&node, inv.json))
 }

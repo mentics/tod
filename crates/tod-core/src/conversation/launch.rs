@@ -240,18 +240,17 @@ mod tests {
 
     fn settings() -> TodSettings {
         let mut settings = TodSettings::default();
-        for role in [AgentRole::Default, AgentRole::Chat, AgentRole::Interview] {
+        for role in [AgentRole::Default, AgentRole::Chat] {
             settings.set_platform_for(role, AgentPlatform::Claude);
         }
         settings.set_model_for(AgentRole::Default, "opus");
         settings.set_model_for(AgentRole::Chat, "sonnet");
         settings.set_effort_for(AgentRole::Chat, "medium");
-        settings.set_model_for(AgentRole::Interview, "haiku");
         settings
     }
 
     #[test]
-    fn a_conversation_follows_its_kinds_settings_not_the_interviews() {
+    fn a_conversation_follows_its_kinds_settings() {
         let (root, store, node) = store_with_node();
         let settings = settings();
         let chat = resolve(&store, &settings, Focus::Node(node), ProtocolKind::Chat);

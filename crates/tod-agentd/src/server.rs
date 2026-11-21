@@ -87,7 +87,7 @@ pub fn run(data_root: &Path) -> Result<bool> {
     } else {
         let paths = tod_core::interview::TodPaths::at(data_root);
         let settings = tod_core::interview::TodSettings::load(&paths).unwrap_or_default();
-        AgentBackend::from_platform(settings.agent_platform)
+        AgentBackend::from_platform(settings.platform_for(tod_store::AgentRole::Default))
     };
     let runners = Runners::new(store.clone(), backend.create(tod_agent::agent_traffic::shared_log()));
 

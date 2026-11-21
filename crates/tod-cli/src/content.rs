@@ -61,7 +61,6 @@ pub fn content(inv: Invocation) -> anyhow::Result<String> {
                     content_type: ty.to_string(),
                     body,
                 },
-                target: None,
             })?;
             Ok("ok".into())
         }

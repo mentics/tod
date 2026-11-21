@@ -247,7 +247,6 @@ fn directive(client: &impl Access, conversation: Uuid, line: &str) -> Result<Opt
     let outline = |mutation| {
         client.interview(InterviewCommand::Outline {
             mutation,
-            target: None,
         })
     };
     // The visual-design agent's working draft: written where `tod-cli

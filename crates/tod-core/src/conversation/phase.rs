@@ -283,7 +283,6 @@ impl Protocol for PhaseProtocol {
                         node_id: node,
                         capabilities: vec![Capability::Spec],
                     },
-                    target: None,
                 },
             )?;
         }
@@ -537,7 +536,6 @@ pub fn mock_turn(
                     body: answer.trim().to_string(),
                     phase: PHASE_REQUIREMENTS.into(),
                 },
-                target: None,
             })?;
         }
         "planning" => {
@@ -554,7 +552,6 @@ pub fn mock_turn(
                             before: false,
                             body: "Build it.".into(),
                         },
-                        target: None,
                     })?;
                     step_id
                 }
@@ -572,7 +569,6 @@ pub fn mock_turn(
                             step_id,
                             obligation_id: *obligation_id,
                         },
-                        target: None,
                     })?;
                 }
             }
@@ -681,7 +677,6 @@ mod tests {
                         node_id: node,
                         capabilities: vec![Capability::Lifecycle],
                     },
-                    target: None,
                 },
             )
             .unwrap();
@@ -732,7 +727,6 @@ mod tests {
                         node_id: node,
                         capabilities: vec![Capability::Lifecycle, Capability::Spec],
                     },
-                    target: None,
                 },
             )
             .unwrap();

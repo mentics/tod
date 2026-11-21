@@ -12,7 +12,7 @@ use crate::app::transcript_window::TranscriptWindowControl;
 use crate::cli::LaunchOptions;
 use crate::interview::agent::{AgentBackend, AgentPlatform, SharedAgent};
 use crate::interview::settings::{persist_window_geometry, resolve_open_window_bounds};
-use crate::interview::views::{SettingsEvent, SettingsView};
+use crate::interview::views::SettingsView;
 use crate::interview::{TodPaths, TodSettings};
 use crate::ui::actionable::render_shortcut_pill_in_context;
 use crate::ui::agent_chat::OpenAgentChat;
@@ -128,7 +128,6 @@ pub struct Shell {
     /// Claude adapter is out of date: it then carries the update button.
     pending_adapter_update: bool,
     always_on_top: bool,
-    _settings_subscription: Subscription,
     _unified_nav_subscription: Subscription,
 }
 
@@ -399,18 +398,6 @@ impl Shell {
             self.agent_status_text = text.into();
             cx.notify();
         }
-    }
-
-    fn replace_agent_platform(&mut self, platform: AgentPlatform, cx: &mut Context<Self>) {
-        // RoutingAgentProvider already hosts both Cursor and Claude; settings persist the
-        // preferred interview platform without swapping the shared provider mutex.
-        tracing::info!(
-            event = "agent",
-            action = "platform_settings_updated",
-            platform = platform.label(),
-            "interview agent platform setting updated (routing provider unchanged)"
-        );
-        self.refresh_agent_status(cx);
     }
 
     #[cfg(feature = "agent-socket")]
@@ -1425,7 +1412,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
     let agent_backend = if opts.agent_backend_from_cli {
         opts.agent_backend
     } else {
-        AgentBackend::from_platform(app_settings.agent_platform)
+        AgentBackend::from_platform(app_settings.platform_for(tod_store::AgentRole::Default))
     };
     tod_agent::claude_adapter::set_local_dir(tod_store::install::claude_adapter_dir());
     // Whether a missing or outdated Claude adapter is worth saying at start.
@@ -1604,7 +1591,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                             })
                             .flatten();
                         if agent_backend == AgentBackend::Mock {
-                            // Mock interview agents write through the socket just started,
+                            // Mock agents write through the socket just started,
                             // the same path `tod-cli` gives real agents.
                             tod_core::interview::mock::install_mock_interview_handler(
                                 fleet.paths().root().to_path_buf(),
@@ -1663,14 +1650,6 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                             )
                         });
                         let view = cx.new(|cx| {
-                            let _settings_subscription = cx.subscribe(
-                                &settings,
-                                |this: &mut Shell, _, event, cx| match event {
-                                    SettingsEvent::AgentPlatformChanged(platform) => {
-                                        this.replace_agent_platform(*platform, cx);
-                                    }
-                                },
-                            );
                             let agent_status_text =
                                 format_status_bar(&AgentStatusGroups::default()).into();
                             let _unified_nav_subscription =
@@ -1707,7 +1686,6 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 pending_warning_toast: None,
                                 pending_adapter_update: false,
                                 always_on_top: restore_always_on_top,
-                                _settings_subscription,
                                 _unified_nav_subscription,
                             };
                             let status_hub = status::hub(cx);
