@@ -31,7 +31,7 @@ use tod_store::check_runs::Verdict;
 use tod_store::conversation::ProtocolKind;
 use tod_store::fleet::provision::resolve_launch_cwd;
 use tod_store::fleet::{FleetMutation, FleetStore, Workdir};
-use tod_store::quick_fixes::{self, OUTCOME_ESCALATED, OUTCOME_SUCCEEDED, QuickFix, SOURCE_CI};
+use tod_store::quick_fixes::{self, OUTCOME_ESCALATED, OUTCOME_SUCCEEDED, QuickFix, SOURCE_CHECK, SOURCE_CI, SOURCE_REVIEW};
 use uuid::Uuid;
 
 /// The most of the branch's diff a quick fix is shown.
@@ -147,7 +147,13 @@ pub fn diff_for_files(cwd: &Workdir, files: &[String]) -> Result<String> {
 pub fn render_target(fix: &QuickFix, named: &[String], diff: Result<String, String>, usual: &[(String, String, String)]) -> String {
     let (dir, command) = dir_and_command(fix);
     let mut out = String::new();
-    if fix.source == SOURCE_CI {
+    if fix.source == SOURCE_REVIEW {
+        out.push_str(
+            "A code review of this task's change found the problems below. Each is scored mechanical or simple: a \
+             tool, a rule or a local edit fixes it. Fix exactly these and nothing else. You have one turn.\n\n",
+        );
+        out.push_str(&format!("The findings:\n\n{}\n", fix.output.trim_end()));
+    } else if fix.source == SOURCE_CI {
         out.push_str(&format!("Pull request check **{}** is failing.\n\n", fix.check_name));
         out.push_str(
             "You cannot run it here: it runs on the pull request's server. Run the project's own commands below that \
@@ -284,8 +290,9 @@ impl Protocol for QuickFixProtocol {
         let env = turn.env;
         let mut fix = current(env)?.context("a quick fix turn ended with no quick fix open")?;
         fix.turns = i64::from(turn.continuations) + 1;
-        if fix.source == SOURCE_CI {
-            // Nothing to run here: the pull request's checks say, afterwards.
+        if fix.source != SOURCE_CHECK {
+            // Nothing to run here: the pull request's checks say (CI), or the
+            // small review of the commit does (review findings), afterwards.
             save(env.fleet, &fix)?;
             return Ok(Next::Done(Stop::Complete));
         }
@@ -347,7 +354,7 @@ impl Protocol for QuickFixProtocol {
             // fingerprint): a checkout still on it made no commit, and
             // recording it would send an old, pushed commit to the small
             // review and make "made no commit" unreachable.
-            if fix.source == SOURCE_CI && head == fix.fingerprint {
+            if fix.source != SOURCE_CHECK && head == fix.fingerprint {
                 return Ok(notices);
             }
             if fix.head != head {

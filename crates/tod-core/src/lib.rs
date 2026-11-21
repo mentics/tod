@@ -50,6 +50,7 @@ pub mod babysitter_request;
 pub mod pr_draft_review;
 pub mod pr_pushes;
 pub mod review_progress;
+pub mod review_scoring;
 pub mod fix_escalation;
 pub mod follow_up_request;
 pub mod skills_context;

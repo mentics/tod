@@ -1024,6 +1024,14 @@ impl Autopilot {
             if step == NextStep::Review && stopped.is_none() {
                 self.state.loops.review_rounds += 1;
                 self.save()?;
+                // Each finding goes where its scores send it, before the heads
+                // are recorded: a quick fix's commit is part of what was reviewed.
+                if lifecycle == "review" {
+                    let round = self.state.loops.review_rounds;
+                    if let Some(outcome) = self.settle_review_round(fleet, agent, hook, &lifecycle, round, quick_fix::Lanes::All)? {
+                        return Ok(outcome);
+                    }
+                }
                 // What the round reviewed, so a clean one covers the pull
                 // request's first head in `pr_draft` (`pr_draft_review::latest_review`).
                 if lifecycle == "review" && fleet.read(|conn| crate::pr_draft_review::enabled(conn, self.node))? {
@@ -3326,6 +3334,10 @@ impl Autopilot {
                     if let Some(outcome) = self.converse(fleet, agent, hook, ProtocolKind::Review, None)? {
                         return Ok(Some(outcome));
                     }
+                    let round = self.state.loops.review_rounds;
+                    if let Some(outcome) = self.settle_review_round(fleet, agent, hook, lifecycle, round, quick_fix::Lanes::LeaveOnly)? {
+                        return Ok(Some(outcome));
+                    }
                     self.owe_groups(fleet, ProtocolKind::Review, "review", lifecycle)?;
                     if let Some(outcome) = self.run_pending_groups(fleet, agent, hook, lifecycle)? {
                         return Ok(Some(outcome));
@@ -3425,6 +3437,16 @@ impl Autopilot {
                     return Ok(OwnReview::Stop(outcome));
                 }
                 let review = fleet.read(|conn| pr_draft_review::latest_review(conn, node))?;
+                if let Some(outcome) = self.settle_review_round(
+                    fleet,
+                    agent,
+                    hook,
+                    pr_draft_review::STATE,
+                    rounds + u32::from(!resuming),
+                    quick_fix::Lanes::LeaveOnly,
+                )? {
+                    return Ok(OwnReview::Stop(outcome));
+                }
                 self.owe_groups(fleet, ProtocolKind::Review, "review", pr_draft_review::STATE)?;
                 if let Some(outcome) = self.run_pending_groups(fleet, agent, hook, pr_draft_review::STATE)? {
                     return Ok(OwnReview::Stop(outcome));

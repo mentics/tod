@@ -320,3 +320,207 @@ impl Autopilot {
         Ok(out)
     }
 }
+
+/// What [`Autopilot::settle_review_round`] needs to know about where the
+/// round ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Lanes {
+    /// `review`: the quick fix lane runs, and the small review clears it.
+    All,
+    /// `pr_draft`, or tod's review of a change before it is pushed: nothing
+    /// is fixed here (a commit would need its own push), so a finding that
+    /// blocks goes on as before and one that does not is left.
+    LeaveOnly,
+}
+
+impl Autopilot {
+    /// A review round just finished: route each finding it left open by its
+    /// scores (`crate::review_scoring`). Findings that do not block are
+    /// settled `left` with tod's reason, noted on the node's Activity; the
+    /// mechanical and simple ones that do block (and the mechanical nits) go
+    /// together to one quick fix session and the small-change review; the
+    /// rest stay open for the Fix protocol. A check is suggested for a rule
+    /// three tasks' mechanical findings cite. `None` when the run goes on.
+    pub(super) fn settle_review_round<A: AgentAccess + ?Sized, H: StepHook + ?Sized>(
+        &mut self,
+        fleet: &FleetStore,
+        agent: &mut A,
+        hook: &mut H,
+        lifecycle: &str,
+        round: u32,
+        lanes: Lanes,
+    ) -> Result<Option<Outcome>> {
+        use crate::review_scoring::{self, QUICK_FIX_FAILED_NIT};
+        use tod_store::review::{ReviewFinding, ReviewRepo};
+        let node = self.node;
+        let minor_rounds = tod_store::TodSettings::load(&tod_store::TodPaths::at(&self.config.data_root))?.review.minor_rounds;
+        let open: Vec<ReviewFinding> = fleet.read(|conn| {
+            let Some(lead) = ConversationRepo::new(conn).latest_for_focus_with_protocol(Focus::Node(node), ProtocolKind::Review)? else {
+                return Ok(Vec::new());
+            };
+            let members = tod_store::review::round::conversations(conn, lead.id)?;
+            Ok(ReviewRepo::new(conn)
+                .list_for_node(node)?
+                .into_iter()
+                .filter(|f| f.is_open() && f.conversation_id.is_some_and(|c| members.contains(&c)))
+                .collect())
+        })?;
+        if open.is_empty() {
+            return Ok(None);
+        }
+        let mut routing = review_scoring::route(&open, round, minor_rounds);
+        if lanes == Lanes::LeaveOnly {
+            for finding in std::mem::take(&mut routing.quick) {
+                if review_scoring::blocks(&finding, round, minor_rounds) {
+                    routing.fix.push(finding);
+                } else {
+                    routing.leave.push((finding, "nit: left as it is".to_string()));
+                }
+            }
+        }
+        self.leave_findings(fleet, lifecycle, &routing.leave)?;
+        self.suggest_checks(fleet)?;
+        if routing.quick.is_empty() {
+            return Ok(None);
+        }
+
+        let findings = routing.quick;
+        let cwd = tod_store::fleet::provision::resolve_launch_cwd(fleet, &node.to_string())
+            .context("finding the node's checkout, for the quick fix of the review's findings")?;
+        let head = cwd.git(&["rev-parse", "HEAD"]).context("read the commit the quick fix starts from")?;
+        let name = format!("{} review finding(s)", findings.len());
+        let fix = QuickFix::open(
+            node,
+            quick_fixes::SOURCE_REVIEW,
+            lifecycle,
+            &name,
+            quick_fixes::REVIEW_KEY,
+            &review_scoring::ids_text(&findings),
+            &review_scoring::render_for_quick_fix(&findings),
+            &head,
+        );
+        crate::conversation::quick_fix::save(fleet, &fix)?;
+        hook.working_on(&format!("a quick fix for {name}"));
+        if let Some(outcome) = self.converse(fleet, agent, hook, ProtocolKind::QuickFix, None)? {
+            self.escalate_interrupted(fleet)?;
+            return Ok(Some(outcome));
+        }
+        let mut done = fleet
+            .read(|conn| quick_fixes::get(conn, fix.id))?
+            .with_context(|| format!("the quick fix for {name} was not recorded"))?;
+        let mut why = String::new();
+        if done.head.is_empty() {
+            why = "The quick fix made no commit.".to_string();
+        } else {
+            // The small-change review of that commit, not a full round.
+            hook.working_on("a small review of the quick fix");
+            if let Some(outcome) = self.converse(fleet, agent, hook, ProtocolKind::SmallReview, None)? {
+                return Ok(Some(outcome));
+            }
+            let review = fleet
+                .read(|conn| ConversationRepo::new(conn).latest_for_focus_with_protocol(Focus::Node(node), ProtocolKind::SmallReview))?
+                .context("the small review left no conversation")?;
+            let found = crate::conversation::small_review::findings_of(fleet, node, review.id)?;
+            if !found.is_empty() {
+                why = format!(
+                    "The small review of the quick fix found {} problem(s): {}",
+                    found.len(),
+                    found.iter().map(|f| f.summary.clone()).collect::<Vec<_>>().join("; ")
+                );
+            }
+        }
+        if why.is_empty() {
+            done.finish(tod_store::quick_fixes::OUTCOME_SUCCEEDED);
+            crate::conversation::quick_fix::save(fleet, &done)?;
+            let response = format!("Quick fix {}; the small review found nothing", &done.head[..done.head.len().min(8)]);
+            for finding in &findings {
+                fleet.interview(
+                    "autopilot",
+                    InterviewCommand::SettleReviewFinding { finding_id: finding.id, quick_fix: done.id, response: response.clone() },
+                )?;
+            }
+            self.note(
+                fleet,
+                lifecycle,
+                format!("A quick fix settled {} review finding(s); the small review found nothing", findings.len()),
+                false,
+                review_scoring::render_for_quick_fix(&findings),
+            )?;
+            return Ok(None);
+        }
+        // Rung 1 failed: what blocks goes to Fix with these notes (the ladder
+        // lesson is recorded with the outcome); a nit it could not fix is left.
+        done.notes = format!("{}\n\n{why}", done.notes.trim()).trim().to_string();
+        done.finish(OUTCOME_ESCALATED);
+        crate::conversation::quick_fix::save(fleet, &done)?;
+        let nits: Vec<(ReviewFinding, String)> = findings
+            .iter()
+            .filter(|f| !review_scoring::blocks(f, round, minor_rounds))
+            .map(|f| (f.clone(), QUICK_FIX_FAILED_NIT.to_string()))
+            .collect();
+        self.leave_findings(fleet, lifecycle, &nits)?;
+        self.note(
+            fleet,
+            lifecycle,
+            format!("A quick fix could not settle {} review finding(s): {}", findings.len(), why.lines().next().unwrap_or("")),
+            true,
+            done.notes.clone(),
+        )?;
+        Ok(None)
+    }
+
+    /// Settle `findings` as `left`, each with its reason, and note it.
+    fn leave_findings(&mut self, fleet: &FleetStore, lifecycle: &str, findings: &[(tod_store::review::ReviewFinding, String)]) -> Result<()> {
+        if findings.is_empty() {
+            return Ok(());
+        }
+        for (finding, reason) in findings {
+            fleet.interview(
+                "autopilot",
+                InterviewCommand::RespondReviewFinding {
+                    finding_id: finding.id,
+                    status: tod_store::review::FINDING_LEFT.to_string(),
+                    response: Some(reason.clone()),
+                },
+            )?;
+        }
+        self.note(
+            fleet,
+            lifecycle,
+            format!("tod left {} review finding(s) that do not block", findings.len()),
+            false,
+            findings
+                .iter()
+                .map(|(f, why)| format!("[{}] {}/{}/{} {}: {why}", tod_store::interview::short_id(f.id), f.importance, f.impact, f.complexity, f.summary))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    }
+
+    /// File a suggestion to add a check for each rule three tasks' mechanical
+    /// findings cite (`crate::review_scoring::rule_suggestions`); a filing
+    /// that fails is the error of the step.
+    fn suggest_checks(&mut self, fleet: &FleetStore) -> Result<()> {
+        let node = self.node;
+        for suggestion in fleet.read(|conn| crate::review_scoring::rule_suggestions(conn, node))? {
+            let request = crate::suggestions::FileRequest {
+                node,
+                title: suggestion.title(),
+                body: suggestion.body(),
+                conversation: None,
+                filed_by: tod_store::suggestions::FILED_BY_APP,
+            };
+            crate::suggestions::file(fleet, &request).with_context(|| format!("filing the suggestion {:?}", request.title))?;
+            self.note(fleet, "review", format!("Suggested a check: {}", suggestion.rule), false, suggestion.body())?;
+        }
+        Ok(())
+    }
+
+    /// A note on the node's Activity.
+    fn note(&mut self, fleet: &FleetStore, lifecycle: &str, title: String, failed: bool, body: String) -> Result<()> {
+        let entry = tod_store::node_timeline::TimelineEntry::new(self.node, tod_store::node_timeline::KIND_NOTE, lifecycle, title, failed, body);
+        fleet.enqueue(tod_store::fleet::FleetMutation::RecordTimeline(Box::new(entry)))?;
+        fleet.writer().flush()?;
+        Ok(())
+    }
+}

@@ -705,6 +705,24 @@ impl<'a> ReviewRepo<'a> {
         Ok(rows)
     }
 
+    /// The rule every `mechanical` finding on any node cites, with the node
+    /// and the finding: what `tod_core::review_scoring` matches (by
+    /// [`rule_key`]) to suggest a check.
+    pub fn mechanical_rules(&self) -> Result<Vec<(Uuid, Uuid, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT node_id, id, rule FROM review_findings
+             WHERE complexity = 'mechanical' AND rule IS NOT NULL AND rule <> '' ORDER BY created_at",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                let node: Vec<u8> = r.get(0)?;
+                let id: Vec<u8> = r.get(1)?;
+                Ok((blob_to_uuid_sql(&node)?, blob_to_uuid_sql(&id)?, r.get::<_, String>(2)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Open findings across every node in `node_ids`, oldest first, in one
     /// query — for a list view over many nodes at once (e.g.
     /// `tod_core::attention`).
