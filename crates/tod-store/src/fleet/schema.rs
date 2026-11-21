@@ -851,7 +851,7 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         crate::decisions::ensure_cause(conn)?;
         conn.pragma_update(None, "user_version", 115)?;
     }
-    // 116 is another step of `doc/requests/design.md`, built beside this one.
+    // 116 is unused: the cloud half of incidents needed no schema change.
     if version < 117 {
         // Review findings are scored (`doc/requests/design.md` 5.1): importance,
         // impact and complexity replace severity, a finding may be `left`, and
