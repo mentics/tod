@@ -3,13 +3,17 @@
 //! node's cause too; this module is what the autopilot, the daemon and the
 //! status bar call, and what escalates once per incident.
 //!
-//! Incidents are the local daemon's. A cloud supervisor never parks (its
-//! node is alone in its sandbox and has no fleet to compare with): the
-//! daemon switches this on at startup ([`set_enabled`]), and until then every
-//! observation says "not an incident", so the callers' own retry ladder runs
-//! as before.
+//! Incidents are the local daemon's: it switches this on at startup
+//! ([`set_enabled`]), and until then every observation says "not an
+//! incident", so the callers' own retry ladder runs as before. A cloud
+//! supervisor never parks by itself (its node is alone in its sandbox and
+//! has no fleet to compare with); it switches on [`set_cloud_reporting`]
+//! instead, and what it sees goes to the daemon as a report, which holds the
+//! node in its sandbox when an incident parks it ([`cloud`]).
 
 use std::sync::atomic::{AtomicBool, Ordering};
+
+pub mod cloud;
 
 use anyhow::Result;
 use tod_store::decisions::{Brief, NewDecision, REASON_ACCESS};
@@ -41,6 +45,19 @@ pub fn enabled() -> bool {
     ENABLED.load(Ordering::SeqCst)
 }
 
+static CLOUD_REPORTING: AtomicBool = AtomicBool::new(false);
+
+/// Makes this process a cloud supervisor for incidents: what it observes is
+/// written to the node's problem directory for the daemon ([`cloud`]) rather
+/// than recorded here.
+pub fn set_cloud_reporting(on: bool) {
+    CLOUD_REPORTING.store(on, Ordering::SeqCst);
+}
+
+pub fn cloud_reporting() -> bool {
+    CLOUD_REPORTING.load(Ordering::SeqCst)
+}
+
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
@@ -56,9 +73,24 @@ fn none() -> Observed {
 /// `node` failed `operation` with `error`, seen at `source`. The verdict says
 /// whether to retry as before, or that the node is parked on an incident.
 pub fn observe(fleet: &FleetStore, node: Uuid, source: Source, operation: &str, error: &str) -> Result<Observed> {
+    if cloud_reporting() {
+        return Ok(cloud::report_failure(&tod_problems::node_dir(), node, source, operation, error));
+    }
     if !enabled() {
         return Ok(none());
     }
+    observe_unchecked(fleet, node, source, operation, error)
+}
+
+/// [`observe`] without the process's switch: the daemon's ingest of a cloud
+/// node's report, which may arrive through a client of the daemon's store.
+pub(crate) fn observe_unchecked(
+    fleet: &FleetStore,
+    node: Uuid,
+    source: Source,
+    operation: &str,
+    error: &str,
+) -> Result<Observed> {
     let value = write(
         fleet,
         Op::Observe { node, source, operation: operation.to_string(), error: error.to_string(), now: now_ms() },
@@ -69,9 +101,17 @@ pub fn observe(fleet: &FleetStore, node: Uuid, source: Source, operation: &str, 
 /// `node`'s operation went through: it is no longer parked, and if it was
 /// the incident's probe, the incident is resolved.
 pub fn node_ok(fleet: &FleetStore, node: Uuid) -> Result<()> {
+    if cloud_reporting() {
+        cloud::report_ok(&tod_problems::node_dir(), node);
+        return Ok(());
+    }
     if !enabled() {
         return Ok(());
     }
+    node_ok_unchecked(fleet, node)
+}
+
+pub(crate) fn node_ok_unchecked(fleet: &FleetStore, node: Uuid) -> Result<()> {
     write(fleet, Op::NodeOk { node, now: now_ms() })?;
     Ok(())
 }
@@ -100,6 +140,10 @@ pub fn parking(fleet: &FleetStore, node: Uuid) -> Result<Option<Parking>> {
     if !enabled() {
         return Ok(None);
     }
+    parking_unchecked(fleet, node)
+}
+
+pub(crate) fn parking_unchecked(fleet: &FleetStore, node: Uuid) -> Result<Option<Parking>> {
     fleet.read(|conn| incidents::parking_of(conn, node))
 }
 

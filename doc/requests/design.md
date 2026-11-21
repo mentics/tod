@@ -170,8 +170,10 @@ The goal is that 50 nodes failing the same way cost one session, not 50.
 - **Status bar.** Open incidents are shown fleet-wide, not only on each node.
 - **Cloud nodes.** Supervisors already forward problems through the outbox
   (`doc/problems.md`). They also send failure signatures, so the daemon groups
-  cloud and local nodes together. (v1 may start with local runs and the
-  failures the app observes itself, such as GitHub reads.)
+  cloud and local nodes together. Built: the supervisor reports through the
+  problem channel, the daemon ingests, parks and holds the node in its sandbox
+  with an `incident:<id>` wait, and a release wakes it
+  (`doc/lifecycle/incidents.md`, "Cloud nodes").
 
 ### 4.4 Review bot silence
 
@@ -662,7 +664,7 @@ Each step stands alone and is worth having without the next.
    as send-backs with resolutions (10.3), and suspended certificates (10.4).
 4. **Suggestions** (section 9).
 5. **Quick fix** (section 5) and the small-change review in `pr_draft`.
-6. **Incidents** (4.3), local first, then cloud signatures.
+6. **Incidents** (4.3), local and cloud (done).
 7. **Triage**: the protocol, the `triage` status, answers with `decided_by`
    and session links, Discuss in the chat drawer with the request-session
    labels, highlight to flag, and the closing reflection (section 8).

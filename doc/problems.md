@@ -45,6 +45,13 @@ already happens:
    `cloud-sync.json`, first read starts from now) **inside a notify-driven or
    manual sync only**, and records each as `[<node>] message`.
 
+A problem line may carry an `incident` object: a supervisor's report of a
+failure other nodes may share, or that it went through again
+(`tod_core::incident::cloud`, `doc/lifecycle/incidents.md`). The daemon's sync
+feeds those to the incident table; an `ok` line is bookkeeping and is not shown
+in the log panel. The orchestrator must be the same build as the app, or it
+drops the field.
+
 The app never polls a sandbox and never calls one for logs.
 
 ## Not covered / open
