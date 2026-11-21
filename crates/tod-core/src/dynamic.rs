@@ -133,7 +133,7 @@ pub enum DynamicBlock {
     /// `crate::node_context::render_work_history`). Omitted when empty.
     WorkHistory,
     /// The review findings a fix session is to resolve — the open ones,
-    /// with their ids, severity, location, and detail.
+    /// with their ids, scores, location, and detail.
     ReviewFindings,
     /// Repo, branch, working directory, and task notes.
     Workspace,
@@ -223,7 +223,7 @@ pub struct DynamicContext<'a> {
     pub visual_design: Option<&'a VisualDesignState>,
 }
 
-/// One finding as a fix session is shown it: a line with its id, severity,
+/// One finding as a fix session is shown it: a line with its id, scores (importance/impact/complexity),
 /// location, and summary, then its root cause and detail indented under it.
 pub fn review_finding_lines(finding: &ReviewFinding) -> String {
     finding_lines(finding, "", true)
@@ -237,9 +237,11 @@ fn finding_lines(finding: &ReviewFinding, indent: &str, with_root_cause: bool) -
         .map(|l| format!(" `{l}`"))
         .unwrap_or_default();
     let mut out = format!(
-        "{indent}- [{}] {}{location}: {}\n",
+        "{indent}- [{}] {}/{}/{}{location}: {}\n",
         tod_store::interview::short_id(finding.id),
-        finding.severity,
+        finding.importance,
+        finding.impact,
+        finding.complexity,
         finding.summary.trim()
     );
     let root_cause = finding.root_cause.as_deref().map(str::trim).filter(|c| !c.is_empty());

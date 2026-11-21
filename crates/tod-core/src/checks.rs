@@ -1308,6 +1308,7 @@ pub fn record_findings_with_notes(fleet: &FleetStore, node: Uuid, failed: &[&Che
                         run.output
                     ) + &quick_fix_note(notes, &run_name(run))),
                     root_cause: None,
+                    rule: None,
                 },
             },
         )?;

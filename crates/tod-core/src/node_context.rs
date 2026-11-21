@@ -313,7 +313,7 @@ pub fn render_work_history(conn: &Connection, node_id: Uuid) -> Result<String> {
                 out,
                 "- [{}] {} {}: {}{response}",
                 short_id(finding.id),
-                finding.severity,
+                finding.importance,
                 finding.status,
                 one_line(&finding.summary)
             );

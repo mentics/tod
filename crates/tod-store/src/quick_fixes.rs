@@ -29,6 +29,12 @@ pub const TABLE: &str = "node_quick_fixes";
 pub const SOURCE_CHECK: &str = "check";
 /// The failing thing was a CI check on a pull request.
 pub const SOURCE_CI: &str = "ci";
+/// The work was a batch of review findings scored mechanical or simple
+/// (schema v117; `doc/requests/design.md` 5.1). `command` holds the finding
+/// ids, one per line; `check_key` is [`REVIEW_KEY`].
+pub const SOURCE_REVIEW: &str = "review";
+/// The `check_key` of every review quick fix.
+pub const REVIEW_KEY: &str = "review-findings";
 
 pub const OUTCOME_OPEN: &str = "open";
 pub const OUTCOME_SUCCEEDED: &str = "succeeded";
@@ -38,7 +44,7 @@ pub const CREATE_TABLE: &str = "
     CREATE TABLE IF NOT EXISTS node_quick_fixes (
         id              BLOB PRIMARY KEY NOT NULL,
         node_id         BLOB NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
-        source          TEXT NOT NULL CHECK (source IN ('check', 'ci')),
+        source          TEXT NOT NULL CHECK (source IN ('check', 'ci', 'review')),
         phase           TEXT NOT NULL,
         check_name      TEXT NOT NULL,
         check_key       TEXT NOT NULL,
@@ -56,6 +62,41 @@ pub const CREATE_TABLE: &str = "
     CREATE INDEX IF NOT EXISTS idx_node_quick_fixes_node ON node_quick_fixes(node_id, started_at);
     CREATE INDEX IF NOT EXISTS idx_node_quick_fixes_check ON node_quick_fixes(check_key, outcome);
 ";
+
+/// Schema v117: widen `source` to allow `review`. The CHECK cannot be
+/// altered, so the table is rebuilt when its definition lacks it (idempotent;
+/// the journey trigger is made again, the sync ones by `crate::sync::install`).
+pub fn migrate_review_source(conn: &Connection) -> Result<()> {
+    let sql: Option<String> = conn
+        .query_row("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'node_quick_fixes'", [], |r| r.get(0))
+        .optional()?;
+    match sql {
+        None => {
+            conn.execute_batch(CREATE_TABLE)?;
+            return Ok(());
+        }
+        Some(sql) if sql.contains("'review'") => return Ok(()),
+        Some(_) => {}
+    }
+    conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch("PRAGMA legacy_alter_table = ON;")?;
+    tx.execute_batch(
+        "DROP INDEX IF EXISTS idx_node_quick_fixes_node;
+         DROP INDEX IF EXISTS idx_node_quick_fixes_check;
+         ALTER TABLE node_quick_fixes RENAME TO node_quick_fixes_v116;",
+    )?;
+    tx.execute_batch("PRAGMA legacy_alter_table = OFF;")?;
+    tx.execute_batch(CREATE_TABLE)?;
+    tx.execute_batch(&format!(
+        "INSERT INTO node_quick_fixes ({COLUMNS}) SELECT {COLUMNS} FROM node_quick_fixes_v116;
+         DROP TABLE node_quick_fixes_v116;"
+    ))?;
+    tx.commit()?;
+    conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+    conn.execute_batch(&crate::journey_changes::quick_fixes_triggers_sql())?;
+    Ok(())
+}
 
 const COLUMNS: &str = "id, node_id, source, phase, check_name, check_key, command, output, fingerprint, \
     conversation_id, outcome, notes, turns, head, started_at, finished_at";
@@ -159,7 +200,7 @@ fn row(r: &Row<'_>) -> rusqlite::Result<QuickFix> {
 /// Records `fix`: inserts it, or updates the row of the same id (the session
 /// started, a turn ran, the outcome is known).
 pub fn upsert(conn: &Connection, fix: &QuickFix) -> Result<()> {
-    if ![SOURCE_CHECK, SOURCE_CI].contains(&fix.source.as_str()) {
+    if ![SOURCE_CHECK, SOURCE_CI, SOURCE_REVIEW].contains(&fix.source.as_str()) {
         bail!("unknown quick fix source {:?}", fix.source);
     }
     if ![OUTCOME_OPEN, OUTCOME_SUCCEEDED, OUTCOME_ESCALATED].contains(&fix.outcome.as_str()) {
@@ -337,6 +378,25 @@ mod tests {
         assert_eq!((stats[0].succeeded, stats[0].escalated, stats[0].finished()), (1, 2, 3));
         assert!((stats[0].failure_rate().unwrap() - 2.0 / 3.0).abs() < 1e-9);
         assert_eq!(stats[1].failure_rate(), Some(0.0));
+    }
+
+    /// A table made before v117 (no `review` source) is rebuilt with its rows
+    /// and takes review attempts afterwards.
+    #[test]
+    fn a_table_from_before_v117_is_widened_and_keeps_its_rows() {
+        let (conn, node) = setup();
+        let old = CREATE_TABLE.replace("'ci', 'review'", "'ci'");
+        conn.execute_batch("DROP TABLE node_quick_fixes;").unwrap();
+        conn.execute_batch(&old).unwrap();
+        upsert(&conn, &attempt(node, "lint")).unwrap();
+        let mut review = attempt(node, "x");
+        review.source = SOURCE_REVIEW.into();
+        assert!(upsert(&conn, &review).is_err(), "the old table refuses a review attempt");
+        migrate_review_source(&conn).unwrap();
+        migrate_review_source(&conn).unwrap();
+        assert_eq!(list_for_node(&conn, node).unwrap().len(), 1);
+        upsert(&conn, &review).unwrap();
+        assert_eq!(list_for_node(&conn, node).unwrap().len(), 2);
     }
 
     #[test]

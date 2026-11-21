@@ -854,6 +854,7 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         // (`crate::review::migrate_to_scored`). Synced (sync copies the
         // columns both sides have) and journaled, as before.
         crate::review::migrate_to_scored(conn)?;
+        crate::quick_fixes::migrate_review_source(conn)?;
         conn.pragma_update(None, "user_version", 117)?;
     }
     // Other branches (the task panel) numbered their own steps 66–67 at the
@@ -895,6 +896,7 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     crate::review::add_reviewer_columns(conn)?;
     // Idempotent, so a store that skipped 117 for a branch's 115 or 116 has it.
     crate::review::migrate_to_scored(conn)?;
+    crate::quick_fixes::migrate_review_source(conn)?;
     conn.execute_batch(crate::review::coverage::CREATE_TABLE)?;
     conn.execute_batch(&crate::journey_changes::review_coverage_triggers_sql())?;
     // A cloud supervisor's heartbeat for a node (`crate::cloud_activity`):

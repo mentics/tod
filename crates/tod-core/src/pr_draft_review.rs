@@ -810,7 +810,7 @@ fn marker(finding: &ReviewFinding) -> String {
 }
 
 fn comment_body(finding: &ReviewFinding, place: &Place) -> String {
-    let mut out = format!("**[{}]** {}", finding.severity, finding.summary.trim());
+    let mut out = format!("**[{}]** {}", finding.importance, finding.summary.trim());
     if let (Place::File { path }, Some(location)) = (place, finding.location()) {
         // Say where it is about when the thread could not sit on that line.
         let about = match finding.line {
@@ -819,7 +819,7 @@ fn comment_body(finding: &ReviewFinding, place: &Place) -> String {
             }
             _ => format!("`{location}`"),
         };
-        out = format!("**[{}]** ({about}) {}", finding.severity, finding.summary.trim());
+        out = format!("**[{}]** ({about}) {}", finding.importance, finding.summary.trim());
     }
     if let Some(cause) = root_cause(finding) {
         out.push_str(&format!("\n\nRoot cause: {cause}"));
@@ -840,7 +840,7 @@ fn text_item(finding: &ReviewFinding) -> String {
     let location = finding.location().map(|l| format!(" `{l}`")).unwrap_or_default();
     let mut out = format!(
         "- **[{}]**{location} {} (finding `{}`)",
-        finding.severity,
+        finding.importance,
         finding.summary.trim(),
         tod_store::interview::short_id(finding.id)
     );
@@ -971,7 +971,7 @@ pub fn answer_message(findings: &[ReviewFinding]) -> String {
         out.push_str(&format!(
             "- `{}` [{}]{} {}\n",
             finding.id,
-            finding.severity,
+            finding.importance,
             finding.location().map(|l| format!(" {l}")).unwrap_or_default(),
             finding.summary.trim()
         ));

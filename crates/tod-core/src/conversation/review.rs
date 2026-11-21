@@ -344,6 +344,7 @@ pub fn mock_turn(
                 summary: "Mock finding — the mock agent reads no code.".to_string(),
                 detail: Some("Recorded by `--agent mock` to exercise the review pane.".to_string()),
                 root_cause: Some("The mock agent reads no code.".to_string()),
+                rule: None,
             },
         })?;
         return Ok(String::new());

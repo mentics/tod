@@ -7,7 +7,7 @@ only in a reply is lost.
 ```
 tod-cli --data-root <DATA_ROOT> review list     [--node <NODE_UUID>] [--open]
 tod-cli --data-root <DATA_ROOT> review show     <FINDING_ID>
-tod-cli --data-root <DATA_ROOT> review add      [--node <NODE_UUID>] --severity high|medium|low --summary <TEXT> [--file <PATH>] [--line <N>] [--detail <TEXT>] [--root-cause <TEXT>]
+tod-cli --data-root <DATA_ROOT> review add      [--node <NODE_UUID>] --importance blocker|major|minor|nit --impact high|medium|low --complexity mechanical|simple|involved --summary <TEXT> [--file <PATH>] [--line <N>] [--detail <TEXT>] [--root-cause <TEXT>] [--rule <TEXT>]
 tod-cli --data-root <DATA_ROOT> review respond  <FINDING_ID> --status open|fixed|out_of_scope|declined|rejected [--response <TEXT>]
 tod-cli --data-root <DATA_ROOT> review coverage --lens <LENS> --checked <TEXT> --result none|finding:<FINDING_ID> [--result finding:<FINDING_ID>]... [--file <PATH>]... [--read <PATH>]...
 tod-cli --data-root <DATA_ROOT> review coverage --lens <LENS> --result n/a --reason <TEXT> [--file <PATH>]...
@@ -22,9 +22,23 @@ findings nobody has responded to.
 
 `add` records one open finding:
 
-- `--severity`: `high` (wrong behavior, data loss, a security hole, a broken
-  build), `medium` (a real defect in a narrower case, or a maintenance hazard
-  that will cause one), `low` (worth fixing, harmless as it stands).
+- `--importance`, `--impact` and `--complexity` are all required: tod routes
+  and blocks on them.
+  - `--importance`: `blocker` (wrong behavior, data loss, a security hole, a
+    broken build, an obligation not met), `major` (a real defect in a narrower
+    case, or a hazard that will cause one: fix before merge), `minor` (worth
+    fixing, fine to leave), `nit` (style, wording or taste). A project rule
+    broken without harm is at most `minor`; a matter of taste is a `nit`.
+  - `--impact`: `high`, `medium` or `low`: how much harm leaving it does, by
+    its reach into users, data, production and other code.
+  - `--complexity`: what the fix takes. `mechanical` (a tool or a one-line
+    rule: formatting, length, a rename, a stale comment), `simple` (a local
+    edit with no design), `involved` (design, several files, or tests).
+- `--rule`: for a `mechanical` finding that breaks a written rule, the rule
+  in the same words every time ("docstrings are at most three lines"). tod
+  matches findings on it: three of one rule, across tasks, suggest a check
+  that catches it before any reviewer sees it. Leave it out when the finding
+  is not about a rule.
 - `--summary`: the defect in one sentence — the claim, not the fix.
 - `--detail`: the concrete inputs or state that go wrong, and what happens;
   add the fix you would make if it is not obvious. Use `--detail -` and a
@@ -40,7 +54,9 @@ findings nobody has responded to.
 commit), `out_of_scope` (real, but not this node's), `declined` (not
 critical, beyond the requirements, or not worth the cost), or `rejected` (not
 a problem after all — the response says why, for the user to read). Every
-status but `open` needs `--response`; `open` clears it. Inside a fix or pull
+status but `open` needs `--response`; `open` clears it. (`left` is tod's own
+answer, for a finding it sets aside under the scoring rules; you cannot give
+it.) Inside a fix or pull
 request conversation only `fixed` and `rejected` are accepted: the others are
 the user's answers.
 

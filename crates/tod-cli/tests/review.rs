@@ -73,7 +73,7 @@ fn a_finding_carries_its_root_cause() {
             node,
             Some(review),
             &[
-                "review", "add", "--severity", "high", "--summary", "Picks an arbitrary org id",
+                "review", "add", "--importance", "blocker", "--impact", "high", "--complexity", "involved", "--summary", "Picks an arbitrary org id",
                 "--root-cause", "The org's supplier id is treated as unique",
             ],
         )
@@ -97,7 +97,7 @@ fn done_is_refused_until_the_coverage_is_complete() {
     assert!(err.contains("an entry for 11 of the 11 lenses"), "{err}");
     assert!(err.contains("a saturation pass"), "{err}");
 
-    let finding = short(&run(&["review", "add", "--severity", "medium", "--summary", "No ORDER BY"]).unwrap());
+    let finding = short(&run(&["review", "add", "--importance", "major", "--impact", "medium", "--complexity", "simple", "--summary", "No ORDER BY"]).unwrap());
     let ack = run(&[
         "review", "coverage", "--lens", "data-assumptions", "--file", "digikey.py", "--checked",
         "org id lookup: queried prod, 113 orgs with more than one id", "--result",

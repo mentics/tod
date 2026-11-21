@@ -287,6 +287,24 @@ pub enum InterviewCommand {
         #[serde(default)]
         response: Option<String>,
     },
+    /// Mark a finding fixed by a quick fix whose small review was clean
+    /// (`ReviewRepo::settle_by_quick_fix`).
+    SettleReviewFinding {
+        finding_id: Uuid,
+        quick_fix: Uuid,
+        response: String,
+    },
+    /// Change a finding's scores (the user's edit in the findings panel);
+    /// a `None` score stays as it is (`ReviewRepo::rescore`).
+    RescoreReviewFinding {
+        finding_id: Uuid,
+        #[serde(default)]
+        importance: Option<String>,
+        #[serde(default)]
+        impact: Option<String>,
+        #[serde(default)]
+        complexity: Option<String>,
+    },
     /// Record verification's verdict on one obligation, as it holds for
     /// `node_id` (`crate::verification`).
     RecordObligationVerdict {
@@ -839,6 +857,28 @@ pub fn execute(
             response,
         } => {
             crate::review::ReviewRepo::new(conn).respond(*finding_id, status, response.as_deref())?;
+            Ok(json!({}))
+        }
+        InterviewCommand::SettleReviewFinding {
+            finding_id,
+            quick_fix,
+            response,
+        } => {
+            crate::review::ReviewRepo::new(conn).settle_by_quick_fix(*finding_id, *quick_fix, response)?;
+            Ok(json!({}))
+        }
+        InterviewCommand::RescoreReviewFinding {
+            finding_id,
+            importance,
+            impact,
+            complexity,
+        } => {
+            crate::review::ReviewRepo::new(conn).rescore(
+                *finding_id,
+                importance.as_deref(),
+                impact.as_deref(),
+                complexity.as_deref(),
+            )?;
             Ok(json!({}))
         }
         InterviewCommand::RecordObligationVerdict {

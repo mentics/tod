@@ -30,7 +30,7 @@ Inside a review or fix conversation --node defaults to the node under review.
 COMMANDS:
     list      [--node <UUID>] [--open]
     show      <ID>
-    add       [--node <UUID>] --severity high|medium|low --summary <TEXT> [--file <PATH>] [--line <N>] [--detail <TEXT>] [--root-cause <TEXT>]
+    add       [--node <UUID>] --importance blocker|major|minor|nit --impact high|medium|low --complexity mechanical|simple|involved --summary <TEXT> [--file <PATH>] [--line <N>] [--detail <TEXT>] [--root-cause <TEXT>] [--rule <TEXT>]
     respond   <ID> --status open|fixed|out_of_scope|declined|rejected [--response <TEXT>]
     coverage  --lens <LENS> | --pass saturation  --checked <TEXT> --result none|n/a|finding:<ID> [--reason <TEXT>] [--file <PATH>]... [--read <PATH>]...
     done
@@ -39,7 +39,10 @@ COMMANDS:
 the inputs or state that go wrong and how (use `--detail -` and a heredoc for
 anything long), --file a repo-relative path and --line its 1-based line,
 --root-cause the assumption or pattern that made it possible, in the same words
-for every finding that shares it.
+for every finding that shares it. The three scores are required: --importance
+(how much it matters), --impact (how much harm leaving it does) and
+--complexity (what the fix takes). A mechanical finding that breaks a written
+rule names it with --rule, in the same words every time.
 `respond` answers one: fixed (the response points at the change), out_of_scope,
 declined (not critical, beyond the requirements, or not worth the cost), or
 rejected (not a problem after all; the response says why).
@@ -103,7 +106,10 @@ fn finding_json(f: &ReviewFinding) -> serde_json::Value {
         "id": f.id.to_string(),
         "node_id": f.node_id.to_string(),
         "seq": f.seq,
-        "severity": f.severity,
+        "importance": f.importance,
+        "impact": f.impact,
+        "complexity": f.complexity,
+        "rule": f.rule,
         "file": f.file,
         "line": f.line,
         "summary": f.summary,
@@ -130,10 +136,12 @@ fn finding_line(f: &ReviewFinding) -> String {
         None => String::new(),
     };
     format!(
-        "[{}] {} {}{location}: {}{root_cause}{reviewer}{response}",
+        "[{}] {} {}/{}/{}{location}: {}{root_cause}{reviewer}{response}",
         short_id(f.id),
         f.status,
-        f.severity,
+        f.importance,
+        f.impact,
+        f.complexity,
         f.summary
     )
 }
@@ -197,7 +205,10 @@ fn add(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
         })
         .transpose()?;
     let finding = NewFinding {
-        severity: args.require("--severity")?.to_string(),
+        importance: args.require("--importance")?.to_string(),
+        impact: args.require("--impact")?.to_string(),
+        complexity: args.require("--complexity")?.to_string(),
+        rule: args.get("--rule").map(str::to_string),
         file: args.get("--file").map(str::to_string),
         line,
         summary: args.require("--summary")?.to_string(),
@@ -227,6 +238,11 @@ fn respond(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
         .get("--response")
         .map(str::trim)
         .filter(|r| !r.is_empty());
+    anyhow::ensure!(
+        status != tod_store::review::FINDING_LEFT,
+        "`left` is tod's own answer (a finding it sets aside under the scoring rules): give fixed, \
+         out_of_scope, declined, rejected or open"
+    );
     anyhow::ensure!(
         status == FINDING_OPEN || response.is_some(),
         "--status {status} needs --response: the fix, or why not"
