@@ -238,6 +238,7 @@ impl FakeAgent {
                                 },
                                 detail: None,
                                 root_cause: self.review_root_cause.clone(),
+                                rule: None,
                             },
                         })?;
                     }
@@ -333,6 +334,7 @@ impl FakeAgent {
                             summary: "The small review found a defect.".into(),
                             detail: None,
                             root_cause: None,
+                            rule: None,
                         },
                     })?;
                     return Ok(String::new());
@@ -3267,6 +3269,7 @@ fn pr_draft_with_review_steps_reviews_the_clean_head_once() {
                     summary: "From the review before the pull request.".into(),
                     detail: None,
                     root_cause: None,
+                    rule: None,
                 },
             },
         )
@@ -3316,6 +3319,7 @@ fn seed_review_phase_round(fx: &Fixture, repo_heads: serde_json::Value, finding:
                 summary: "Still standing.".into(),
                 detail: None,
                 root_cause: None,
+                rule: None,
             },
         });
     }
@@ -4203,6 +4207,7 @@ fn a_merge_of_the_base_alone_is_pushed_without_a_review() {
                     summary: "From the review before the pull request.".into(),
                     detail: None,
                     root_cause: None,
+                    rule: None,
                 },
             },
         )
@@ -4341,6 +4346,7 @@ fn a_finding_before_the_pull_request(fx: &Fixture) {
                     summary: "From the review before the pull request.".into(),
                     detail: None,
                     root_cause: None,
+                    rule: None,
                 },
             },
         )
@@ -4491,6 +4497,7 @@ fn seed_unclean_review_saying(fx: &Fixture, summary: &str) {
             summary: summary.into(),
             detail: None,
             root_cause: None,
+            rule: None,
         },
     });
     conversation(InterviewCommand::RecordConversationReport {
@@ -5173,6 +5180,7 @@ fn bot_node_in_draft(feed: Arc<BotFeed>, bot_yaml: &str) -> (Fixture, FakeAgent)
                     summary: "From the review before the pull request.".into(),
                     detail: None,
                     root_cause: None,
+                    rule: None,
                 },
             },
         )

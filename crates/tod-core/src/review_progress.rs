@@ -17,7 +17,7 @@ use rusqlite::Connection;
 use std::collections::BTreeSet;
 use tod_store::conversation::{Conversation, ConversationRepo, Focus, ProtocolKind};
 use tod_store::phase::PhaseRepo;
-use tod_store::review::{FINDING_DECLINED, FINDING_OUT_OF_SCOPE, ReviewFinding, ReviewRepo};
+use tod_store::review::{ReviewFinding, ReviewRepo};
 use uuid::Uuid;
 
 /// The most rounds a review gets while it keeps finding only new problems, as
@@ -117,7 +117,7 @@ pub fn finding_rounds(conn: &Connection, node: Uuid, since_ms: i64, on_pr: bool)
             round
                 .findings
                 .iter()
-                .filter(|f| !matches!(f.status.as_str(), FINDING_OUT_OF_SCOPE | FINDING_DECLINED))
+                .filter(|f| f.stands())
                 .map(|f| key(f.file.as_deref(), &f.summary))
                 .collect()
         })

@@ -1819,6 +1819,7 @@ fn a_fix_loops_until_no_finding_is_open() {
                         summary: summary.into(),
                         detail: Some("Reproduce with an empty string.".into()),
                         root_cause: None,
+                        rule: None,
                     },
                 },
             )

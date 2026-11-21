@@ -981,7 +981,7 @@ impl Autopilot {
                             .list_for_node(node)?
                             .iter()
                             .filter(|f| f.conversation_id.is_some_and(|c| members.contains(&c)))
-                            .filter(|f| !matches!(f.status.as_str(), "out_of_scope" | "declined"))
+                            .filter(|f| f.stands())
                             .map(|f| format!("[{}] {} ({})", tod_store::interview::short_id(f.id), f.summary, f.status))
                             .collect::<Vec<_>>())
                     })?;

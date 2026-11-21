@@ -335,6 +335,7 @@ mod tests {
                                 summary: format!("Finding {i}"),
                                 detail: Some("Empty input panics.".into()),
                                 root_cause: None,
+                                rule: None,
                             },
                         },
                     )

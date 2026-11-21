@@ -41,7 +41,7 @@ use tod_store::conversation::{Conversation, ConversationRepo, Focus, ProtocolKin
 use tod_store::fleet::{FleetStore, Workdir};
 use tod_store::interview::InterviewCommand;
 use tod_store::phase::PhaseRepo;
-use tod_store::review::{FINDING_DECLINED, FINDING_OUT_OF_SCOPE, ReviewFinding, ReviewRepo};
+use tod_store::review::{FINDING_DECLINED, ReviewFinding, ReviewRepo};
 use uuid::Uuid;
 
 /// The lifecycle state this review runs in.
@@ -150,7 +150,7 @@ pub fn unconverged_rounds_since(conn: &Connection, node: Uuid, since_ms: Option<
         let stands = findings
             .iter()
             .filter(|f| f.created_at >= review.created_at && f.created_at < next_start)
-            .any(|f| !matches!(f.status.as_str(), FINDING_OUT_OF_SCOPE | FINDING_DECLINED));
+            .any(|f| f.stands());
         next_start = review.created_at;
         // A review the agent never finished (killed, crashed) is not a round.
         if !done {
@@ -172,7 +172,7 @@ pub fn stay_standing(conn: &Connection, node: Uuid) -> Result<Vec<String>> {
     Ok(own_findings(conn, node)?
         .iter()
         .filter(|f| latest.as_ref().is_some_and(|l| f.created_at >= l.created_at))
-        .filter(|f| !matches!(f.status.as_str(), FINDING_OUT_OF_SCOPE | FINDING_DECLINED))
+        .filter(|f| f.stands())
         .map(|f| format!("[{}] {} ({})", tod_store::interview::short_id(f.id), f.summary, f.status))
         .collect())
 }
@@ -329,7 +329,7 @@ fn round_clean(findings: &[ReviewFinding], latest: &Conversation) -> bool {
     findings
         .iter()
         .filter(|f| f.created_at >= latest.created_at)
-        .all(|f| matches!(f.status.as_str(), FINDING_OUT_OF_SCOPE | FINDING_DECLINED))
+        .all(|f| !f.stands())
 }
 
 /// What tod's own review owes the pull request now that nothing else is left
@@ -613,7 +613,7 @@ pub fn change_standing(conn: &Connection, node: Uuid, since_ms: i64) -> Result<V
     Ok(own_findings(conn, node)?
         .iter()
         .filter(|f| f.created_at >= latest.created_at)
-        .filter(|f| !matches!(f.status.as_str(), FINDING_OUT_OF_SCOPE | FINDING_DECLINED))
+        .filter(|f| f.stands())
         .map(|f| format!("[{}] {} ({})", tod_store::interview::short_id(f.id), f.summary, f.status))
         .collect())
 }
@@ -1128,6 +1128,8 @@ mod tests {
             pr_posted_at: None,
             root_cause: None,
             reviewer: None,
+            rule: None,
+            quick_fix: None,
         }
     }
 

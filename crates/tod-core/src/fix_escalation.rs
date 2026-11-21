@@ -32,7 +32,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use tod_store::decisions::EvidenceRef;
 use tod_store::fleet::FleetStore;
 use tod_store::interview::{InterviewCommand, short_id};
-use tod_store::review::{FINDING_DECLINED, FINDING_FIXED, FINDING_OUT_OF_SCOPE, FINDING_REJECTED, ReviewFinding};
+use tod_store::review::{FINDING_FIXED, FINDING_REJECTED, ReviewFinding};
 use uuid::Uuid;
 
 /// Rounds of one stay that recorded findings with the same root cause before
@@ -62,7 +62,7 @@ pub struct Escalation {
 }
 
 fn stands(finding: &ReviewFinding) -> bool {
-    !matches!(finding.status.as_str(), FINDING_OUT_OF_SCOPE | FINDING_DECLINED)
+    finding.stands()
 }
 
 fn closed(finding: &ReviewFinding) -> bool {
@@ -231,6 +231,8 @@ mod tests {
             pr_posted_at: None,
             root_cause: root_cause.map(str::to_string),
             reviewer: None,
+            rule: None,
+            quick_fix: None,
         }
     }
 

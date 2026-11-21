@@ -24,7 +24,7 @@ use tod_store::fleet::provision::resolve_launch_cwd;
 use tod_store::outline::EXTRA_CONTENT_DETAILS;
 use tod_store::outline::repos::NodeRepo;
 use tod_store::review::{
-    CoveragePass, CoverageResult, FINDING_DECLINED, FINDING_OUT_OF_SCOPE, NewCoverage, NewFinding,
+    CoveragePass, CoverageResult, NewCoverage, NewFinding,
     ReviewRepo, Reviewer,
 };
 use uuid::Uuid;
@@ -72,7 +72,7 @@ pub fn review_passed(conn: &Connection, node_id: Uuid) -> Result<bool> {
         .list_for_node(node_id)?
         .iter()
         .filter(|f| f.conversation_id.is_some_and(|c| round.contains(&c)))
-        .all(|f| matches!(f.status.as_str(), FINDING_OUT_OF_SCOPE | FINDING_DECLINED)))
+        .all(|f| !f.stands()))
 }
 
 pub struct ReviewProtocol;

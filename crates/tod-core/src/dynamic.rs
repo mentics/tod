@@ -836,6 +836,8 @@ mod tests {
             pr_posted_at: None,
             root_cause: root_cause.map(str::to_string),
             reviewer: None,
+            rule: None,
+            quick_fix: None,
         }
     }
 

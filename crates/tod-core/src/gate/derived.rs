@@ -1577,6 +1577,7 @@ mod tests {
                     summary: "Unchecked unwrap".into(),
                     detail: None,
                     root_cause: None,
+                    rule: None,
                 },
             )
             .unwrap();
