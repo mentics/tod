@@ -166,6 +166,20 @@ new gotcha to this file and `doc/live-verification.md` and merge them.
   workspace without emptying its `pr` skills (it opens a PR on Cofactr/workspace);
   the Lessons dialog's `D` needs the cursor off the section header.
 
+## Gotchas from the third pass (build-test golden)
+
+- **The 401 in a built golden (found 2026-11-21).** Blaxel's `GET` of a sandbox
+  never returns a proxy's secret values, and `PUT` replaces the whole spec, so
+  `Blaxel::set_labels` (a read-modify-write of the record) blanked the GitHub token
+  the golden was made with: the proxy no longer injected it and every request,
+  `{{SECRET:github}}` included, got 401. Fixed: a golden built from an image
+  labels itself with `update_proxy` (the proxy with its secrets, sent again).
+  Any new `set_labels` on a sandbox whose proxy holds secrets has the same
+  trap. The baked image `sandbox/tod-lv-base:latest` can disappear from Blaxel
+  (`IMAGE_NOT_FOUND`): bake it again (46 s). Build recipe: back up
+  `sandboxes.toml`, set `default_image = "sandbox/tod-lv-base:latest"`, run
+  `tod-sandbox golden refresh joel-cofactr/build-test`, set `default_image` back.
+
 ## Gotchas from the second requests pass (local scratch repo)
 
 - A local Files location without Treehouse needs `worktree_backend: git_only` in the root's `tod.yml` (`treehouse_required` fails the launch).

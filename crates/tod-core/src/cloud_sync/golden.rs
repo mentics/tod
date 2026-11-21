@@ -738,7 +738,7 @@ fn build_golden(
     let proxy = if rules.is_empty() { placeholder_proxy() } else { node::proxy_spec(&rules) };
     let image = sandboxes.runtime_image("", false, progress)?;
     progress(&format!("creating {name} from {image}…"));
-    let body = golden::build_body(&name, &image, &account.region, account.memory_mb, proxy);
+    let body = golden::build_body(&name, &image, &account.region, account.memory_mb, proxy.clone());
     if let Err(err) = bx.create_from_body(&body) {
         // The call may have made the sandbox before it failed.
         let err = err.context(format!("create {name} from {image}"));
@@ -759,7 +759,7 @@ fn build_golden(
         sandboxes.config.upsert(tod_sandbox::config::Sandbox { name: name.clone(), image: info.image, url: Some(url.clone()), agents: true });
         sandboxes.save()?;
         step!("wake it", bx.wait_reachable(&url, tod_sandbox::blaxel::WAKE_CEILING).with_context(|| format!("wake {name}")))?;
-        label_golden(bx, &name, repo, mine, &policy, &say, None)?;
+        label_golden(bx, &name, repo, mine, &policy, &say, None, Some(&proxy))?;
         // A node's fork is redeployed from this sandbox's image by its proxy
         // update, which wipes whatever is installed here afterwards. So the
         // packages tod needs must be in the image itself; installing them
@@ -831,6 +831,11 @@ fn label_golden(
     // `Some(original)` for a fork of the workspace's golden; `None` for one
     // built from an image, which is itself an original.
     from: Option<&str>,
+    // The proxy the sandbox was made with, secrets and all, for one built
+    // from an image. Blaxel's `GET` never returns a proxy's secret values, so
+    // a label update that puts the record back would blank them (the clone
+    // then got 401 for every request); `Some` sends them again with the labels.
+    proxy: Option<&serde_json::Value>,
 ) -> Result<()> {
     let stamp_labels = mine.labels();
     let mut labels: Vec<(&str, &str)> = stamp_labels.iter().map(|(k, v)| (*k, v.as_str())).collect();
@@ -845,7 +850,10 @@ fn label_golden(
         labels.push((golden::LABEL_FROM, from));
     }
     labels.push((golden::LABEL_READY, "true"));
-    golden::retry_step(name, "label it", policy, &mut std::thread::sleep, &mut |m| say(m), || bx.set_labels(name, &labels))
+    golden::retry_step(name, "label it", policy, &mut std::thread::sleep, &mut |m| say(m), || match proxy {
+        Some(proxy) => bx.update_proxy(name, proxy, &labels),
+        None => bx.set_labels(name, &labels),
+    })
 }
 
 /// Checks Blaxel says the golden is `ready` (see [`label_golden`]).
@@ -1022,7 +1030,7 @@ fn refresh_attempt(
         let info = step!("wait until deployed", bx.wait_deployed(&name, Duration::from_secs(300)))?;
         let url = info.url.ok_or_else(|| anyhow!("sandbox {name} has no URL"))?;
         step!("wake it", bx.wait_reachable(&url, tod_sandbox::blaxel::WAKE_CEILING).with_context(|| format!("wake {name}")))?;
-        label_golden(bx, &name, repo, mine, &policy, &say, Some(origin))?;
+        label_golden(bx, &name, repo, mine, &policy, &say, Some(origin), None)?;
         step!("check what a fork needs", tod_sandbox::provision::require_fork_prerequisites(bx, &url, true, &mut |m| say(m)))?;
         let payload = tod_sandbox::node::NodePayload {
             relay: &files.relay,
@@ -1404,6 +1412,35 @@ mod tests {
         let record = serde_json::json!({ "spec": { "network": { "proxy": placeholder_proxy() } } });
         assert!(has_proxy_routes(&record));
         assert!(!has_proxy_routes(&serde_json::json!({ "spec": { "network": {} } })));
+    }
+
+    /// Live (2026-11-21): a golden built from an image had every GitHub request
+    /// refused with 401, so the clone failed. Blaxel's `GET` never returns a
+    /// proxy's secret values, and labelling the new sandbox put its record
+    /// back, blanking them. The labels must go with the proxy and its secrets.
+    #[test]
+    fn labelling_a_built_golden_sends_the_proxy_secrets_again() {
+        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = sent.clone();
+        let bx = tod_sandbox::fake::blaxel_with_body(move |method, _path, body| match method {
+            "GET" => (
+                200,
+                r#"{"metadata":{"name":"g","labels":{}},"status":"DEPLOYED","spec":{"runtime":{"image":"i"},"network":{"proxy":{"routing":[{"destinations":["github.com"],"headers":{"Authorization":"Basic {{SECRET:github_basic}}"}}]}}}}"#.to_string(),
+            ),
+            _ => {
+                seen.lock().unwrap().push(body.to_string());
+                (200, "{}".to_string())
+            }
+        });
+        let creds = tod_sandbox::node::NodeCredentials { github_token: Some("ghp_secret_value".into()), ..Default::default() };
+        let rules = tod_sandbox::node::credential_rules(&creds, Default::default());
+        let proxy = tod_sandbox::node::proxy_spec(&rules);
+        let mine = GoldenStamp { install: "mine".into(), schema: 93, wire: 1, built: 100, on_main: None };
+        label_golden(&bx, "g", "acme/widget", &mine, &golden::StepRetry::default(), &|_| {}, None, Some(&proxy)).unwrap();
+        let bodies = sent.lock().unwrap();
+        assert_eq!(bodies.len(), 1, "{bodies:?}");
+        assert!(bodies[0].contains("ghp_secret_value"), "the proxy's secrets went back with the labels: {}", bodies[0]);
+        assert!(bodies[0].contains("tod-kind"), "{}", bodies[0]);
     }
 
     fn info_with(stamp: Option<&GoldenStamp>) -> tod_sandbox::blaxel::SandboxInfo {

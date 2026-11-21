@@ -15,11 +15,21 @@ pub const NOT_FOUND_BODY: &str = r#"{"error":{"code":"NOT_FOUND","message":"sand
 /// after `/v0`, e.g. `/sandboxes/name`) as `(status, body)`, with a fast
 /// retry policy.
 pub fn blaxel(handler: impl Fn(&str, &str) -> (u16, String) + Send + Sync + 'static) -> Blaxel {
+    blaxel_with_body(move |method, path, _| handler(method, path))
+}
+
+/// [`blaxel`], with the request's body (text; empty without one) as the
+/// handler's third argument, for tests of what a call sends.
+pub fn blaxel_with_body(handler: impl Fn(&str, &str, &str) -> (u16, String) + Send + Sync + 'static) -> Blaxel {
     let config = ureq::Agent::config_builder()
         .http_status_as_error(false)
         .middleware(move |req: ureq::http::Request<ureq::SendBody>, _next: ureq::middleware::MiddlewareNext| {
+            use std::io::Read;
             let path = req.uri().path().trim_start_matches("/v0").to_string();
-            let (status, body) = handler(req.method().as_str(), &path);
+            let method = req.method().as_str().to_string();
+            let mut sent = String::new();
+            req.into_body().into_reader().read_to_string(&mut sent).ok();
+            let (status, body) = handler(&method, &path, &sent);
             Ok(ureq::http::Response::builder()
                 .status(status)
                 .body(ureq::Body::builder().data(body))

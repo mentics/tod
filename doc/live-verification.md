@@ -249,6 +249,17 @@ the app made; macOS `tar` adds `._` files that break a git checkout (use
   lifecycle config with empty `pr`, `pr_draft` and `pr_review` skills
   (`tod-cli capabilities set <node> lifecycle-config --phase pr --skills ''`)
   before it can get there.
+- **The 401 in a built golden (found 2026-11-21).** Blaxel's `GET` of a sandbox
+  never returns a proxy's secret values, and `PUT` replaces the whole spec, so
+  `Blaxel::set_labels` (a read-modify-write of the record) blanked the GitHub token
+  the golden was made with: the proxy no longer injected it and every request,
+  `{{SECRET:github}}` included, got 401. Fixed: a golden built from an image
+  labels itself with `update_proxy` (the proxy with its secrets, sent again).
+  Any new `set_labels` on a sandbox whose proxy holds secrets has the same
+  trap. The baked image `sandbox/tod-lv-base:latest` can disappear from Blaxel
+  (`IMAGE_NOT_FOUND`): bake it again (46 s). Build recipe: back up
+  `sandboxes.toml`, set `default_image = "sandbox/tod-lv-base:latest"`, run
+  `tod-sandbox golden refresh joel-cofactr/build-test`, set `default_image` back.
 - Pre-existing-failure waivers and CI reruns are PR CI features; a failing local
   check goes to the quick fix, never to a waiver.
 - The Lessons dialog's `D` acts on the row under the cursor: it starts on the
