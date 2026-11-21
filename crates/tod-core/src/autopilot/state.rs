@@ -230,6 +230,12 @@ pub struct LoopCounters {
     /// (`doc/requests/design.md` section 5).
     #[serde(default)]
     pub quick_fix_tried: Vec<String>,
+    /// The untracked files the checkout held when the review round in
+    /// progress started (`crate::review_leftovers`): what it holds beyond
+    /// them when the round is done is what the round left. `None` outside a
+    /// round, and for a round an older run started.
+    #[serde(default)]
+    pub review_untracked_before: Option<Vec<String>>,
     /// Times the app reopened the node's implementation because its code was
     /// lost ([`crate::lost_work`]); once is the repair, again means the rebuilt
     /// work is gone too and the run stops for the user.

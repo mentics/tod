@@ -166,6 +166,30 @@ new gotcha to this file and `doc/live-verification.md` and merge them.
   workspace without emptying its `pr` skills (it opens a PR on Cofactr/workspace);
   the Lessons dialog's `D` needs the cursor off the section header.
 
+## Gotchas from the third pass (build-test golden)
+
+- **The 401 in a built golden (found 2026-11-21).** Blaxel's `GET` of a sandbox
+  never returns a proxy's secret values, and `PUT` replaces the whole spec, so
+  `Blaxel::set_labels` (a read-modify-write of the record) blanked the GitHub token
+  the golden was made with: the proxy no longer injected it and every request,
+  `{{SECRET:github}}` included, got 401. Fixed: a golden built from an image
+  labels itself with `update_proxy` (the proxy with its secrets, sent again).
+  Any new `set_labels` on a sandbox whose proxy holds secrets has the same
+  trap. The baked image `sandbox/tod-lv-base:latest` can disappear from Blaxel
+  (`IMAGE_NOT_FOUND`): bake it again (46 s). Build recipe: back up
+  `sandboxes.toml`, set `default_image = "sandbox/tod-lv-base:latest"`, run
+  `tod-sandbox golden refresh joel-cofactr/build-test`, set `default_image` back.
+
+- **A golden refresh's fork failed "lacks node>=20.10" (found 2026-11-21).** The
+  golden built from an image has a proxy; its fork inherits the platform's
+  `HTTPS_PROXY` as an unrendered `{{file(...)}}` template once it is labelled, and
+  Node 22 then dies with `ERR_PROXY_INVALID_CONFIG` before running anything, so
+  the requirements check read the sandbox as lacking Node. The check now starts
+  Node without the proxy variables (`provision::NODE_OK_SH`). Starting the app
+  refreshes the golden whenever its build is newer than the golden's stamp, so
+  after the last commit: build, refresh the golden with the built `tod-sandbox`,
+  then launch (a commit after the refresh makes the daemon refresh it again).
+
 ## Gotchas from the second requests pass (local scratch repo)
 
 - A local Files location without Treehouse needs `worktree_backend: git_only` in the root's `tod.yml` (`treehouse_required` fails the launch).
@@ -177,3 +201,22 @@ new gotcha to this file and `doc/live-verification.md` and merge them.
 - Checks YAML is imported through the Settings panel.
 - `grep -r` over a worktree matches `.pyc` files; exclude them.
 - Foreground `sleep` over 90s is backgrounded; poll in loops under about 180s.
+
+### Gotchas from the third pass (build-test pull-request half)
+
+- A scenario's own obligations can make a CI failure unfixable: a requirement
+  that mandates the failing text makes triage escalate (correctly) and the node
+  stops with a request. Quick fixes need a failure the obligations allow the
+  agent to fix (here a check wanting a blank line before the README's last line).
+- A requirements-phase obligation cannot be edited from `pr_draft`
+  (`tod-cli obligations update` refuses); change the scenario at the base
+  (`lv-base`) instead, and close and reopen the PR to make `pull_request`
+  workflows run against the new base.
+- A node that stops on a request, or waits on others, has its sandbox deleted
+  by the daemon within minutes (idle retire); answering a request makes a new
+  one and resumes. A cancelled job produced while the node waits was NOT woken
+  by the webhook within 5 minutes in the verify root, so the infra rerun cannot
+  be induced by cancelling a run while the node is parked; cancel while the
+  supervisor is running, or Pause and Resume the node after.
+- `pr_pushes` rows written by a supervisor just before its sandbox is retired
+  may not be synced; read them after the node has been awake a while.

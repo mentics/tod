@@ -7,7 +7,7 @@ only in a reply is lost.
 ```
 tod-cli --data-root <DATA_ROOT> review list     [--node <NODE_UUID>] [--open]
 tod-cli --data-root <DATA_ROOT> review show     <FINDING_ID>
-tod-cli --data-root <DATA_ROOT> review add      [--node <NODE_UUID>] --importance blocker|major|minor|nit --impact high|medium|low --complexity mechanical|simple|involved --summary <TEXT> [--file <PATH>] [--line <N>] [--detail <TEXT>] [--root-cause <TEXT>] [--rule <TEXT>]
+tod-cli --data-root <DATA_ROOT> review add      [--node <NODE_UUID>] --importance blocker|major|minor|nit --impact high|medium|low --complexity mechanical|simple|involved --summary <TEXT> [--file <PATH>] [--line <N>] [--detail <TEXT>] [--root-cause <TEXT> | --same-cause-as <FINDING_ID>] [--rule <TEXT>]
 tod-cli --data-root <DATA_ROOT> review respond  <FINDING_ID> --status open|fixed|out_of_scope|declined|rejected [--response <TEXT>]
 tod-cli --data-root <DATA_ROOT> review coverage --lens <LENS> --checked <TEXT> --result none|finding:<FINDING_ID> [--result finding:<FINDING_ID>]... [--file <PATH>]... [--read <PATH>]...
 tod-cli --data-root <DATA_ROOT> review coverage --lens <LENS> --result n/a --reason <TEXT> [--file <PATH>]...
@@ -49,6 +49,11 @@ findings nobody has responded to.
   ("the org's supplier id is treated as unique"). Give every finding that
   shares a cause the same words: the fixer is shown them together, as one
   class to fix. `list` and `show` print it under the finding.
+  `--same-cause-as <FINDING_ID>` instead takes the cause of a finding already
+  recorded, word for word: use it whenever the cause is one the task has
+  already met, found by you, the other reviewer, or an earlier round. A cause
+  worded close to an earlier one is filed under the earlier wording anyway,
+  and the reply to `add` names the findings that already carry it.
 
 `respond` answers a finding: `fixed` (the response points at the change or
 commit), `out_of_scope` (real, but not this node's), `declined` (not

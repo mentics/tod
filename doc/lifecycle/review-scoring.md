@@ -27,7 +27,10 @@ is rebuilt the same way to accept the new source `review`.
 `review.minor_rounds` in `tod.yml` (default 2):
 
 - `blocker` and `major` always block;
-- `minor` blocks in the first `minor_rounds` rounds of a stay (0: never);
+- `minor` blocks in the first `minor_rounds` rounds of a stay (0: never), and
+  only when a blocker or a major stands in the same round
+  (`review_scoring::blocks_in`): minors and nits alone never keep a round
+  going;
 - `nit` never blocks.
 
 Every reader (`review_passed`, the `own-review` criterion, the round limit,
@@ -49,6 +52,8 @@ When a review round is done (both reviewers recorded done),
 | `nit`, `mechanical` | the quick fix session (fixed only because it is cheap) |
 | `nit`, anything else | `left` at once, reason "nit" |
 | `minor` after the blocking rounds | `left`, reason "minor after round N" |
+| `minor`, `mechanical` or `simple`, in a round with no blocker or major | the quick fix session |
+| `minor`, `involved`, in a round with no blocker or major | `left`, reason "minor, and the round found no blocker or major" |
 
 `left` is a status with tod's reason as its response; it is noted on the node's
 Activity (one note per round). The user can reopen a left finding in the

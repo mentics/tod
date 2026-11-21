@@ -30,7 +30,7 @@ Inside a review or fix conversation --node defaults to the node under review.
 COMMANDS:
     list      [--node <UUID>] [--open]
     show      <ID>
-    add       [--node <UUID>] --importance blocker|major|minor|nit --impact high|medium|low --complexity mechanical|simple|involved --summary <TEXT> [--file <PATH>] [--line <N>] [--detail <TEXT>] [--root-cause <TEXT>] [--rule <TEXT>]
+    add       [--node <UUID>] --importance blocker|major|minor|nit --impact high|medium|low --complexity mechanical|simple|involved --summary <TEXT> [--file <PATH>] [--line <N>] [--detail <TEXT>] [--root-cause <TEXT> | --same-cause-as <ID>] [--rule <TEXT>]
     respond   <ID> --status open|fixed|out_of_scope|declined|rejected [--response <TEXT>]
     coverage  --lens <LENS> | --pass saturation  --checked <TEXT> --result none|n/a|finding:<ID> [--reason <TEXT>] [--file <PATH>]... [--read <PATH>]...
     done
@@ -39,7 +39,10 @@ COMMANDS:
 the inputs or state that go wrong and how (use `--detail -` and a heredoc for
 anything long), --file a repo-relative path and --line its 1-based line,
 --root-cause the assumption or pattern that made it possible, in the same words
-for every finding that shares it. The three scores are required: --importance
+for every finding that shares it (--same-cause-as <ID> takes the cause of
+a finding already recorded; a cause worded close to an earlier one is filed
+under the earlier wording, and the reply says what else already carries it).
+The three scores are required: --importance
 (how much it matters), --impact (how much harm leaving it does) and
 --complexity (what the fix takes). A mechanical finding that breaks a written
 rule names it with --rule, in the same words every time.
@@ -204,6 +207,20 @@ fn add(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
                 })
         })
         .transpose()?;
+    let root_cause = match (args.get("--root-cause"), args.get("--same-cause-as")) {
+        (Some(_), Some(_)) => anyhow::bail!("give --root-cause or --same-cause-as, not both"),
+        (Some(cause), None) => Some(cause.to_string()),
+        (None, Some(other)) => {
+            let other = resolve(inv, other)?;
+            let found = inv.client().read(|conn| ReviewRepo::new(conn).get(other))?;
+            let cause = found
+                .and_then(|f| f.root_cause)
+                .filter(|c| !c.trim().is_empty())
+                .ok_or_else(|| anyhow::anyhow!("finding {} has no root cause to share", short_id(other)))?;
+            Some(cause)
+        }
+        (None, None) => None,
+    };
     let finding = NewFinding {
         importance: args.require("--importance")?.to_string(),
         impact: args.require("--impact")?.to_string(),
@@ -213,7 +230,7 @@ fn add(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
         line,
         summary: args.require("--summary")?.to_string(),
         detail: args.get("--detail").map(str::to_string),
-        root_cause: args.get("--root-cause").map(str::to_string),
+        root_cause,
     };
     let result = inv.client().interview(InterviewCommand::AddReviewFinding {
         node_id: node,
@@ -228,7 +245,45 @@ fn add(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
     if inv.json {
         return Ok(serde_json::to_string(&result)?);
     }
-    Ok(format!("ok {}", short_id(id)))
+    let findings = inv.client().read(|conn| ReviewRepo::new(conn).list_for_node(node))?;
+    let note = same_cause_note(&findings, id, env_uuid(IMPLEMENT_CONVERSATION_ENV)?);
+    Ok(format!("ok {}{note}", short_id(id)))
+}
+
+/// What the reply to `add` says about the new finding's root cause: the
+/// wording it was filed under when that is not the one given, and the other
+/// findings already carrying it, with the instruction to sweep the class
+/// before recording the next instance (`surface/review.md`).
+fn same_cause_note(findings: &[ReviewFinding], id: Uuid, conversation: Option<Uuid>) -> String {
+    let Some(new) = findings.iter().find(|f| f.id == id) else { return String::new() };
+    let Some(cause) = new.root_cause.as_deref().filter(|c| !c.trim().is_empty()) else {
+        return String::new();
+    };
+    let key = tod_store::review::root_cause_key(cause);
+    let others: Vec<&ReviewFinding> = findings
+        .iter()
+        .filter(|f| f.id != id && f.root_cause.as_deref().is_some_and(|c| tod_store::review::root_cause_key(c) == key))
+        .collect();
+    if others.is_empty() {
+        return String::new();
+    }
+    // An answered one comes from an earlier round: the round's own findings
+    // (this reviewer's and the other's) are still open.
+    let earlier = others.iter().filter(|f| !f.is_open() && f.conversation_id != conversation).count();
+    let mut out = format!(
+        "\nroot cause: \"{cause}\" (filed in this wording: it is how the node's first finding with this cause words it)\n\
+         {} other finding(s) already have this cause ({earlier} answered in an earlier round): {}.",
+        others.len(),
+        others.iter().map(|f| short_id(f.id)).collect::<Vec<_>>().join(", ")
+    );
+    if earlier > 0 {
+        out.push_str(
+            "\nThis cause was found in an earlier round and answered: that fix covered an instance, not the class. Before the next \
+             finding, search every caller, path and data shape that reaches it and record each one now, in this \
+             session.",
+        );
+    }
+    out
 }
 
 fn respond(inv: &Invocation, args: &Args) -> anyhow::Result<String> {

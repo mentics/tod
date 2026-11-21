@@ -249,6 +249,26 @@ the app made; macOS `tar` adds `._` files that break a git checkout (use
   lifecycle config with empty `pr`, `pr_draft` and `pr_review` skills
   (`tod-cli capabilities set <node> lifecycle-config --phase pr --skills ''`)
   before it can get there.
+- **The 401 in a built golden (found 2026-11-21).** Blaxel's `GET` of a sandbox
+  never returns a proxy's secret values, and `PUT` replaces the whole spec, so
+  `Blaxel::set_labels` (a read-modify-write of the record) blanked the GitHub token
+  the golden was made with: the proxy no longer injected it and every request,
+  `{{SECRET:github}}` included, got 401. Fixed: a golden built from an image
+  labels itself with `update_proxy` (the proxy with its secrets, sent again).
+  Any new `set_labels` on a sandbox whose proxy holds secrets has the same
+  trap. The baked image `sandbox/tod-lv-base:latest` can disappear from Blaxel
+  (`IMAGE_NOT_FOUND`): bake it again (46 s). Build recipe: back up
+  `sandboxes.toml`, set `default_image = "sandbox/tod-lv-base:latest"`, run
+  `tod-sandbox golden refresh joel-cofactr/build-test`, set `default_image` back.
+- **A golden refresh's fork failed "lacks node>=20.10" (found 2026-11-21).** The
+  golden built from an image has a proxy; its fork inherits the platform's
+  `HTTPS_PROXY` as an unrendered `{{file(...)}}` template once it is labelled, and
+  Node 22 then dies with `ERR_PROXY_INVALID_CONFIG` before running anything, so
+  the requirements check read the sandbox as lacking Node. The check now starts
+  Node without the proxy variables (`provision::NODE_OK_SH`). Starting the app
+  refreshes the golden whenever its build is newer than the golden's stamp, so
+  after the last commit: build, refresh the golden with the built `tod-sandbox`,
+  then launch (a commit after the refresh makes the daemon refresh it again).
 - Pre-existing-failure waivers and CI reruns are PR CI features; a failing local
   check goes to the quick fix, never to a waiver.
 - The Lessons dialog's `D` acts on the row under the cursor: it starts on the
@@ -265,3 +285,14 @@ the app made; macOS `tar` adds `._` files that break a git checkout (use
 - Checks YAML is imported through the Settings panel.
 - `grep -r` over a worktree matches `.pyc` files; exclude them.
 - Foreground `sleep` over 90s is backgrounded; poll in loops under about 180s.
+
+## Pull-request half on build-test (third pass)
+
+Verified live on a node under the Build test location (PR against `lv-base`):
+the pre-existing failure (`legacy-lint`, same on the base) is waived and filed as
+a suggestion; a check the agent can fix (`blank-before-last`) is fixed by the
+Haiku quick fix, reviewed by the small review and pushed (`pr_pushes`:
+`mechanical`, `small_review`); a failure the obligations forbid fixing escalates
+to the user. Not induced: the infra rerun of a cancelled job (the node's sandbox
+was retired while it waited, and the webhook did not wake it). See the live-verify
+skill's "Gotchas from the third pass".
