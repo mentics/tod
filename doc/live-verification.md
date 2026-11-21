@@ -285,3 +285,14 @@ the app made; macOS `tar` adds `._` files that break a git checkout (use
 - Checks YAML is imported through the Settings panel.
 - `grep -r` over a worktree matches `.pyc` files; exclude them.
 - Foreground `sleep` over 90s is backgrounded; poll in loops under about 180s.
+
+## Pull-request half on build-test (third pass)
+
+Verified live on a node under the Build test location (PR against `lv-base`):
+the pre-existing failure (`legacy-lint`, same on the base) is waived and filed as
+a suggestion; a check the agent can fix (`blank-before-last`) is fixed by the
+Haiku quick fix, reviewed by the small review and pushed (`pr_pushes`:
+`mechanical`, `small_review`); a failure the obligations forbid fixing escalates
+to the user. Not induced: the infra rerun of a cancelled job (the node's sandbox
+was retired while it waited, and the webhook did not wake it). See the live-verify
+skill's "Gotchas from the third pass".
