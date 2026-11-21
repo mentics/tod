@@ -1463,6 +1463,8 @@ mod tests {
         assert_eq!(outcome.outcome, OUTCOME_FAIL);
         assert!(outcome.detail.contains("not audited"), "{}", outcome.detail);
 
+        // Events are ordered by millisecond timestamps: keep them apart.
+        std::thread::sleep(std::time::Duration::from_millis(3));
         let phases = PhaseRepo::new(&conn);
         phases
             .record(node, VERIFYING, PHASE_REJECT, None, CERTIFIER_INDEPENDENT, r#"["no replay"]"#)
@@ -1475,18 +1477,24 @@ mod tests {
             ["no replay"]
         );
 
+        // Events are ordered by millisecond timestamps: keep them apart.
+        std::thread::sleep(std::time::Duration::from_millis(3));
         // Verification answers it; the evaluator certifies.
         record_verdict(&conn, node, obligation, "live");
         assert_eq!(
             store.read(|c| crate::phase::evidence_audit(c, node)).unwrap(),
             crate::phase::EvidenceAudit::Due
         );
+        // Events are ordered by millisecond timestamps: keep them apart.
+        std::thread::sleep(std::time::Duration::from_millis(3));
         phases
             .record(node, VERIFYING, PHASE_CERTIFY, None, CERTIFIER_INDEPENDENT, "Live run shown.")
             .unwrap();
         let outcome = evaluate(&store, node, slug).unwrap();
         assert_eq!(outcome.outcome, OUTCOME_PASS, "{}", outcome.detail);
 
+        // Events are ordered by millisecond timestamps: keep them apart.
+        std::thread::sleep(std::time::Duration::from_millis(3));
         // A changed verdict makes the certificate stale.
         record_verdict(&conn, node, obligation, "local-data");
         let outcome = evaluate(&store, node, slug).unwrap();

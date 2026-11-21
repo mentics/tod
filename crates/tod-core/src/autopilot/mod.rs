@@ -23,7 +23,7 @@
 //! file under the data root (`autopilot/<node>.json`). A restart reopens the
 //! conversation that was in progress instead of starting another.
 
-mod github_wait;
+pub(crate) mod github_wait;
 mod process_review;
 mod quick_fix;
 mod triage;

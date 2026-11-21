@@ -338,7 +338,14 @@ chat drawer, whose session list shows request sessions first as "Request: ..."),
 (`lessons::record_triage_lesson` into `improvement_lessons`). Only triage writes
 a request's wording (`surface/triage.md`). Number keys never answer an escalated
 request. There is no "shouldn't have asked" control: highlight words and pick
-**This is confusing** to send them into the session. An answer's
+**This is confusing** (on every request) to send them into the session, or, on
+a request no session read, to record a `user` lesson (`lessons::Op::FlagRequest`).
+`lifecycle.triage: false` turns triage off (requests are filed `pending`;
+`decisions::triage_enabled`, `triage::Op::Release`). Requests on one task that
+give `decisions ask --cause <KEY>` the same key (schema v115, `decisions.cause`)
+are one group: one session reads them, its lead's answer settles all, an
+escalated group is one card (`DecisionRepo::triage_group`, `is_triage_follower`).
+An answer's
 `decided_by` is `user`, `tod` or `triage`; the Answered drawer shows it and
 **Change** offers sending the task back to the phase that asked.
 
@@ -439,7 +446,7 @@ start time) for both kinds. For every surface, the context is:
 
    | Category | Rule |
    |---|---|
-   | `stance/` | **Exactly one.** Interactive-chat, autonomous-session, one-shot, or agent-to-agent. The *only* place behavioral policy (confirm-or-act, brevity, whether questions are possible) may live. |
+   | `stance/` | **Exactly one.** Interactive-chat, autonomous-session, bounded-session, one-shot, or triage-session. The *only* place behavioral policy (confirm-or-act, brevity, whether questions are possible) may live. |
    | `domain/` | Only the concepts the surface actually handles — outline, obligations, lifecycle, capabilities, plan. |
    | `cli/` | `cli/intro` plus only the nouns the surface uses. The only place `tod-cli` syntax is documented. |
    | `surface/` | What this particular job is. Scoped exceptions to the stance are stated here, *as* exceptions. |

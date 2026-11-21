@@ -845,8 +845,13 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         remove_legacy_interviews(conn)?;
         conn.pragma_update(None, "user_version", 114)?;
     }
-    // 115 and 116 are other steps of `doc/requests/design.md`, built beside
-    // this one.
+    if version < 115 {
+        // Requests that share a cause are read by one triage session
+        // (`decisions.cause`; `doc/lifecycle/triage.md`).
+        crate::decisions::ensure_cause(conn)?;
+        conn.pragma_update(None, "user_version", 115)?;
+    }
+    // 116 is another step of `doc/requests/design.md`, built beside this one.
     if version < 117 {
         // Review findings are scored (`doc/requests/design.md` 5.1): importance,
         // impact and complexity replace severity, a finding may be `left`, and
@@ -962,6 +967,7 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     conn.execute_batch(&crate::journey_changes::quick_fixes_triggers_sql())?;
     // Idempotent, so a store that skipped 112 still has them.
     crate::decisions::ensure_triage(conn)?;
+    crate::decisions::ensure_cause(conn)?;
     conn.execute_batch(crate::lessons::CREATE_TABLE)?;
     crate::lessons::ensure_columns(conn)?;
     conn.execute_batch(&crate::journey_changes::lessons_triggers_sql())?;

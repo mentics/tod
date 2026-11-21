@@ -42,6 +42,17 @@ pub const TRIAGED_REASONS: [&str; 5] = [REASON_INTENT, REASON_MISSING_RULE, REAS
 /// incident investigation and the app's own stop questions go to the user.
 pub const TRIAGED_PROTOCOLS: [&str; 6] = ["implementation", "verification", "review", "fix", "phase", "pr"];
 
+/// Whether triage is on (`lifecycle.triage` in the settings of the data root
+/// `conn`'s database lives in; `tod.db` sits directly at it). On for a database
+/// with no file (in memory) and when no settings file exists. A settings file
+/// that cannot be read is an error, not a guess: a request is never filed
+/// under a setting nobody could read.
+pub fn triage_enabled(conn: &Connection) -> Result<bool> {
+    let root = conn.path().filter(|p| !p.is_empty()).and_then(|p| std::path::Path::new(p).parent());
+    let Some(root) = root else { return Ok(true) };
+    Ok(crate::settings::TodSettings::load_from_path(&crate::paths::TodPaths::at(root).settings_path())?.lifecycle.triage)
+}
+
 /// Whether an agent's ask with this `reason` from this `protocol` is filed for
 /// triage. `guard_reask` is false for the app's own questions, never triaged.
 pub fn goes_to_triage(protocol: Option<&str>, reason: &str, guard_reask: bool) -> bool {
@@ -262,6 +273,11 @@ pub struct Decision {
     /// there is no error. Another request about the same failure, and an
     /// incident, match on it.
     pub error_signature: String,
+    /// The explicit cause the agent named (`decisions ask --cause`, schema
+    /// v115), lowercased and trimmed; empty when it named none. Requests on a
+    /// node that share it, or the same failure, are read by one triage
+    /// session ([`DecisionRepo::triage_group`]).
+    pub cause: String,
     /// The triage session that read this request (schema v112), set once one
     /// started; it stays linked after the request is escalated (the user's
     /// chat partner for it) and after it is answered (the evidence).
@@ -283,6 +299,23 @@ impl Decision {
     /// This request is waiting on triage, not the user.
     pub fn in_triage(&self) -> bool {
         self.status == DECISION_TRIAGE
+    }
+
+    /// Whether this request may be read, and answered, together with others
+    /// that share its cause: not one whose options move the task or edit
+    /// obligations, which only the user decides.
+    pub fn groupable(&self) -> bool {
+        self.moves.is_empty() && self.edits.is_empty()
+    }
+
+    /// Whether `other` has this request's cause: the same explicit `cause` key.
+    /// The other ways the app knows two requests are one are not grouping: the
+    /// same question, the same held-up plan steps and the same failure
+    /// (`error_signature`, which only an access, broken or capability request,
+    /// never triaged, carries) are refused at ask time as duplicates
+    /// ([`Cause`]).
+    pub fn shares_cause_with(&self, other: &Decision) -> bool {
+        !self.cause.is_empty() && self.cause == other.cause
     }
 
     /// The state picking `option` (1-based) moves the node back to, if it does.
@@ -380,6 +413,11 @@ pub struct NewDecision {
     /// [`goes_to_triage`], never by the caller of `tod-cli`).
     #[serde(default)]
     pub triage: bool,
+    /// What these requests share (`--cause <KEY>`): requests on one node that
+    /// give the same key are read, and settled, by one triage session. Empty
+    /// for none.
+    #[serde(default)]
+    pub cause: String,
 }
 
 /// `decision_answers.decided_by`: the user picked an option or settled it in
@@ -438,7 +476,7 @@ pub const CREATE_TABLE: &str = "
 ";
 
 const DECISION_COLUMNS: &str =
-    "id, node_id, conversation_id, protocol, question, options, evidence, status, created_at, reason, option_moves, blocks, new_evidence, option_edits, brief_need, brief_command, brief_error, brief_tried, brief_after, error_signature, triage_conversation_id, asked";
+    "id, node_id, conversation_id, protocol, question, options, evidence, status, created_at, reason, option_moves, blocks, new_evidence, option_edits, brief_need, brief_command, brief_error, brief_tried, brief_after, error_signature, triage_conversation_id, asked, cause";
 
 /// Schema v112: `decisions.status` may be `triage`, and a decision records its
 /// triage session and what the asking agent wrote when triage replaced it.
@@ -491,6 +529,21 @@ pub fn ensure_triage(conn: &Connection) -> Result<()> {
     }
     if !has("asked")? {
         conn.execute_batch("ALTER TABLE decisions ADD COLUMN asked TEXT;")?;
+    }
+    Ok(())
+}
+
+/// Schema v115: `decisions.cause`, the key requests that share one cause give
+/// (`decisions ask --cause`). A no-op when the column is there. The table is
+/// journaled and synced already (the columns follow it).
+pub fn ensure_cause(conn: &Connection) -> Result<()> {
+    let has: bool = conn.query_row(
+        "SELECT COUNT(*) > 0 FROM pragma_table_info('decisions') WHERE name = 'cause'",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has {
+        conn.execute_batch("ALTER TABLE decisions ADD COLUMN cause TEXT NOT NULL DEFAULT '';")?;
     }
     Ok(())
 }
@@ -832,8 +885,8 @@ impl<'a> DecisionRepo<'a> {
         self.conn.execute(
             "INSERT INTO decisions
              (id, node_id, conversation_id, protocol, question, options, evidence, status, created_at, reason, option_moves, blocks, new_evidence, option_edits,
-              brief_need, brief_command, brief_error, brief_tried, brief_after, error_signature)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?20, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+              brief_need, brief_command, brief_error, brief_tried, brief_after, error_signature, cause)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?20, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?21)",
             params![
                 uuid_to_blob(id),
                 uuid_to_blob(node_id),
@@ -855,6 +908,7 @@ impl<'a> DecisionRepo<'a> {
                 brief.after,
                 error_signature,
                 if decision.triage { DECISION_TRIAGE } else { DECISION_PENDING },
+                normal_text(&decision.cause),
             ],
         )?;
         self.get(id)?.context("decision vanished after insert")
@@ -1040,16 +1094,82 @@ impl<'a> DecisionRepo<'a> {
         Ok(rows)
     }
 
-    /// The decision a triage conversation reads or read, if any.
+    /// The decision a triage conversation reads or read, if any: with a group
+    /// of requests sharing a cause ([`Self::triage_group`]), the **lead**, the
+    /// oldest one still open (else the oldest of them all).
     pub fn for_triage_conversation(&self, conversation: Uuid) -> Result<Option<Decision>> {
         Ok(self
             .conn
             .query_row(
-                &format!("SELECT {DECISION_COLUMNS} FROM decisions WHERE triage_conversation_id = ?1"),
+                &format!(
+                    "SELECT {DECISION_COLUMNS} FROM decisions WHERE triage_conversation_id = ?1
+                     ORDER BY status IN ('pending','triage') DESC, created_at, rowid LIMIT 1"
+                ),
                 params![uuid_to_blob(conversation)],
                 map_decision,
             )
             .optional()?)
+    }
+
+    /// Every decision a triage conversation reads or read, oldest first: the
+    /// lead and the requests that share its cause.
+    pub fn all_for_triage_conversation(&self, conversation: Uuid) -> Result<Vec<Decision>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {DECISION_COLUMNS} FROM decisions WHERE triage_conversation_id = ?1 ORDER BY created_at, rowid"
+        ))?;
+        let rows = stmt
+            .query_map(params![uuid_to_blob(conversation)], map_decision)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// The requests on `lead`'s node that share its cause and wait on triage
+    /// with no session yet: one session reads them together and its answer
+    /// settles every one of them (`doc/lifecycle/triage.md`, "Requests that
+    /// share a cause"). They share a cause when they name the same `--cause`
+    /// key (`Decision::shares_cause_with`).
+    /// A request whose options move the task or edit obligations is never
+    /// grouped (only the user decides those, one by one), and neither is one
+    /// that is not in triage.
+    pub fn triage_group(&self, lead: &Decision) -> Result<Vec<Decision>> {
+        if !lead.in_triage() || !lead.groupable() {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .list_triage_for_node(lead.node_id)?
+            .into_iter()
+            .filter(|d| {
+                d.id != lead.id && d.triage_conversation_id.is_none() && d.groupable() && lead.shares_cause_with(d)
+            })
+            .collect())
+    }
+
+    /// Whether `decision` is read by a triage session through another request
+    /// that leads it: it waits in triage while the lead is open (escalated and
+    /// pending, or being read), and is answered when the lead is. It is never
+    /// a card of its own for the user, and no session is started for it.
+    pub fn is_triage_follower(&self, decision: &Decision) -> Result<bool> {
+        let Some(conversation) = decision.triage_conversation_id else { return Ok(false) };
+        if !decision.in_triage() {
+            return Ok(false);
+        }
+        Ok(self.for_triage_conversation(conversation)?.is_some_and(|lead| lead.id != decision.id))
+    }
+
+    /// Hand a request that waits on triage to the user as it was asked
+    /// (`pending`): what happens to the requests in triage when the setting
+    /// that turns triage off is off. Its followers (a group's other requests)
+    /// are released too.
+    pub fn release_to_user(&self, id: Uuid) -> Result<()> {
+        let decision = self.get(id)?.with_context(|| format!("decision {id} not found"))?;
+        if !decision.in_triage() {
+            bail!("decision {id} is not waiting on triage");
+        }
+        self.conn.execute(
+            "UPDATE decisions SET status = 'pending' WHERE id = ?1 AND status = 'triage'",
+            params![uuid_to_blob(id)],
+        )?;
+        Ok(())
     }
 
     /// Pending decisions across every node in `node_ids`, oldest first, in
@@ -1130,6 +1250,51 @@ impl<'a> DecisionRepo<'a> {
         conversation_id: Option<Uuid>,
         rationale: Option<&str>,
     ) -> Result<DecisionAnswer> {
+        self.answer_inner(decision_id, option, text, actor, decided_by, conversation_id, rationale, true)
+    }
+
+    /// The followers of `lead` (the other requests its triage session reads,
+    /// still waiting in triage) are answered with what the lead's answer says,
+    /// as the same decision by the same hand: one cause, one answer.
+    #[allow(clippy::too_many_arguments)]
+    fn settle_followers(
+        &self,
+        lead: &Decision,
+        followers: &[Decision],
+        option: Option<i64>,
+        text: Option<&str>,
+        actor: &str,
+        decided_by: &str,
+        conversation_id: Option<Uuid>,
+        rationale: Option<&str>,
+    ) -> Result<()> {
+        let label = option.and_then(|o| lead.options.get(usize::try_from(o).ok()?.checked_sub(1)?)).cloned();
+        let given = match (label, text.map(str::trim).filter(|t| !t.is_empty())) {
+            (Some(label), Some(text)) => format!("{label} ({text})"),
+            (Some(label), None) => label,
+            (None, Some(text)) => text.to_string(),
+            (None, None) => bail!("an answer needs an option or text"),
+        };
+        let why = rationale.map(str::trim).filter(|r| !r.is_empty()).unwrap_or("the lead request was answered");
+        let why = format!("Same cause as request {}: {why}", crate::interview::short_id(lead.id));
+        for follower in followers {
+            self.answer_inner(follower.id, None, Some(&given), actor, decided_by, conversation_id, Some(&why), false)?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn answer_inner(
+        &self,
+        decision_id: Uuid,
+        option: Option<i64>,
+        text: Option<&str>,
+        actor: &str,
+        decided_by: &str,
+        conversation_id: Option<Uuid>,
+        rationale: Option<&str>,
+        settle_group: bool,
+    ) -> Result<DecisionAnswer> {
         let decision = self
             .get(decision_id)?
             .with_context(|| format!("decision {decision_id} not found"))?;
@@ -1145,6 +1310,21 @@ impl<'a> DecisionRepo<'a> {
         if option.is_none() && text.is_none() {
             bail!("an answer needs an option or text");
         }
+        // Answering the lead of a group answers every request that waits behind
+        // it (computed before this one is closed, which changes who leads).
+        let followers = match decision.triage_conversation_id {
+            Some(conversation) if settle_group && is_open(&decision.status) => {
+                if self.for_triage_conversation(conversation)?.is_some_and(|lead| lead.id == decision_id) {
+                    self.all_for_triage_conversation(conversation)?
+                        .into_iter()
+                        .filter(|d| d.id != decision_id && d.in_triage() && d.groupable())
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            }
+            _ => Vec::new(),
+        };
         let now = now_ms();
         self.conn.execute(
             "INSERT INTO decision_answers
@@ -1173,6 +1353,9 @@ impl<'a> DecisionRepo<'a> {
             self.reopen_blocked_steps(&decision)?;
         }
         let id = self.conn.last_insert_rowid();
+        if !followers.is_empty() {
+            self.settle_followers(&decision, &followers, option, text, actor, decided_by, conversation_id, rationale)?;
+        }
         self.conn
             .query_row(
                 &format!("SELECT {ANSWER_COLUMNS} FROM decision_answers WHERE id = ?1"),
@@ -1625,6 +1808,7 @@ fn map_decision(row: &rusqlite::Row<'_>) -> rusqlite::Result<Decision> {
             })?),
             None => None,
         },
+        cause: row.get(22)?,
     })
 }
 

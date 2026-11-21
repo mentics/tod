@@ -146,6 +146,29 @@ pub fn render(conn: &Connection, decision: &Decision) -> Result<String> {
         let _ = writeln!(out, "It holds up plan steps [{}].\n", steps.join(", "));
     }
 
+    // The requests that share this one's cause: this session reads them too,
+    // and answering this one answers them all.
+    if let Some(conversation) = decision.triage_conversation_id {
+        let group: Vec<Decision> =
+            repo.all_for_triage_conversation(conversation)?.into_iter().filter(|d| d.id != decision.id).collect();
+        if !group.is_empty() {
+            out.push_str(
+                "### Requests that share this cause\n\nThe agent named one cause for these, so you read them together. \
+                 Whatever answers or closes the request above settles every one of them the same way (an option's \
+                 text, or your free text), so give an answer that fits them all; if it cannot, escalate.\n\n",
+            );
+            for other in &group {
+                let options = if other.options.is_empty() {
+                    "free text".to_string()
+                } else {
+                    other.options.iter().map(|o| format!("\"{}\"", one_line(o))).collect::<Vec<_>>().join(", ")
+                };
+                let _ = writeln!(out, "- `{}`: {} (options: {options})", short_id(other.id), one_line(other.question.lines().next().unwrap_or("")));
+            }
+            out.push('\n');
+        }
+    }
+
     if let Some(closed) = closed_as(conn, decision)? {
         let _ = writeln!(out, "### How it closed\n\n{closed}\n");
     }

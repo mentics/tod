@@ -7,10 +7,11 @@ Spec: `doc/requests/design.md` 4.1, 4.3, 4.4 (build step 6). Code:
 (`tod_ui::views::incidents_dialog`).
 
 Fifty nodes hitting an expired GitHub token must be one problem, not fifty
-retry ladders and fifty requests. An **incident** is that one problem. It is
-local to this machine and its daemon: a cloud supervisor never parks
-(`tod_core::incident::set_enabled`, switched on by `tod-agentd` at startup),
-so every observation there says "not an incident" and the old ladder runs.
+retry ladders and fifty requests. An **incident** is that one problem. The
+tables are this machine's and its daemon's (`tod_core::incident::set_enabled`,
+switched on by `tod-agentd` at startup). A cloud supervisor never parks by
+itself: it reports what it sees and the daemon parks and holds it (see
+**Cloud nodes**).
 
 ## Classification
 
@@ -108,9 +109,49 @@ Machine-local (schema v111, not synced): `incidents`, `incident_nodes`,
 `incidents` and `incident_sightings` do not: they are this machine's
 bookkeeping, and a node's membership is what shows in a journey.
 
+## Cloud nodes
+
+`tod_core::incident::cloud`. One channel, the problem forwarding of
+`doc/problems.md`; no parallel path.
+
+- **Report.** The supervisor switches on `incident::set_cloud_reporting`. A
+  failure of a kind an incident can hold (not `work`) that it would have
+  observed goes to the node's problem directory as a problem line carrying an
+  `incident` object (event, node, source, kind, signature, operation, error).
+  A look at GitHub still retries first; an agent turn goes to the supervisor's
+  own failure guard. When the operation goes through again after a report, one
+  `ok` line says so (a marker file in the problem directory keeps it to one).
+- **Ingest.** The daemon's cloud sync reads the lines (`cloud_sync::sync_once`,
+  `cloud::ingest`) and feeds each to the same `observe` a local failure goes
+  through, so cloud and local nodes with one signature are one incident. The
+  daemon classifies from the error itself and warns when the sender's
+  signature differs (build skew). A report that cannot be used (a node that is
+  not a cloud node here, an unknown source) is an error in the log panel, since
+  the cursor has moved on.
+- **Hold.** A parked cloud node gets an ordinary synced `event` wait
+  `incident:<id>` (`cloud::hold`, `hold_parked`: at every ingest and every
+  daemon tick, so a node parked by someone else's report is held too). The
+  supervisor already stops at its next boundary and sleeps while any wait is
+  pending: no retry, no session, no request, nothing spent in the sandbox. The
+  wait's deadline (`PARKED_FALLBACK_MS`, 6 h) only keeps a lost release from
+  holding it forever; the user's "run" cancels it as any wait.
+- **Release and probe.** For a cloud node the probe is the release: the daemon
+  ends the hold and wakes the supervisor as Check now does
+  (`cloud::release`, `wake_node_requesting`). It resolves when the supervisor
+  reports `ok`, or when it reports no new failure within
+  `CLOUD_PROBE_GRACE_MS` (20 min, longer than the local grace since a sandbox
+  has to wake). A wake that fails parks the node again and holds it again.
+- **Who is next.** Parked is `Others`, naming the incident, as for a local node.
+- **Escalation.** An investigation needs a local autopilot; an incident whose
+  escalation node is a cloud node becomes the user's one request instead, and
+  the representative prefers a local parked node.
+
+Needs the orchestrator deployed with the app: an older orchestrator re-encodes
+problem lines without the `incident` field, so the reports are lost. Not
+forwarded: a `decisions ask --reason broken|access` an agent files from a cloud
+node.
+
 ## Deferred
 
-- Cloud signatures through the outbox: a supervisor's failures do not reach
-  the local incident table yet, so a node in a sandbox is not parked.
 - A daemon-level conversation runner: the investigation borrows a node's
   autopilot.

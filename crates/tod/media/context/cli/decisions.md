@@ -7,7 +7,7 @@ as what a node with nothing on it is for. You only ask; answering is the
 user's.
 
 ```
-tod-cli --data-root <DATA_ROOT> decisions ask  [--node <NODE_UUID>] <QUESTION> [--option <TEXT> (repeatable)] [--evidence <KIND>:<ID> (repeatable)] [--reason <KIND>] [--moves-to <N>:<STATE> (repeatable)] [--edit-obligation <N>:<OBLIGATION_ID>=<NEW_TEXT> (repeatable)] [--affirm-obligation <N>:<OBLIGATION_ID> (repeatable)] [--blocks <STEP_ID> (repeatable)] [--new-evidence <TEXT>] [--need <TEXT>] [--command <TEXT>] [--error <TEXT>] [--tried <TEXT> (repeatable)] [--after <TEXT>]
+tod-cli --data-root <DATA_ROOT> decisions ask  [--node <NODE_UUID>] <QUESTION> [--option <TEXT> (repeatable)] [--evidence <KIND>:<ID> (repeatable)] [--reason <KIND>] [--moves-to <N>:<STATE> (repeatable)] [--edit-obligation <N>:<OBLIGATION_ID>=<NEW_TEXT> (repeatable)] [--affirm-obligation <N>:<OBLIGATION_ID> (repeatable)] [--blocks <STEP_ID> (repeatable)] [--new-evidence <TEXT>] [--cause <KEY>] [--need <TEXT>] [--command <TEXT>] [--error <TEXT>] [--tried <TEXT> (repeatable)] [--after <TEXT>]
 tod-cli --data-root <DATA_ROOT> decisions list [--node <NODE_UUID>] [--all]
 tod-cli --data-root <DATA_ROOT> decisions show <DECISION_ID>
 ```
@@ -82,6 +82,12 @@ reaches you. It is filed as follows:
   `--new-evidence` only when something really changed since (you did what
   they said and it failed: say the command and the error). Never to repeat
   the question, and never to re-word it.
+- `--cause <KEY>`: a short key for what this question shares with others you
+  ask on this node ("importer-endpoint", on each of them). Requests with the
+  same key are read together by one triage session, and its one answer settles
+  all of them, so use it only for questions one decision truly answers (not for
+  separate questions on one topic, and not on a request whose options move the
+  task or edit obligations: those are never grouped). Leave it out otherwise.
 - `--need`, `--command`, `--error`, `--tried`, `--after`: only with `--reason
   access`, `broken` or `capability`. The app writes the request from these;
   you do not word it. `--need` is what you need, in one line ("Read access to

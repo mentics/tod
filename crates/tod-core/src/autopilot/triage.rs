@@ -36,8 +36,35 @@ impl Autopilot {
         hook: &mut H,
     ) -> Result<Option<Outcome>> {
         let node = self.node;
-        loop {
+        // With `lifecycle.triage` off a request that is still in triage goes
+        // to the user as it was asked, never left waiting on a session that
+        // will not run.
+        if !fleet.read(|conn| tod_store::decisions::triage_enabled(conn))? {
             let waiting = fleet.read(|conn| Ok(DecisionRepo::new(conn).list_triage_for_node(node)?))?;
+            for decision in waiting {
+                // A group released with its lead is already pending.
+                let still = fleet.read(|conn| Ok(DecisionRepo::new(conn).get(decision.id)?))?;
+                if still.is_some_and(|d| d.in_triage()) {
+                    fleet
+                        .interview("autopilot", InterviewCommand::Triage(Op::Release { decision: decision.id }))
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                }
+            }
+            return self.triage_reflections(fleet, agent, hook);
+        }
+        loop {
+            // A request that shares a cause with one read by a session waits
+            // behind its lead: it is settled when the lead is.
+            let waiting = fleet.read(|conn| {
+                let repo = DecisionRepo::new(conn);
+                let mut leads = Vec::new();
+                for d in repo.list_triage_for_node(node)? {
+                    if !repo.is_triage_follower(&d)? {
+                        leads.push(d);
+                    }
+                }
+                Ok(leads)
+            })?;
             let Some(decision) = waiting.into_iter().next() else { break };
             let (conversation, message) = match decision.triage_conversation_id {
                 Some(id) => (id, RESUME_MESSAGE),
@@ -105,6 +132,10 @@ impl Autopilot {
                 let notes = TimelineRepo::new(conn).list(node)?;
                 for d in DecisionRepo::new(conn).list_for_node(node)? {
                     let Some(conversation) = d.triage_conversation_id else { continue };
+                    // One reflection for a group of requests: the lead's.
+                    if DecisionRepo::new(conn).for_triage_conversation(conversation)?.is_some_and(|lead| lead.id != d.id) {
+                        continue;
+                    }
                     if d.status != DECISION_ANSWERED
                         || tod_store::lessons::triage_lesson_exists(conn, d.id)?
                         || notes.iter().any(|n| n.kind == KIND_NOTE && n.title == no_lesson_title(&d))

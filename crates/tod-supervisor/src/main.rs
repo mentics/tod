@@ -186,6 +186,10 @@ fn run(args: &[String]) -> Result<()> {
         sandbox: config.sandbox.clone(),
         state_dir: config.state_dir.clone(),
     };
+    // A failure other nodes may share goes to the app as a report, forwarded
+    // with the problem log; the app holds this node (a wait) when an incident
+    // parks it (`tod_core::incident::cloud`). Nothing here parks by itself.
+    tod_core::incident::set_cloud_reporting(true);
     let woke = match wake(config) {
         Ok(woke) => woke,
         Err(err) => return Err(retry.after_error(err)),
