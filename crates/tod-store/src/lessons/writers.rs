@@ -370,6 +370,22 @@ pub fn last_grouped_at(conn: &Connection) -> Result<Option<i64>> {
     Ok(conn.query_row("SELECT MAX(grouped_at) FROM improvement_lessons", [], |r| r.get(0))?)
 }
 
+/// Take a declined lesson back: `grouped` if a run had taken it in, else
+/// `new`. Returns the status it has now. Any other lesson is an error, so a
+/// stale click is not silently ignored.
+pub fn reopen(conn: &Connection, id: Uuid) -> Result<&'static str> {
+    let found = get(conn, id)?.ok_or_else(|| anyhow::anyhow!("lesson {id} not found"))?;
+    if found.status != STATUS_DECLINED {
+        bail!("lesson {id} is {}, not declined: there is nothing to reopen", found.status);
+    }
+    let status = if found.run_node_id.is_some() { STATUS_GROUPED } else { STATUS_NEW };
+    conn.execute(
+        "UPDATE improvement_lessons SET status = ?2, updated_at = ?3 WHERE id = ?1",
+        params![uuid_to_blob(id), status, now_ms()],
+    )?;
+    Ok(status)
+}
+
 /// A write of the lessons the user, an agent or the process review make
 /// (`InterviewCommand::Lessons`).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -387,6 +403,9 @@ pub enum Op {
     },
     /// The user declines a lesson: it is not acted on.
     Decline { id: Uuid },
+    /// The user takes a declined lesson back: `grouped` again if a process
+    /// review run had taken it in, else `new`.
+    Reopen { id: Uuid },
     /// A lesson was acted on: by the commit or node `applied_ref`. By a
     /// process-review session (only for the lessons its run took in) or the user.
     Apply { ids: Vec<Uuid>, applied_ref: String },
@@ -447,6 +466,12 @@ pub fn run_op(conn: &Connection, actor: &str, op: &Op) -> Result<serde_json::Val
                 params![uuid_to_blob(*id), now_ms()],
             )?;
             Ok(serde_json::json!({ "id": id }))
+        }
+        Op::Reopen { id } => {
+            if session_of(conn, actor)?.is_some() {
+                bail!("only the user reopens a lesson");
+            }
+            Ok(serde_json::json!({ "id": id, "status": reopen(conn, *id)? }))
         }
         Op::FixerFailed { node, check_name, check_key, why } => {
             if session_of(conn, actor)?.is_some() {

@@ -1210,6 +1210,17 @@ impl UnifiedView {
         cx.notify();
     }
 
+    /// Show `node` in its default panel (the task panel for a task node), as
+    /// a link to it does: select it in the tree when its row is visible, open
+    /// the panel by the ordinary column rule, and move keyboard focus there.
+    pub fn show_node(&mut self, node: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        let task_id = node.to_string();
+        self.task_list.update(cx, |task_list, cx| task_list.reveal_node(&task_id, window, cx));
+        self.open_panel(self.default_panel(node), 0, false, window, cx);
+        self.sync_window_focus(window, cx);
+        cx.notify();
+    }
+
     /// Alt+J: the user's own recent activity, as a panel (the project journey).
     fn open_recent_activity(
         &mut self,
