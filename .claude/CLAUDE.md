@@ -896,6 +896,14 @@ removes, in the task panel's Guidance section or with `tod-cli guidance
 add|remove`. An item the user removed is not selected again until the user
 adds it back.
 
+**Self-improvement view** (`views::self_improvement`, `doc/ui/self-improvement.md`):
+the status bar's Lessons button opens a dialog over `tod_core::self_improvement`
+(lessons sectioned new / per process-review run / per applied commit or node /
+declined, plus `lesson_stats::compute`, the same measures as `tod-cli lessons
+stats`). The user declines or reopens a lesson (`lessons::Op::Reopen`), opens a
+node's task panel (`UnifiedView::show_node`), and looks at an applied commit
+(`git show --stat` off the UI thread, or the checkout in the code editor).
+
 **Groups** (`Capability::Groups`, `tod_store::groups`, table `node_groups`)
 has one setting, `by_lifecycle`. The node tree then shows the node's children
 under a header per lifecycle state, in lifecycle order, made only while a child

@@ -463,6 +463,14 @@ impl Shell {
         cx.notify();
     }
 
+    /// Show a node's task panel in the workbench (a link from the
+    /// self-improvement view).
+    fn show_node_in_workbench(&mut self, node: uuid::Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        self.select_view(ShellView::Unified, window, cx);
+        self.unified.update(cx, |unified, cx| unified.show_node(node, window, cx));
+        cx.notify();
+    }
+
     fn open_cloud_vms_window(&mut self, cx: &mut Context<Self>) {
         let root = self.fleet.paths().root().to_path_buf();
         if let Err(err) = crate::app::CloudVmsWindowControl::global().open_or_focus(cx, root) {
@@ -761,6 +769,24 @@ impl Shell {
                             )
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.open_transcript_window(cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("open-self-improvement")
+                            .outline()
+                            .compact()
+                            .label("Lessons")
+                            .tooltip("What tod learned about its own process: the feedback gathered, how it was grouped, what was changed, and the measures")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                let shell = cx.entity();
+                                crate::views::self_improvement::open_self_improvement_dialog(
+                                    window,
+                                    cx,
+                                    this.fleet.clone(),
+                                    std::rc::Rc::new(move |node, window, cx| {
+                                        shell.update(cx, |shell, cx| shell.show_node_in_workbench(node, window, cx));
+                                    }),
+                                );
                             })),
                     )
                     .child(

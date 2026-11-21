@@ -1,6 +1,6 @@
 # Requests for the user: fewer, cheaper, clearer, and self-improving
 
-Status: steps 1 to 8 built (lessons and process review: `doc/lifecycle/self-improvement.md`); the self-improvement view (11.4) is deferred. 2026-11-20.
+Status: steps 1 to 8 built (lessons and process review: `doc/lifecycle/self-improvement.md`), and the self-improvement view (11.4, `doc/ui/self-improvement.md`). 2026-11-20.
 
 This replaces how a node asks the user for something today: an agent runs
 `tod-cli decisions ask`, the run stops, and the request sits in the task panel
@@ -574,13 +574,16 @@ is a view:
 - incidents: the number of nodes each one absorbed, and the sessions saved;
 - send-backs, and disputes by the phase they went back to.
 
-### 11.4 The self-improvement view (deferred)
+### 11.4 The self-improvement view (built)
 
-The app will get a place showing the feedback gathered, how it was grouped,
-and what was changed because of it, with diffs. It is **not part of this
-work**: diffs may be shown through Zed, or with features borrowed from other
-projects. Until then, `tod-cli lessons` and the process-review nodes are how
-the loop is seen.
+The status bar's **Lessons** button opens a dialog showing the feedback
+gathered, how it was grouped, what was changed because of it, and the measures
+(`doc/ui/self-improvement.md`). Lessons are sectioned as new, one section per
+process-review run, one per commit or node that acted on them, and declined; the
+Measures tab is the same computation as `tod-cli lessons stats`. A lesson links
+to its node (opening its task panel); an applied commit's changes are shown as
+`git show --stat` text, or its checkout opens in the code editor. The user can
+decline a lesson or reopen a declined one.
 
 ## 12. What this removes or replaces
 

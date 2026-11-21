@@ -3,7 +3,7 @@
 The app records what went wrong in its own process as **lessons**, and a
 periodic **process review** turns groups of them into drafted changes that go
 through the lifecycle, so the user approves them. Design:
-`doc/requests/design.md` section 11 (the view, 11.4, is deferred).
+`doc/requests/design.md` section 11. The view is `doc/ui/self-improvement.md`.
 
 ## Lessons
 
@@ -27,7 +27,7 @@ migration (`migrate_request_feedback`) moves the rows of the old
 `request_feedback` table into lessons on upgrade.
 
 Writes go through `InterviewCommand::Lessons(Op)` on the fleet writer.
-`Decline`, `Group` and `FixerFailed` are refused for agent sessions; `Apply` is
+`Decline`, `Reopen` (a declined lesson back to `grouped` or `new`, user only, not exposed in `tod-cli`), `Group` and `FixerFailed` are refused for agent sessions; `Apply` is
 allowed only from a process review session, and only for the lessons its own
 run took in.
 
@@ -75,6 +75,11 @@ lessons its commits address with `tod-cli lessons apply --ref <commit>`. The
 node goes through the lifecycle like any other, so nothing edits a prompt
 silently. A lesson the user declines stays out of later groups.
 
+## The view
+
+The status bar's **Lessons** button (`views::self_improvement`, projection
+`tod_core::self_improvement`): see `doc/ui/self-improvement.md`.
+
 ## Known gaps
 
 - The daemon only creates the run node; the review session starts when the
@@ -85,5 +90,5 @@ silently. A lesson the user declines stays out of later groups.
 - Stats cannot give a request's lifecycle phase (the asking protocol is used),
   the share of items rung 0 settled, per-request cost beyond triage and quick
   fix, or the sessions saved by an incident beyond an assumption.
-- The self-improvement view is deferred; `tod-cli lessons` and the run nodes
-  are how the loop is seen.
+- The self-improvement view shows a lesson's request and session as short ids,
+  not links; its node link opens the task panel, where the requests are.
