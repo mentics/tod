@@ -171,6 +171,13 @@ fn is_rejection(err: &anyhow::Error) -> bool {
         return false;
     }
     let text = format!("{err:#}").to_ascii_lowercase();
+    // A refusal that says "cannot" (recording a review or a phase done before
+    // its record is complete) is the command turned down, not tod failing:
+    // the agent is told exactly what is missing and retries.
+    const REFUSALS: &[&str] = &["cannot be recorded"];
+    if REFUSALS.iter().any(|r| text.contains(r)) {
+        return true;
+    }
     const FAILURES: &[&str] = &[
         "another tod instance",
         "tod-agentd",
@@ -1356,6 +1363,8 @@ mod rejection_tests {
             "refused: node x is in `verifying`, past planning, and the obligations change only with approval",
             "`resume` (Resume) is not offered for this node now (it is running)",
             "malformed batch, nothing ran: the script has no commands",
+            "the review cannot be recorded done yet; its coverage record is missing:\n- an entry for 3 of the 5 lenses",
+            "`design` cannot be recorded ready: dispute 1 is open",
         ] {
             assert!(is_rejection(&anyhow::anyhow!("{text}")), "{text}");
         }
