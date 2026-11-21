@@ -71,6 +71,36 @@ pub mod kind {
     pub const LOST_WORK: &str = "lost_work";
     /// An agent's send-back was refused by the loop guard.
     pub const SEND_BACK_LOOP: &str = "send_back_loop";
+    /// The user's Check now found the stopped reason no longer true.
+    pub const CHECKED: &str = "checked";
+
+    /// The stopped reasons that are about the phase's work or its gate, so a
+    /// gate check that is now clear or has moved the node on can make them
+    /// untrue. Never the user's own pause or stop, a failed agent or runner,
+    /// a spent budget, a permission, or a pull request's trouble: a gate
+    /// check says nothing about those.
+    pub fn depends_on_gate(kind: &str) -> bool {
+        matches!(
+            kind,
+            NO_PLAN
+                | EVALUATION_STUCK
+                | NO_PROGRESS
+                | LOOPING
+                | REVIEW_NOT_CONVERGING
+                | CHECK_BROKEN
+                | CHECKS_NOT_CONVERGING
+                | CHECKS_UNFIXED
+                | LOST_WORK
+                | SEND_BACK_LOOP
+        )
+    }
+}
+
+/// What Check now leaves in the row when it made the stopped reason untrue:
+/// still stopped and resumable by the user (a check never starts a run), with
+/// the words saying what the check found.
+pub fn checked_now(what: &str) -> Draft {
+    draft(Phase::Stopped, kind::CHECKED, what, RESUMABLE_BY_YOU)
 }
 
 /// How a run's words differ by who ran it.

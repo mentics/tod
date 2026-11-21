@@ -163,6 +163,16 @@ default shows what it is doing, disabled, and the menu is empty.
 autopilot's gate step makes, then, when the gate is clear, the advance; in
 `pr_draft`, `approved` and `merged` it also looks at GitHub. It never starts
 or wakes the runner and is offered only while the runner is idle.
+The stopped reason the panel shows is the node's run state row, so a check
+that makes it untrue updates it (`check_now::refresh_stopped_reason`): when the
+gate is clear, or the check moved the node on, a stopped reason about the
+phase's work or gate (`run_state::kind::depends_on_gate`: no plan, evaluation
+stuck, no progress, looping, review or checks not converging, a broken check,
+lost work, a send-back loop) is replaced by "checked now: the gate … is clear"
+(kind `checked`, still stopped and the user's to resume), instead of staying
+until the next Resume. A reason a gate check says nothing about (the user's
+pause or stop, a failed agent, a spent budget, a permission, a pull request's
+trouble) is left alone, and so is a gate that still fails.
 
 The line says where the node runs: `in the cloud (sandbox …)` for a node
 supervised in a sandbox (`in the cloud (its Files location records no

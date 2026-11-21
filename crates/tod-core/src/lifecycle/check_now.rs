@@ -114,7 +114,42 @@ pub fn check_now(fleet: &FleetStore, node: Uuid, data_root: &std::path::Path) ->
         && !gate.clear()
         && gate.to.is_some()
         && crate::phase::has_phase_agent(&state);
+    refresh_stopped_reason(fleet, node, &from, &gate, advanced)?;
     Ok(CheckNow { gate, advanced, github, held, needs_agent })
+}
+
+/// A stopped reason about the phase's work or gate (`run_state::kind::depends_on_gate`)
+/// is no longer true once the check finds the gate clear, or has moved the
+/// node on: replace it, in the node's run state row, with what the check
+/// found, so the panel does not go on showing the old reason until the next
+/// Resume. The node stays stopped and the user's to resume (a check never
+/// starts a run). A reason the check says nothing about (a pause, a failed
+/// agent, a budget, a permission) is left alone, and so is a gate that still
+/// fails: the reason may still be true.
+fn refresh_stopped_reason(
+    fleet: &FleetStore,
+    node: Uuid,
+    from: &str,
+    gate: &GateCheck,
+    advanced: Option<&'static str>,
+) -> Result<()> {
+    use crate::run_state::{checked_now, kind, record};
+    use tod_store::run_state::Phase;
+    let Some(row) = fleet.read(|conn| tod_store::run_state::get(conn, node))? else {
+        return Ok(());
+    };
+    if row.phase != Phase::Stopped || !kind::depends_on_gate(&row.reason_kind) {
+        return Ok(());
+    }
+    let what = match advanced {
+        Some(to) => format!("checked now: the gate out of {from} is clear and the node moved to {to}; resume to carry on"),
+        None if gate.clear() => {
+            format!("checked now: the gate out of {from} is clear; resume to carry on")
+        }
+        None => return Ok(()),
+    };
+    record(fleet, node, checked_now(&what), "app")?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -207,6 +242,50 @@ mod tests {
             .into_iter()
             .map(|w| w.match_spec)
             .collect()
+    }
+
+    fn stop_with(fx: &Fixture, reason: crate::autopilot::NeedsHuman) {
+        let outcome = crate::autopilot::Outcome::NeedsHuman { reason };
+        let draft = crate::run_state::for_outcome(&outcome, crate::run_state::Words::local());
+        crate::run_state::record(&fx.fleet, fx.node, draft, "local").unwrap();
+    }
+
+    fn run_row(fx: &Fixture) -> tod_store::run_state::RunState {
+        fx.fleet.read(|conn| tod_store::run_state::get(conn, fx.node)).unwrap().expect("a run state row")
+    }
+
+    #[test]
+    fn a_check_that_makes_the_stopped_reason_untrue_replaces_it() {
+        use crate::run_state::kind;
+        let fx = fixture();
+        enable_lifecycle(&fx, "proposed");
+        stop_with(&fx, crate::autopilot::NeedsHuman::ChecksUnfixed { failing: vec!["lint".into()] });
+        assert_eq!(run_row(&fx).reason_kind, kind::CHECKS_UNFIXED);
+        retire_all_criteria(&fx);
+        let found = check_now(&fx.fleet, fx.node, &fx.root).unwrap();
+        assert_eq!(found.advanced, Some("design"));
+        let row = run_row(&fx);
+        assert_eq!(row.reason_kind, kind::CHECKED);
+        assert_eq!(row.phase, tod_store::run_state::Phase::Stopped, "a check never starts a run");
+        assert!(row.reason_text.contains("moved to design"), "{}", row.reason_text);
+    }
+
+    #[test]
+    fn a_check_leaves_a_reason_it_says_nothing_about_and_a_gate_that_still_fails() {
+        use crate::run_state::kind;
+        let fx = fixture();
+        // The gate fails: the stopped reason may still be true.
+        enable_lifecycle(&fx, "ready");
+        stop_with(&fx, crate::autopilot::NeedsHuman::ChecksUnfixed { failing: vec!["lint".into()] });
+        let found = check_now(&fx.fleet, fx.node, &fx.root).unwrap();
+        assert!(!found.gate.clear());
+        assert_eq!(run_row(&fx).reason_kind, kind::CHECKS_UNFIXED);
+        // The gate is clear, but the agent failing is not about the gate.
+        enable_lifecycle(&fx, "proposed");
+        retire_all_criteria(&fx);
+        stop_with(&fx, crate::autopilot::NeedsHuman::AgentFailed { error: "not signed in".into() });
+        check_now(&fx.fleet, fx.node, &fx.root).unwrap();
+        assert_eq!(run_row(&fx).reason_kind, kind::FAILED);
     }
 
     #[test]
