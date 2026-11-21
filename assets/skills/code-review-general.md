@@ -250,6 +250,11 @@ When the change under review was made to address earlier feedback:
 - **Pre-existing** — real, but would survive a revert. Surfaced for triage, never
   blocking.
 
+Inside tod, a finding is scored on three axes instead of by this label
+(importance blocker/major/minor/nit, impact, and the complexity of the fix);
+the reviewer's own session says how. Important here is a blocker or major; a
+nit is a nit; a project rule broken without harm is at most minor.
+
 Tag each Important finding with a scope estimate: `in-scope` (fixable within the
 files the change touches) or `likely separate change` (needs a migration, a
 cross-module refactor, or edits well outside the change).

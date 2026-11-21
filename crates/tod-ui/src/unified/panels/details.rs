@@ -662,6 +662,7 @@ mod tests {
                         line: None,
                         detail: None,
                         root_cause: None,
+                        rule: None,
                     },
                 },
             )

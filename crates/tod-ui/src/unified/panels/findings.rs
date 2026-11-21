@@ -29,9 +29,11 @@ use crate::ui::style;
 use crate::unified::PanelKind;
 use crate::unified::panel::{ColumnPanel, PanelOpenRequest};
 use crate::views::rows::{
-    FindingRowEvent, FindingRowProps, RowHost, RowOptions, StatusMenu, finding_columns,
+    FindingRowEvent, FindingRowProps, RowHost, RowOptions, Score, StatusMenu, finding_columns,
     finding_row,
 };
+use tod_journey::Presented;
+use tod_store::conversation::Focus;
 use tod_store::fleet::FleetStore;
 use tod_store::interview::{ACTOR_USER, InterviewCommand};
 use tod_store::review::{
@@ -75,6 +77,7 @@ enum ListAction {
     ToggleStatusMenu { finding_id: Uuid },
     ChooseStatus { finding_id: Uuid, status: &'static str },
     DismissStatusMenu,
+    CycleScore { finding_id: Uuid, score: Score },
     Ignored,
 }
 
@@ -89,6 +92,7 @@ impl From<FindingRowEvent> for ListAction {
                 Self::ChooseStatus { finding_id, status }
             }
             FindingRowEvent::DismissStatusMenu => Self::DismissStatusMenu,
+            FindingRowEvent::CycleScore { finding_id, score } => Self::CycleScore { finding_id, score },
         }
     }
 }
@@ -140,6 +144,9 @@ pub struct FindingsPanel {
     list: ItemList<FindingItem>,
     host: RowHost<ListAction>,
     status_menu: Option<StatusMenu>,
+    /// Why the user's last edit of a score did not go through; shown, not
+    /// hidden, until the next one succeeds.
+    edit_error: Option<String>,
 }
 
 impl FindingsPanel {
@@ -159,6 +166,7 @@ impl FindingsPanel {
             list: ItemList::new().with_columns(finding_columns()),
             host,
             status_menu: None,
+            edit_error: None,
         };
         this.reload(cx);
         this
@@ -287,6 +295,44 @@ impl FindingsPanel {
         cx.notify();
     }
 
+    /// The user edits a finding's score: it moves to the next value, which the
+    /// store checks like a new finding's. Recorded as a journey `UserAction`.
+    fn cycle_score(&mut self, finding_id: Uuid, score: Score, cx: &mut Context<Self>) {
+        self.status_menu = None;
+        let Some(current) = self.items.iter().find(|f| f.id == finding_id) else {
+            return;
+        };
+        let value = match score {
+            Score::Importance => &current.importance,
+            Score::Impact => &current.impact,
+            Score::Complexity => &current.complexity,
+        };
+        let next = score.next(value).to_string();
+        crate::ui::journey::record_action(
+            cx,
+            Focus::Node(self.node_id),
+            format!("RescoreFinding:{score:?}:{next}"),
+            crate::ui::journey::Source::Click,
+            "findings_panel",
+            Presented { actions: Vec::new(), focused: None, notices: Vec::new() },
+        );
+        let (importance, impact, complexity) = match score {
+            Score::Importance => (Some(next), None, None),
+            Score::Impact => (None, Some(next), None),
+            Score::Complexity => (None, None, Some(next)),
+        };
+        self.edit_error = self
+            .fleet
+            .interview(
+                ACTOR_USER,
+                InterviewCommand::RescoreReviewFinding { finding_id, importance, impact, complexity },
+            )
+            .err()
+            .map(|err| format!("Could not change the finding's score: {err}"));
+        self.reload(cx);
+        cx.notify();
+    }
+
     fn drain_row_actions(&mut self, cx: &mut Context<Self>) {
         for action in self.host.drain() {
             match action {
@@ -310,6 +356,9 @@ impl FindingsPanel {
                 }
                 ListAction::DismissStatusMenu => {
                     self.close_status_menu(cx);
+                }
+                ListAction::CycleScore { finding_id, score } => {
+                    self.cycle_score(finding_id, score, cx);
                 }
                 ListAction::Ignored => {}
             }
@@ -451,6 +500,7 @@ mod tests {
                         line: None,
                         detail: None,
                         root_cause: None,
+                        rule: None,
                     },
                 },
             )
@@ -557,6 +607,64 @@ mod tests {
             assert_eq!(view.items[0].status, tod_store::review::FINDING_DECLINED);
         });
     }
+
+    /// A click on a score moves it to its next value and the panel shows it.
+    #[gpui::test]
+    fn clicking_a_score_moves_it_to_its_next_value(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let finding_id = add_finding(&fixture);
+        let (view, cx) = open_view(&fixture, cx);
+
+        view.update(cx, |view, cx| {
+            view.cycle_score(finding_id, Score::Importance, cx);
+            view.cycle_score(finding_id, Score::Complexity, cx);
+        });
+
+        view.read_with(cx, |view, _| {
+            // blocker -> major, simple -> involved; impact untouched.
+            assert_eq!(
+                (view.items[0].importance.as_str(), view.items[0].impact.as_str(), view.items[0].complexity.as_str()),
+                ("major", "high", "involved")
+            );
+            assert!(view.edit_error.is_none());
+        });
+    }
+
+    /// Answering `open` on a finding tod left makes it block again (like a
+    /// major, from a minor or a nit).
+    #[gpui::test]
+    fn reopening_a_left_finding_makes_it_block(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let finding_id = add_finding(&fixture);
+        fixture
+            .store
+            .interview(ACTOR_AGENT, InterviewCommand::RescoreReviewFinding {
+                finding_id,
+                importance: Some("nit".into()),
+                impact: None,
+                complexity: None,
+            })
+            .unwrap();
+        fixture
+            .store
+            .interview(ACTOR_AGENT, InterviewCommand::RespondReviewFinding {
+                finding_id,
+                status: tod_store::review::FINDING_LEFT.into(),
+                response: Some("nit: left as it is".into()),
+            })
+            .unwrap();
+        let (view, cx) = open_view(&fixture, cx);
+        view.read_with(cx, |view, _| assert!(view.items[0].dismissed()));
+
+        view.update(cx, |view, cx| {
+            view.respond_to_finding(finding_id, tod_store::review::FINDING_OPEN, cx);
+        });
+
+        view.read_with(cx, |view, _| {
+            assert!(view.items[0].stands());
+            assert_eq!(view.items[0].importance, "major");
+        });
+    }
 }
 
 impl Focusable for FindingsPanel {
@@ -629,6 +737,14 @@ impl Render for FindingsPanel {
                 )
             })
             .children(self.render_coverage(window, cx))
+            .children(self.edit_error.clone().map(|why| {
+                div().px_3().py_1().text_xs().text_color(cx.theme().danger).child(selectable_text(
+                    "unified-findings-edit-error",
+                    why,
+                    window,
+                    cx,
+                ))
+            }))
             .child(
                 div()
                     .px_3()
@@ -637,7 +753,7 @@ impl Render for FindingsPanel {
                     .border_color(border)
                     .text_xs()
                     .text_color(muted)
-                    .child("↑/↓ navigate · T sets status · E opens transcript"),
+                    .child("↑/↓ navigate · T sets status (open reopens a left finding) · click a score to change it · E opens transcript"),
             )
     }
 }

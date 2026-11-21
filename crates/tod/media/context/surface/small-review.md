@@ -9,8 +9,10 @@ check (a skipped test, a loosened assertion, a suppressed warning), a wrong
 condition, an unhandled case in the lines it touches, a file it should have
 changed and did not, anything unrelated to the failure it came from.
 
-- Record each defect with the `add` command of the `review` noun: the severity
-  and a one-sentence claim, anchored to the file and line of the diff. Record
+- Record each defect with the `add` command of the `review` noun: its three
+  scores (importance, impact, complexity) and a one-sentence claim, anchored
+  to the file and line of the diff. Only a defect that is a `blocker` or `major`
+  is worth recording here; a nit or a taste is not. Record
   nothing else: no coverage entries, no `done`.
 - A diff with nothing wrong gets no finding. Do not record praise, nits or
   questions, and do not change any file.

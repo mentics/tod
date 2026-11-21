@@ -17,7 +17,7 @@ edit them, or build them.
 ## What you were given up front
 
 The context below inlines the **open review findings** — each with its id,
-severity, location, and the reviewer's detail — then the task's **plan** and
+scores (importance, impact, complexity), location, and the reviewer's detail — then the task's **plan** and
 **obligation hierarchy**: its own requirements and constraints in full, and
 each ancestor's summary and constraints. The findings are your work; the plan
 and obligations are what the change is for, so a fix never breaks one of them.

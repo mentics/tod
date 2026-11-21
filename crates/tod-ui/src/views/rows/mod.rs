@@ -28,7 +28,7 @@ use gpui_kit_assets::IconName;
 use tod_store::conversation::NetOp;
 
 pub use finding_row::{
-    FindingRowEvent, FindingRowProps, finding_columns, finding_row,
+    FindingRowEvent, FindingRowProps, Score, finding_columns, finding_row,
 };
 pub use obligation_row::{
     ObligationRowEvent, ObligationRowProps, obligation_columns, obligation_row,

@@ -68,7 +68,7 @@ pub enum ItemListEvent {
 /// A list declares its columns once, so every row and the header above them
 /// agree on where a value starts without any row setting a width itself. A
 /// column is for something *every* row has — a plan step's status, a
-/// finding's severity. A value only some rows carry stays inside the content
+/// finding's scores. A value only some rows carry stays inside the content
 /// column, where empty space costs nothing.
 pub struct ColumnSpec {
     /// How a row asks for this column: [`ItemRowState::column`]. Owned rather

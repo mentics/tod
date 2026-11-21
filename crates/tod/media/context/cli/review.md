@@ -22,7 +22,7 @@ findings nobody has responded to.
 
 `add` records one open finding:
 
-- `--importance`, `--impact` and `--complexity` are all required: tod routes
+- `--importance`, `--impact` and `--complexity` are all required: the app routes
   and blocks on them.
   - `--importance`: `blocker` (wrong behavior, data loss, a security hole, a
     broken build, an obligation not met), `major` (a real defect in a narrower
@@ -35,7 +35,7 @@ findings nobody has responded to.
     rule: formatting, length, a rename, a stale comment), `simple` (a local
     edit with no design), `involved` (design, several files, or tests).
 - `--rule`: for a `mechanical` finding that breaks a written rule, the rule
-  in the same words every time ("docstrings are at most three lines"). tod
+  in the same words every time ("docstrings are at most three lines"). The app
   matches findings on it: three of one rule, across tasks, suggest a check
   that catches it before any reviewer sees it. Leave it out when the finding
   is not about a rule.
@@ -54,7 +54,7 @@ findings nobody has responded to.
 commit), `out_of_scope` (real, but not this node's), `declined` (not
 critical, beyond the requirements, or not worth the cost), or `rejected` (not
 a problem after all — the response says why, for the user to read). Every
-status but `open` needs `--response`; `open` clears it. (`left` is tod's own
+status but `open` needs `--response`; `open` clears it. (`left` is the app's own
 answer, for a finding it sets aside under the scoring rules; you cannot give
 it.) Inside a fix or pull
 request conversation only `fixed` and `rejected` are accepted: the others are

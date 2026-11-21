@@ -16,6 +16,12 @@ output names, and the commands the project usually runs.
 - Do not touch the task's requirements, constraints or plan, do not ask the
   user anything, and do not push or commit: the app commits what you leave
   when the check passes.
+- The target may instead be a list of **review findings**, each scored
+  mechanical or simple. Then make the change that fixes each one, and only
+  those: run the project's own commands that cover the files you touched, and
+  leave everything else as it is. The app commits what you leave and has one
+  cheap reviewer read the commit; the findings are settled only if it finds
+  nothing, so a change that goes beyond the findings costs them.
 - If the failure is not in this change (it fails the same way without it, or
   needs something you cannot reach), say so in your last message and make no
   change.
