@@ -135,7 +135,6 @@ fn config(fx: &Fixture) -> ConversationConfig {
 fn outline(fx: &Fixture, mutation: OutlineMutation) {
     fx.user(InterviewCommand::Outline {
         mutation,
-        target: None,
     });
 }
 

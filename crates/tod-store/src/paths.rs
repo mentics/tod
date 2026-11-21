@@ -94,15 +94,6 @@ impl TodPaths {
         &self.config_dir
     }
 
-    /// Legacy per-repo interview SQLite (migrated into fleet on open).
-    pub fn sqlite_path(&self) -> PathBuf {
-        self.data_root
-            .join(".local")
-            .join(".config")
-            .join("tod")
-            .join("tod.db")
-    }
-
     pub fn settings_path(&self) -> PathBuf {
         self.config_dir.join(SETTINGS_FILE)
     }

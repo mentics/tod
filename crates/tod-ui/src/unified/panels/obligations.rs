@@ -260,7 +260,6 @@ mod tests {
                         obligation_id,
                         body: "Agent edit.".into(),
                     },
-                    target: None,
                 },
             )
             .unwrap();

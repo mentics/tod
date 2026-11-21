@@ -332,7 +332,6 @@ fn add(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
             before: args.has("--before"),
             body,
         },
-        target: None,
     })?;
     let client = inv.client();
     // Before the dependency, which is checked against it.
@@ -342,7 +341,6 @@ fn add(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
                 step_id: id,
                 phase: phase.to_string(),
             },
-            target: Some(id),
         })?;
     }
     if let Some(raw) = args.get("--depends-on") {
@@ -352,7 +350,6 @@ fn add(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
                 step_id: id,
                 depends_on_step_id: dep,
             },
-            target: Some(id),
         })?;
     }
     if let Some(raw) = args.get("--satisfies") {
@@ -362,7 +359,6 @@ fn add(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
                 step_id: id,
                 obligation_id: obligation,
             },
-            target: Some(id),
         })?;
     }
     Ok(ack(id, inv.json))
@@ -448,7 +444,6 @@ fn update(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
         None => None,
     };
     let client = inv.client();
-    let mut target = Some(id);
     // Everything this call writes goes as one command, so one transaction:
     // the step handed back and the question holding it are written together
     // or not at all (a failure between them used to leave a blocked step with
@@ -460,7 +455,6 @@ fn update(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
                 step_id: id,
                 body: body.to_string(),
             },
-            target: target.take(),
         });
     }
     if let Some(phase) = phase {
@@ -469,7 +463,6 @@ fn update(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
                 step_id: id,
                 phase: phase.to_string(),
             },
-            target: target.take(),
         });
     }
     if let Some(status) = status {
@@ -480,7 +473,6 @@ fn update(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
                 note,
                 reason,
             },
-            target,
         });
     }
     if let Some(decision_id) = decision {
@@ -628,7 +620,6 @@ fn delete(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
     let id = resolve(inv, args.target("a plan step id")?)?;
     inv.client().interview(InterviewCommand::Outline {
         mutation: OutlineMutation::DeletePlanStep { step_id: id },
-        target: Some(id),
     })?;
     Ok(ack(id, inv.json))
 }
@@ -641,7 +632,6 @@ fn depend(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
             step_id: id,
             depends_on_step_id: on,
         },
-        target: Some(id),
     })?;
     Ok(ack(id, inv.json))
 }
@@ -654,7 +644,6 @@ fn undepend(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
             step_id: id,
             depends_on_step_id: on,
         },
-        target: Some(id),
     })?;
     Ok(ack(id, inv.json))
 }
@@ -667,7 +656,6 @@ fn satisfy(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
             step_id: id,
             obligation_id: obligation,
         },
-        target: Some(id),
     })?;
     Ok(ack(id, inv.json))
 }
@@ -680,7 +668,6 @@ fn unsatisfy(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
             step_id: id,
             obligation_id: obligation,
         },
-        target: Some(id),
     })?;
     Ok(ack(id, inv.json))
 }

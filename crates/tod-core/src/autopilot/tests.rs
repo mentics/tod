@@ -151,7 +151,6 @@ impl FakeAgent {
                     note: failed.then(|| "scripted failure".to_string()),
                     reason: None,
                 },
-                target: None,
             })?;
         }
         let run = crate::conversation::implement::TestRun {
@@ -273,7 +272,6 @@ impl FakeAgent {
                                 body: format!("Churn {}", Uuid::new_v4()),
                                 phase: tod_store::interview::PHASE_REQUIREMENTS.into(),
                             },
-                            target: None,
                         },
                     )?;
                 }

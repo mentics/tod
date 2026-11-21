@@ -372,7 +372,6 @@ mod tests {
             "verifier-actor",
             InterviewCommand::Outline {
                 mutation: OutlineMutation::UpdateObligationBody { obligation_id: one, body: "agent".into() },
-                target: None,
             },
         );
         assert!(agent.is_err());
@@ -451,7 +450,6 @@ mod tests {
             "verifier-actor",
             InterviewCommand::Outline {
                 mutation: OutlineMutation::UpdateObligationBody { obligation_id: one, body: "agent".into() },
-                target: None,
             },
         );
         assert!(agent.is_err());

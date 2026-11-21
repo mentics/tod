@@ -15,8 +15,6 @@ pub enum InterviewCommand {
     /// An obligation or content write.
     Outline {
         mutation: OutlineMutation,
-        #[serde(default)]
-        target: Option<Uuid>,
     },
 
     /// Append a note to a node's notes list.
@@ -472,7 +470,7 @@ pub fn execute(
     }
 
     match command {
-        InterviewCommand::Outline { mutation, target: _ } => {
+        InterviewCommand::Outline { mutation } => {
             if actor != ACTOR_USER {
                 crate::outline::check_references(conn, mutation)?;
             }
@@ -1091,6 +1089,15 @@ mod tests {
     use super::super::repo::InterviewRepo;
     use crate::outline::types::{OutlineEntry, OutlineList};
 
+    #[test]
+    fn outline_command_accepts_old_target_without_emitting_it() {
+        let mutation = OutlineMutation::CreateList { slug: "t".into(), title: "T".into() };
+        let mut wire = serde_json::to_value(InterviewCommand::Outline { mutation }).unwrap();
+        wire["target"] = serde_json::json!(Uuid::new_v4());
+        let command: InterviewCommand = serde_json::from_value(wire).unwrap();
+        assert!(serde_json::to_value(command).unwrap().get("target").is_none());
+    }
+
     fn setup() -> (tempfile::TempDir, Connection, Uuid, Uuid) {
         let dir = tempfile::Builder::new()
             .prefix("tod-interview-cmd-")
@@ -1164,7 +1171,6 @@ mod tests {
             ACTOR_USER,
             InterviewCommand::Outline {
                 mutation: OutlineMutation::RestoreObligation { rev },
-                target: None,
             },
         )
     }
@@ -1200,7 +1206,6 @@ mod tests {
                 agent,
                 InterviewCommand::Outline {
                     mutation: OutlineMutation::DeleteObligation { obligation_id: *id },
-                    target: Some(*id),
                 },
             )
             .unwrap();
@@ -1265,7 +1270,6 @@ mod tests {
                     obligation_id: id,
                     body: "The agent's wording.".into(),
                 },
-                target: Some(id),
             },
         )
         .unwrap();
@@ -1337,7 +1341,6 @@ mod tests {
                     tried: "ran it".into(),
                 }),
             },
-            target: None,
         };
         // The decision does not exist, so the link fails after the step was set.
         let batch = InterviewCommand::Batch {

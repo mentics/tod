@@ -73,7 +73,6 @@ fn outline(conn: &Connection, actor: &str, mutation: M) {
         actor,
         InterviewCommand::Outline {
             mutation,
-            target: None,
         },
     );
 }

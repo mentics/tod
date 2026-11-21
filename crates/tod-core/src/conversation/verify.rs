@@ -525,7 +525,6 @@ pub fn mock_turn(
                 note: None,
                 reason: None,
             },
-            target: None,
         })?;
     }
     let run = TestRun {

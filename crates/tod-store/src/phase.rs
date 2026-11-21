@@ -1356,7 +1356,6 @@ mod tests {
                 body: "Added by the evaluator".into(),
                 phase: crate::interview::PHASE_REQUIREMENTS.into(),
             },
-            target: None,
         };
         let err = run(&fx, &actor, edit).unwrap_err();
         assert!(format!("{err:#}").contains("evaluator"), "{err:#}");

@@ -135,7 +135,6 @@ impl Fx {
             &actor_for(self.conv),
             InterviewCommand::Outline {
                 mutation,
-                target: None,
             },
         )
     }
@@ -1512,7 +1511,6 @@ fn agent_writes_record_one_conversation_action_and_other_actors_record_outside_i
                     obligation_id: o,
                     body: actor.clone(),
                 },
-                target: Some(o),
             },
         )
         .unwrap();
@@ -1529,7 +1527,6 @@ fn agent_writes_record_one_conversation_action_and_other_actors_record_outside_i
                 obligation_id: o,
                 body: "Lost.".into(),
             },
-            target: None,
         },
     )
     .unwrap_err();
@@ -1547,7 +1544,6 @@ fn agent_writes_record_one_conversation_action_and_other_actors_record_outside_i
                     obligation_id: o,
                     body: "Lost.".into()
                 },
-                target: None,
             },
         )
         .is_err()
@@ -1958,7 +1954,6 @@ fn writes_outside_a_conversation_stay_out_of_its_projections() {
                 obligation_id: theirs,
                 body: "theirs, edited".into(),
             },
-            target: None,
         },
     )
     .unwrap();

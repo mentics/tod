@@ -239,7 +239,6 @@ mod tests {
                         step_id,
                         body: "Agent edit.".into(),
                     },
-                    target: None,
                 },
             )
             .unwrap();

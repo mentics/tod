@@ -1102,19 +1102,16 @@ pub enum AgentRole {
     Default,
     /// Chatting with an agent from a panel (unset Agent capability values).
     Chat,
-    /// Interview question-maker / answer-processor work.
-    Interview,
 }
 
 impl AgentRole {
     /// Settings display order.
-    pub const ALL: [AgentRole; 3] = [Self::Default, Self::Chat, Self::Interview];
+    pub const ALL: [AgentRole; 2] = [Self::Default, Self::Chat];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Default => "Default agent",
             Self::Chat => "Chat with agent",
-            Self::Interview => "Interview agent",
         }
     }
 }
@@ -1210,7 +1207,7 @@ pub struct TodSettings {
     /// Keep the main window above other windows (Windows only).
     #[serde(default)]
     pub always_on_top: bool,
-    /// Worktree provisioning backend for interview agents.
+    /// Worktree provisioning backend for agent workspaces.
     #[serde(default = "default_worktree_backend")]
     pub worktree_backend: WorktreeBackend,
     /// Parent directory for Treehouse worktree pools (`TREEHOUSE_WORKTREES`). When unset, pools live under `TREEHOUSE_HOME`.
@@ -1229,18 +1226,6 @@ pub struct TodSettings {
     /// several nodes) runs at once.
     #[serde(default = "default_max_parallel_agent_sessions")]
     pub max_parallel_agent_sessions: u32,
-    /// Which agent platform runs interview question-maker / answer-processor work.
-    #[serde(default = "default_agent_platform")]
-    pub agent_platform: AgentPlatform,
-    /// Per-platform model and effort for interview agent launches.
-    #[serde(default)]
-    pub agent_launch: AgentLaunchByPlatform,
-    /// Legacy flat model from older `tod.yml`; migrated into `agent_launch` on load.
-    #[serde(default, rename = "agent_model", skip_serializing)]
-    pub(crate) legacy_agent_model: Option<String>,
-    /// Legacy flat effort from older `tod.yml`; migrated into `agent_launch` on load.
-    #[serde(default, rename = "agent_effort", skip_serializing)]
-    pub(crate) legacy_agent_effort: Option<String>,
     /// Terminal emulator for interactive shell sessions.
     #[serde(default = "default_terminal_settings")]
     pub terminal: TerminalSettings,
@@ -1297,10 +1282,6 @@ impl Default for TodSettings {
             default_agent: AgentRoleSettings::default(),
             chat_agent: AgentRoleSettings::default(),
             max_parallel_agent_sessions: DEFAULT_MAX_PARALLEL_AGENT_SESSIONS,
-            agent_platform: AgentPlatform::default(),
-            agent_launch: AgentLaunchByPlatform::default(),
-            legacy_agent_model: None,
-            legacy_agent_effort: None,
             terminal: TerminalSettings::default(),
             window_geometry: None,
             journeys: JourneySettings::default(),
@@ -1317,12 +1298,10 @@ impl Default for TodSettings {
 }
 
 impl TodSettings {
-    /// Interview settings predate roles and keep their flat `tod.yml` keys.
     fn role_slot(&self, role: AgentRole) -> (AgentPlatform, &AgentLaunchByPlatform) {
         match role {
             AgentRole::Default => (self.default_agent.platform, &self.default_agent.launch),
             AgentRole::Chat => (self.chat_agent.platform, &self.chat_agent.launch),
-            AgentRole::Interview => (self.agent_platform, &self.agent_launch),
         }
     }
 
@@ -1336,7 +1315,6 @@ impl TodSettings {
                 &mut self.default_agent.launch,
             ),
             AgentRole::Chat => (&mut self.chat_agent.platform, &mut self.chat_agent.launch),
-            AgentRole::Interview => (&mut self.agent_platform, &mut self.agent_launch),
         }
     }
 
@@ -1384,44 +1362,6 @@ impl TodSettings {
         )
     }
 
-    /// Launch options for the currently selected interview platform.
-    pub fn interview_launch_options(&self) -> crate::agent_launch::AgentLaunchOptions {
-        self.launch_options_for(AgentRole::Interview)
-    }
-
-    /// Model for the active interview platform.
-    pub fn agent_model(&self) -> &str {
-        self.model_for(AgentRole::Interview)
-    }
-
-    /// Effort for the active interview platform.
-    pub fn agent_effort(&self) -> &str {
-        self.effort_for(AgentRole::Interview)
-    }
-
-    /// Update model for the active interview platform.
-    pub fn set_agent_model(&mut self, model: impl Into<String>) {
-        self.set_model_for(AgentRole::Interview, model);
-    }
-
-    /// Update effort for the active interview platform.
-    pub fn set_agent_effort(&mut self, effort: impl Into<String>) {
-        self.set_effort_for(AgentRole::Interview, effort);
-    }
-
-    /// Apply legacy flat `agent_model` / `agent_effort` into the active platform slot.
-    fn migrate_legacy_agent_launch(&mut self) {
-        let platform = self.agent_platform;
-        if let Some(model) = self.legacy_agent_model.take() {
-            self.agent_launch.get_mut(platform).model =
-                crate::agent_launch::coerce_model(platform, &model);
-        }
-        if let Some(effort) = self.legacy_agent_effort.take() {
-            self.agent_launch.get_mut(platform).effort =
-                crate::agent_launch::coerce_effort(platform, &effort);
-        }
-    }
-
     pub fn load(paths: &TodPaths) -> Result<Self> {
         paths.ensure_config_dir()?;
         Self::load_from_path(&paths.settings_path())
@@ -1438,21 +1378,9 @@ impl TodSettings {
         }
         let value: serde_yaml::Value = serde_yaml::from_str(&contents)
             .with_context(|| format!("failed to parse settings YAML from {}", path.display()))?;
-        let has_agent_launch = value
-            .as_mapping()
-            .is_some_and(|m| m.contains_key(serde_yaml::Value::from("agent_launch")));
-        let mut settings: Self = serde_yaml::from_value(value).with_context(|| {
-            format!(
-                "failed to deserialize settings YAML from {}",
-                path.display()
-            )
+        let settings: Self = serde_yaml::from_value(value).with_context(|| {
+            format!("failed to deserialize settings YAML from {}", path.display())
         })?;
-        if has_agent_launch {
-            settings.legacy_agent_model = None;
-            settings.legacy_agent_effort = None;
-        } else {
-            settings.migrate_legacy_agent_launch();
-        }
         settings.validate()?;
         Ok(settings)
     }
@@ -1648,6 +1576,17 @@ mod tests {
     }
 
     #[test]
+    fn retired_interview_agent_settings_do_not_change_active_roles() {
+        let settings: TodSettings = serde_yaml::from_str(
+            "agent_platform: cursor\nagent_model: composer-2.5\nagent_effort: high\nagent_launch:\n  cursor:\n    model: composer-2.5\n    effort: high\ndefault_agent:\n  platform: claude\nchat_agent:\n  platform: cursor\n",
+        ).unwrap();
+        assert_eq!(settings.platform_for(AgentRole::Default), AgentPlatform::Claude);
+        assert_eq!(settings.platform_for(AgentRole::Chat), AgentPlatform::Cursor);
+        let saved = serde_yaml::to_string(&settings).unwrap();
+        assert!(!saved.lines().any(|line| line.starts_with("agent_platform:") || line.starts_with("agent_launch:") || line.starts_with("agent_model:") || line.starts_with("agent_effort:")));
+    }
+
+    #[test]
     fn defaults_when_missing() {
         let dir = tod_test_util::scratch_dir(format!("tod-settings-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
@@ -1662,7 +1601,6 @@ mod tests {
             settings.worktree_backend,
             WorktreeBackend::TreehouseWithGitFallback
         );
-        assert_eq!(settings.agent_platform, AgentPlatform::Claude);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -1725,16 +1663,6 @@ mod tests {
             },
             chat_agent: AgentRoleSettings::default(),
             max_parallel_agent_sessions: 2,
-            agent_platform: AgentPlatform::Claude,
-            agent_launch: AgentLaunchByPlatform {
-                claude: PlatformLaunchSettings {
-                    model: "opus".into(),
-                    effort: "high".into(),
-                },
-                cursor: PlatformLaunchSettings::for_platform(AgentPlatform::Cursor),
-            },
-            legacy_agent_model: None,
-            legacy_agent_effort: None,
             terminal: TerminalSettings {
                 program: Some(r"C:\app\dev\Git\git-bash.exe".into()),
             },
@@ -1833,57 +1761,11 @@ mod tests {
     }
 
     #[test]
-    fn migrates_legacy_flat_model_effort_into_active_platform() {
-        let dir = tod_test_util::scratch_dir(format!("tod-settings-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("tod.yml");
-        fs::write(
-            &path,
-            "agent_platform: cursor\nagent_model: composer-2.5\nagent_effort: high\n",
-        )
-        .unwrap();
-        let loaded = TodSettings::load_from_path(&path).unwrap();
-        assert_eq!(loaded.agent_platform, AgentPlatform::Cursor);
-        assert_eq!(loaded.agent_launch.cursor.model, "composer-2.5");
-        assert_eq!(loaded.agent_launch.cursor.effort, "high");
-        assert_eq!(
-            loaded.agent_launch.claude.model,
-            crate::agent_launch::default_model_for(AgentPlatform::Claude)
-        );
-        // Re-save should write per-platform block, not flat legacy keys.
-        loaded.save_to_path(&path).unwrap();
-        let yaml = fs::read_to_string(&path).unwrap();
-        assert!(yaml.contains("agent_launch:"));
-        assert!(!yaml.contains("agent_model:"));
-        assert!(!yaml.contains("agent_effort:"));
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn keeps_independent_platform_launch_settings() {
-        let mut settings = TodSettings::default();
-        settings.agent_platform = AgentPlatform::Claude;
-        settings.set_agent_model("opus");
-        settings.set_agent_effort("high");
-        settings.agent_platform = AgentPlatform::Cursor;
-        settings.set_agent_model("composer-2.5");
-        settings.set_agent_effort("medium");
-        assert_eq!(settings.agent_launch.claude.model, "opus");
-        assert_eq!(settings.agent_launch.claude.effort, "high");
-        assert_eq!(settings.agent_launch.cursor.model, "composer-2.5");
-        assert_eq!(settings.agent_launch.cursor.effort, "medium");
-        settings.agent_platform = AgentPlatform::Claude;
-        assert_eq!(settings.agent_model(), "opus");
-        assert_eq!(settings.agent_effort(), "high");
-    }
-
-    #[test]
     fn agent_roles_are_independent() {
         let mut settings = TodSettings::default();
         settings.set_platform_for(AgentRole::Chat, AgentPlatform::Cursor);
         settings.set_model_for(AgentRole::Chat, "composer-2.5");
         settings.set_effort_for(AgentRole::Default, "high");
-        settings.set_model_for(AgentRole::Interview, "opus");
 
         let chat = settings.launch_options_for(AgentRole::Chat);
         assert_eq!(chat.platform, AgentPlatform::Cursor);
@@ -1895,9 +1777,6 @@ mod tests {
         assert_eq!(default.model, "default");
         assert_eq!(default.effort, "high");
 
-        assert_eq!(settings.agent_platform, AgentPlatform::Claude);
-        assert_eq!(settings.agent_model(), "opus");
-        assert_eq!(settings.agent_effort(), "auto");
     }
 
     #[test]

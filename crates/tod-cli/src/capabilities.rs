@@ -344,7 +344,6 @@ fn disable(inv: &Invocation, node: Uuid, raw: &[String]) -> anyhow::Result<Strin
 fn write(inv: &Invocation, mutation: OutlineMutation) -> anyhow::Result<()> {
     inv.client().interview(InterviewCommand::Outline {
         mutation,
-        target: None,
     })?;
     Ok(())
 }
