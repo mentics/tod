@@ -298,4 +298,6 @@ node's sandbox was retired while it waited (by design), and the app replaced a l
 sandbox only for a running node, so the webhook's mark did nothing; it now looks at
 GitHub and remakes the sandbox when there is work. A cancelled job is also hidden
 while another check fails, and `pr_pushes` rows exist only with "Include review
-steps" on for `pr_draft`. See the live-verify skill's gotchas.
+steps" on for `pr_draft`. Both fixes were then confirmed live (build-test, base `lv-base2`: the
+sandbox remade ~12 s after a cancel; the job rerun with and without another failing check;
+`pr_pushes` rows baseline, unreviewed, pushed_by_tod). See the live-verify skill's gotchas.
