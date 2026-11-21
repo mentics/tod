@@ -44,6 +44,48 @@ pub struct Problem {
     pub message: String,
     /// The node or sandbox it concerns, when the reporter knows.
     pub label: Option<String>,
+    /// Set when a node's supervisor saw a failure other nodes may share (or
+    /// the operation that failed went through again): the daemon groups it
+    /// with the same failure on other nodes (`doc/lifecycle/incidents.md`).
+    pub incident: Option<IncidentReport>,
+}
+
+/// A node's sighting of a cause that may be shared by other nodes, riding
+/// the problem channel from a sandbox to the daemon.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IncidentReport {
+    /// [`IncidentEvent::Failure`] or [`IncidentEvent::Ok`].
+    pub event: IncidentEvent,
+    /// The node it concerns (its id).
+    pub node: String,
+    /// Where it was seen (`tod_store::incident_class::Source`, snake case).
+    pub source: String,
+    /// The class (`auth`, `service_down`, ...), as the sender classified it.
+    pub kind: String,
+    /// `<kind>:<key>`, as the sender classified it. The daemon classifies
+    /// the error itself and says when the two differ.
+    pub signature: String,
+    /// What the node was doing ("looking at GitHub").
+    pub operation: String,
+    /// The full error (empty for [`IncidentEvent::Ok`]).
+    pub error: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IncidentEvent {
+    /// The node failed `operation`.
+    Failure,
+    /// The node's operation went through (sent once after a failure).
+    Ok,
+}
+
+impl IncidentEvent {
+    fn as_str(self) -> &'static str {
+        match self {
+            IncidentEvent::Failure => "failure",
+            IncidentEvent::Ok => "ok",
+        }
+    }
 }
 
 pub fn dir(data_root: &Path) -> PathBuf {
@@ -83,6 +125,21 @@ fn write_line(dir: &Path, process: &str, level: Level, label: Option<&str>, mess
         process: process.to_string(),
         message: message.to_string(),
         label: label.map(str::to_string),
+        incident: None,
+    };
+    write_json(dir, &safe_name(process), &to_json(&p))
+}
+
+/// Append a problem carrying an incident report to `dir` (a node's
+/// [`node_dir`]); the supervisor forwards it with the rest.
+pub fn report_incident(dir: &Path, process: &str, message: &str, incident: IncidentReport) -> std::io::Result<()> {
+    let p = Problem {
+        time: now_secs(),
+        level: Level::Warn,
+        process: process.to_string(),
+        message: message.to_string(),
+        label: None,
+        incident: Some(incident),
     };
     write_json(dir, &safe_name(process), &to_json(&p))
 }
@@ -137,6 +194,24 @@ fn parse(line: &str) -> Option<Problem> {
         process: v.get("process")?.as_str()?.to_string(),
         message: v.get("message")?.as_str()?.to_string(),
         label: v.get("label").and_then(|l| l.as_str()).map(str::to_string),
+        incident: v.get("incident").and_then(parse_incident),
+    })
+}
+
+fn parse_incident(v: &serde_json::Value) -> Option<IncidentReport> {
+    let text = |key: &str| v.get(key).and_then(|x| x.as_str()).map(str::to_string);
+    Some(IncidentReport {
+        event: match v.get("event")?.as_str()? {
+            "failure" => IncidentEvent::Failure,
+            "ok" => IncidentEvent::Ok,
+            _ => return None,
+        },
+        node: text("node")?,
+        source: text("source").unwrap_or_default(),
+        kind: text("kind").unwrap_or_default(),
+        signature: text("signature").unwrap_or_default(),
+        operation: text("operation").unwrap_or_default(),
+        error: text("error").unwrap_or_default(),
     })
 }
 
@@ -288,6 +363,12 @@ pub fn to_json(p: &Problem) -> serde_json::Value {
     if let Some(label) = &p.label {
         v["label"] = label.clone().into();
     }
+    if let Some(i) = &p.incident {
+        v["incident"] = serde_json::json!({
+            "event": i.event.as_str(), "node": i.node, "source": i.source, "kind": i.kind,
+            "signature": i.signature, "operation": i.operation, "error": i.error,
+        });
+    }
     v
 }
 
@@ -387,6 +468,31 @@ mod tests {
         if std::env::var_os(DATA_ROOT_ENV).is_none() {
             assert!(!report_to(None, "x", Level::Error, None, "m").unwrap());
         }
+    }
+
+    #[test]
+    fn an_incident_report_survives_the_wire_and_the_files() {
+        let dir = temp("incident").join("node");
+        let report = IncidentReport {
+            event: IncidentEvent::Failure,
+            node: "n1".into(),
+            source: "github".into(),
+            kind: "auth".into(),
+            signature: "auth:github".into(),
+            operation: "looking at GitHub".into(),
+            error: "GitHub rejected the token \"x\"".into(),
+        };
+        report_incident(&dir, "tod-supervisor", "incident auth:github", report.clone()).unwrap();
+        report_in(&dir, "tod-supervisor", Level::Warn, None, "plain").unwrap();
+        let mut outbox = Outbox::open(&dir).unwrap();
+        let pending = outbox.pending().unwrap();
+        assert_eq!(pending.len(), 2);
+        let with = pending.iter().find(|p| p.incident.is_some()).unwrap();
+        assert_eq!(with.incident.as_ref(), Some(&report));
+        assert!(pending.iter().any(|p| p.incident.is_none()));
+        // Through the orchestrator's re-encoding.
+        let again = from_json(&to_json(with)).unwrap();
+        assert_eq!(again.incident, Some(report));
     }
 
     #[test]

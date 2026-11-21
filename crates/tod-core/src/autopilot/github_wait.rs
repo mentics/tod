@@ -333,7 +333,7 @@ pub fn look_failed_next_look(
 }
 
 /// The node's `github:*:read` waits end: GitHub has been read since.
-pub(super) fn clear_read_failures(fleet: &FleetStore, node: uuid::Uuid) -> Result<()> {
+pub(crate) fn clear_read_failures(fleet: &FleetStore, node: uuid::Uuid) -> Result<()> {
     cancel_waits(fleet, node, |spec| spec.ends_with(":read") && spec.starts_with("github:"))
 }
 

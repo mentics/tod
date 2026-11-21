@@ -48,6 +48,11 @@ pub const PROBE_MAX_MS: i64 = 30 * 60 * 1000;
 /// A probe node that has not parked again this long after it was resumed
 /// succeeded (its operation went through), and the incident is resolved.
 pub const PROBE_GRACE_MS: i64 = 3 * 60 * 1000;
+/// The same for a probe node that runs in a cloud sandbox: its supervisor has
+/// to wake, run, and have its failure forwarded and read on a later sync, so a
+/// failure arrives later than a local run's. A report that its operation went
+/// through (`NodeOk`) resolves sooner.
+pub const CLOUD_PROBE_GRACE_MS: i64 = 20 * 60 * 1000;
 /// The gap between nodes resumed after an incident resolves.
 pub const RELEASE_STAGGER_MS: i64 = 5_000;
 /// A notice incident (a bot silent on several pull requests: nothing parks)
@@ -900,6 +905,24 @@ fn start_probe(conn: &Connection, incident: Uuid, node: Uuid, now: i64) -> Resul
     Ok(())
 }
 
+/// Whether `node` runs under a supervisor in a cloud sandbox (it has a
+/// `cloud_nodes` row). Its autopilot is not this machine's.
+pub fn is_cloud_node(conn: &Connection, node: Uuid) -> bool {
+    crate::cloud_nodes::get(conn, node).ok().flatten().is_some()
+}
+
+/// The node an incident's escalation goes to: a parked node that runs on this
+/// machine when there is one (its autopilot can run an investigation), else
+/// the oldest parked, else any member.
+fn escalation_node(conn: &Connection, incident: Uuid) -> Result<Option<Uuid>> {
+    let held: Vec<Member> = members(conn, incident)?;
+    let parked = || held.iter().filter(|m| m.parked());
+    if let Some(local) = parked().find(|m| !is_cloud_node(conn, m.node_id)) {
+        return Ok(Some(local.node_id));
+    }
+    Ok(oldest_parked(conn, incident)?.or(held.first().map(|m| m.node_id)))
+}
+
 fn oldest_parked(conn: &Connection, incident: Uuid) -> Result<Option<Uuid>> {
     Ok(conn
         .query_row(
@@ -938,8 +961,8 @@ pub fn pass(conn: &Connection, now: i64) -> Result<Passed> {
     }
     for incident in list_open(conn)?.into_iter().filter(|i| !i.notice) {
         // A probe that did not park again within the grace succeeded.
-        if let (Some(_), Some(started)) = (incident.probe_node, incident.probe_started_at)
-            && now - started >= PROBE_GRACE_MS
+        if let (Some(probe), Some(started)) = (incident.probe_node, incident.probe_started_at)
+            && now - started >= if is_cloud_node(conn, probe) { CLOUD_PROBE_GRACE_MS } else { PROBE_GRACE_MS }
         {
             resolve(conn, incident.id, now)?;
             out.resolved.push(incident.id);
@@ -963,13 +986,16 @@ pub fn pass(conn: &Connection, now: i64) -> Result<Passed> {
         // The one escalation.
         if incident.escalated_at.is_none()
             && escalation_due(&incident, now)
-            && let Some(node) = oldest_parked(conn, incident.id)?.or(members(conn, incident.id)?.first().map(|m| m.node_id))
+            && let Some(node) = escalation_node(conn, incident.id)?
         {
             conn.execute(
                 "UPDATE incidents SET escalated_at = ?2, escalation_node = ?3 WHERE id = ?1 AND escalated_at IS NULL",
                 params![uuid_to_blob(incident.id), now, uuid_to_blob(node)],
             )?;
-            if incident.kind == Kind::Auth {
+            // An investigation runs on a local autopilot; when every node
+            // that has it runs in a sandbox, none can, so it is the user's
+            // one request instead, as for auth.
+            if incident.kind == Kind::Auth || is_cloud_node(conn, node) {
                 out.requests.push((incident.id, node));
             }
             // Any other kind is investigated: the node is released as the
@@ -979,10 +1005,12 @@ pub fn pass(conn: &Connection, now: i64) -> Result<Passed> {
         if incident.probe_node.is_none() {
             // A claimed investigation runs on its node's autopilot: that node
             // is released as the probe, once.
-            if let Some(node) = incident.escalation_node.filter(|_| {
+            if let Some(node) = incident.escalation_node.filter(|escalation| {
                 incident.escalation_decision.is_none()
                     && incident.investigation_conversation.is_none()
                     && incident.kind != Kind::Auth
+                    // A sandbox's node was asked of the user instead (above).
+                    && !is_cloud_node(conn, *escalation)
                     && incident.next_probe_at.is_none_or(|at| at <= now)
             }) {
                 let parked = members(conn, incident.id)?.into_iter().any(|m| m.node_id == node && m.parked());

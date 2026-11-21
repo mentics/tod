@@ -128,6 +128,52 @@ fn a_probe_that_does_not_park_again_within_the_grace_resolves_the_incident() {
     assert_eq!(get(&conn, id).unwrap().unwrap().status, STATUS_RESOLVED);
 }
 
+fn in_cloud(conn: &Connection, nodes: &[Uuid]) {
+    for node in nodes {
+        crate::cloud_nodes::upsert(conn, *node, "node-sandbox", "alice", 1).unwrap();
+    }
+}
+
+#[test]
+fn a_cloud_probe_gets_the_longer_grace_before_it_counts_as_succeeded() {
+    let (_dir, conn, n) = setup(2);
+    in_cloud(&conn, &n);
+    fail(&conn, n[0], AUTH, 0);
+    let id = fail(&conn, n[1], AUTH, 0).incident.unwrap().id;
+    pass(&conn, PROBE_FIRST_MS).unwrap();
+    // The local grace is not enough: the sandbox has to wake and look.
+    let early = pass(&conn, PROBE_FIRST_MS + PROBE_GRACE_MS).unwrap();
+    assert!(early.resolved.is_empty(), "{early:?}");
+    let late = pass(&conn, PROBE_FIRST_MS + CLOUD_PROBE_GRACE_MS).unwrap();
+    assert_eq!(late.resolved, vec![id]);
+}
+
+#[test]
+fn an_incident_only_cloud_nodes_have_asks_the_user_instead_of_starting_an_investigation() {
+    let (_dir, conn, n) = setup(2);
+    in_cloud(&conn, &n);
+    let down = "GitHub is unavailable (HTTP 503)";
+    fail(&conn, n[0], down, 0);
+    let id = fail(&conn, n[1], down, 0).incident.unwrap().id;
+    let early = pass(&conn, PROBE_FIRST_MS).unwrap();
+    observe(&conn, early.resumed[0], Source::Github, "reading the pull request", down, PROBE_FIRST_MS + 1).unwrap();
+    let late = pass(&conn, ESCALATE_AFTER_MS + 1).unwrap();
+    assert_eq!(late.requests.len(), 1, "a sandbox has no local autopilot to investigate: {late:?}");
+    assert_eq!(late.requests[0].0, id);
+    assert!(late.investigations.is_empty());
+}
+
+#[test]
+fn an_incident_with_a_local_node_is_represented_by_it_not_by_a_sandbox() {
+    let (_dir, conn, n) = setup(3);
+    in_cloud(&conn, &n[..2]);
+    fail(&conn, n[0], AUTH, 0);
+    fail(&conn, n[1], AUTH, 0);
+    fail(&conn, n[2], AUTH, 10);
+    let first = pass(&conn, 1_000).unwrap();
+    assert_eq!(first.requests[0].1, n[2]);
+}
+
 #[test]
 fn an_auth_incident_is_escalated_once_with_one_representative() {
     let (_dir, conn, n) = setup(3);

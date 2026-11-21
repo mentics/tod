@@ -404,6 +404,18 @@ impl Runners {
             tracing::error!("the incidents' pass failed: {err:#}");
             return;
         }
+        // A cloud node an incident parked after its own failure (another
+        // node opened it) is held in its sandbox from here.
+        if tod_core::incident::enabled() {
+            match tod_core::incident::cloud::hold_parked(store) {
+                Ok(held) => {
+                    for node in held {
+                        tracing::info!(%node, "holding a cloud node parked on an incident");
+                    }
+                }
+                Err(err) => tracing::error!("could not hold the cloud nodes parked on an incident: {err:#}"),
+            }
+        }
         let released = match tod_core::incident::take_released(store) {
             Ok(released) => released,
             Err(err) => {
@@ -413,6 +425,24 @@ impl Runners {
         };
         for node in released {
             tracing::info!(%node, "resuming a node parked on an incident");
+            match RunnerPlace::of(store, node) {
+                // A cloud node is not this daemon's to start: its hold (a
+                // wait in its sandbox's copy) ends and its supervisor is woken.
+                // That blocks on the network, so it runs on a thread of its
+                // own; a failure parks the node again from there.
+                Ok(RunnerPlace::Supervisor) => {
+                    self.release_cloud_node(node);
+                    continue;
+                }
+                Ok(RunnerPlace::Local) => {}
+                Err(err) => {
+                    tracing::error!(%node, "could not tell where a node parked on an incident runs: {err:#}");
+                    if let Err(err) = tod_core::incident::repark(store, node) {
+                        tracing::error!(%node, "could not park it again: {err:#}");
+                    }
+                    continue;
+                }
+            }
             if let Err(err) = self.start_auto(node) {
                 tracing::error!(%node, "could not resume a node parked on an incident: {err:#}");
                 if let Err(err) = tod_core::incident::repark(store, node) {
@@ -420,6 +450,32 @@ impl Runners {
                 }
             }
         }
+    }
+
+    /// Resumes a cloud node parked on an incident: its hold ends and its
+    /// supervisor is woken as a Check now is (`cloud_sync::wake_node_requesting`),
+    /// which also replaces a sandbox that is gone. On a thread: waking a
+    /// sandbox takes as long as Blaxel takes.
+    fn release_cloud_node(&self, node: Uuid) {
+        let store = self.inner.store.clone();
+        let root = store.paths().root().to_path_buf();
+        std::thread::spawn(move || {
+            let mut wake = |node: Uuid| -> Result<()> {
+                // Not the tracked variant: that fails when the supervisor is
+                // slow to report in, and a supervisor that is already running
+                // must not be held again for it.
+                tod_core::cloud_sync::wake_node_requesting(
+                    &store,
+                    &root,
+                    &node.to_string(),
+                    tod_core::cloud_sync::REQUEST_CHECK_NOW,
+                )
+                .map(|_| ())
+            };
+            if let Err(err) = tod_core::incident::cloud::release(&store, node, &mut wake) {
+                tracing::error!(%node, "could not resume a cloud node parked on an incident: {err:#}");
+            }
+        });
     }
 
     fn tick(&self) {

@@ -821,6 +821,11 @@ pub fn record_remote_problems(problems: &[tod_problems::Problem]) {
             tod_problems::Level::Error => Level3::Error,
             tod_problems::Level::Warn => Level3::Warn,
         };
+        // The note that a failed operation went through again is the
+        // incident's bookkeeping, not a problem to show.
+        if p.incident.as_ref().is_some_and(|i| i.event == tod_problems::IncidentEvent::Ok) {
+            continue;
+        }
         let label = p.label.as_deref().unwrap_or("cloud");
         record(level, LogSource::for_process(&p.process), format!("[{label}] {}", p.message));
     }
@@ -1007,6 +1012,28 @@ fn sync_once(fleet: &FleetStore, root: &Path, orch: &dyn Orchestrator, user: &st
     match orch.pull_problems(user, state.problems_after.as_ref()) {
         Ok((cursor, problems)) => {
             record_remote_problems(&problems);
+            // The failures the supervisors saw that other nodes may share go
+            // to the incident table, so cloud and local nodes group together
+            // and a parked cloud node is held in its sandbox
+            // (`crate::incident::cloud`). Said, never dropped: the cursor
+            // moves on, so a report that cannot be used is an error now.
+            match crate::incident::cloud::ingest(fleet, &problems) {
+                Ok(done) if done.failures + done.oks > 0 => tracing::info!(
+                    failures = done.failures,
+                    oks = done.oks,
+                    held = done.held.len(),
+                    "cloud sync: incident reports from supervisors"
+                ),
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::error!("cloud sync: {err:#}");
+                    crate::logging::buffer::record(
+                        crate::logging::buffer::Level3::Error,
+                        crate::logging::buffer::LogSource::App,
+                        format!("Incident reports from the cloud could not be used: {err:#}"),
+                    );
+                }
+            }
             state.problems_after = Some(cursor);
             state.save(root)?;
         }

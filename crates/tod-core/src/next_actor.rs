@@ -1947,6 +1947,24 @@ mod tests {
     }
 
     #[test]
+    fn a_cloud_node_parked_on_an_incident_is_others_naming_it() {
+        use tod_store::incident_class::Source;
+        let fx = fixture();
+        let local = node(&fx.conn, "local", Some("pr_draft"));
+        let cloud = node(&fx.conn, "cloud", Some("pr_draft"));
+        tod_store::cloud_nodes::upsert(&fx.conn, cloud, "node-cloud", "alice", 1).unwrap();
+        let error = "GitHub rejected the token (HTTP 401): it is expired, revoked, or mistyped";
+        for n in [local, cloud] {
+            tod_store::incidents::observe(&fx.conn, n, Source::Github, "looking at GitHub", error, NOW).unwrap();
+        }
+        let inputs = Inputs { now_ms: NOW, ..Default::default() };
+        let got = for_nodes(&fx.conn, &[cloud], &inputs).unwrap();
+        let NextActor::Others { wait } = &got[&cloud].actor else { panic!("{:?}", got[&cloud].actor) };
+        assert_eq!(wait.who.as_deref(), Some("GitHub auth failing, 2 nodes"));
+        assert!(!got[&cloud].on_you());
+    }
+
+    #[test]
     fn for_nodes_reads_leases_and_takes_deferrals_per_node() {
         let fx = fixture();
         let running = node(&fx.conn, "running", Some("active"));

@@ -462,6 +462,74 @@ fn a_nodes_problem_reaches_the_apps_log_on_a_sync_and_only_once() {
     assert!(CloudSyncState::load(&root).unwrap().problems_after.is_some());
 }
 
+/// Two sandboxes' supervisors see the same failure; their reports come through
+/// the orchestrator's problem forwarding and one sync groups them into one
+/// incident and holds both nodes (`incident::cloud`).
+#[test]
+fn incident_reports_from_two_supervisors_become_one_incident_and_hold_both_nodes() {
+    use tod_store::outline::{CreatePosition, OutlineMutation};
+    let base = temp_root("orch-incidents");
+    let url = start_orchestrator(&base);
+    let orch = HttpOrchestrator::new(url.clone(), None).with_client("app-test");
+    let root = temp_root("app-incidents");
+    let app = FleetStore::open(&root).unwrap();
+    add_list(&app, "first");
+    let list_id = app.list_outline_lists().unwrap()[0].id;
+    let nodes: Vec<uuid::Uuid> = (0..2).map(|_| uuid::Uuid::new_v4()).collect();
+    for (i, node) in nodes.iter().enumerate() {
+        app.enqueue_outline(OutlineMutation::CreateNode {
+            node_id: Some(*node),
+            list_id,
+            parent_id: None,
+            anchor_id: None,
+            position: CreatePosition::Below,
+            title: format!("n{i}"),
+        })
+        .unwrap();
+    }
+    app.writer().flush().unwrap();
+    for node in &nodes {
+        // Their Files run in a sandbox, so the sync keeps their cloud records.
+        crate::runner_place::test_support::set_files(&app, *node, crate::runner_place::test_support::sandbox(), false);
+    }
+    sync(&app, &root, &orch, "alice").unwrap();
+    {
+        let conn = rusqlite::Connection::open(root.join("tod.db")).unwrap();
+        for node in &nodes {
+            tod_store::cloud_nodes::upsert(&conn, *node, "node-sandbox", "alice", 1).unwrap();
+        }
+    }
+    let _ = app.reload_if_stale();
+
+    crate::incident::set_enabled(true);
+    let error = "GitHub rejected the token (HTTP 401): it is expired, revoked, or mistyped";
+    for node in &nodes {
+        let dir = temp_root("supervisor-problems");
+        crate::incident::cloud::report_failure(
+            &dir,
+            *node,
+            tod_store::incident_class::Source::Github,
+            "looking at GitHub",
+            error,
+        );
+        let lines: Vec<serde_json::Value> =
+            tod_problems::read_since(&dir, &mut tod_problems::Cursor::new()).unwrap().iter().map(tod_problems::to_json).collect();
+        let sent = ureq::post(format!("{url}/users/alice/nodes/{node}/problems"))
+            .header(sync::CLIENT_HEADER, format!("supervisor-{node}"))
+            .send_json(serde_json::Value::Array(lines))
+            .unwrap();
+        assert_eq!(sent.status(), 200);
+    }
+    sync(&app, &root, &orch, "alice").unwrap();
+
+    let open = app.read(|conn| tod_store::incidents::list_open(conn)).unwrap();
+    assert_eq!(open.len(), 1, "one incident for both nodes: {open:?}");
+    for node in &nodes {
+        assert!(crate::incident::cloud::is_held(&app, *node).unwrap(), "{node} is held in its sandbox");
+    }
+    crate::incident::set_enabled(false);
+}
+
 #[test]
 fn a_cloud_node_is_working_only_while_its_supervisor_is_beating() {
     use tod_store::interview::InterviewCommand;
