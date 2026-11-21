@@ -25,6 +25,13 @@ run the read commands of `tod-cli`, to check a fact instead of asking about it.
    the brief the user will read, shaped as below. You stay linked to the
    request as the user's chat partner for it.
 
+When the context has a section **Requests that share this cause**, the agent
+named one cause for those requests and you read them together as one group. Your
+verb names the first request, and what answers or closes it (an answer, a
+suggestion, a dispute) settles the others the same way. Answer only when one
+answer fits every request in the group; otherwise escalate, and the user's one
+answer will settle them all.
+
 Never answer a request that carries obligation edits or moves, or that reverses
 what the user decided earlier. When unsure whether the user must decide,
 escalate: a wrongly escalated request costs a minute, a wrongly answered one

@@ -18,7 +18,10 @@
 //! - **settle** (in the chat, after escalation): the user decided with it
 //!   (`decided_by = user`).
 //!
-//! plus **lesson**, the one reflection a closed request gets. Every verb checks
+//! A session may read a group of requests that share a cause
+//! ([`crate::decisions::DecisionRepo::triage_group`]): the oldest leads, and
+//! answering (or closing) the lead answers the rest the same way. plus
+//! **lesson**, the one reflection a closed request gets. Every verb checks
 //! that the writing session is the triage session linked to the request.
 
 use crate::conversation::{ConversationRepo, ProtocolKind};
@@ -79,6 +82,10 @@ pub enum Op {
         #[serde(default)]
         rationale: String,
     },
+    /// The app hands a request that waits on triage to the user as it was
+    /// asked (`lifecycle.triage` is off), with the requests that wait behind it
+    /// in the same group. Only the app (not a session).
+    Release { decision: Uuid },
     Lesson {
         decision: Uuid,
         conversation: Uuid,
@@ -135,7 +142,16 @@ pub fn run_op(conn: &Connection, actor: &str, op: &Op) -> Result<Value> {
                 }
             }
             decisions.link_triage(*decision, *conversation)?;
-            Ok(json!({ "decision": decision.to_string() }))
+            // The requests on the task that share this one's cause are read by
+            // this same session, and its answer settles them all.
+            let group = decisions.triage_group(&target)?;
+            for member in &group {
+                decisions.link_triage(member.id, *conversation)?;
+            }
+            Ok(json!({
+                "decision": decision.to_string(),
+                "group": group.iter().map(|d| d.id.to_string()).collect::<Vec<_>>(),
+            }))
         }
         Op::Answer { decision, conversation, option, text, rationale } => {
             check_session(conn, actor, *conversation)?;
@@ -204,6 +220,27 @@ pub fn run_op(conn: &Connection, actor: &str, op: &Op) -> Result<Value> {
                 decisions.close_converted(*decision, *conversation, &what, reason)?;
             }
             Ok(outcome)
+        }
+        Op::Release { decision } => {
+            if crate::conversation::actor_conversation(actor)
+                .or_else(|| crate::conversation::agent_actor_conversation(actor))
+                .is_some()
+            {
+                bail!("only the app hands a request in triage to the user");
+            }
+            let found = decisions.get(*decision)?.ok_or_else(|| anyhow::anyhow!("decision {decision} not found"))?;
+            let mut released = vec![found.id];
+            if let Some(conversation) = found.triage_conversation_id {
+                for other in decisions.all_for_triage_conversation(conversation)? {
+                    if other.id != found.id && other.in_triage() {
+                        released.push(other.id);
+                    }
+                }
+            }
+            for id in &released {
+                decisions.release_to_user(*id)?;
+            }
+            Ok(json!({ "released": released.iter().map(|id| id.to_string()).collect::<Vec<_>>() }))
         }
         Op::Settle { decision, conversation, option, text, rationale } => {
             check_session(conn, actor, *conversation)?;

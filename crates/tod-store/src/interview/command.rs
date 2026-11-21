@@ -1178,11 +1178,12 @@ pub fn execute(
             // An agent's judgment request from a lifecycle session is read by
             // triage first (`crate::decisions::goes_to_triage`).
             let mut filed = decision.clone();
+            // With `lifecycle.triage` off it goes straight to the user.
             filed.triage = crate::decisions::goes_to_triage(
                 protocol.as_deref(),
                 &filed.reason,
                 filed.guard_reask,
-            );
+            ) && crate::decisions::triage_enabled(conn)?;
             let decision = crate::decisions::DecisionRepo::new(conn).create(
                 *node_id,
                 *conversation_id,

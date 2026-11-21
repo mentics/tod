@@ -141,3 +141,97 @@ fn the_asking_agent_is_told_triage_decided_it() {
     let told = fx.fleet.read(|conn| crate::node_context::render_recent_answers(conn, fx.node, "")).unwrap();
     assert!(told.contains("Decided by triage"), "{told}");
 }
+
+/// Like `ask`, naming the cause the request shares with others.
+fn ask_cause(fx: &Fixture, question: &str, cause: &str) -> Uuid {
+    // Requests can share a creation timestamp, so the new one is the id that
+    // was not there before, never the last by time.
+    let before: Vec<Uuid> = all(fx).iter().map(|d| d.id).collect();
+    fx.fleet
+        .interview(
+            "autopilot",
+            InterviewCommand::AskDecision {
+                node_id: fx.node,
+                conversation_id: None,
+                protocol: Some("implementation".into()),
+                decision: NewDecision {
+                    question: question.into(),
+                    options: vec!["Keep it".into(), "Drop it".into()],
+                    reason: "intent".into(),
+                    guard_reask: true,
+                    cause: cause.into(),
+                    ..Default::default()
+                },
+            },
+        )
+        .unwrap();
+    all(fx).into_iter().map(|d| d.id).find(|id| !before.contains(id)).expect("the request was filed")
+}
+
+/// Requests that name one cause are read by one session; its answer settles
+/// every one, and the session reflects once, on the lead.
+#[test]
+fn requests_with_one_cause_are_triaged_in_one_session_and_answered_together() {
+    let fx = setup();
+    let lead = ask_cause(&fx, "Keep the old name?\n\ntriage-answer 2", "rename");
+    let other = ask_cause(&fx, "Should the alias stay too?", "rename");
+    let separate = ask_cause(&fx, "Unrelated: wrap the call?\n\ntriage-answer 1", "");
+    let mut agent = FakeAgent::new(&fx.fleet);
+    autopilot(&fx, Budget::default()).run(&fx.fleet, &mut agent).unwrap();
+    let (a, b, c) = (get(&fx, lead), get(&fx, other), get(&fx, separate));
+    assert_eq!((a.status.as_str(), b.status.as_str(), c.status.as_str()), (DECISION_ANSWERED, DECISION_ANSWERED, DECISION_ANSWERED));
+    assert_eq!(a.triage_conversation_id, b.triage_conversation_id, "one session read both");
+    assert_ne!(a.triage_conversation_id, c.triage_conversation_id, "the unrelated request had its own");
+    let found = fx.fleet.read(|conn| Ok(DecisionRepo::new(conn).get_with_answers(other)?)).unwrap().unwrap();
+    assert_eq!(found.answers[0].text.as_deref(), Some("Drop it"));
+    assert_eq!(found.answers[0].decided_by, DECIDED_BY_TRIAGE);
+    // Two sessions (the group's and the unrelated request's), each read once
+    // and reflected on once: four turns, not six.
+    assert_eq!(triage_turns(&agent), 4);
+    assert_eq!(lessons(&fx, lead).len(), 1);
+    assert!(lessons(&fx, other).is_empty(), "a follower has no reflection of its own");
+}
+
+/// An escalated group is one card for the user; answering it settles the rest.
+#[test]
+fn an_escalated_group_is_one_request_for_the_user() {
+    let fx = setup();
+    let lead = ask_cause(&fx, "Ship without the migration?", "migration");
+    let other = ask_cause(&fx, "Also skip the backfill?", "migration");
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let outcome = autopilot(&fx, Budget::default()).run(&fx.fleet, &mut agent).unwrap();
+    assert_eq!(outcome, Outcome::NeedsHuman { reason: NeedsHuman::Decision { pending: 1 } });
+    assert_eq!(get(&fx, lead).status, DECISION_PENDING);
+    assert_eq!(get(&fx, other).status, DECISION_TRIAGE, "waits behind the lead");
+    assert_eq!(pending_requests(&fx).len(), 1);
+    assert_eq!(triage_turns(&agent), 1, "one session read both");
+    let mut again = FakeAgent::new(&fx.fleet);
+    autopilot(&fx, Budget::default()).run(&fx.fleet, &mut again).unwrap();
+    assert_eq!(triage_turns(&again), 0, "the follower is never read on its own");
+
+    fx.fleet
+        .interview(ACTOR_USER, InterviewCommand::AnswerDecision { decision_id: lead, option: Some(2), text: None })
+        .unwrap();
+    assert_eq!(get(&fx, other).status, DECISION_ANSWERED);
+    let mut after = FakeAgent::new(&fx.fleet);
+    autopilot(&fx, Budget::default()).run(&fx.fleet, &mut after).unwrap();
+    assert_eq!(triage_turns(&after), 1, "one reflection for the group");
+}
+
+/// With `lifecycle.triage` off, judgment requests go to the user as asked, and
+/// one already waiting in triage is handed over by the next round.
+#[test]
+fn with_triage_off_judgment_requests_go_straight_to_the_user() {
+    let fx = setup();
+    let waiting = ask(&fx, "implementation", "intent", "Keep the old name?");
+    assert_eq!(get(&fx, waiting).status, DECISION_TRIAGE);
+    std::fs::write(fx.root.join("tod.yml"), "lifecycle:\n  triage: false\n").unwrap();
+    let filed_off = ask(&fx, "implementation", "risk", "Ship without the migration?");
+    assert_eq!(get(&fx, filed_off).status, DECISION_PENDING);
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let outcome = autopilot(&fx, Budget::default()).run(&fx.fleet, &mut agent).unwrap();
+    assert_eq!(outcome, Outcome::NeedsHuman { reason: NeedsHuman::Decision { pending: 2 } });
+    assert_eq!(get(&fx, waiting).status, DECISION_PENDING);
+    assert_eq!(get(&fx, waiting).question, "Keep the old name?", "as the agent asked it");
+    assert_eq!(triage_turns(&agent), 0);
+}

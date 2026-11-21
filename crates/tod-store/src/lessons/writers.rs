@@ -385,6 +385,16 @@ pub enum Op {
         #[serde(default)]
         target: String,
     },
+    /// The user flagged a request as confusing with **This is confusing**, and
+    /// no triage session read it to explain itself: a lesson (source `user`,
+    /// category `brief_unclear`) linked to the request and the conversation
+    /// that asked it, with the user's remark (the highlighted words, or what
+    /// they said) when there is one. Only the user.
+    FlagRequest {
+        decision: Uuid,
+        #[serde(default)]
+        remark: String,
+    },
     /// The user declines a lesson: it is not acted on.
     Decline { id: Uuid },
     /// A lesson was acted on: by the commit or node `applied_ref`. By a
@@ -429,6 +439,44 @@ pub fn run_op(conn: &Connection, actor: &str, op: &Op) -> Result<serde_json::Val
                     target: target.clone(),
                     summary: text.clone(),
                     user_quote: text.clone(),
+                    ..Default::default()
+                },
+            )?;
+            Ok(serde_json::json!({ "id": lesson.id }))
+        }
+        Op::FlagRequest { decision, remark } => {
+            if session_of(conn, actor)?.is_some() {
+                bail!("only the user flags a request as confusing");
+            }
+            let found = crate::decisions::DecisionRepo::new(conn)
+                .get(*decision)?
+                .ok_or_else(|| anyhow::anyhow!("decision {decision} not found"))?;
+            let remark = remark.trim();
+            let first = found.question.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+            let first: String = first.chars().take(160).collect();
+            let asker = found.protocol.as_deref().unwrap_or("an agent");
+            let mut summary = format!(
+                "The user found request {} confusing (a `{}` request from {asker}): \"{first}\"",
+                crate::interview::short_id(found.id),
+                found.reason,
+            );
+            if !remark.is_empty() {
+                summary.push_str(&format!("\nThey said: {remark}"));
+            }
+            let lesson = record(
+                conn,
+                &NewLesson {
+                    node_id: found.node_id,
+                    source: SOURCE_USER.to_string(),
+                    decision_id: Some(found.id),
+                    conversation_id: found.conversation_id,
+                    category: CATEGORY_BRIEF_UNCLEAR.to_string(),
+                    target: format!(
+                        "how the asking phase words a request: its role doc or stance (asked by {asker}, reason `{}`)",
+                        found.reason
+                    ),
+                    summary,
+                    user_quote: remark.to_string(),
                     ..Default::default()
                 },
             )?;

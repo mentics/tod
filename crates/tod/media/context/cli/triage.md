@@ -1,8 +1,9 @@
 ## `tod-cli triage`
 
-What a triage session records about the one request it reads. Every verb names
+What a triage session records about the request it reads. Every verb names
 the request (the 8-character prefix is fine) and works only from the triage
-session that was started for it.
+session that was started for it. When the context lists requests that share
+its cause, name the first one: what answers or closes it settles the others.
 
 ```
 tod-cli --data-root <DATA_ROOT> triage answer <DECISION_ID> [--option <N>] [--text <TEXT>] --rationale <TEXT>

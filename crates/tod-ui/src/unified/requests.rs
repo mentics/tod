@@ -467,6 +467,9 @@ pub struct Requests {
     /// Index of the keyboard stop on the current decision.
     selected_link: usize,
     pub(crate) last_error: Option<String>,
+    /// A line saying what a flag recorded (**This is confusing** on a request
+    /// no triage session read), until the next one or a reload.
+    pub(crate) flag_note: Option<String>,
     _subscriptions: Vec<Subscription>,
     _poll: gpui::Task<()>,
 }
@@ -527,6 +530,7 @@ impl Requests {
             changing: None,
             selected_link: 0,
             last_error: None,
+            flag_note: None,
             _subscriptions: vec![freeform_sub, lifecycle_sub],
             _poll,
         };
@@ -651,6 +655,7 @@ impl Requests {
         let decision_id = decision.id;
         // The answer is recorded off the UI thread; what was being edited
         // closes now, and the list reloads when it is in.
+        self.flag_note = None;
         self.freeform_editing = None;
         FreeformDrafts::set(decision.id, String::new(), cx);
         if self.freeform_draft_for == Some(decision.id) {
@@ -721,13 +726,21 @@ impl Requests {
         cx.emit(PanelDiscussRequest { node_id: decision.node_id, conversation, message });
     }
 
-    /// The highlight menu's **This is confusing**: the highlighted words go
-    /// into the request's triage session as a chat message, so it can explain
-    /// or rewrite its brief.
+    /// The highlight menu's **This is confusing**. On a request a triage
+    /// session read, the highlighted words go into that session as a chat
+    /// message, so it can explain or rewrite its brief. On any other request
+    /// (one that went straight to the user, or that triage never read) there is
+    /// no one to explain it, so the flag is recorded as an improvement lesson
+    /// (source `user`, linked to the request and the conversation that asked
+    /// it) with the highlighted words as the user's remark.
     pub(crate) fn flag_confusing(&mut self, decision_id: Uuid, text: String, cx: &mut Context<Self>) {
         let Some(decision) = self.loaded.pending.iter().find(|d| d.id == decision_id).cloned() else { return };
         let text = text.trim();
         if text.is_empty() {
+            return;
+        }
+        if decision.triage_conversation_id.is_none() {
+            self.record_confusing_lesson(&decision, text.to_string(), cx);
             return;
         }
         let message = format!(
@@ -737,11 +750,53 @@ impl Requests {
         self.discuss(&decision, Some(message), Source::Click, cx);
     }
 
-    /// The flag a request's text offers when highlighted: only a request with
-    /// a triage session has someone to send it to (a request an agent filed
-    /// that triage never read has no menu item).
+    /// **This is confusing** on a request with no triage session: records the
+    /// lesson off the UI thread and says so; a failure is shown, never dropped.
+    fn record_confusing_lesson(&mut self, decision: &Decision, remark: String, cx: &mut Context<Self>) {
+        let mut presented = Self::presented_for(decision);
+        presented.actions.push(PresentedAction {
+            id: FLAG_CONFUSING_ACTION.to_string(),
+            label: FLAG_CONFUSING_LABEL.to_string(),
+            primary: false,
+            disabled: false,
+        });
+        record_action(
+            cx,
+            Focus::Node(decision.node_id),
+            FLAG_CONFUSING_ACTION.to_string(),
+            Source::Click,
+            JOURNEY_SURFACE,
+            presented,
+        );
+        let fleet = self.fleet.clone();
+        let id = decision.id;
+        off_thread(
+            cx,
+            move || {
+                fleet
+                    .interview(
+                        tod_store::interview::AUTHOR_USER,
+                        tod_store::interview::InterviewCommand::Lessons(tod_store::lessons::Op::FlagRequest {
+                            decision: id,
+                            remark,
+                        }),
+                    )
+                    .map(|_| ())
+                    .map_err(|e| anyhow::anyhow!("{e}"))
+            },
+            |this, result, cx| {
+                let ok = result.is_ok();
+                this.set_error("record that the request is confusing", result);
+                this.flag_note = ok.then(|| "Noted: this request was confusing. It goes into the process review.".to_string());
+                cx.notify();
+            },
+        );
+    }
+
+    /// The flag a request's text offers when highlighted: on every request.
+    /// With a triage session it goes there; without one it is recorded as a
+    /// lesson ([`Self::flag_confusing`]).
     fn flag_for(&self, decision: &Decision, cx: &mut Context<Self>) -> Option<(&'static str, FlagHandler)> {
-        decision.triage_conversation_id?;
         let this = cx.weak_entity();
         let id = decision.id;
         let handler: FlagHandler = std::rc::Rc::new(move |text, _window, cx| {
@@ -1432,7 +1487,7 @@ impl Requests {
                 match &brief {
                     // Written by the app from the agent's fields
                     // (`tod_core::request_brief`), never by a model.
-                    Some(brief) => self.render_brief(decision.id, brief, window, cx),
+                    Some(brief) => self.render_brief(decision.id, brief, self.flag_for(&decision, cx), window, cx),
                     None => selectable_markdown_flaggable(
                         SharedString::from(format!("unified-decisions-question-{}", decision.id)),
                         decision.question.clone(),
@@ -1488,12 +1543,14 @@ impl Requests {
         &self,
         decision_id: Uuid,
         brief: &tod_core::request_brief::RequestBrief,
+        flag: Option<(&'static str, FlagHandler)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let mut col = div().flex().flex_col().gap_2().w_full().min_w_0().child(selectable_markdown(
+        let mut col = div().flex().flex_col().gap_2().w_full().min_w_0().child(selectable_markdown_flaggable(
             SharedString::from(format!("unified-decisions-need-{decision_id}")),
             brief.need.clone(),
+            flag.clone(),
             window,
             cx,
         ));
@@ -1536,9 +1593,10 @@ impl Requests {
         }
         let details = brief.details_markdown();
         if !details.is_empty() {
-            col = col.child(selectable_markdown(
+            col = col.child(selectable_markdown_flaggable(
                 SharedString::from(format!("unified-decisions-brief-details-{decision_id}")),
                 details,
+                flag,
                 window,
                 cx,
             ));
@@ -1845,6 +1903,14 @@ impl Render for Requests {
                     cx,
                 )))
             })
+            .when_some(self.flag_note.clone(), |el, note| {
+                el.child(style::text_muted(div().text_sm()).child(selectable_text(
+                    "unified-decisions-flag-note",
+                    note,
+                    window,
+                    cx,
+                )))
+            })
             .children(items)
     }
 }
@@ -1903,6 +1969,7 @@ mod tests {
             new_evidence: String::new(),
             brief: Default::default(),
             error_signature: String::new(),
+            cause: String::new(),
             triage_conversation_id: None,
             asked: None,
         };
@@ -1944,6 +2011,7 @@ mod tests {
             new_evidence: String::new(),
             brief: Default::default(),
             error_signature: String::new(),
+            cause: String::new(),
             triage_conversation_id: None,
             asked: None,
         };
@@ -1980,6 +2048,7 @@ mod tests {
             new_evidence: String::new(),
             brief: Default::default(),
             error_signature: String::new(),
+            cause: String::new(),
             triage_conversation_id: None,
             asked: None,
         };
@@ -2025,6 +2094,7 @@ mod tests {
             new_evidence: String::new(),
             brief: Default::default(),
             error_signature: String::new(),
+            cause: String::new(),
             triage_conversation_id: triage.then(Uuid::new_v4),
             asked: None,
         }
@@ -2123,6 +2193,70 @@ mod tests {
         assert!(events[1].message.as_deref().is_some_and(|m| m.contains("the old name")));
     }
 
+    #[gpui::test]
+    fn this_is_confusing_on_a_request_no_triage_session_read_records_a_lesson(cx: &mut gpui::TestAppContext) {
+        use crate::views::rows::fixture::Fixture;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use tod_store::interview::InterviewCommand;
+
+        let fixture = Fixture::new();
+        // An access request goes straight to the user: no triage session.
+        let ask = fixture
+            .store
+            .interview(
+                "autopilot",
+                InterviewCommand::AskDecision {
+                    node_id: fixture.node_id,
+                    conversation_id: None,
+                    protocol: Some("implementation".into()),
+                    decision: tod_store::decisions::NewDecision {
+                        question: "Give me read access to the v2 index?".into(),
+                        options: vec!["Done".into(), "No".into()],
+                        reason: "access".into(),
+                        guard_reask: true,
+                        ..Default::default()
+                    },
+                },
+            )
+            .unwrap();
+        let decision_id = Uuid::parse_str(ask.get("id").and_then(|v| v.as_str()).unwrap()).unwrap();
+
+        cx.update(gpui_component::init);
+        let agent: crate::interview::agent::SharedAgent =
+            Arc::new(std::sync::Mutex::new(Box::new(tod_agent::MockAgentProvider::new())));
+        let agent_runs = cx.new(|_| AgentRuns::new(fixture.store.clone(), agent));
+        let lifecycle = cx.new(|_| LifecycleController::new(fixture.store.clone()));
+        let (node, fleet) = (fixture.node_id, fixture.store.clone());
+        let slot = Rc::new(RefCell::new(None));
+        let slot_in = slot.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let focus = cx.focus_handle();
+            let view = cx.new(|cx| Requests::new(Some(node), fleet, agent_runs, lifecycle, focus, window, cx));
+            *slot_in.borrow_mut() = Some(view.clone());
+            gpui_component::Root::new(view, window, cx)
+        });
+        let requests: Entity<Requests> = slot.borrow_mut().take().unwrap();
+        cx.run_until_parked();
+
+        let opened = Rc::new(RefCell::new(0usize));
+        let sink = opened.clone();
+        let _sub = cx.update(|_, app| {
+            app.subscribe(&requests, move |_, _: &PanelDiscussRequest, _| *sink.borrow_mut() += 1)
+        });
+        // Every request offers the flag, with or without a triage session.
+        let decision = requests.read_with(cx, |r, _| r.loaded.pending[0].clone());
+        assert!(decision.triage_conversation_id.is_none());
+        requests.update(cx, |r, cx| r.flag_confusing(decision_id, " what is v2? ".into(), cx));
+        cx.run_until_parked();
+        assert_eq!(*opened.borrow(), 0, "no session to open: nothing goes to the chat");
+        let lessons = fixture.store.read(|conn| tod_store::lessons::for_decision(conn, decision_id)).unwrap();
+        assert_eq!(lessons.len(), 1);
+        assert_eq!(lessons[0].source, tod_store::lessons::SOURCE_USER);
+        assert_eq!(lessons[0].user_quote, "what is v2?");
+        assert_eq!(lessons[0].decision_id, Some(decision_id));
+        assert!(requests.read_with(cx, |r, _| r.flag_note.is_some() && r.last_error.is_none()));
+    }
 }
 
 /// Most rows of agent output a request shows before it scrolls.
