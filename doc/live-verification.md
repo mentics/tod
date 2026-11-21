@@ -253,3 +253,15 @@ the app made; macOS `tar` adds `._` files that break a git checkout (use
   check goes to the quick fix, never to a waiver.
 - The Lessons dialog's `D` acts on the row under the cursor: it starts on the
   section header, where it does nothing. Press Down first.
+
+## Gotchas from the second requests pass (local scratch repo)
+
+- A local Files location without Treehouse needs `worktree_backend: git_only` in the root's `tod.yml` (`treehouse_required` fails the launch).
+- Control socket: `tree` lists elements and `act` drives them by selector; drag, press, moveto and release are unsupported on macOS. To get the text-highlight menu, `click` the text, `key cmd-a`, then `rclick`.
+- Settings menus: click the menu button, wait, then click the item by coordinates; a click made too soon closes the menu. The triage toggle is Settings, Lifecycle, `#lifecycle-triage-toggle`.
+- The autopilot advances a local node to `pr`, and the PR agent tries a GitHub `pr open` against the local owner (a 404 lookup; nothing is created). Check the selected node in a screenshot before clicking Resume, and pause nodes in review.
+- The Locations dialog closes by clicking outside it, not Escape or its X.
+- `tod-cli obligations add` defaults to agent authority, which the proposed agent may delete. `tod-cli lifecycle set <node> planning` starts a node at planning with contradictory obligations to exercise disputes.
+- Checks YAML is imported through the Settings panel.
+- `grep -r` over a worktree matches `.pyc` files; exclude them.
+- Foreground `sleep` over 90s is backgrounded; poll in loops under about 180s.
