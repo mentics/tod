@@ -39,6 +39,7 @@ pub fn open_locations_dialog(
     paths: TodPaths,
 ) {
     let view = cx.new(|cx| LocationsDialog::new(fleet, paths, window, cx));
+    let handle = view.read(cx).focus_handle.clone();
     window.open_dialog(cx, move |d, _, _| {
         d.title("Locations")
             .w(px(720.))
@@ -48,6 +49,8 @@ pub fn open_locations_dialog(
             .close_button(true)
             .child(view.clone())
     });
+    // Escape reaches the dialog only while focus is inside it.
+    handle.focus(window, cx);
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -76,6 +79,8 @@ struct Pending {
 }
 
 struct LocationsDialog {
+    /// Held by the dialog's body so Escape closes the dialog from the start.
+    focus_handle: gpui::FocusHandle,
     fleet: Arc<FleetStore>,
     paths: TodPaths,
     mode: Mode,
@@ -166,6 +171,7 @@ impl LocationsDialog {
             cx.new(|cx| InputState::new(window, cx).placeholder(placeholder))
         };
         let mut this = Self {
+            focus_handle: cx.focus_handle(),
             fleet,
             paths,
             mode: Mode::List,
@@ -1195,12 +1201,19 @@ impl Render for LocationsDialog {
         // The form can outgrow the window (the image builder is long), so the
         // body scrolls rather than push its buttons off screen.
         let max_height = (window.viewport_size().height - px(200.)).max(px(240.));
+        // Escape and the X button act on whatever holds focus, and a click on
+        // a button that this view then replaces (List to Edit, Save back to
+        // List) takes focus with it. Take it back, or neither would close.
+        if !self.focus_handle.contains_focused(window, cx) {
+            let handle = self.focus_handle.clone();
+            window.defer(cx, move |window, cx| handle.focus(window, cx));
+        }
         let body = match &self.mode {
             Mode::List => self.render_list(window, cx),
             Mode::Edit => self.render_edit(window, cx),
             Mode::Confirm(_) => self.render_confirm(window, cx),
         };
-        div().id("locations-body").max_h(max_height).overflow_y_scroll().child(body)
+        div().id("locations-body").track_focus(&self.focus_handle).max_h(max_height).overflow_y_scroll().child(body)
     }
 }
 
@@ -1449,5 +1462,55 @@ mod tests {
         dialog.update_in(cx, |d, _, _| d.fork_name = "tod-golden-owner-name-1".into());
         let named = dialog.read_with(cx, |d, cx| d.draft(cx));
         assert_eq!(named.dev_container.as_ref().unwrap().clone_url, None);
+    }
+
+    /// The dialog closes on Escape, however the user got into it, and on its X.
+    #[gpui::test]
+    fn the_dialog_closes_on_escape_and_on_its_x_button(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let fixture = crate::views::rows::fixture::Fixture::new();
+        let fleet = fixture.store.clone();
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            struct Host;
+            impl Render for Host {
+                fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                    div().size_full().children(Root::render_dialog_layer(window, cx))
+                }
+            }
+            let host = cx.new(|_| Host);
+            Root::new(host, window, cx)
+        });
+        for close_with_x in [false, true] {
+            cx.update(|window, cx| {
+                open_locations_dialog(window, cx, fleet.clone(), TodPaths::at(std::env::temp_dir()));
+            });
+            cx.run_until_parked();
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+                assert!(window.has_active_dialog(cx), "the dialog opened");
+            });
+            // Focus lost to an element the dialog then dropped: a button it
+            // replaced after a click. The next render takes it back.
+            cx.update(|window, cx| {
+                window.blur(cx);
+                cx.refresh_windows();
+                let _ = window.draw(cx);
+            });
+            cx.run_until_parked();
+            cx.update(|window, cx| assert!(window.focused(cx).is_some(), "the dialog took focus back"));
+            if close_with_x {
+                // The X dispatches the same cancel action Escape is bound to,
+                // to whatever holds focus, so it works only with focus inside.
+                cx.update(|window, cx| window.dispatch_action(Box::new(gpui_base::actions::Cancel), cx));
+            } else {
+                cx.simulate_keystrokes("escape");
+            }
+            cx.executor().advance_clock(std::time::Duration::from_secs(1));
+            cx.run_until_parked();
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+                assert!(!window.has_active_dialog(cx), "closed (x: {close_with_x})");
+            });
+        }
     }
 }
