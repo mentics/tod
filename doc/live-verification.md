@@ -226,3 +226,30 @@ the app made; macOS `tar` adds `._` files that break a git checkout (use
 - `pkill -f <pattern>` inside `tod-sandbox exec ... sh -c` also matches, and
   kills, that `sh`: kill by PID.
 - In zsh, `"$B:refs"` is a history modifier; write `"${B}:refs"`.
+
+## Gotchas from the requests pass (2026-11-20)
+
+- A golden for `joel-cofactr/build-test` can no longer be built from the
+  default image: the fork-prerequisites check (curl, scp, sftp-server,
+  claude-agent-acp, and now jq for the command redirects) refuses it. Bake an
+  image first (`tod-sandbox bake ubuntu:24.04 --name tod-lv-base --agents`) and
+  point `default_image` at it only while the golden builds; put it back
+  afterwards, or the daemon's background golden check builds half-made goldens
+  from it for every repository (and the Blaxel spend alert fires).
+- In a golden built that way the proxy did not inject the GitHub token (every
+  request, `{{SECRET:github}}` included, got 401), so the clone failed. Without a
+  Build test golden nothing that needs a real pull request is exercisable: the
+  pr_draft push, CI infra reruns and the pre-existing-failure waiver.
+- The goldens belong to the Blaxel account, shared by every data root on it. A
+  stale pointer in this root's `sandboxes.toml` makes the daemon retry the
+  build forever. Never refresh the real root's golden.
+- Never point a node at the Golden workspace location: the project's `open-pr`
+  skill (eng-work's lifecycle config) opens a draft PR on the Cofactr org
+  repository as soon as the node reaches `pr`. Give the node its own
+  lifecycle config with empty `pr`, `pr_draft` and `pr_review` skills
+  (`tod-cli capabilities set <node> lifecycle-config --phase pr --skills ''`)
+  before it can get there.
+- Pre-existing-failure waivers and CI reruns are PR CI features; a failing local
+  check goes to the quick fix, never to a waiver.
+- The Lessons dialog's `D` acts on the row under the cursor: it starts on the
+  section header, where it does nothing. Press Down first.

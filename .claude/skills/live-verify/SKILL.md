@@ -160,3 +160,8 @@ new gotcha to this file and `doc/live-verification.md` and merge them.
 - `pkill -f <pattern>` inside `tod-sandbox exec ... sh -c` also matches, and
   kills, that `sh`: kill by PID.
 - In zsh, `"$B:refs"` is a history modifier; write `"${B}:refs"`.
+- Requests pass (2026-11-20): see "Gotchas from the requests pass" in
+  doc/live-verification.md. In short: a Build test golden needs a baked image
+  (with jq) and restoring `default_image` at once; never point a node at Golden
+  workspace without emptying its `pr` skills (it opens a PR on Cofactr/workspace);
+  the Lessons dialog's `D` needs the cursor off the section header.
