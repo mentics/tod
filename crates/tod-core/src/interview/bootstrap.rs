@@ -1,10 +1,8 @@
-use crate::interview::{SessionStore, TodPaths, TodSettings};
+use crate::interview::{TodPaths, TodSettings};
 use anyhow::Result;
-use std::sync::Arc;
-use tod_store::fleet::FleetStore;
 
-/// Initialize interview persistence (config dir, default settings).
-pub fn bootstrap(fleet: Arc<FleetStore>) -> Result<()> {
+/// Initialize configuration (config dir, default settings).
+pub fn bootstrap() -> Result<()> {
     let paths = TodPaths::discover()?;
     paths.ensure_config_dir()?;
     let settings = TodSettings::load(&paths)?;
@@ -14,6 +12,5 @@ pub fn bootstrap(fleet: Arc<FleetStore>) -> Result<()> {
     if let Err(err) = settings.sync_treehouse_config(&paths) {
         tracing::warn!("failed to sync treehouse config: {err:#}");
     }
-    let _store = SessionStore::open(fleet);
     Ok(())
 }

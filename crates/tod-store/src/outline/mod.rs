@@ -4,7 +4,6 @@ pub mod archive;
 pub mod ddl;
 pub mod file_refs;
 pub mod gate_criteria_seed;
-pub mod migrate_interview;
 pub mod mutations;
 pub mod references;
 pub mod repos;

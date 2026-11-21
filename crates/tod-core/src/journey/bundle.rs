@@ -146,6 +146,9 @@ pub fn build_bundle(
 
     for mut record in reader {
         match &mut record.event {
+            Event::DataChanged { rows } => {
+                rows.retain(|row| !tod_store::journey_rows::is_transcript_table(&row.table));
+            }
             Event::Report {
                 screenshot: screenshot @ Some(_),
                 ..
@@ -203,7 +206,7 @@ pub fn build_bundle(
     }
     for key in &row_order {
         let state = row_state.get(key).expect("row_order and row_state stay in sync");
-        resolve_row(&mut writer, store, key, state, include_transcripts)?;
+        resolve_row(&mut writer, store, key, state)?;
     }
 
     // Note: gate results are also carried inline by `Event::GateResult`
@@ -407,7 +410,6 @@ fn resolve_row(
     store: &FleetStore,
     key: &(String, String),
     state: &RowRefState,
-    include_transcripts: bool,
 ) -> Result<()> {
     let (table, row_id) = key;
     let reference = Reference {
@@ -419,8 +421,8 @@ fn resolve_row(
     // Spec §5.3: resolve the row's current content from the database
     // (`Missing` if gone). Only if the lookup errors do we fall back to the
     // last state the journey itself recorded for the row.
-    let content = if tod_store::journey_rows::is_transcript_table(table) && !include_transcripts {
-        withheld_placeholder()
+    let content = if tod_store::journey_rows::is_transcript_table(table) {
+        Resolution::Missing
     } else {
         match store.read(|conn| tod_store::journey_rows::fetch_row(conn, table, row_id)) {
             Ok(Some(value)) => found_json(&value)?,
@@ -548,12 +550,6 @@ mod tests {
                 "INSERT OR REPLACE INTO node_gate_evaluations (node_id, criterion_id, outcome, detail, source, evaluated_at)
                  VALUES (?1, ?2, 'pass', 'live-gate-detail', 'agent', 1)",
                 rusqlite::params![fx.node.as_bytes().to_vec(), criterion],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO interview_transcripts (id, node_id, phase, display_name, body, created_at, updated_at)
-                 VALUES (?1, ?2, 'requirements', 'T', 'secret transcript body', 1, 1)",
-                rusqlite::params![transcript_id.as_bytes().to_vec(), fx.node.as_bytes().to_vec()],
             )
             .unwrap();
             format!("{}:{}", hex(fx.node.as_bytes()), hex(&criterion))
@@ -762,14 +758,7 @@ mod tests {
             .find(|(r, c)| r.id.starts_with("node_obligations:") && text_of(c).is_some())
             .expect("live obligation row");
         assert!(text_of(&obligation.1).unwrap().contains("Passwords are hashed."));
-        let transcript = row_res
-            .iter()
-            .find(|(r, _)| r.id.starts_with("interview_transcripts:"))
-            .expect("transcript row reference");
-        if include_transcripts {
-            assert!(text_of(&transcript.1).unwrap().contains("secret transcript body"));
-        } else {
-            assert!(matches!(transcript.1, Resolution::Withheld { .. }));
-        }
+        assert!(!row_res.iter().any(|(r, _)| r.id.starts_with("interview_transcripts:")));
+
     }
 }

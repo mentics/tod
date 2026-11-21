@@ -218,7 +218,7 @@ mod tests {
 
     #[test]
     fn an_agent_session_is_refused_and_nothing_moves() {
-        let (root, node, _) = crate::tests::data_root();
+        let (root, node) = crate::tests::data_root();
         crate::tests::set_lifecycle(&root, node, "review");
         let id = node.to_string();
         let (i, a) = inv(&root, &[&id, "active", "--reason", "x"]);
@@ -229,7 +229,7 @@ mod tests {
 
     #[test]
     fn pr_review_is_refused_and_nothing_moves() {
-        let (root, node, _) = crate::tests::data_root();
+        let (root, node) = crate::tests::data_root();
         crate::tests::set_lifecycle(&root, node, "review");
         let id = node.to_string();
         let (i, a) = inv(&root, &[&id, "pr_review", "--reason", "x"]);
@@ -240,7 +240,7 @@ mod tests {
 
     #[test]
     fn a_reason_is_required() {
-        let (root, node, _) = crate::tests::data_root();
+        let (root, node) = crate::tests::data_root();
         crate::tests::set_lifecycle(&root, node, "review");
         let id = node.to_string();
         let (i, a) = inv(&root, &[&id, "active"]);
@@ -253,7 +253,7 @@ mod tests {
     #[test]
     fn review_to_active_has_the_effects_of_the_chip() {
         use tod_store::verification::VerdictRepo;
-        let (root, node, _) = crate::tests::data_root();
+        let (root, node) = crate::tests::data_root();
         crate::tests::set_lifecycle(&root, node, "review");
         let obligation = Uuid::new_v4();
         {
@@ -303,7 +303,7 @@ mod tests {
 
     #[test]
     fn send_back_outside_a_session_says_who_may() {
-        let (root, node, _) = crate::tests::data_root();
+        let (root, node) = crate::tests::data_root();
         crate::tests::set_lifecycle(&root, node, "review");
         let (i, a) = inv(&root, &["--to", "active", "--reason", "x"]);
         let err = send_back(&i, &a, no_env).unwrap_err();
@@ -313,7 +313,7 @@ mod tests {
 
     #[test]
     fn send_back_by_an_implementation_session_is_refused() {
-        let (root, node, _) = crate::tests::data_root();
+        let (root, node) = crate::tests::data_root();
         crate::tests::set_lifecycle(&root, node, "active");
         let id = conversation(&root, node, tod_store::conversation::ProtocolKind::Implementation);
         let (i, a) = inv(&root, &["--to", "design", "--reason", "x"]);
@@ -324,7 +324,7 @@ mod tests {
 
     #[test]
     fn a_review_session_sends_the_node_back_and_a_repeat_is_refused() {
-        let (root, node, _) = crate::tests::data_root();
+        let (root, node) = crate::tests::data_root();
         crate::tests::set_lifecycle(&root, node, "review");
         let id = conversation(&root, node, tod_store::conversation::ProtocolKind::Review);
         let (i, a) = inv(&root, &["--to", "active", "--reason", "the build is wrong"]);

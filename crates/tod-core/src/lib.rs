@@ -124,7 +124,7 @@ pub use interview::{TodPaths, set_data_root};
 /// UI crate.
 pub mod settings {
     pub use tod_store::settings::{
-        InterviewContextSettings, MAX_LOG_MAX_SIZE_KB, MIN_LOG_MAX_SIZE_KB, QuestionMakerSettings,
+        InterviewContextSettings, MAX_LOG_MAX_SIZE_KB, MIN_LOG_MAX_SIZE_KB,
         TodSettings, WindowGeometry, WorktreeBackend,
     };
 }

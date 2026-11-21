@@ -54,7 +54,7 @@ When child tasks are added or scope evolves:
 
 ### Child-task decomposition (optional)
 
-When the user wants to split work under this task, optional task-decomposition interview or **task generator** side tool may propose child tasks. Accept creates child tasks via the app — not full requirements interviews for each child.
+When the user wants to split work under this task, the **task generator** side tool may propose child tasks. Accept creates child tasks via the app.
 
 ## Reconcile
 

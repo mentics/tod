@@ -8,7 +8,6 @@ The app reads bundled markdown at launch and **inlines** instructions and contex
 
 | Interaction | Bundled docs | App status |
 |--|--|--|
-| Interview question maker + answer processor | role doc + `phases/{proposed\|design\|planning}.md` + `base.md`; Interview state block each turn | **Docs redesigned** (DB/`tod-cli` wiring pending — see `doc/new-reqs/interview-protocol.md`) |
 | State agents | `agents/state/base.md` + `agents/state/{state}.md` + DB gate criteria | **Docs ready** (runtime wiring pending) |
 | Side tools | `agents/tools/*.md` | **Docs ready** (runtime wiring pending) |
 
@@ -22,7 +21,6 @@ assets/process/
   agents/
     README.md            # index of agent role files
     state/               # base.md + one file per lifecycle state (includes forward gate prose)
-    interview/           # base.md, question maker, answer-processor
     tools/               # optional side tools
 ```
 
@@ -41,6 +39,5 @@ User data (obligations, interviews, DB) lives under the app **data root** — no
 | Goal | Start here |
 |------|------------|
 | Agent roles | [`agents/README.md`](agents/README.md) |
-| Interview protocol (in bundled form) | [`agents/interview/base.md`](agents/interview/base.md) + role docs |
 | State agent protocol (in bundled form) | [`agents/state/base.md`](agents/state/base.md) + state role docs |
 | Gate checklist criteria (DB) | [`doc/new-reqs/gate-criteria.md`](../../doc/new-reqs/gate-criteria.md) |

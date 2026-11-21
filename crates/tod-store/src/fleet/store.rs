@@ -229,8 +229,7 @@ impl FleetStore {
         self.writer.remote_backend().is_some()
     }
 
-    /// Run launch-time reattach (stale agent/shell liveness reconciliation) plus the legacy
-    /// interview-session migration check. Safe to call from a background thread after the store
+    /// Run launch-time reattach (stale agent/shell liveness reconciliation). Safe to call from a background thread after the store
     /// is already in use — it only enqueues writes through the normal writer and reloads the
     /// projection, both of which are already safe for concurrent readers.
     pub fn run_launch_hooks(&self, guest: &dyn GuestLivenessCheck) -> Result<(), FleetLaunchError> {
@@ -239,12 +238,6 @@ impl FleetStore {
             return Ok(());
         }
         self.run_reattach(guest)?;
-        if let Ok(paths) = crate::paths::TodPaths::discover() {
-            let projection = self.projection.lock().expect("fleet projection mutex");
-            let conn = projection.connection();
-            let _ =
-                crate::outline::migrate_interview::migrate_legacy_interview_sessions(&conn, &paths);
-        }
         Ok(())
     }
 

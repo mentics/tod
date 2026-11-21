@@ -35,11 +35,10 @@ const SIDEBAR_MIN: f32 = 140.0;
 const PANEL_MIN: f32 = 320.0;
 const SETTINGS_CONTEXT: &str = "Settings";
 
-const SECTIONS: [SettingsSection; 12] = [
+const SECTIONS: [SettingsSection; 11] = [
     SettingsSection::Agents,
     SettingsSection::Lifecycle,
-    SettingsSection::QuestionMaker,
-    SettingsSection::AnswerProcessor,
+    SettingsSection::AgentContext,
     SettingsSection::Workspaces,
     SettingsSection::CloudSandboxes,
     SettingsSection::Databases,
@@ -119,8 +118,7 @@ enum SettingsFocus {
 enum SettingsSection {
     Agents,
     Lifecycle,
-    QuestionMaker,
-    AnswerProcessor,
+    AgentContext,
     Workspaces,
     CloudSandboxes,
     Databases,
@@ -136,8 +134,7 @@ impl SettingsSection {
         match self {
             Self::Agents => "Agents",
             Self::Lifecycle => "Lifecycle",
-            Self::QuestionMaker => "Question maker",
-            Self::AnswerProcessor => "Agent context",
+            Self::AgentContext => "Agent context",
             Self::Workspaces => "Workspaces",
             Self::CloudSandboxes => "Cloud sandboxes",
             Self::Databases => "Databases",
@@ -153,8 +150,7 @@ impl SettingsSection {
         match self {
             Self::Agents => "agents",
             Self::Lifecycle => "lifecycle",
-            Self::QuestionMaker => "question-maker",
-            Self::AnswerProcessor => "answer-processor",
+            Self::AgentContext => "agent-context",
             Self::Workspaces => "workspaces",
             Self::CloudSandboxes => "cloud-sandboxes",
             Self::Databases => "databases",
@@ -177,8 +173,7 @@ impl SettingsSection {
                 MaxParallelSessions,
             ],
             Self::Lifecycle => &[LifecycleIndependentEvaluation, LifecycleReviewRoundLimit, LifecycleRepoProfiles, PrReviewBots],
-            Self::QuestionMaker => &[ReplenishThreshold],
-            Self::AnswerProcessor => &[ContextBudget, PromptCacheIdle, AnsweredHistoryCap],
+            Self::AgentContext => &[ContextBudget],
             Self::Workspaces => &[
                 WorktreeBackend,
                 TreehouseExecutable,
@@ -226,10 +221,7 @@ enum SettingField {
     Agent(AgentRole),
     /// Claude's ACP adapter: what is installed, and installing it for tod.
     ClaudeAdapter,
-    ReplenishThreshold,
     ContextBudget,
-    PromptCacheIdle,
-    AnsweredHistoryCap,
     WorktreeBackend,
     TreehouseExecutable,
     TreehouseWorktreesRoot,
@@ -305,10 +297,7 @@ impl SettingField {
             Self::Agent(AgentRole::Chat) => "chat-agent",
             Self::Agent(AgentRole::Interview) => "interview-agent",
             Self::ClaudeAdapter => "claude-adapter",
-            Self::ReplenishThreshold => "replenish",
             Self::ContextBudget => "context-budget",
-            Self::PromptCacheIdle => "prompt-cache-idle",
-            Self::AnsweredHistoryCap => "answered-history-cap",
             Self::WorktreeBackend => "worktree-backend",
             Self::TreehouseExecutable => "treehouse-executable",
             Self::TreehouseWorktreesRoot => "treehouse-worktrees-root",
@@ -1662,10 +1651,7 @@ impl SettingsView {
         match self.selected_field() {
             SettingField::EnvironmentPresetsFile | SettingField::OrchestratorGithub | SettingField::Databases => {}
             SettingField::Agent(role) => self.cycle_platform_for(role, delta, cx),
-            SettingField::ReplenishThreshold => self.step_replenish(delta, cx),
             SettingField::ContextBudget => self.step_context_budget(delta, cx),
-            SettingField::PromptCacheIdle => self.step_prompt_cache_idle(delta, cx),
-            SettingField::AnsweredHistoryCap => self.step_answered_history_cap(delta, cx),
             SettingField::WorktreeBackend => self.cycle_worktree_backend(delta, cx),
             SettingField::MaxParallelSessions => self.step_max_parallel_sessions(delta, cx),
             SettingField::TreehouseExecutable
@@ -2049,13 +2035,6 @@ impl SettingsView {
         cx.notify();
     }
 
-    fn step_replenish(&mut self, delta: i32, cx: &mut Context<Self>) {
-        self.settings.question_maker.replenish_threshold =
-            step_u32(self.settings.question_maker.replenish_threshold, delta);
-        self.schedule_save("question_maker.replenish_threshold", cx);
-        cx.notify();
-    }
-
     fn step_context_budget(&mut self, delta: i32, cx: &mut Context<Self>) {
         let budget = &mut self.settings.interview_context.context_budget_tokens;
         *budget = if delta >= 0 {
@@ -2064,28 +2043,6 @@ impl SettingsView {
             budget.saturating_sub(10_000).max(10_000)
         };
         self.schedule_save("interview_context.context_budget_tokens", cx);
-        cx.notify();
-    }
-
-    fn step_prompt_cache_idle(&mut self, delta: i32, cx: &mut Context<Self>) {
-        let minutes = &mut self.settings.interview_context.prompt_cache_idle_minutes;
-        *minutes = if delta >= 0 {
-            minutes.saturating_add(1)
-        } else {
-            minutes.saturating_sub(1).max(1)
-        };
-        self.schedule_save("interview_context.prompt_cache_idle_minutes", cx);
-        cx.notify();
-    }
-
-    fn step_answered_history_cap(&mut self, delta: i32, cx: &mut Context<Self>) {
-        let cap = &mut self.settings.interview_context.answered_history_cap;
-        *cap = if delta >= 0 {
-            cap.saturating_add(10)
-        } else {
-            cap.saturating_sub(10).max(10)
-        };
-        self.schedule_save("interview_context.answered_history_cap", cx);
         cx.notify();
     }
 
@@ -2418,28 +2375,13 @@ fn check_sandbox_sign_in(root: &std::path::Path) -> Result<SharedString, SharedS
     }
 }
 
-fn step_u32(value: u32, delta: i32) -> u32 {
-    if delta >= 0 {
-        value.saturating_add(delta as u32)
-    } else {
-        value.saturating_sub((-delta) as u32)
-    }
-}
-
 fn catalog_strings(items: &[&str]) -> Vec<String> {
     items.iter().map(|s| (*s).to_string()).collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{SettingsView, step_u32};
-
-    #[test]
-    fn step_increments_and_decrements() {
-        assert_eq!(step_u32(8, 1), 9);
-        assert_eq!(step_u32(8, -1), 7);
-        assert_eq!(step_u32(0, -1), 0);
-    }
+    use super::SettingsView;
 
     #[test]
     fn milestone_states_valid_accepts_known_lifecycle_states() {
@@ -2677,21 +2619,7 @@ impl SettingsView {
                 ));
                 rows.into_any_element()
             }
-            SettingsSection::QuestionMaker => v_flex()
-                .gap_1()
-                .child(stepper_row(
-                    cx,
-                    self,
-                    SettingField::ReplenishThreshold,
-                    self.settings.question_maker.replenish_threshold.to_string(),
-                    "Target open questions",
-                    "Start a question maker turn when open questions fall below this count. A second answer processor session starts when unprocessed answers exceed half of it. Default 8.",
-                    theme,
-                    |this, _, cx| this.step_replenish(-1, cx),
-                    |this, _, cx| this.step_replenish(1, cx),
-                ))
-                .into_any_element(),
-            SettingsSection::AnswerProcessor => v_flex()
+            SettingsSection::AgentContext => v_flex()
                 .gap_1()
                 .child(stepper_row(
                     cx,
@@ -2702,38 +2630,10 @@ impl SettingsView {
                         .context_budget_tokens
                         .to_string(),
                     "Context budget (tokens)",
-                    "An interview agent session rotates to a fresh snapshot once its estimated context passes this. Default 100000.",
+                    "An agent conversation starts a fresh session when its estimated context passes this. Default 100000.",
                     theme,
                     |this, _, cx| this.step_context_budget(-1, cx),
                     |this, _, cx| this.step_context_budget(1, cx),
-                ))
-                .child(stepper_row(
-                    cx,
-                    self,
-                    SettingField::PromptCacheIdle,
-                    self.settings
-                        .interview_context
-                        .prompt_cache_idle_minutes
-                        .to_string(),
-                    "Prompt cache idle (minutes)",
-                    "A session idle longer than this, and much larger than its snapshot, starts fresh instead of resuming uncached. Default 5.",
-                    theme,
-                    |this, _, cx| this.step_prompt_cache_idle(-1, cx),
-                    |this, _, cx| this.step_prompt_cache_idle(1, cx),
-                ))
-                .child(stepper_row(
-                    cx,
-                    self,
-                    SettingField::AnsweredHistoryCap,
-                    self.settings
-                        .interview_context
-                        .answered_history_cap
-                        .to_string(),
-                    "Answered questions in a snapshot",
-                    "Most recent answered questions included when an interview agent session starts. Default 100.",
-                    theme,
-                    |this, _, cx| this.step_answered_history_cap(-1, cx),
-                    |this, _, cx| this.step_answered_history_cap(1, cx),
                 ))
                 .into_any_element(),
             SettingsSection::Workspaces => v_flex()

@@ -10,7 +10,6 @@
 use crate::replica::Replica;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use tod_agent::agent_traffic::InterviewAgentCounts;
 use tod_agent::{
     AgentBackend, AgentEnvironment, AgentLaunchOptions, AgentProvider, AgentRunHandle, AgentRunState, RunId,
     SessionTurn,
@@ -134,10 +133,6 @@ impl AgentProvider for Syncing {
 
     fn cancel_run(&mut self, id: RunId) -> anyhow::Result<()> {
         self.inner.cancel_run(id)
-    }
-
-    fn interview_status_counts(&self) -> InterviewAgentCounts {
-        self.inner.interview_status_counts()
     }
 
     fn set_session_observer(&mut self, observer: tod_agent::SessionObserver) {

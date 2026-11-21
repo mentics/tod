@@ -22,9 +22,9 @@ mod suggest;
 mod lessons;
 mod triage;
 mod incoming;
+mod interview;
 mod learn;
 mod lifecycle;
-mod interview;
 mod node;
 mod operator;
 #[cfg(test)]
@@ -65,9 +65,6 @@ NOUNS:
     obligations            Requirements and constraints attached to a node
     content                A node's details, design, plan, and summary
     plan                   Structured, dependency-graph plan steps for a node
-    questions              Interview questions for a node
-    memory                 Interview memory notes for a node
-    interview              Interview session state
     visual-design          the UI mockup associated with one obligation
     capabilities           Enable, disable, configure a node's capabilities (spec, lifecycle, agent, ...)
     changeset              This conversation's net changes and unsure flags
@@ -104,9 +101,6 @@ const NOUNS: &[(&str, &str)] = &[
     ("plan", crate::plan::USAGE),
     ("visual-design", crate::visual_design::USAGE),
     ("content", crate::interview::CONTENT_USAGE),
-    ("questions", crate::interview::QUESTIONS_USAGE),
-    ("memory", crate::interview::MEMORY_USAGE),
-    ("interview", crate::interview::INTERVIEW_USAGE),
     ("capabilities", crate::capabilities::USAGE),
     ("changeset", crate::changeset::USAGE),
     ("tests", crate::test_runs::USAGE),
@@ -386,9 +380,6 @@ fn run_with(args: &[String], env: operator::Env) -> anyhow::Result<String> {
         "obligations" => obligations::run(invocation),
         "content" => interview::content(invocation),
         "plan" => plan::run(invocation),
-        "questions" => interview::questions(invocation),
-        "memory" => interview::memory(invocation),
-        "interview" => interview::interview(invocation),
         "visual-design" => visual_design::run(invocation),
         "capabilities" => capabilities::run(invocation),
         "changeset" => changeset::run(invocation),
@@ -414,7 +405,7 @@ fn run_with(args: &[String], env: operator::Env) -> anyhow::Result<String> {
         "journey" => journey::run(invocation),
         "skills" => skills::run(invocation),
         other => anyhow::bail!(
-            "unknown noun `{other}` (expected: node, obligations, content, plan, questions, memory, interview, visual-design, capabilities, changeset, tests, review, pr, verdicts, incoming, guidance, suggest, learn, lifecycle, secrets, db, environment, decisions, triage, lessons, phase, wait, batch, journey, skills)"
+            "unknown noun `{other}` (expected: node, obligations, content, plan, visual-design, capabilities, changeset, tests, review, pr, verdicts, incoming, guidance, suggest, learn, lifecycle, secrets, db, environment, decisions, triage, lessons, phase, wait, batch, journey, skills)"
         ),
     }
 }
@@ -424,7 +415,6 @@ pub(crate) mod tests {
     use super::run;
     use std::path::PathBuf;
     use std::sync::Arc;
-    use tod_core::interview::db::{InterviewSessionStatus, NewInterviewSession, SessionStore};
     use tod_store::fleet::FleetStore;
     use tod_store::outline::{Capability, CreatePosition, OutlineMutation};
     use uuid::Uuid;
@@ -439,6 +429,15 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn retired_interview_commands_are_not_advertised() {
+        let help = run(&[]).unwrap();
+        for noun in ["questions", "memory", "interview"] {
+            assert!(!help.lines().any(|line| line.trim_start().starts_with(noun)), "{noun}: {help}");
+        }
+        assert_eq!(run(&["content".into(), "--help".into()]).unwrap(), crate::interview::CONTENT_USAGE.trim_end());
+    }
+
+    #[test]
     fn db_needs_no_data_root() {
         let run = |args: &[&str]| run(&args.iter().map(|a| a.to_string()).collect::<Vec<_>>());
         assert_eq!(run(&["db"]).unwrap(), crate::db::USAGE.trim_end());
@@ -446,9 +445,9 @@ pub(crate) mod tests {
         assert!(err.contains("unknown command `query`"), "{err}");
     }
 
-    /// A data root holding one Spec node and its interview session. The store
+    /// A data root holding one Spec node. The store
     /// is closed again so `tod-cli` opens it itself, as with no app running.
-    pub(crate) fn data_root() -> (PathBuf, Uuid, Uuid) {
+    pub(crate) fn data_root() -> (PathBuf, Uuid) {
         let root = tod_test_util::scratch_dir(format!("tod-cli-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let fleet = Arc::new(FleetStore::open(&root).unwrap());
@@ -476,17 +475,7 @@ pub(crate) mod tests {
         ] {
             fleet.enqueue_outline(mutation).unwrap();
         }
-        let session = SessionStore::open(fleet.clone())
-            .insert_session_with_metadata(
-                NewInterviewSession {
-                    node_id: node,
-                    display_name: "Interview".into(),
-                    phase: "task-requirements-interview".into(),
-                },
-                InterviewSessionStatus::Active,
-            )
-            .unwrap()
-            .id;
+        fleet.writer().flush().unwrap();
         // The one location the tests pick for Files.
         tod_store::fleet::places::save(
             &fleet,
@@ -498,7 +487,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         drop(fleet);
-        (root, node, session)
+        (root, node)
     }
 
     /// Sets a node's lifecycle state straight in the store, as a test's setup.
@@ -518,7 +507,7 @@ pub(crate) mod tests {
 
     #[test]
     fn node_search_finds_by_fuzzy_title() {
-        let (root, node, _) = data_root();
+        let (root, node) = data_root();
 
         // `data_root()` already created a node titled "Node"; add a second,
         // more distinctively titled node to search for.
@@ -550,7 +539,7 @@ pub(crate) mod tests {
 
     #[test]
     fn node_notes_append_without_touching_existing_ones() {
-        let (root, node, _) = data_root();
+        let (root, node) = data_root();
         let node = node.to_string();
         assert_eq!(cli(&root, &["node", "notes", &node]).unwrap(), "(none)");
 
@@ -583,7 +572,7 @@ Second."), "{listed}");
 
     #[test]
     fn obligations_round_trip_with_short_ids_and_sections() {
-        let (root, node, _) = data_root();
+        let (root, node) = data_root();
         let node = node.to_string();
         let added = cli(
             &root,
@@ -642,7 +631,7 @@ Second."), "{listed}");
     /// created, and reports only the line that failed.
     #[test]
     fn batch_applies_what_it_can_and_reports_only_failures() {
-        let (root, node, _) = data_root();
+        let (root, node) = data_root();
         let slug = {
             let out = cli(&root, &["--json", "node", "show", &node.to_string()]).unwrap();
             let json: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -672,7 +661,7 @@ Second."), "{listed}");
 
     #[test]
     fn node_round_trip_with_slugs() {
-        let (root, node, _) = data_root();
+        let (root, node) = data_root();
         let node_str = node.to_string();
         let node_slug = {
             let output = cli(&root, &["--json", "node", "show", &node_str]).unwrap();
@@ -720,7 +709,7 @@ Second."), "{listed}");
 
     #[test]
     fn visual_design_save_writes_file_and_links_obligation() {
-        let (root, node, _) = data_root();
+        let (root, node) = data_root();
         let node_str = node.to_string();
 
         let created = cli(
@@ -826,7 +815,7 @@ Second."), "{listed}");
 
     #[test]
     fn plan_round_trip_with_dependencies_and_obligations() {
-        let (root, node, _) = data_root();
+        let (root, node) = data_root();
         let node = node.to_string();
 
         let req_added = cli(
@@ -925,7 +914,7 @@ Second."), "{listed}");
 
     #[test]
     fn obligations_and_plan_search_the_whole_project_without_a_node() {
-        let (root, first, _) = data_root();
+        let (root, first) = data_root();
         let second = add_chain(&root, "Billing", &[])[0];
         let (first_str, second_str) = (first.to_string(), second.to_string());
         for (node, body) in [
@@ -976,7 +965,7 @@ Second."), "{listed}");
 
     #[test]
     fn node_tree_indents_counts_and_respects_depth() {
-        let (root, _, _) = data_root();
+        let (root, _) = data_root();
         let chain = add_chain(&root, "Top", &["Middle", "Bottom"]);
         let top = chain[0].to_string();
         cli(&root, &["obligations", "add", "--node", &top, "--kind", "req", "--body", "One."]).unwrap();
@@ -1014,61 +1003,12 @@ Second."), "{listed}");
         let _ = std::fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn memory_questions_and_interview_commands() {
-        let (root, node, session) = data_root();
-        let node = node.to_string();
-        let added = cli(
-            &root,
-            &[
-                "memory", "add", "--node", &node, "--kind", "parked", "--phase", "design",
-                "--body", "Use the vendor API.",
-            ],
-        )
-        .unwrap();
-        assert_eq!(added, "ok m-1");
-        let memory = cli(&root, &["memory", "list", "--node", &node, "--kind", "parked"]).unwrap();
-        assert_eq!(memory, "m-1 parked (open): Use the vendor API.");
-        assert_eq!(
-            cli(&root, &["memory", "update", "--node", &node, "m-1", "--status", "done"]).unwrap(),
-            "ok m-1"
-        );
-        let err = cli(
-            &root,
-            &["memory", "add", "--node", &node, "--kind", "parked", "--body", "No phase."],
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("--phase"), "{err}");
-
-        assert_eq!(
-            cli(&root, &["questions", "list", "--node", &node]).unwrap(),
-            "(none)"
-        );
-        let err = cli(
-            &root,
-            &["questions", "withdraw", "--node", &node, "q-9", "--reason", "gone"],
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("q-9 not found"), "{err}");
-
-        let session = session.to_string();
-        assert_eq!(
-            cli(
-                &root,
-                &["interview", "exhausted", "--session", &session, "--reason", "All asked."]
-            )
-            .unwrap(),
-            "ok"
-        );
-        let _ = std::fs::remove_dir_all(root);
-    }
-
     /// A node without the Agent capability still lists the Files, Tags, and
     /// Ticket settings it was given, and a later `set` keeps the ones it
     /// does not name.
     #[test]
     fn capabilities_set_then_list_without_the_agent_capability() {
-        let (root, node, _) = data_root();
+        let (root, node) = data_root();
         let node = node.to_string();
         cli(&root, &["capabilities", "enable", &node, "files", "tags", "ticket"]).unwrap();
         let dir = root.join("repo").display().to_string();
@@ -1106,7 +1046,7 @@ Second."), "{listed}");
 
     #[test]
     fn wait_round_trip_add_list_and_close() {
-        let (root, node, _) = data_root();
+        let (root, node) = data_root();
         let node = node.to_string();
         assert_eq!(cli(&root, &["wait", "list", "--node", &node]).unwrap(), "(no pending waits)");
         let err = cli(&root, &["wait", "--node", &node, "--until", "2h", "--check", "true"]).unwrap_err();
@@ -1130,7 +1070,7 @@ Second."), "{listed}");
 
     #[test]
     fn decisions_round_trip_ask_list_and_show() {
-        let (root, node, _) = data_root();
+        let (root, node) = data_root();
         let node = node.to_string();
 
         assert_eq!(
@@ -1231,7 +1171,7 @@ Second."), "{listed}");
     /// The fields of an access or broken request, and the refusal of a repeat.
     #[test]
     fn a_structured_request_keeps_its_fields_and_a_repeat_is_refused_with_the_existing_id() {
-        let (root, node, _) = data_root();
+        let (root, node) = data_root();
         let node = node.to_string();
 
         // `broken` needs the exact error.
@@ -1275,7 +1215,7 @@ Second."), "{listed}");
     /// command's.
     #[test]
     fn a_pull_request_agent_is_refused_a_request_about_a_review_bot_or_a_github_hiccup() {
-        let (root, node_id, _) = data_root();
+        let (root, node_id) = data_root();
         let node = node_id.to_string();
         let conversation = Uuid::new_v4();
         {
@@ -1319,7 +1259,7 @@ Second."), "{listed}");
 
     #[test]
     fn phase_round_trip_status_ready_certify_and_reject() {
-        let (root, node_id, _) = data_root();
+        let (root, node_id) = data_root();
         let set_lifecycle = |state: &str| {
             let fleet = FleetStore::open(&root).unwrap();
             fleet

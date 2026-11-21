@@ -10,7 +10,7 @@ use super::provider::{
 use crate::agent_launch::{AgentLaunchOptions, effort_for_acp};
 use crate::devcontainer::AgentEnvironment;
 use crate::agent_traffic::{
-    InterviewAgentCounts, SharedAgentTrafficLog, TrafficDirection, TrafficTag,
+    SharedAgentTrafficLog, TrafficDirection, TrafficTag,
 };
 use crate::ReplyPart;
 use crate::process_tree::AgentProcess;
@@ -130,7 +130,6 @@ struct LiveConversation {
     activity: Arc<Mutex<Option<String>>>,
     /// Set while the current turn is blocked on `session/request_permission`.
     pending_permission: PendingPermissionSlot,
-    purpose: SessionPurpose,
     /// Characters that entered this conversation's context (see
     /// [`AgentProvider::session_context_chars`]).
     context_chars: Arc<AtomicU64>,
@@ -145,7 +144,6 @@ struct LiveConversation {
 impl LiveConversation {
     fn spawn(spec: ConversationSpec, resume_session_id: Option<String>) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel();
-        let purpose = spec.purpose;
         let worker = ConversationWorker {
             spec,
             child: Arc::new(Mutex::new(None)),
@@ -166,7 +164,6 @@ impl LiveConversation {
             session_id: worker.session_id.clone(),
             activity: worker.activity.clone(),
             pending_permission: worker.pending_permission.clone(),
-            purpose,
             context_chars: worker.context_chars.clone(),
             reply_parts: worker.reply_parts.clone(),
             usage: worker.usage.clone(),
@@ -824,28 +821,6 @@ impl AgentProvider for CursorAcpProvider {
         self.session_observer = Some(observer);
     }
 
-    fn interview_status_counts(&self) -> InterviewAgentCounts {
-        let mut counts = InterviewAgentCounts::default();
-        for run in self.runs.values() {
-            if !matches!(run.state, AgentRunState::InFlight(_)) {
-                continue;
-            }
-            match run.kind {
-                AgentRunKind::QuestionMakerReplenishment => counts.question_maker_in_flight += 1,
-                AgentRunKind::AnswerProcessor => counts.answer_active += 1,
-                AgentRunKind::FleetAgent => {}
-            }
-        }
-        counts.answer_pool = self
-            .conversations
-            .values()
-            .filter(|c| c.purpose == SessionPurpose::AnswerProcessor)
-            .count() as u32;
-        if counts.answer_pool > 0 {
-            counts.answer_max = 2;
-        }
-        counts
-    }
 }
 
 fn auth_method_from_initialize(init_result: &Value, host: AcpHost) -> Option<String> {

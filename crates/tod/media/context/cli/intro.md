@@ -31,7 +31,7 @@ Only some nouns are documented below. All of them:
 
 `node` `obligations` `plan` `content` `capabilities` `changeset` `tests`
 `review` `guidance` `suggest` `pr` `verdicts` `incoming` `learn` `lifecycle` `secrets` `db` `access` `environment` `decisions` `triage` `phase`
-`wait` `batch` `questions` `memory` `interview` `visual-design` `journey` `skills` `lessons`
+`wait` `batch` `visual-design` `journey` `skills` `lessons`
 
 For a noun's commands and rules run `tod-cli <noun> --help`; to find a command
 by topic run `tod-cli help <WORDS>` (e.g. `tod-cli help lifecycle`). Search

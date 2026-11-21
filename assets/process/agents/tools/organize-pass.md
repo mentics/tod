@@ -1,6 +1,6 @@
 **Role:** Reorder and group obligations without changing meaning.
 
-Typically invoked after a requirements interview has drained.
+Typically invoked after requirements have been gathered.
 
 ## Context
 
@@ -31,7 +31,7 @@ Or `result: no_change` when obligations are already well organized.
 ## Do not
 
 - Add, remove, or rewrite obligation bodies
-- Run interviews or advance lifecycle
+- Advance lifecycle
 
 ## Guidelines
 

@@ -1,8 +1,6 @@
 //! Shared fixtures for interview tests: a fresh store with one Spec-enabled
-//! node and an active requirements interview session on it.
+//! node.
 
-use crate::interview::context::{ContextScope, delta, snapshot};
-use crate::interview::db::{InterviewSessionStatus, NewInterviewSession, SessionStore};
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -15,7 +13,6 @@ pub(crate) struct Fixture {
     pub root: PathBuf,
     pub fleet: Arc<FleetStore>,
     pub node: Uuid,
-    pub session: Uuid,
     /// Removes `root` when the fixture is dropped. Declared last so the store
     /// (and its SQLite connections) is dropped before the directory goes.
     _dir: tempfile::TempDir,
@@ -52,31 +49,12 @@ pub(crate) fn fixture() -> Fixture {
             capabilities: vec![Capability::Spec],
         })
         .unwrap();
-    let session = SessionStore::open(fleet.clone())
-        .insert_session_with_metadata(
-            NewInterviewSession {
-                node_id: node,
-                display_name: "Interview".into(),
-                phase: "task-requirements-interview".into(),
-            },
-            InterviewSessionStatus::Active,
-        )
-        .unwrap()
-        .id;
+    fleet.writer().flush().unwrap();
     Fixture {
         root,
         fleet,
         node,
-        session,
         _dir: dir,
-    }
-}
-
-pub(crate) fn draft(question: &str) -> QuestionDraft {
-    QuestionDraft {
-        question: question.into(),
-        options: vec!["Yes".into(), "No".into()],
-        ..Default::default()
     }
 }
 
@@ -89,44 +67,6 @@ impl Fixture {
 
     pub fn user(&self, command: InterviewCommand) -> Value {
         self.act(ACTOR_USER, command).unwrap()
-    }
-
-    /// Add a requirements-phase question as `actor`; returns its seq.
-    pub fn question(&self, actor: &str, draft: QuestionDraft) -> i64 {
-        let value = self
-            .act(
-                actor,
-                InterviewCommand::AddQuestion {
-                    node_id: self.node,
-                    session_id: Some(self.session),
-                    phase: Some(PHASE_REQUIREMENTS.into()),
-                    draft,
-                },
-            )
-            .unwrap();
-        value["id"]
-            .as_str()
-            .unwrap()
-            .trim_start_matches("q-")
-            .parse()
-            .unwrap()
-    }
-
-    pub fn answer(&self, seq: i64, option: Option<i64>, text: Option<&str>) {
-        self.user(InterviewCommand::AnswerQuestion {
-            node_id: self.node,
-            seq,
-            option,
-            text: text.map(str::to_string),
-            edited_text: None,
-        });
-    }
-
-    pub fn exhaust(&self) {
-        self.user(InterviewCommand::SetExhausted {
-            session_id: self.session,
-            reason: Some("nothing left".into()),
-        });
     }
 
     pub fn outline(&self, mutation: OutlineMutation) {
@@ -155,42 +95,7 @@ impl Fixture {
         id
     }
 
-    pub fn head(&self) -> i64 {
-        self.fleet
-            .read(|conn| InterviewRepo::new(conn).head_rev())
-            .unwrap()
-    }
 
-    pub fn get_question(&self, seq: i64) -> InterviewQuestion {
-        self.fleet
-            .read(|conn| InterviewRepo::new(conn).get_question(self.node, seq))
-            .unwrap()
-            .unwrap()
-    }
-
-    fn scope<'a>(&'a self, role: Role, phase: &'a str) -> ContextScope<'a> {
-        ContextScope {
-            node_id: self.node,
-            phase,
-            role,
-            interview_session_id: Some(self.session),
-            data_root: &self.root,
-            tod_cli: &self.root,
-            answered_cap: 100,
-        }
-    }
-
-    pub fn snapshot(&self, role: Role, phase: &str) -> String {
-        self.fleet
-            .read(|conn| snapshot(conn, &self.scope(role, phase)))
-            .unwrap()
-    }
-
-    pub fn delta(&self, role: Role, phase: &str, since: i64, actor: &str) -> String {
-        self.fleet
-            .read(|conn| delta(conn, &self.scope(role, phase), since, actor))
-            .unwrap()
-    }
 }
 
 #[cfg(test)]

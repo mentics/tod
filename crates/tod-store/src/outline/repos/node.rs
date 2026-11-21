@@ -589,10 +589,6 @@ impl<'a> NodeRepo<'a> {
                     params![blob],
                 )?;
                 self.conn.execute(
-                    "DELETE FROM interview_transcripts WHERE node_id = ?1",
-                    params![blob],
-                )?;
-                self.conn.execute(
                     "DELETE FROM node_media_links WHERE node_id = ?1",
                     params![blob],
                 )?;

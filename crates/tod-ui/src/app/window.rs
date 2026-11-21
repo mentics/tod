@@ -102,7 +102,6 @@ pub struct Shell {
     history: NavHistory<Location>,
     fleet: Arc<FleetStore>,
     _mutation_socket: Option<tod_store::fleet::mutation_socket::PortFileGuard>,
-    agent: SharedAgent,
     traffic_log: SharedAgentTrafficLog,
     transcript_window: TranscriptWindowControl,
     engagement: tod_agent::SharedEngagementRegistry,
@@ -359,9 +358,6 @@ impl Shell {
                     )
                 })
                 .count() as u32;
-        }
-        if let Ok(provider) = self.agent.lock() {
-            groups.interview = provider.interview_status_counts();
         }
         if let Ok(log) = self.traffic_log.lock() {
             groups.traffic_entries = log.entries().len();
@@ -1604,7 +1600,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                         tod_core::logging::buffer::start_agentd_tail(
                             tod_agentd_client::Paths::new(fleet.paths().root()).log(),
                         );
-                        let _ = crate::interview::bootstrap(fleet.clone());
+                        let _ = crate::interview::bootstrap();
                         // Before the tree is built, so no row is ever drawn as
                         // "refreshing…" for a refresh the last run never finished.
                         if let Err(err) = tod_core::generator::clear_interrupted_refreshes(&fleet) {
@@ -1664,7 +1660,6 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 history: NavHistory::new(Location::same_kind),
                                 fleet: fleet.clone(),
                                 _mutation_socket: mutation_socket,
-                                agent: agent.clone(),
                                 traffic_log: traffic_log.clone(),
                                 transcript_window: transcript_window.clone(),
                                 engagement: engagement.clone(),

@@ -5,7 +5,7 @@ use super::provider::{
 use crate::ReplyPart;
 use crate::agent_launch::AgentLaunchOptions;
 use crate::agent_traffic::{
-    InterviewAgentCounts, SharedAgentTrafficLog, TrafficDirection, TrafficTag,
+    SharedAgentTrafficLog, TrafficDirection, TrafficTag,
 };
 use anyhow::Result;
 use std::collections::HashMap;
@@ -76,7 +76,6 @@ pub struct MockAgentProvider {
 struct MockSession {
     session_id: String,
     messages: u32,
-    purpose: SessionPurpose,
     context_chars: u64,
     /// The latest turn's parts, when the handler gave any.
     reply_parts: Option<Vec<ReplyPart>>,
@@ -234,7 +233,6 @@ impl AgentProvider for MockAgentProvider {
                     .clone()
                     .unwrap_or_else(|| format!("mock-session-{}", uuid::Uuid::new_v4())),
                 messages: 0,
-                purpose: turn.purpose,
                 context_chars: 0,
                 reply_parts: None,
                 usage: crate::TokenUsage {
@@ -367,25 +365,6 @@ impl AgentProvider for MockAgentProvider {
         Ok(())
     }
 
-    fn interview_status_counts(&self) -> InterviewAgentCounts {
-        let mut counts = InterviewAgentCounts::default();
-        for (kind, _, _) in self.pending.values() {
-            match kind {
-                AgentRunKind::QuestionMakerReplenishment => counts.question_maker_in_flight += 1,
-                AgentRunKind::AnswerProcessor => counts.answer_active += 1,
-                AgentRunKind::FleetAgent => {}
-            }
-        }
-        counts.answer_pool = self
-            .sessions
-            .values()
-            .filter(|s| s.purpose == SessionPurpose::AnswerProcessor)
-            .count() as u32;
-        if counts.answer_pool > 0 {
-            counts.answer_max = 2;
-        }
-        counts
-    }
 }
 
 /// Spell out what reached the agent, so UI checks can see a session's opening
@@ -563,7 +542,7 @@ mod tests {
     }
 
     #[test]
-    fn interview_turns_run_the_registered_handler_with_env() {
+    fn conversation_turns_run_the_registered_handler_with_env() {
         set_mock_interview_handler(Arc::new(echo_handler));
         let mut mock = MockAgentProvider::new();
         let run = mock
@@ -572,17 +551,17 @@ mod tests {
                 None,
                 None,
                 "Target open questions: 8.",
-                SessionPurpose::QuestionMaker,
+                SessionPurpose::Conversation,
             ))
             .unwrap();
         let AgentRunState::Success(Some(reply)) = poll_run(&mut mock, run.id) else {
             panic!("interview turn failed");
         };
-        assert_eq!(reply, "QuestionMaker actor-1 Target open questions: 8.");
+        assert_eq!(reply, "Conversation actor-1 Target open questions: 8.");
     }
 
     /// Conversation turns are played by the registered handler, like the
-    /// interview purposes, not by the canned chat reply.
+    /// other handled turns, rather than by the canned chat reply.
     #[test]
     fn conversation_turns_run_the_registered_handler() {
         set_mock_interview_handler(Arc::new(echo_handler));

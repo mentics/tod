@@ -4,7 +4,7 @@
 
 ## First
 
-1. Read lifecycle state, obligations (including design-phase) and plan steps, the interview history (answered questions and interview memory), and evidence from the full lifecycle.
+1. Read lifecycle state, obligations (including design-phase) and plan steps, conversation history and evidence from the full lifecycle.
 2. Read the **Work history** section of the context when there is one: every obligation and plan step that failed verification or was handed back, every code review finding, every gate criterion that did not pass, and how many conversations of each kind the task took. The plan and obligations only show where the work ended up — every step `verified` says nothing about how many attempts that took — so the history, not the final state, is what the retrospective is about. Never report a clean run from the final state alone.
 3. The work history covers only this **pass**: a task sent back goes through its lifecycle again, and each earlier pass's retrospective is already stored. When it opens with "This pass began because …", that incoming change is why the task was reworked; say whether an earlier stage should have caught it.
 3a. When the history has **Findings made outside tod**, each one is a defect no phase found first. For every one, put in the retrospective (`learn record`) which phase should have caught it and why that phase missed it (a missing check, an unread lens, a gate that passed on thin evidence). Do the same for a finding in a later review round on code an earlier round already covered: that earlier round missed it. Report the counts the history gives (outside findings, findings per review round, rounds until a clean review).

@@ -48,7 +48,7 @@ fn without_the_tier_nothing_mentions_it_and_invoking_it_is_unknown() {
         assert!(!found.contains("tod-cli runner") && !found.contains("decisions answer"), "{words:?}: {found}");
     }
 
-    let (root, node, _) = data_root();
+    let (root, node) = data_root();
     let id = node.to_string();
     let err = cli_with(&root, &off, &["runner", "menu", &id]).unwrap_err().to_string();
     assert!(err.contains("unknown noun `runner`"), "{err}");
@@ -85,7 +85,7 @@ fn with_the_tier_the_help_lists_it() {
 
 #[test]
 fn the_operator_tier_is_refused_in_an_agent_session_even_when_on() {
-    let (root, node, _) = data_root();
+    let (root, node) = data_root();
     set_lifecycle(&root, node, "active");
     let id = node.to_string();
     for agent in [
@@ -145,7 +145,7 @@ fn timeline_titles(root: &PathBuf, node: Uuid) -> Vec<String> {
 
 #[test]
 fn answering_an_option_records_the_shepherd() {
-    let (root, node, _) = data_root();
+    let (root, node) = data_root();
     let short = ask(&root, node, "Which way?", &["left", "right"], &[]);
     let shepherd = env(&[ON, ("TOD_ACTOR", "shepherd:abc")]);
     let out = cli_with(&root, &shepherd, &["decisions", "answer", &short, "--option", "2"]).unwrap();
@@ -158,7 +158,7 @@ fn answering_an_option_records_the_shepherd() {
 
 #[test]
 fn answering_without_an_actor_records_the_operator() {
-    let (root, node, _) = data_root();
+    let (root, node) = data_root();
     let short = ask(&root, node, "Which way?", &["left", "right"], &[]);
     cli_with(&root, env(&[ON]), &["decisions", "answer", &short, "--option", "1"]).unwrap();
     assert_eq!(answer_actors(&root, &short), [(Some(1), None, ACTOR_USER.to_string())]);
@@ -167,7 +167,7 @@ fn answering_without_an_actor_records_the_operator() {
 
 #[test]
 fn answering_free_text_records_it() {
-    let (root, node, _) = data_root();
+    let (root, node) = data_root();
     let short = ask(&root, node, "What is the name?", &[], &[]);
     let out = cli_with(&root, env(&[ON, ("TOD_ACTOR", "shepherd:s2")]), &["decisions", "answer", &short, "--text", "Mabel"])
         .unwrap();
@@ -177,7 +177,7 @@ fn answering_free_text_records_it() {
 
 #[test]
 fn an_answer_needs_an_option_or_text_and_a_valid_option() {
-    let (root, node, _) = data_root();
+    let (root, node) = data_root();
     let short = ask(&root, node, "Which way?", &["left", "right"], &[]);
     let on = env(&[ON]);
     let err = cli_with(&root, &on, &["decisions", "answer", &short]).unwrap_err().to_string();
@@ -196,7 +196,7 @@ fn an_answer_needs_an_option_or_text_and_a_valid_option() {
 
 #[test]
 fn an_option_that_moves_the_node_back_moves_it() {
-    let (root, node, _) = data_root();
+    let (root, node) = data_root();
     set_lifecycle(&root, node, "review");
     let short = ask(&root, node, "Rebuild it?", &["rebuild", "leave"], &["--moves-to", "1:active"]);
     let out = cli_with(&root, env(&[ON, ("TOD_ACTOR", "shepherd:abc")]), &["decisions", "answer", &short, "--option", "1"])
@@ -211,7 +211,7 @@ fn an_option_that_moves_the_node_back_moves_it() {
 
 #[test]
 fn runner_menu_of_a_local_node_without_the_daemon_says_so() {
-    let (root, node, _) = data_root();
+    let (root, node) = data_root();
     set_lifecycle(&root, node, "active");
     let id = node.to_string();
     let err = cli_with(&root, env(&[ON]), &["runner", "menu", &id]).unwrap_err();
@@ -257,7 +257,7 @@ fn dispatch(root: &PathBuf, daemon: &FakeDaemon, who: &Who, json: bool, command:
 
 #[test]
 fn a_runner_verb_goes_to_the_daemon_and_the_menu_follows_it() {
-    let (root, node, _) = data_root();
+    let (root, node) = data_root();
     set_lifecycle(&root, node, "active");
     let id = node.to_string();
     let daemon = FakeDaemon::default();
@@ -304,7 +304,7 @@ fn a_runner_verb_goes_to_the_daemon_and_the_menu_follows_it() {
 #[test]
 fn stats_is_hidden_without_the_tier_refused_in_an_agent_session_and_reads_a_store() {
     let off = env(&[]);
-    let (root, node, _) = data_root();
+    let (root, node) = data_root();
     let err = cli_with(&root, &off, &["stats"]).unwrap_err().to_string();
     assert!(err.contains("unknown noun `stats`"), "{err}");
     assert!(!help_with(&off, &["--help"]).unwrap().contains("stats"));

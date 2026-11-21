@@ -9,16 +9,12 @@ const DEFAULT_MAX_ENTRIES: usize = 5_000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum AgentCategory {
     Fleet,
-    QuestionMaker,
-    AnswerProcessor,
 }
 
 impl AgentCategory {
     pub fn label(self) -> &'static str {
         match self {
             Self::Fleet => "Fleet",
-            Self::QuestionMaker => "Question maker",
-            Self::AnswerProcessor => "Answer",
         }
     }
 }
@@ -60,14 +56,6 @@ pub struct AgentSummary {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct InterviewAgentCounts {
-    pub question_maker_in_flight: u32,
-    pub answer_active: u32,
-    pub answer_pool: u32,
-    pub answer_max: u32,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FleetAgentCounts {
     pub total: u32,
     pub processing: u32,
@@ -76,7 +64,6 @@ pub struct FleetAgentCounts {
 
 #[derive(Debug, Clone, Default)]
 pub struct AgentStatusGroups {
-    pub interview: InterviewAgentCounts,
     pub fleet: FleetAgentCounts,
     pub traffic_entries: usize,
 }
@@ -259,21 +246,6 @@ pub fn shared_log() -> SharedAgentTrafficLog {
 pub fn format_status_bar(groups: &AgentStatusGroups) -> String {
     let mut parts = Vec::new();
 
-    if groups.interview.question_maker_in_flight > 0 {
-        parts.push(format!(
-            "Question maker {}",
-            groups.interview.question_maker_in_flight
-        ));
-    }
-    if groups.interview.answer_active > 0
-        || groups.interview.answer_pool > 0
-        || groups.interview.answer_max > 0
-    {
-        parts.push(format!(
-            "Answer {}/{}",
-            groups.interview.answer_active, groups.interview.answer_max
-        ));
-    }
     if groups.fleet.total > 0 {
         let mut agents = if groups.fleet.total == 1 {
             "1 agent".to_string()
@@ -307,7 +279,7 @@ mod tests {
     fn groups_agents_by_category() {
         let mut log = AgentTrafficLog::new();
         log.record(
-            AgentCategory::QuestionMaker,
+            AgentCategory::Fleet,
             "run-1",
             "question-maker",
             TrafficDirection::Request,
@@ -321,20 +293,13 @@ mod tests {
             "prompt",
         );
         let grouped = log.agents_grouped();
-        assert_eq!(grouped.len(), 2);
-        assert_eq!(grouped[&AgentCategory::QuestionMaker].len(), 1);
-        assert_eq!(grouped[&AgentCategory::Fleet].len(), 1);
+        assert_eq!(grouped.len(), 1);
+        assert_eq!(grouped[&AgentCategory::Fleet].len(), 2);
     }
 
     #[test]
     fn status_bar_shows_grouped_counts() {
         let text = format_status_bar(&AgentStatusGroups {
-            interview: InterviewAgentCounts {
-                question_maker_in_flight: 1,
-                answer_active: 2,
-                answer_pool: 2,
-                answer_max: 5,
-            },
             fleet: FleetAgentCounts {
                 total: 3,
                 processing: 1,
@@ -342,8 +307,6 @@ mod tests {
             },
             traffic_entries: 10,
         });
-        assert!(text.contains("Question maker 1"));
-        assert!(text.contains("Answer 2/5"));
         assert!(text.contains("3 agents"));
     }
 }

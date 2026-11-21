@@ -122,7 +122,7 @@ mod tests {
 
     #[test]
     fn a_ticket_is_filed_once_and_listed_without_a_tracker() {
-        let (root, node, _) = crate::tests::data_root();
+        let (root, node) = crate::tests::data_root();
         let id = node.to_string();
         assert_eq!(cli(&root, &["suggest", "list", "--node", &id]).unwrap(), "(no suggestions)");
         let args = ["suggest", "ticket", "--node", &id, "--title", "Add retry", "--body", "Retry.\n\nAcceptance: it does."];
@@ -141,7 +141,7 @@ mod tests {
 
     #[test]
     fn asking_whether_to_open_a_ticket_is_refused_with_a_pointer() {
-        let (root, node, _) = crate::tests::data_root();
+        let (root, node) = crate::tests::data_root();
         let id = node.to_string();
         let err = cli(&root, &["decisions", "ask", "--node", &id, "Should we open a follow-up ticket for the retry bug?"])
             .unwrap_err()

@@ -295,21 +295,7 @@ pub enum FleetMutation {
     RecordTurnUsage(crate::conversation_usage::TurnUsage),
     // --- Outline (tree / lists) ---
     Outline(OutlineMutation),
-    // --- Interview sessions (immediate) ---
-    InsertInterviewSession {
-        id: uuid::Uuid,
-        new_session: crate::fleet::repos::interview_session::NewInterviewSession,
-        status: String,
-    },
-    UpdateInterviewSessionScaffolding {
-        id: uuid::Uuid,
-        session_id: Option<String>,
-        scratchpad_path: Option<String>,
-    },
-    SetInterviewSessionStatus {
-        id: uuid::Uuid,
-        status: String,
-    },
+
 }
 
 impl FleetMutation {
@@ -345,9 +331,6 @@ impl FleetMutation {
                 | FleetMutation::CreateShellSession { .. }
                 | FleetMutation::DismissShellSession { .. }
                 | FleetMutation::ClearShellReconnect { .. }
-                | FleetMutation::InsertInterviewSession { .. }
-                | FleetMutation::UpdateInterviewSessionScaffolding { .. }
-                | FleetMutation::SetInterviewSessionStatus { .. }
                 | FleetMutation::CloudNodeUpsert { .. }
                 | FleetMutation::CloudNodeSetOwnership { .. }
                 | FleetMutation::CloudNodeRemove { .. }
@@ -566,36 +549,6 @@ impl FleetMutation {
             }
             FleetMutation::ClearShellReconnect { id } => {
                 ShellRepo::new(conn).clear_reconnect(id)?;
-            }
-            FleetMutation::InsertInterviewSession {
-                id,
-                new_session,
-                status,
-            } => {
-                use crate::fleet::repos::interview_session::{
-                    InterviewSessionRepo, InterviewSessionStatus,
-                };
-                let status = InterviewSessionStatus::from_str(status)?;
-                InterviewSessionRepo::new(conn).insert_with_id(*id, new_session.clone(), status)?;
-            }
-            FleetMutation::UpdateInterviewSessionScaffolding {
-                id,
-                session_id,
-                scratchpad_path,
-            } => {
-                use crate::fleet::repos::interview_session::InterviewSessionRepo;
-                InterviewSessionRepo::new(conn).update_scaffolding(
-                    *id,
-                    session_id.as_deref(),
-                    scratchpad_path.as_deref(),
-                )?;
-            }
-            FleetMutation::SetInterviewSessionStatus { id, status } => {
-                use crate::fleet::repos::interview_session::{
-                    InterviewSessionRepo, InterviewSessionStatus,
-                };
-                let status = InterviewSessionStatus::from_str(status)?;
-                InterviewSessionRepo::new(conn).set_status(*id, status)?;
             }
             FleetMutation::CloudNodeUpsert { node, user, accepted_at } => {
                 let location =

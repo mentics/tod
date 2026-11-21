@@ -17,10 +17,8 @@
 //! - `outline_entries` (parent/list/ordinal moves)
 //! - `node_obligations`
 //! - `node_extra_content`
-//! - `interview_transcripts`
 //! - `node_fields`, `node_tags`
 //! - `node_media_links`
-//! - `interview_sessions`
 //! - `node_gate_evaluations`
 //! - `node_plan_steps`
 //! - `node_generator_config`
@@ -191,9 +189,7 @@ pub fn create_triggers_sql() -> String {
     for table in [
         "node_obligations",
         "node_extra_content",
-        "interview_transcripts",
         "node_plan_steps",
-        "interview_sessions",
     ] {
         sql.push_str(&simple_id_triggers(table));
     }
