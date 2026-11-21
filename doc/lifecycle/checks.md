@@ -51,6 +51,9 @@ commits what it changed as **its own mechanical commit** (subject
 `tod: fix <check>`, no hooks, a submodule pointer never included), and runs
 **only that check again** on the new tree.
 
+- A review's mechanical and simple findings use the same quick fix (source
+  `review`, `doc/lifecycle/review-scoring.md`), with the small-change review
+  of its commit instead of a check run.
 - If it passes there is no Fix protocol turn, no finding, and no new round of
   review: a change a tool made is not reviewed. In `review` or earlier, a
   round of review that was done before the commit is recorded as covering the

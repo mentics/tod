@@ -1,6 +1,6 @@
 # Requests for the user: fewer, cheaper, clearer, and self-improving
 
-Status: steps 1 to 8 built (lessons and process review: `doc/lifecycle/self-improvement.md`), and the self-improvement view (11.4, `doc/ui/self-improvement.md`). 2026-11-20.
+Status: steps 1 to 9 built (lessons and process review: `doc/lifecycle/self-improvement.md`; scored review findings: `doc/lifecycle/review-scoring.md`), and the self-improvement view (11.4, `doc/ui/self-improvement.md`). 2026-11-20.
 
 This replaces how a node asks the user for something today: an agent runs
 `tod-cli decisions ask`, the run stops, and the request sits in the task panel

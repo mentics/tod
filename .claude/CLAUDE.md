@@ -562,7 +562,21 @@ conversation's coverage record (`review_coverage`, schema v99) has an entry
 for every required lens (`review::LENSES`, `coverage::required_lenses`) and a
 saturation pass that found nothing after its last finding; the findings panel
 shows that record. A finding may carry a root cause, and the Fix session sees
-findings that share one grouped together. `fix.rs`
+findings that share one grouped together. **Findings are scored** (schema v117,
+`doc/lifecycle/review-scoring.md`): `importance` (blocker/major/minor/nit),
+`impact` and `complexity` (mechanical/simple/involved) replace `severity`, and
+a status `left` is tod's own answer to a finding that does not block. Only
+blockers and majors, plus minors in the first `review.minor_rounds` rounds of
+a stay (default 2), block; every reader asks `ReviewFinding::stands`. When a
+round is done `Autopilot::settle_review_round` routes the open findings
+(`tod_core::review_scoring`): non-blocking ones are left, with a note in the
+Activity; mechanical and simple ones that block (and mechanical nits) go
+together to ONE quick fix session (source `review`) and the small-change
+review, settled `fixed` only if that is clean; involved ones go to Fix; a
+failed quick fix hands its findings to Fix. The user can reopen a left
+finding (it blocks like a major) and edit scores in the findings panel.
+Three nodes' mechanical findings citing the same `--rule` (matched
+case-, space- and punctuation-insensitively) file a suggestion to add a check. `fix.rs`
 resolves them (the autopilot's Fix step): given the open findings, the agent answers each `fixed` or
 `rejected` with a note — `tod-cli` refuses it the user's answers — and loops
 until none is open and a test run is green. The `review` → `pr` gate is app-checked

@@ -1175,6 +1175,6 @@ mod tests {
         let f = finding(Some("src/a.rs"), Some(9));
         let body = comment_body(&f, &Place::File { path: "src/a.rs".into() });
         assert!(body.contains(&marker(&f)), "{body}");
-        assert!(body.starts_with("**[high]** (line 9) Wrong"), "{body}");
+        assert!(body.starts_with("**[blocker]** (line 9) Wrong"), "{body}");
     }
 }

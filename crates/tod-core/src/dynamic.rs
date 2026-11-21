@@ -855,14 +855,14 @@ mod tests {
         assert_eq!(
             text,
             "- Root cause shared by 2 findings: The id is treated as unique\n\
-             \x20 - [01000000] high `a.py:1`: First\n\
+             \x20 - [01000000] blocker/high/simple `a.py:1`: First\n\
              \x20   How it goes wrong.\n\
-             \x20 - [03000000] high `a.py:3`: Third\n\
+             \x20 - [03000000] blocker/high/simple `a.py:3`: Third\n\
              \x20   How it goes wrong.\n\
-             - [02000000] high `a.py:2`: Second\n\
+             - [02000000] blocker/high/simple `a.py:2`: Second\n\
              \x20 Root cause: Nulls are not handled\n\
              \x20 How it goes wrong.\n\
-             - [04000000] high `a.py:4`: Fourth\n\
+             - [04000000] blocker/high/simple `a.py:4`: Fourth\n\
              \x20 How it goes wrong.\n"
         );
     }

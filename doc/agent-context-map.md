@@ -379,8 +379,10 @@ is banned.
 
 | Surface | Stance | Fragments | Dynamic blocks | Why |
 |---|---|---|---|---|
-| `quick_fix` | `stance/bounded-session` | `surface/quick-fix` | working directory, the failing check (label, command, output tail, the diff of the files it names, the phase's usual commands) | One failing thing and nothing else: no obligations, plan, design or `cli/` noun. Edits files and runs the check's command. |
-| `small_review` | `stance/bounded-session` | `cli/intro`, `cli/review`, `surface/small-review` | data root, working directory, the commit's diff | One cheap reviewer for a quick fix's commit; records findings only. |
+| `quick_fix` | `stance/bounded-session` | `surface/quick-fix` | working directory, the failing check (label, command, output tail, the diff of the files it names, the phase's usual commands), or a failing CI check, or the review findings scored mechanical or simple (each with scores, place, detail and rule) | One failing thing and nothing else: no obligations, plan, design or `cli/` noun. Edits files and runs the check's command; for review findings it makes one turn of edits and the small review reads the commit. |
+| `small_review` | `stance/bounded-session` | `cli/intro`, `cli/review`, `surface/small-review` | data root, working directory, the commit's diff | One cheap reviewer for a quick fix's commit (a check's, a CI check's, or a review round's findings); records scored findings only. |
+
+Scoring findings (importance, impact, complexity, rule) is taught once, in `surface/review.md` ("Scoring a finding"), with the flags in `cli/review`; `surface/small-review.md` and `surface/fix.md` only refer to the scores.
 
 ## Triage
 
