@@ -460,6 +460,96 @@ pub fn root_cause_key(cause: &str) -> String {
     cause.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
 }
 
+const CAUSE_STOPWORDS: &[&str] = &[
+    "the", "a", "an", "is", "are", "was", "were", "be", "been", "to", "of", "in", "on", "for", "by", "and", "or", "that",
+    "it", "its", "this", "these", "those", "as", "at", "with", "from", "not", "no", "but", "when", "so", "than", "then",
+    "which", "has", "have", "had", "does", "do", "did", "into", "still", "only", "every", "any", "all", "each", "also",
+    "assumed", "assumes", "assume", "assuming", "treated", "treats", "treat", "treating", "unlike", "same", "other",
+    "without", "whether", "while", "where", "what", "there", "their", "them", "they", "can", "could", "may", "might",
+    "will", "would", "should", "never", "instead", "rather", "own", "one", "two", "being", "whose", "about",
+];
+
+/// The words of a root cause that tell it from another: lowercased, with the
+/// filler words dropped and a plural or past-tense ending trimmed, so
+/// "redirect is committed" and "redirects committed" have the same words.
+fn cause_words(cause: &str) -> std::collections::BTreeSet<String> {
+    cause
+        .to_lowercase()
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter(|w| w.len() > 1 && !CAUSE_STOPWORDS.contains(w))
+        .map(|w| {
+            let w = w.strip_suffix("ing").filter(|s| s.len() >= 4).unwrap_or(w);
+            let w = w.strip_suffix("ed").filter(|s| s.len() >= 4).unwrap_or(w);
+            let w = w.strip_suffix("es").filter(|s| s.len() >= 4).unwrap_or(w);
+            let w = w.strip_suffix('s').filter(|s| s.len() >= 4).unwrap_or(w);
+            w.to_string()
+        })
+        .collect()
+}
+
+/// Fewest distinctive words two causes must share to be the same.
+const CAUSE_MIN_SHARED: usize = 3;
+/// How much of the shorter cause's words the longer one must hold.
+const CAUSE_MIN_OVERLAP: f64 = 0.6;
+
+fn same_words(a: &std::collections::BTreeSet<String>, b: &std::collections::BTreeSet<String>) -> bool {
+    let shared = a.intersection(b).count();
+    shared >= CAUSE_MIN_SHARED && shared as f64 >= CAUSE_MIN_OVERLAP * a.len().min(b.len()) as f64
+}
+
+/// Whether two root causes name the same assumption or pattern: equal by
+/// [`root_cause_key`], or sharing most of their distinctive words. Two
+/// reviewers (or two rounds) word one cause differently, and an exact match
+/// never sees it.
+pub fn same_root_cause(a: &str, b: &str) -> bool {
+    root_cause_key(a) == root_cause_key(b) || same_words(&cause_words(a), &cause_words(b))
+}
+
+/// Root causes seen so far, each a class: [`Self::assign`] puts a cause in the
+/// class it is the same as ([`same_root_cause`], against the class's first
+/// wording) or opens a new one.
+#[derive(Default)]
+pub struct CauseClasses {
+    /// The first wording of each class, its key and its words.
+    classes: Vec<(String, String, std::collections::BTreeSet<String>)>,
+}
+
+impl CauseClasses {
+    /// The class of `cause` (an index into [`Self::wording`]), opened when no
+    /// class holds it.
+    pub fn assign(&mut self, cause: &str) -> usize {
+        let cause = cause.trim();
+        let key = root_cause_key(cause);
+        if let Some(found) = self.classes.iter().position(|(k, _, _)| *k == key) {
+            return found;
+        }
+        let words = cause_words(cause);
+        if let Some(found) = self.classes.iter().position(|(_, _, w)| same_words(w, &words)) {
+            return found;
+        }
+        self.classes.push((key, cause.to_string(), words));
+        self.classes.len() - 1
+    }
+
+    /// The first wording of class `class`.
+    pub fn wording(&self, class: usize) -> &str {
+        &self.classes[class].1
+    }
+}
+
+/// The wording a new finding's `cause` is filed under on a node whose findings
+/// already carry `existing` causes (oldest first): the first wording of the
+/// class it is the same as, else its own. Reviewers reword one cause, and the
+/// fix escalation and the fixer's grouping read causes by wording.
+pub fn canonical_root_cause<'a>(existing: impl IntoIterator<Item = &'a str>, cause: &str) -> String {
+    let mut classes = CauseClasses::default();
+    for known in existing.into_iter().map(str::trim).filter(|c| !c.is_empty()) {
+        classes.assign(known);
+    }
+    let class = classes.assign(cause);
+    classes.wording(class).to_string()
+}
+
 /// Findings that share a root cause, or one finding without one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FindingGroup<'a> {
@@ -472,21 +562,22 @@ pub struct FindingGroup<'a> {
 /// comes; a finding with no root cause is a group of its own. A fixer sees
 /// the class, not only its instances.
 pub fn group_by_root_cause(findings: &[ReviewFinding]) -> Vec<FindingGroup<'_>> {
-    let mut groups: Vec<(Option<String>, FindingGroup<'_>)> = Vec::new();
+    let mut classes = CauseClasses::default();
+    let mut groups: Vec<(Option<usize>, FindingGroup<'_>)> = Vec::new();
     for finding in findings {
         let cause = finding
             .root_cause
             .as_deref()
             .map(str::trim)
             .filter(|c| !c.is_empty());
-        let key = cause.map(root_cause_key);
-        if let Some(key) = &key
-            && let Some((_, group)) = groups.iter_mut().find(|(k, _)| k.as_ref() == Some(key))
+        let class = cause.map(|c| classes.assign(c));
+        if let Some(class) = class
+            && let Some((_, group)) = groups.iter_mut().find(|(k, _)| *k == Some(class))
         {
             group.findings.push(finding);
             continue;
         }
-        groups.push((key, FindingGroup { root_cause: cause, findings: vec![finding] }));
+        groups.push((class, FindingGroup { root_cause: cause, findings: vec![finding] }));
     }
     groups.into_iter().map(|(_, group)| group).collect()
 }
@@ -542,6 +633,23 @@ impl<'a> ReviewRepo<'a> {
             .as_deref()
             .map(str::trim)
             .filter(|c| !c.is_empty());
+        // Filed in the words the node's first finding of the same cause used,
+        // so the fix escalation and the fixer's grouping see one cause.
+        let root_cause = match root_cause {
+            Some(cause) => {
+                let known: Vec<String> = self
+                    .conn
+                    .prepare(
+                        "SELECT root_cause FROM review_findings
+                         WHERE node_id = ?1 AND root_cause IS NOT NULL AND TRIM(root_cause) <> ''
+                         ORDER BY seq",
+                    )?
+                    .query_map(params![uuid_to_blob(node_id)], |row| row.get(0))?
+                    .collect::<rusqlite::Result<_>>()?;
+                Some(canonical_root_cause(known.iter().map(String::as_str), cause))
+            }
+            None => None,
+        };
         let rule = finding
             .rule
             .as_deref()
@@ -1040,6 +1148,69 @@ mod tests {
                 (None, vec!["d"]),
             ]
         );
+    }
+
+    /// Wordings from the live nodes ENG-3038 and ENG-3559 (2026-11-20): the
+    /// one cause the reviewers worded three ways, and causes that are not it.
+    #[test]
+    fn reworded_causes_are_the_same_cause_and_other_causes_are_not() {
+        let redirect = [
+            "The command's redirect is committed independently of the merge of the group it creates, unlike the shared redirect paths, which revert the redirect when the merge is refused",
+            "The command's deprecated-part redirect is committed independently of the merge it is meant to feed, unlike the shared redirect path that reverts when the merge does not happen",
+            "The command's redirect is committed whenever its target is not among the detected groups, treating 'not detected' as 'joins no group' even when detection did not run",
+        ];
+        assert!(same_root_cause(redirect[0], redirect[1]));
+        // The third says it from the other side (the target not being among
+        // the detected groups): only the reviewer can join it, by naming the
+        // finding it shares a cause with.
+        assert!(!same_root_cause(redirect[0], redirect[2]));
+        let others = [
+            "Merge writes added to the shared merge without a matching revert path",
+            "The shared merge was extended to write more state, but the revert path it relies on (DELETED_AT_VALUE sentinel + unmerge_parts_last_state) was not extended to match",
+            "Query cost assumed from the filter's shape rather than checked against prod indexes and plans",
+            "The replicated deprecation lookup assumes every deprecated product resolves to exactly one existing, active canonical product row",
+            "The existence check for a live part on (org, canonical id) runs without a lock that covers rows other transactions may be writing",
+            "Fix responses cite commits that are not on the task branch",
+            "The task branch was cut before the merged pull request and never rebased onto main, so it re-adds superseded code and lacks fixes that already shipped",
+        ];
+        for (i, a) in others.iter().enumerate() {
+            for r in &redirect[..2] {
+                assert!(!same_root_cause(a, r), "{a} / {r}");
+            }
+            for b in &others[i + 1..] {
+                // The two merge/revert wordings are one cause.
+                if i == 0 {
+                    continue;
+                }
+                assert!(!same_root_cause(a, b), "{a} / {b}");
+            }
+        }
+        assert!(same_root_cause(others[0], others[1]), "merge writes without revert path");
+        // ENG-3559: the reviewers' two first wordings are different words for
+        // one cause, which only the reviewer can join (by `--same-cause-as`);
+        // the later wordings share the exact words and so are one.
+        let part = "V2OrgPart is assumed unique per (org, cofactr_id); get_part's org-scoped .first() is used as if it returned the record's own V2OrgPart.";
+        assert!(same_root_cause(part, "v2orgpart is assumed unique per (org, cofactr_id); get_part's org-scoped .first() is used as if it returned the record's own v2orgpart."));
+    }
+
+    #[test]
+    fn a_finding_is_filed_under_the_first_wording_of_its_cause() {
+        let fx = setup();
+        let repo = ReviewRepo::new(&fx.conn);
+        let with_cause = |summary: &str, cause: &str| NewFinding { root_cause: Some(cause.to_string()), ..finding(summary) };
+        let first = "The command's redirect is committed independently of the merge of the group it creates";
+        repo.add(fx.node, None, &with_cause("a", first)).unwrap();
+        let b = repo
+            .add(fx.node, None, &with_cause("b", "The command's deprecated-part redirect is committed independently of the merge it is meant to feed"))
+            .unwrap();
+        assert_eq!(b.root_cause.as_deref(), Some(first));
+        let c = repo.add(fx.node, None, &with_cause("c", "Query cost assumed from the filter's shape rather than checked against prod indexes")).unwrap();
+        assert_eq!(c.root_cause.as_deref(), Some("Query cost assumed from the filter's shape rather than checked against prod indexes"));
+        let groups = group_by_root_cause(&repo.list_for_node(fx.node).unwrap())
+            .into_iter()
+            .map(|g| g.findings.len())
+            .collect::<Vec<_>>();
+        assert_eq!(groups, [2, 1]);
     }
 
     /// Findings belong to the node: deleting the conversation that recorded

@@ -44,6 +44,50 @@ pub fn open_findings(fleet: &FleetStore, node_id: Uuid) -> Vec<ReviewFinding> {
         .collect()
 }
 
+/// The checks the task is held to in `state` (the app runs them on the
+/// fixer's commit, and a failure is a new finding), as the fixer is told to run
+/// them before it answers: label, command, directory, and what limits where it
+/// applies. Empty when the task has none.
+pub fn checks_block(fleet: &FleetStore, node_id: Uuid, state: &str) -> Result<String> {
+    let checks = fleet
+        .read(|conn| crate::checks::configured(conn, node_id, state))
+        .with_context(|| format!("could not read the checks for `{state}`"))?;
+    Ok(render_checks(&checks))
+}
+
+fn render_checks(checks: &[tod_store::lifecycle_config::Check]) -> String {
+    if checks.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "\n\n# The checks this task is held to\n\n\
+         Run each that applies to the files you changed, in its directory, before you answer `fixed`. \
+         A failure here is a new finding for the next round.\n\n",
+    );
+    for check in checks {
+        let name = if check.label.trim().is_empty() { check.command.trim() } else { check.label.trim() };
+        out.push_str(&format!("- {name}: `{}`", check.command.trim()));
+        if !check.dir.trim().is_empty() {
+            out.push_str(&format!(" (run in `{}`)", check.dir.trim()));
+        }
+        let mut limits = Vec::new();
+        if !check.changed.trim().is_empty() {
+            limits.push(format!("applies when `{}` changed", check.changed.trim()));
+        }
+        if !check.pattern.trim().is_empty() {
+            limits.push(format!("on files matching `{}`", check.pattern.trim()));
+        }
+        if !limits.is_empty() {
+            out.push_str(&format!("; {}", limits.join(", ")));
+        }
+        if !check.fix.trim().is_empty() {
+            out.push_str(&format!("; to fix what it reports: `{}`", check.fix.trim()));
+        }
+        out.push('\n');
+    }
+    out
+}
+
 pub struct FixProtocol;
 
 impl Protocol for FixProtocol {
@@ -120,7 +164,7 @@ impl Protocol for FixProtocol {
         let cwd = self.cwd(env)?;
         let working_dir = PathBuf::from(cwd.path_text());
         let skills = crate::skills_context::for_work(fleet, node_id, "fix", &cwd, env.skill_group())?;
-        build_fix_message(
+        let mut message = build_fix_message(
             env.media,
             &ImplementRequest {
                 data_root: env.data_root,
@@ -140,7 +184,9 @@ impl Protocol for FixProtocol {
                 pull_requests: crate::pr_context::for_node(fleet, node_id),
             },
             &open_findings(fleet, node_id),
-        )
+        )?;
+        message.push_str(&checks_block(fleet, node_id, &node.lifecycle)?);
+        Ok(message)
     }
 
     /// The findings open now. A later message usually follows another review,
@@ -316,6 +362,29 @@ mod tests {
     use tod_store::conversation::Focus;
     use tod_store::interview::ACTOR_AGENT;
     use tod_store::review::{FINDING_REJECTED, NewFinding};
+
+    #[test]
+    fn the_fixer_is_told_which_checks_to_run_before_it_answers() {
+        use tod_store::lifecycle_config::Check;
+        assert_eq!(render_checks(&[]), "");
+        let shown = render_checks(&[
+            Check {
+                label: "ruff format".into(),
+                command: "ruff format --check .".into(),
+                dir: "flagship".into(),
+                pattern: "*.py".into(),
+                fix: "ruff format .".into(),
+                ..Check::default()
+            },
+            Check { command: "make lint".into(), ..Check::default() },
+        ]);
+        assert!(shown.contains("# The checks this task is held to"), "{shown}");
+        assert!(
+            shown.contains("- ruff format: `ruff format --check .` (run in `flagship`); on files matching `*.py`; to fix what it reports: `ruff format .`"),
+            "{shown}"
+        );
+        assert!(shown.contains("- make lint: `make lint`\n"), "{shown}");
+    }
 
     fn with_findings(n: usize) -> (Fixture, Vec<Uuid>) {
         let fx = fixture();

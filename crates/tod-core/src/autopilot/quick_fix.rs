@@ -368,13 +368,19 @@ impl Autopilot {
         if open.is_empty() {
             return Ok(None);
         }
+        let serious = review_scoring::has_serious(&open);
         let mut routing = review_scoring::route(&open, round, minor_rounds);
         if lanes == Lanes::LeaveOnly {
             for finding in std::mem::take(&mut routing.quick) {
-                if review_scoring::blocks(&finding, round, minor_rounds) {
+                if review_scoring::blocks_in(&finding, round, minor_rounds, serious) {
                     routing.fix.push(finding);
                 } else {
-                    routing.leave.push((finding, "nit: left as it is".to_string()));
+                    let why = if finding.importance == tod_store::review::IMPORTANCE_MINOR {
+                        review_scoring::MINOR_ALONE.to_string()
+                    } else {
+                        "nit: left as it is".to_string()
+                    };
+                    routing.leave.push((finding, why));
                 }
             }
         }
@@ -455,7 +461,7 @@ impl Autopilot {
         crate::conversation::quick_fix::save(fleet, &done)?;
         let nits: Vec<(ReviewFinding, String)> = findings
             .iter()
-            .filter(|f| !review_scoring::blocks(f, round, minor_rounds))
+            .filter(|f| !review_scoring::blocks_in(f, round, minor_rounds, serious))
             .map(|f| (f.clone(), QUICK_FIX_FAILED_NIT.to_string()))
             .collect();
         self.leave_findings(fleet, lifecycle, &nits)?;
@@ -517,7 +523,7 @@ impl Autopilot {
     }
 
     /// A note on the node's Activity.
-    fn note(&mut self, fleet: &FleetStore, lifecycle: &str, title: String, failed: bool, body: String) -> Result<()> {
+    pub(super) fn note(&mut self, fleet: &FleetStore, lifecycle: &str, title: String, failed: bool, body: String) -> Result<()> {
         let entry = tod_store::node_timeline::TimelineEntry::new(self.node, tod_store::node_timeline::KIND_NOTE, lifecycle, title, failed, body);
         fleet.enqueue(tod_store::fleet::FleetMutation::RecordTimeline(Box::new(entry)))?;
         fleet.writer().flush()?;

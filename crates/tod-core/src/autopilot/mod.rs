@@ -48,7 +48,7 @@ use state::{PendingGroups, PrChange};
 use crate::lifecycle_next::{NextStep, Standing, next_step};
 use crate::phase::PhaseStanding;
 use tod_store::phase::PhaseRepo;
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tod_store::conversation::{ConversationRepo, Focus, ProtocolKind};
@@ -3870,6 +3870,7 @@ impl Autopilot {
                 .ok()
                 .map(|driver| (driver, message, partner))
         });
+        let opened_fresh = opened.is_none();
         let (lead, lead_message, partner) = match opened {
             Some(opened) => opened,
             None => {
@@ -3877,6 +3878,16 @@ impl Autopilot {
                 (driver.with_reviewer(Reviewer::Main, None), message, None)
             }
         };
+        // What the checkout holds before a new round, to tell what the round
+        // leaves in it (`crate::review_leftovers`). A round picked up again
+        // keeps the list its first run took.
+        if opened_fresh {
+            let cwd = tod_store::fleet::provision::resolve_launch_cwd(fleet, &self.node.to_string())
+                .context("finding the node's checkout, to list the files it holds before the review")?;
+            let before = crate::review_leftovers::untracked(&cwd).context("list the untracked files before the review")?;
+            self.state.loops.review_untracked_before = Some(before.into_iter().collect());
+            self.save()?;
+        }
         let mut lanes = vec![Lane::new(lead, step_label(kind, 0))];
         if let Some(outcome) = self.start_lane(fleet, agent, &mut lanes[0], true, &lead_message)? {
             return Ok(Some(outcome));
@@ -4007,11 +4018,39 @@ impl Autopilot {
         }
         self.state.current = None;
         self.save()?;
+        self.remove_review_leftovers(fleet, &lifecycle)?;
         // A head a reviewer pushed that tod's review did not clear.
         if let Some(outcome) = self.check_pushes(fleet, &lifecycle, Some((lead_id, kind)))? {
             return Ok(Some(outcome));
         }
         self.sent_back_during(fleet, &lifecycle, started)
+    }
+
+    /// The review round is done: delete the untracked files it left in the
+    /// checkout (a reviewer's scratch test fails the project's checks) and
+    /// note on the Activity which. A review changes no code, so nothing in
+    /// them is anyone's work; the list taken before the round says what is
+    /// new (`crate::review_leftovers`).
+    fn remove_review_leftovers(&mut self, fleet: &FleetStore, lifecycle: &str) -> Result<()> {
+        let Some(before) = self.state.loops.review_untracked_before.take() else {
+            return Ok(());
+        };
+        self.save()?;
+        let cwd = tod_store::fleet::provision::resolve_launch_cwd(fleet, &self.node.to_string())
+            .context("finding the node's checkout, to look for files the review left")?;
+        let after = crate::review_leftovers::untracked(&cwd).context("list the untracked files after the review")?;
+        let left = crate::review_leftovers::left_by_round(&before, &after);
+        if left.is_empty() {
+            return Ok(());
+        }
+        crate::review_leftovers::remove(&cwd, &left)?;
+        self.note(
+            fleet,
+            lifecycle,
+            format!("The review left {} untracked file(s) in the checkout; tod removed them", left.len()),
+            false,
+            left.join("\n"),
+        )
     }
 
     /// Send a review round's lane its message, unless its reviewer already

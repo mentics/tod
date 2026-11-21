@@ -9,7 +9,8 @@
 //! reviewers' findings:
 //!
 //! - **One root cause, many rounds.** Findings that share a root cause
-//!   (`tod_store::review::root_cause_key`) were recorded in
+//!   (`tod_store::review::CauseClasses`: the same words, or most of the
+//!   distinctive ones) were recorded in
 //!   [`ROOT_CAUSE_ROUNDS`] or more rounds: each fix answered the instance and
 //!   the cause kept producing more.
 //! - **Fixing makes more.** A fix round added more findings than it closed
@@ -83,15 +84,18 @@ fn line(finding: &ReviewFinding) -> String {
 pub fn check(rounds: &[Round]) -> Option<Escalation> {
     let latest = rounds.last()?.lead.id;
 
-    // One root cause across many rounds.
-    let mut causes: BTreeMap<String, (String, BTreeSet<usize>, Vec<&ReviewFinding>)> = BTreeMap::new();
+    // One root cause across many rounds. Causes are read as classes
+    // (`tod_store::review::CauseClasses`), so two wordings of one cause count
+    // together: reviewers reword, and an exact match never fired.
+    let mut classes = tod_store::review::CauseClasses::default();
+    let mut causes: BTreeMap<usize, (String, BTreeSet<usize>, Vec<&ReviewFinding>)> = BTreeMap::new();
     for (index, round) in rounds.iter().enumerate() {
         for finding in round.findings.iter().filter(|f| stands(f)) {
             let Some(cause) = finding.root_cause.as_deref().filter(|c| !c.trim().is_empty()) else {
                 continue;
             };
             let entry = causes
-                .entry(tod_store::review::root_cause_key(cause))
+                .entry(classes.assign(cause))
                 .or_insert_with(|| (cause.trim().to_string(), BTreeSet::new(), Vec::new()));
             entry.1.insert(index);
             entry.2.push(finding);
@@ -252,6 +256,17 @@ mod tests {
         assert_eq!(escalation.findings.len(), 3);
         assert!(escalation.reason.contains("root cause \"Trusts the cache\" across 3 review rounds"), "{}", escalation.reason);
         assert!(escalation.reason.contains("] d (a.py:3)"), "{}", escalation.reason);
+    }
+
+    #[test]
+    fn a_cause_worded_differently_each_round_still_counts_across_rounds() {
+        let rounds = vec![
+            round(vec![finding("a", Some("The command's redirect is committed independently of the merge of the group it creates"), "fixed")]),
+            round(vec![finding("b", Some("The command's deprecated-part redirect is committed independently of the merge it is meant to feed"), "fixed")]),
+            round(vec![finding("c", Some("The redirect the command makes is committed independently of the merge that follows it"), "open")]),
+        ];
+        let escalation = check(&rounds).expect("three wordings of one cause in three rounds");
+        assert_eq!(escalation.findings.len(), 3);
     }
 
     #[test]
