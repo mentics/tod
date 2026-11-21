@@ -614,6 +614,10 @@ Each step stands alone and is worth having without the next.
    and session links, Discuss in the chat drawer with the request-session
    labels, highlight to flag, and the closing reflection (section 8).
 8. **Lessons and process review** (section 11), without the view.
+9. **Scored review findings** (5.1): importance, impact and complexity on every
+   finding; only blockers and majors (and minors early) block; mechanical and
+   simple fixes go to one quick fix with the small-change review; recurring
+   mechanical findings suggest a check.
 
 ## 14. Open questions
 
