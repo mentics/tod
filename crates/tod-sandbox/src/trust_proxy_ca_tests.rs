@@ -151,3 +151,13 @@ fn the_terraform_cache_script_writes_the_profile_file_idempotently_and_bootstrap
     let bootstrap = String::from_utf8(crate::provision::bootstrap_script().to_vec()).unwrap();
     assert!(!bootstrap.contains("#@terraform-cache@") && bootstrap.contains("tod-terraform.sh"));
 }
+
+/// The command redirects (`command_redirects` in sandboxes.toml) are set up
+/// with `jq`, and refuse without it, so a golden built from an image the
+/// bootstrap prepared (`tod-sandbox bake --agents`) must have it installed.
+#[test]
+fn bootstrap_installs_jq_that_the_command_redirects_need() {
+    let src = include_str!("../../../assets/sandbox/bootstrap.sh");
+    assert!(src.contains("for cmd in git curl tar gzip bash ps scp jq; do"), "jq is checked for");
+    assert!(src.contains("*:jq) echo jq ;;"), "jq has a package name");
+}

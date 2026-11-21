@@ -53,6 +53,7 @@ pkg() {
         *:tar) echo tar ;;
         *:gzip) echo gzip ;;
         *:bash) echo bash ;;
+        *:jq) echo jq ;;
         *:ps) case "$PM" in apk) echo procps ;; apt) echo procps ;; *) echo procps-ng ;; esac ;;
         apk:scp) echo openssh-client ;;
         apt:scp) echo openssh-client ;;
@@ -75,7 +76,8 @@ find_sftp_server() {
 }
 
 missing=""
-for cmd in git curl tar gzip bash ps scp; do
+# jq: the command redirects (tod-sandbox's PreToolUse hook) are set up with it.
+for cmd in git curl tar gzip bash ps scp jq; do
     have "$cmd" || missing="$missing $(pkg "$cmd")"
 done
 find_sftp_server >/dev/null || missing="$missing $(pkg sftp-server)"
