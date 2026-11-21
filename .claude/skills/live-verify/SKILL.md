@@ -180,6 +180,16 @@ new gotcha to this file and `doc/live-verification.md` and merge them.
   `sandboxes.toml`, set `default_image = "sandbox/tod-lv-base:latest"`, run
   `tod-sandbox golden refresh joel-cofactr/build-test`, set `default_image` back.
 
+- **A golden refresh's fork failed "lacks node>=20.10" (found 2026-11-21).** The
+  golden built from an image has a proxy; its fork inherits the platform's
+  `HTTPS_PROXY` as an unrendered `{{file(...)}}` template once it is labelled, and
+  Node 22 then dies with `ERR_PROXY_INVALID_CONFIG` before running anything, so
+  the requirements check read the sandbox as lacking Node. The check now starts
+  Node without the proxy variables (`provision::NODE_OK_SH`). Starting the app
+  refreshes the golden whenever its build is newer than the golden's stamp, so
+  after the last commit: build, refresh the golden with the built `tod-sandbox`,
+  then launch (a commit after the refresh makes the daemon refresh it again).
+
 ## Gotchas from the second requests pass (local scratch repo)
 
 - A local Files location without Treehouse needs `worktree_backend: git_only` in the root's `tod.yml` (`treehouse_required` fails the launch).

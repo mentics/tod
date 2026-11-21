@@ -153,24 +153,35 @@ pub enum Mode {
     Fork,
 }
 
+/// The node check of [`requirements_script`]. Node itself is started without
+/// the proxy variables: a fork's `HTTPS_PROXY` can be the platform's
+/// unrendered `{{file(...)}}` template (after the fork was labelled, seen
+/// 2026-11-21), and Node 22 then dies with `ERR_PROXY_INVALID_CONFIG` before
+/// running anything, so a sandbox that has Node read as lacking it. The check
+/// needs no network.
+const NODE_OK_SH: &str = r#"node_ok() {
+    command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1 || return 1
+    env -u HTTPS_PROXY -u HTTP_PROXY -u https_proxy -u http_proxy -u NODE_USE_ENV_PROXY \
+        node -e 'const [a, b] = process.versions.node.split(".").map(Number);
+                 process.exit(a > 20 || (a === 20 && b >= 10) ? 0 : 1)' 2>/dev/null
+}"#;
+
 /// What tod needs in a sandbox that [`Mode::Fork`] only checks for. The
 /// first line it prints is `missing:` and the commands it did not find.
 fn requirements_script(agents: bool) -> String {
     let agent_checks = if agents {
-        r#"
-node_ok() {
-    command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1 || return 1
-    node -e 'const [a, b] = process.versions.node.split(".").map(Number);
-             process.exit(a > 20 || (a === 20 && b >= 10) ? 0 : 1)' 2>/dev/null
-}
+        format!(
+            r#"
+{NODE_OK_SH}
 node_ok || missing="$missing node>=20.10"
 command -v claude-agent-acp >/dev/null 2>&1 || missing="$missing claude-agent-acp"
 # A non-login shell may not have where `claude` was installed on its PATH.
 PATH="$PATH:/usr/local/bin:$HOME/.local/bin:/root/.local/bin:$HOME/.claude/local"
 command -v claude >/dev/null 2>&1 || optional="$optional claude"
 "#
+        )
     } else {
-        ""
+        String::new()
     };
     format!(
         r#"mkdir -p {TOD_DIR}/bin {TOD_DIR}/logs
@@ -709,6 +720,31 @@ protocol = "HTTP"
 
 #[cfg(test)]
 mod tests {
+    /// Seen live: a golden refresh's fork carried the platform's unrendered
+    /// `HTTPS_PROXY` template, Node refused to start, and the check said the
+    /// sandbox lacked Node. The check must run Node without the proxy variables.
+    #[test]
+    #[cfg(unix)]
+    fn the_node_check_ignores_a_proxy_variable_node_would_refuse() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tod_test_util::scratch_dir("node-ok");
+        // A node that dies the way Node 22 does when its proxy variable is a template.
+        std::fs::write(dir.join("node"), "#!/bin/sh\ncase \"$HTTPS_PROXY\" in *'{{'*) exit 1;; esac\nexit 0\n").unwrap();
+        std::fs::write(dir.join("npm"), "#!/bin/sh\nexit 0\n").unwrap();
+        for f in ["node", "npm"] {
+            std::fs::set_permissions(dir.join(f), std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let script = format!("{NODE_OK_SH}\nnode_ok && echo ok || echo lacking");
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .env("PATH", format!("{}:/usr/bin:/bin", dir.display()))
+            .env("HTTPS_PROXY", "https://none:{{file(/var/run/secrets/x)}}@proxy.example")
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ok", "{}", String::from_utf8_lossy(&out.stderr));
+    }
+
     #[test]
     fn node_kind_is_read_from_the_label() {
         assert!(is_node_kind(Some("node")) && is_node_kind(Some("node-base")));
