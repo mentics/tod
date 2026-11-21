@@ -1,26 +1,16 @@
-//! Interview orchestration — turning a conversation into obligations and tasks.
-//!
-//! Decides *what* should happen and *when* to persist it. Agent transport is
-//! reached through `tod-agent`; storage through `tod-store`.
+//! Shared clients and paths, plus support for legacy interview data.
 
 pub mod bootstrap;
 pub mod client;
 pub mod context;
-pub mod db;
-pub mod driver;
 pub mod mock;
 pub mod paths;
-pub mod phase;
-pub mod question_feedback;
-pub mod routing;
 
 #[cfg(test)]
 pub(crate) mod test_support;
 
-pub use routing::{TaskListProceedContext, interview_complete, interview_work_remains};
 
 pub use bootstrap::bootstrap;
-pub use db::{InterviewSession, InterviewSessionStatus, NewInterviewSession, SessionStore};
 pub use paths::{TodPaths, set_data_root};
 pub use tod_store::settings::TodSettings;
 

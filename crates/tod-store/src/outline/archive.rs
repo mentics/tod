@@ -640,7 +640,6 @@ pub fn build_capability_archive(
             for table in [
                 "node_obligations",
                 "node_extra_content",
-                "interview_transcripts",
                 "node_media_links",
             ] {
                 collect_cascade(conn, table, "node_id", &node, &mut seen, &mut rows)?;
@@ -717,7 +716,8 @@ pub fn restore_capability(conn: &Connection, archive_id: Uuid) -> Result<(Uuid, 
             );
         }
     }
-    row_archive::restore(conn, &archive.rows)?;
+    let rows: Vec<_> = archive.rows.iter().filter(|row| row.table != "interview_transcripts").cloned().collect();
+    row_archive::restore(conn, &rows)?;
     conn.execute(
         "INSERT OR IGNORE INTO node_capabilities (node_id, capability, enabled_at) VALUES (?1, ?2, ?3)",
         params![uuid_to_blob(node_id), cap.as_str(), now_ms()],

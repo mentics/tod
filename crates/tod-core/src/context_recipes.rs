@@ -472,30 +472,6 @@ pub const FLEET_AUTONOMOUS: ContextRecipe = ContextRecipe {
     ],
 };
 
-/// An interview agent turn (question-maker or answer-processor). This recipe
-/// contributes static fragments only; the dynamic half is
-/// `interview::context::{snapshot, delta}`, whose sections are single-use and
-/// phase- and role-filtered, so they are not blocks. See "Decisions" in
-/// `doc/agent-context-map.md`.
-pub const INTERVIEW_AGENT: ContextRecipe = ContextRecipe {
-    name: "interview agent",
-    situational: false,
-    layers: &[
-        "stance/agent-to-agent",
-        "domain/outline",
-        "domain/obligations",
-        "domain/plan",
-        "cli/intro",
-        "cli/obligations",
-        "cli/content",
-        "cli/plan",
-        "cli/questions",
-        "cli/memory",
-        "cli/interview",
-    ],
-    blocks: &[],
-};
-
 /// The conversation view's agent. Interactive, with the whole project in
 /// scope: `surface/conversation` states its exception to "confirm first"
 /// (every action is recorded and reversible) and its reply rule. The focus is
@@ -681,7 +657,6 @@ pub const ALL_RECIPES: &[ContextRecipe] = &[
     EVALUATE,
     EVALUATE_VERIFYING,
     FLEET_AUTONOMOUS,
-    INTERVIEW_AGENT,
 ];
 
 #[cfg(test)]

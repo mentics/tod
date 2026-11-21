@@ -79,7 +79,7 @@ impl Capability {
 
     pub fn description(self) -> &'static str {
         match self {
-            Self::Spec => "Requirements, constraints, and interview artifacts",
+            Self::Spec => "Requirements, constraints, and supporting content",
             Self::Lifecycle => "Process state and lifecycle transitions",
             Self::Agent => "Agent platform, model, and effort for chats and coding agents",
             Self::Files => "Workspace directory, branch, and optional worktree",
@@ -97,7 +97,7 @@ impl Capability {
     pub fn disable_warning(self) -> &'static str {
         match self {
             Self::Spec => {
-                "Disabling Spec will permanently remove this node's obligations, extra content, and interview data."
+                "Disabling Spec will permanently remove this node's obligations and extra content."
             }
             Self::Lifecycle => "Disabling Lifecycle will remove this node's lifecycle state.",
             Self::Agent => {

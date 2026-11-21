@@ -229,16 +229,13 @@ mod tests {
         let client = InterviewClient::new(&root, "session-123").without_daemon();
         let session_id = Uuid::new_v4();
         let value = client
-            .interview(InterviewCommand::SetExhausted {
-                session_id,
-                reason: Some("done".into()),
-            })
+            .interview(InterviewCommand::AddNote { node_id: session_id, text: "done".into() })
             .unwrap();
         assert_eq!(value["id"], "q-7");
         let request: Value = serde_json::from_str(&server.join().unwrap()).unwrap();
         assert_eq!(request["actor"], "session-123");
-        assert_eq!(request["interview"]["cmd"], "set-exhausted");
-        assert_eq!(request["interview"]["session_id"], session_id.to_string());
+        assert_eq!(request["interview"]["cmd"], "add-note");
+        assert_eq!(request["interview"]["node_id"], session_id.to_string());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -248,10 +245,7 @@ mod tests {
             fake_instance("err conflict: this changed after your context was built");
         let err = InterviewClient::new(&root, ACTOR_USER)
             .without_daemon()
-            .interview(InterviewCommand::SetExhausted {
-                session_id: Uuid::new_v4(),
-                reason: None,
-            })
+            .interview(InterviewCommand::AddNote { node_id: Uuid::new_v4(), text: "note".into() })
             .unwrap_err();
         assert!(err.to_string().contains("conflict"), "{err}");
         server.join().unwrap();
@@ -275,17 +269,14 @@ mod tests {
         .unwrap();
         let client = InterviewClient::new(&root, ACTOR_USER).without_daemon();
         let err = client
-            .interview(InterviewCommand::SetExhausted {
-                session_id: Uuid::new_v4(),
-                reason: None,
-            })
+            .interview(InterviewCommand::AddNote { node_id: Uuid::new_v4(), text: "note".into() })
             .unwrap_err();
         assert!(
             err.to_string().contains("not found"),
             "reached the store: {err}"
         );
         let head = client
-            .read(|conn| tod_store::interview::InterviewRepo::new(conn).head_rev())
+            .read(|conn| Ok(conn.query_row("SELECT COUNT(*) FROM interview_changes", [], |row| row.get::<_, i64>(0))?))
             .unwrap();
         assert_eq!(head, 0);
         let _ = std::fs::remove_dir_all(root);

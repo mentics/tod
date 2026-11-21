@@ -13,11 +13,9 @@ fn verify_process_bundle() -> anyhow::Result<()> {
     use tod_core::process_bundle::{ProcessManifest, TodInstallPaths};
 
     let install = TodInstallPaths::discover()?;
-    let manifest = ProcessManifest::load(&install)?;
+    ProcessManifest::load(&install)?;
     let root = install.process_root();
-    let phases = manifest.phase_count();
     println!("ok process_root={}", root.display());
-    println!("ok manifest_phases={phases}");
     let skills = tod_core::skills::SkillsPaths::discover()?;
     println!("ok skills_root={}", skills.root().display());
     Ok(())

@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 113;
+pub const CURRENT_USER_VERSION: i32 = 114;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -49,6 +49,75 @@ fn apply_connection_pragmas(conn: &Connection, read_only: bool) -> Result<()> {
     if read_only {
         conn.execute_batch("PRAGMA query_only=ON;")?;
     }
+    Ok(())
+}
+
+/// Remove the retired interview process while retaining obligation history.
+fn remove_legacy_interviews(conn: &Connection) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    // Keep archived task data restorable, while removing transcript rows from
+    // both direct capability archives and those inside deleted subtrees.
+    fn scrub(payload: &str) -> Result<Option<String>> {
+        let mut value: serde_json::Value = serde_json::from_str(payload)
+            .context("reading capability archive while removing interviews")?;
+        let Some(rows) = value.get_mut("rows").and_then(|rows| rows.as_array_mut()) else {
+            return Ok(None);
+        };
+        let before = rows.len();
+        rows.retain(|row| row.get("table").and_then(|v| v.as_str()) != Some("interview_transcripts"));
+        if rows.len() == before { Ok(None) } else { Ok(Some(serde_json::to_string(&value)?)) }
+    }
+    for table in ["capability_archives", "node_subtree_archives"] {
+        let archives: Vec<(Vec<u8>, String)> = {
+            let mut stmt = tx.prepare(&format!("SELECT id, payload FROM {table}"))?;
+            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            rows
+        };
+        for (id, payload) in archives {
+            let updated = if table == "capability_archives" {
+                scrub(&payload)?
+            } else {
+                let mut value: serde_json::Value = serde_json::from_str(&payload)
+                    .context("reading subtree archive while removing interviews")?;
+                let mut changed = false;
+                if let Some(nodes) = value.get_mut("nodes").and_then(|v| v.as_array_mut()) {
+                    for node in nodes {
+                        if let Some(archives) = node.get_mut("capability_archives").and_then(|v| v.as_array_mut()) {
+                            for archive in archives {
+                                if let Some(payload) = archive.get("payload").and_then(|v| v.as_str()) {
+                                    if let Some(clean) = scrub(payload)? {
+                                        archive["payload"] = serde_json::Value::String(clean);
+                                        changed = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if changed { Some(serde_json::to_string(&value)?) } else { None }
+            };
+            if let Some(updated) = updated {
+                tx.execute(&format!("UPDATE {table} SET payload = ?1 WHERE id = ?2"), rusqlite::params![updated, id])?;
+            }
+        }
+    }
+    let has_session_ids = tx.prepare("SELECT 1 FROM pragma_table_info('interview_agent_sessions') WHERE name='agent_session_id'")?.exists([])?;
+    if has_session_ids {
+        tx.execute_batch("DELETE FROM agent_sessions WHERE agent_session_id IN
+            (SELECT agent_session_id FROM interview_agent_sessions WHERE agent_session_id IS NOT NULL)
+            AND NOT EXISTS (SELECT 1 FROM agent_runs WHERE agent_runs.agent_session_id = agent_sessions.agent_session_id)
+            AND NOT EXISTS (SELECT 1 FROM conversations WHERE conversations.agent_session_id = agent_sessions.agent_session_id)")?;
+    }
+    tx.execute_batch("        DELETE FROM journey_changes WHERE tbl IN ('interview_transcripts', 'interview_sessions');
+        DELETE FROM interview_changes WHERE entity IN ('question', 'memory');
+        DROP TABLE IF EXISTS interview_questions;
+        DROP TABLE IF EXISTS interview_memory;
+        DROP TABLE IF EXISTS interview_agent_sessions;
+        DROP TABLE IF EXISTS interview_transcripts;
+        DROP TABLE IF EXISTS interview_sessions;
+    ")?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -772,6 +841,10 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         crate::lessons::migrate_request_feedback(conn)?;
         conn.pragma_update(None, "user_version", 113)?;
     }
+    if version < 114 {
+        remove_legacy_interviews(conn)?;
+        conn.pragma_update(None, "user_version", 114)?;
+    }
     // Other branches (the task panel) numbered their own steps 66–67 at the
     // same time as 66–70 above, so a store may be past a version without
     // having these. Every one is idempotent: make sure of them all.
@@ -1312,6 +1385,9 @@ fn migrate_v36_to_v37(conn: &Connection) -> Result<()> {
                 'visual_design_path', OLD.visual_design_path,
                 'created_at', OLD.created_at, 'updated_at', OLD.updated_at)";
     let tx = conn.unchecked_transaction()?;
+    if tx.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='interview_agent_sessions'")?.exists([])? {
+        tx.execute("UPDATE interview_agent_sessions SET state = 'retired' WHERE role = 'drafter' AND state = 'live'", [])?;
+    }
     let batch = format!(
         "
         DROP INDEX IF EXISTS idx_drafting_dumps_target;
@@ -1319,9 +1395,6 @@ fn migrate_v36_to_v37(conn: &Connection) -> Result<()> {
         DROP INDEX IF EXISTS idx_drafting_choices_node;
         DROP TABLE IF EXISTS drafting_choices;
         DROP TABLE IF EXISTS drafting_summaries;
-
-        UPDATE interview_agent_sessions SET state = 'retired'
-         WHERE role = 'drafter' AND state = 'live';
 
         DROP TRIGGER IF EXISTS trg_drafting_buildable_reset;
         CREATE TRIGGER IF NOT EXISTS trg_buildable_reset AFTER INSERT ON interview_changes
@@ -1835,13 +1908,13 @@ fn migrate_v39_to_v40(conn: &Connection) -> Result<()> {
         FROM (SELECT *, lower(hex(id)) AS h FROM conversations)
         WHERE agent_session_id IS NOT NULL AND agent_session_id != '';
 
-        INSERT OR IGNORE INTO agent_sessions
-            (agent_session_id, title, started_at)
-        SELECT agent_session_id, 'Interview ' || role || ' · ' || phase, created_at
-        FROM interview_agent_sessions
-        WHERE agent_session_id IS NOT NULL AND agent_session_id != '';
         ",
     )?;
+    if conn.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='interview_agent_sessions'")?.exists([])? {
+        conn.execute_batch("INSERT OR IGNORE INTO agent_sessions (agent_session_id, title, started_at)
+            SELECT agent_session_id, 'Interview ' || role || ' · ' || phase, created_at
+            FROM interview_agent_sessions WHERE agent_session_id IS NOT NULL AND agent_session_id != '';")?;
+    }
     Ok(())
 }
 
@@ -4466,6 +4539,48 @@ mod tests {
         (dir, conn)
     }
 
+    #[test]
+    fn v114_removes_interview_history_and_keeps_obligation_archives() {
+        let (_dir, conn) = temp_db();
+        for table in ["interview_questions", "interview_memory", "interview_agent_sessions", "interview_transcripts", "interview_sessions"] {
+            conn.execute_batch(&format!("CREATE TABLE {table} (body TEXT); INSERT INTO {table} VALUES ('old interview');")).unwrap();
+        }
+        conn.execute_batch("ALTER TABLE interview_agent_sessions ADD COLUMN agent_session_id TEXT;
+            INSERT INTO interview_agent_sessions (body,agent_session_id) VALUES ('old', 'old-session');
+            INSERT INTO agent_sessions (agent_session_id, started_at) VALUES ('old-session', 0);").unwrap();
+        let archive_id = uuid::Uuid::new_v4().as_bytes().to_vec();
+        let node_id = uuid::Uuid::new_v4().as_bytes().to_vec();
+        let payload = r#"{"version":1,"rows":[{"table":"interview_transcripts","rows":[]},{"table":"node_obligations","rows":[]}]}"#;
+        conn.execute("INSERT INTO capability_archives (id,node_id,capability,archived_at,payload) VALUES (?1,?2,'spec',0,?3)", params![archive_id, node_id, payload]).unwrap();
+        let subtree_id = uuid::Uuid::new_v4().as_bytes().to_vec();
+        let subtree = serde_json::json!({"nodes": [{"capability_archives": [{"payload": payload}]}]});
+        conn.execute("INSERT INTO node_subtree_archives (id, root_node_id, list_id, archived_at, payload) VALUES (?1, ?2, ?3, 0, ?4)", params![subtree_id, node_id, archive_id, subtree.to_string()]).unwrap();
+        conn.execute("INSERT INTO journey_changes (node_id,tbl,row_id,op,at) VALUES (?1,'interview_transcripts','old','insert','0')", params![node_id]).unwrap();
+        conn.execute("INSERT INTO interview_changes (node_id,entity,entity_id,op,actor,at,prior) VALUES (?1,'question',?2,'insert','user',0,NULL)", params![node_id, archive_id]).unwrap();
+        conn.execute("INSERT INTO interview_changes (node_id,entity,entity_id,op,actor,at,prior) VALUES (?1,'obligation',?2,'delete','user',0,'{}')", params![node_id, archive_id]).unwrap();
+        conn.pragma_update(None, "user_version", 113).unwrap();
+        apply_migrations(&conn).unwrap();
+        for table in ["interview_questions", "interview_memory", "interview_agent_sessions", "interview_transcripts", "interview_sessions"] {
+            let exists: bool = conn.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1").unwrap().exists([table]).unwrap();
+            assert!(!exists, "{table} was retained");
+        }
+        let payload: String = conn.query_row("SELECT payload FROM capability_archives WHERE id=?1", params![archive_id], |row| row.get(0)).unwrap();
+        assert!(!payload.contains("interview_transcripts"));
+        assert!(payload.contains("node_obligations"));
+        let subtree: String = conn.query_row("SELECT payload FROM node_subtree_archives WHERE id=?1", params![subtree_id], |row| row.get(0)).unwrap();
+        assert!(!subtree.contains("interview_transcripts"));
+        assert!(subtree.contains("node_obligations"));
+        let old: i64 = conn.query_row("SELECT COUNT(*) FROM journey_changes WHERE tbl='interview_transcripts'", [], |row| row.get(0)).unwrap();
+        assert_eq!(old, 0);
+        let obligation: i64 = conn.query_row("SELECT COUNT(*) FROM interview_changes WHERE entity='obligation' AND prior IS NOT NULL", [], |row| row.get(0)).unwrap();
+        assert_eq!(obligation, 1);
+        let session_count: i64 = conn.query_row("SELECT COUNT(*) FROM agent_sessions WHERE agent_session_id='old-session'", [], |row| row.get(0)).unwrap();
+        assert_eq!(session_count, 0);
+        let questions: i64 = conn.query_row("SELECT COUNT(*) FROM interview_changes WHERE entity='question'", [], |row| row.get(0)).unwrap();
+        assert_eq!(questions, 0);
+        apply_migrations(&conn).unwrap();
+    }
+
     /// `conversations.skill_group` was added inside the v73 step, after
     /// stores had passed it: a store at the current version without the
     /// column must get it, or every conversation query and every sync slice
@@ -6002,6 +6117,7 @@ mod plan_step_migration_tests {
             params![uuid_to_blob(uuid::Uuid::new_v4())],
         )
         .unwrap();
+        conn.execute_batch("CREATE TABLE interview_agent_sessions (id BLOB, node_id BLOB, phase TEXT, role TEXT, synced_rev INTEGER, state TEXT, created_at INTEGER, agent_session_id TEXT)").unwrap();
         conn.execute(
             "INSERT INTO interview_agent_sessions
                  (id, node_id, phase, role, synced_rev, state, created_at)
@@ -6027,9 +6143,12 @@ mod plan_step_migration_tests {
             mark_refs(&conn)
         );
 
-        apply_migrations(&conn).unwrap();
-        // Running the step again (as under a renumbered version) is harmless.
         migrate_v36_to_v37(&conn).unwrap();
+        migrate_v36_to_v37(&conn).unwrap();
+        let state: String = conn.query_row("SELECT state FROM interview_agent_sessions WHERE id = ?1", params![uuid_to_blob(session_id)], |r| r.get(0)).unwrap();
+        assert_eq!(state, "retired");
+        assert!(conn.prepare("SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='trg_buildable_reset'").unwrap().exists([]).unwrap());
+        apply_migrations(&conn).unwrap();
         let version: i32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
@@ -6092,16 +6211,7 @@ mod plan_step_migration_tests {
                 7
             )
         );
-        let state: String = conn
-            .query_row(
-                "SELECT state FROM interview_agent_sessions WHERE id = ?1",
-                params![uuid_to_blob(session_id)],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(state, "retired");
-
-        // The change-log triggers still fire, and the buildable reset with them.
+        // The change-log triggers still fire; the later certification migration removes the buildable trigger.
         let triggers: Vec<String> = conn
             .prepare(
                 "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name IN (
@@ -6114,16 +6224,7 @@ mod plan_step_migration_tests {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(triggers.len(), 5, "{triggers:?}");
-        conn.execute(
-            "INSERT INTO node_gate_evaluations (node_id, criterion_id, outcome, source, evaluated_at)
-             SELECT ?1, id, 'pass', 'agent', 0 FROM gate_criteria WHERE slug = ?2",
-            params![
-                uuid_to_blob(node_id),
-                crate::outline::BUILDABLE_CRITERION_SLUG
-            ],
-        )
-        .unwrap();
+        assert_eq!(triggers.len(), 4, "{triggers:?}");
         conn.execute(
             "UPDATE node_obligations SET body = 'changed' WHERE id = ?1",
             params![uuid_to_blob(obligation_id)],
@@ -6151,14 +6252,6 @@ mod plan_step_migration_tests {
                 ("delete".into(), "changed".into())
             ]
         );
-        let outcome: String = conn
-            .query_row(
-                "SELECT outcome FROM node_gate_evaluations WHERE node_id = ?1",
-                params![uuid_to_blob(node_id)],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(outcome, "pending");
         let _ = fs::remove_dir_all(dir);
     }
 }

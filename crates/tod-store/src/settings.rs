@@ -4,10 +4,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-const DEFAULT_REPLENISH_THRESHOLD: u32 = 8;
 const DEFAULT_CONTEXT_BUDGET_TOKENS: u64 = 100_000;
-const DEFAULT_PROMPT_CACHE_IDLE_MINUTES: u64 = 5;
-const DEFAULT_ANSWERED_HISTORY_CAP: u32 = 100;
 pub const DEFAULT_LOG_MAX_SIZE_KB: u64 = 51_200;
 pub const MIN_LOG_MAX_SIZE_KB: u64 = 1;
 pub const MAX_LOG_MAX_SIZE_KB: u64 = 104_857_600;
@@ -897,60 +894,25 @@ impl JourneySettings {
 /// re-exported here because it is persisted in `tod.yml` and agent config rows.
 pub use tod_agent::AgentPlatform;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct QuestionMakerSettings {
-    /// Target number of open questions; a question maker run starts below it,
-    /// and the answer processor fans out when unprocessed answers exceed half.
-    #[serde(default = "default_replenish_threshold")]
-    pub replenish_threshold: u32,
-}
-
-impl Default for QuestionMakerSettings {
-    fn default() -> Self {
-        Self {
-            replenish_threshold: DEFAULT_REPLENISH_THRESHOLD,
-        }
-    }
-}
-
-fn default_replenish_threshold() -> u32 {
-    DEFAULT_REPLENISH_THRESHOLD
-}
-
-/// How interview agent sessions keep their context small.
+/// Context budget for agent conversations.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InterviewContextSettings {
     /// Rotate a session to a fresh snapshot once its estimated context exceeds this.
     #[serde(default = "default_context_budget_tokens")]
     pub context_budget_tokens: u64,
-    /// Idle time after which a resumed session would miss the provider's prompt cache.
-    #[serde(default = "default_prompt_cache_idle_minutes")]
-    pub prompt_cache_idle_minutes: u64,
-    /// Most answered questions (current phase) included in a snapshot.
-    #[serde(default = "default_answered_history_cap")]
-    pub answered_history_cap: u32,
+
 }
 
 impl Default for InterviewContextSettings {
     fn default() -> Self {
         Self {
             context_budget_tokens: DEFAULT_CONTEXT_BUDGET_TOKENS,
-            prompt_cache_idle_minutes: DEFAULT_PROMPT_CACHE_IDLE_MINUTES,
-            answered_history_cap: DEFAULT_ANSWERED_HISTORY_CAP,
         }
     }
 }
 
 fn default_context_budget_tokens() -> u64 {
     DEFAULT_CONTEXT_BUDGET_TOKENS
-}
-
-fn default_prompt_cache_idle_minutes() -> u64 {
-    DEFAULT_PROMPT_CACHE_IDLE_MINUTES
-}
-
-fn default_answered_history_cap() -> u32 {
-    DEFAULT_ANSWERED_HISTORY_CAP
 }
 
 /// How long a connection to a cloud sandbox stays open with nothing
@@ -1201,8 +1163,6 @@ impl WindowGeometry {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TodSettings {
-    #[serde(default, alias = "researcher")]
-    pub question_maker: QuestionMakerSettings,
     #[serde(default)]
     pub interview_context: InterviewContextSettings,
     #[serde(default = "default_log_level")]
@@ -1288,7 +1248,6 @@ pub const DEFAULT_TREEHOUSE_EXECUTABLE: &str = "treehouse";
 impl Default for TodSettings {
     fn default() -> Self {
         Self {
-            question_maker: QuestionMakerSettings::default(),
             interview_context: InterviewContextSettings::default(),
             log_level: LogLevel::Info,
             log_max_size_kb: DEFAULT_LOG_MAX_SIZE_KB,
@@ -1642,14 +1601,20 @@ mod tests {
     }
 
     #[test]
+    fn legacy_question_maker_settings_are_ignored() {
+        let settings: TodSettings = serde_yaml::from_str(
+            "question_maker:\n  replenish_threshold: 10\nresearcher:\n  replenish_threshold: 4\ninterview_context:\n  prompt_cache_idle_minutes: 5\n  answered_history_cap: 100\n",
+        ).unwrap();
+        assert_eq!(settings.interview_context.context_budget_tokens, 100_000);
+    }
+
+    #[test]
     fn defaults_when_missing() {
         let dir = tod_test_util::scratch_dir(format!("tod-settings-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("tod.yml");
         let settings = TodSettings::load_from_path(&path).unwrap();
-        assert_eq!(settings.question_maker.replenish_threshold, 8);
         assert_eq!(settings.interview_context.context_budget_tokens, 100_000);
-        assert_eq!(settings.interview_context.answered_history_cap, 100);
         assert_eq!(settings.log_level, LogLevel::Info);
         assert_eq!(settings.log_max_size_kb, DEFAULT_LOG_MAX_SIZE_KB);
         assert_eq!(settings.fleet_storage_root, None);
@@ -1701,9 +1666,6 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("tod.yml");
         let settings = TodSettings {
-            question_maker: QuestionMakerSettings {
-                replenish_threshold: 10,
-            },
             interview_context: InterviewContextSettings::default(),
             log_level: LogLevel::Debug,
             log_max_size_kb: 1024,

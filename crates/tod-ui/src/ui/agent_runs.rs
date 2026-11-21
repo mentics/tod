@@ -1166,10 +1166,7 @@ mod tests {
             Ok(())
         }
 
-        fn interview_status_counts(&self) -> tod_agent::agent_traffic::InterviewAgentCounts {
-            Default::default()
         }
-    }
 
     /// Answering a decision records an append-only answer (a change of mind
     /// is a second row, not an update to the first) and delivers a turn to

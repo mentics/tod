@@ -155,15 +155,7 @@ impl Args {
             .ok_or_else(|| anyhow::anyhow!("{what} is required"))
     }
 
-    /// `q-14`, `m-3`, or a bare number.
-    pub fn seq(&self, prefix: &str) -> anyhow::Result<i64> {
-        let raw = self.target(&format!("a {prefix}-<n> id"))?;
-        raw.trim()
-            .strip_prefix(&format!("{prefix}-"))
-            .unwrap_or(raw.trim())
-            .parse()
-            .map_err(|_| anyhow::anyhow!("`{raw}` is not a {prefix}-<n> id"))
-    }
+
 }
 
 #[cfg(test)]
@@ -198,15 +190,6 @@ mod tests {
         assert_eq!(args.get("--body"), Some("two words"));
         assert!(args.has("--append"));
         assert!(!args.has("--before"));
-        assert_eq!(args.seq("q").unwrap(), 14);
-    }
-
-    #[test]
-    fn ids_accept_the_prefix_or_a_bare_number() {
-        assert_eq!(parse(&["m-3"]).unwrap().seq("m").unwrap(), 3);
-        assert_eq!(parse(&["7"]).unwrap().seq("q").unwrap(), 7);
-        assert!(parse(&["x-2"]).unwrap().seq("q").is_err());
-        assert!(parse(&[]).unwrap().seq("q").is_err());
     }
 
     #[test]

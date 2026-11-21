@@ -10,7 +10,6 @@ use crate::media::MediaPaths;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tod_agent::agent_traffic::InterviewAgentCounts;
 use tod_agent::{
     AgentLaunchOptions, AgentPlatform, AgentProvider, AgentRunHandle, AgentRunState, RunId,
     SessionTurn,
@@ -21,6 +20,8 @@ use tod_store::outline::repos::plan_steps::STATUS_BLOCKED;
 use tod_store::outline::{Capability, OutlineMutation};
 use tod_store::settings::InterviewContextSettings;
 
+mod agent_incident;
+mod ci_quick_fix;
 mod guidance;
 mod lost_work;
 mod push_failure;
@@ -59,6 +60,16 @@ struct FakeAgent {
     fix_writes: Option<(PathBuf, String)>,
     /// Every quick fix turn first writes this file (its path and content).
     quick_fix_writes: Option<(PathBuf, String)>,
+    /// The small-change reviewer records a finding.
+    small_review_finds: bool,
+    /// Every node turn fails with this error (the agent run, not the change).
+    fail_turns: Option<String>,
+    /// The provider refuses to start a turn at all (a launch that fails).
+    send_error: Option<String>,
+    /// The first node turn files `decisions ask --reason broken` with this
+    /// error, as an agent does, and keeps what came back.
+    broken_ask: Option<String>,
+    broken_ask_result: Arc<std::sync::Mutex<Option<serde_json::Value>>>,
     /// Every node turn, in order: its protocol and what it was sent.
     log: Arc<std::sync::Mutex<Vec<(ProtocolKind, String)>>>,
     /// Called with what a pull request turn was sent, before the mock plays
@@ -88,6 +99,11 @@ impl FakeAgent {
             review_fails: std::sync::atomic::AtomicUsize::new(0),
             fix_writes: None,
             quick_fix_writes: None,
+            small_review_finds: false,
+            fail_turns: None,
+            send_error: None,
+            broken_ask: None,
+            broken_ask_result: Default::default(),
             log: Default::default(),
             pr_hook: None,
         }
@@ -277,6 +293,51 @@ impl FakeAgent {
                     std::fs::write(path, content)?;
                 }
             }
+            if let Some(error) = &self.fail_turns {
+                anyhow::bail!("{error}");
+            }
+            if let Some(error) = &self.broken_ask
+                && self.broken_ask_result.lock().unwrap().is_none()
+            {
+                use crate::conversation::mock::Access;
+                let result = user.interview(InterviewCommand::AskDecision {
+                    node_id: node.parse()?,
+                    conversation_id: Some(conversation.parse()?),
+                    protocol: None,
+                    decision: tod_store::decisions::NewDecision {
+                        question: "The tool is broken".into(),
+                        options: vec!["Fixed: try again".into()],
+                        reason: tod_store::decisions::REASON_BROKEN.into(),
+                        guard_reask: true,
+                        brief: tod_store::decisions::Brief { error: error.clone(), ..Default::default() },
+                        ..Default::default()
+                    },
+                })?;
+                *self.broken_ask_result.lock().unwrap() = Some(result);
+            }
+            if self.small_review_finds {
+                let protocol = self.fleet.read(|conn| {
+                    Ok(tod_store::conversation::ConversationRepo::new(conn)
+                        .get(conversation.parse()?)?
+                        .map(|c| c.protocol))
+                })?;
+                if protocol == Some(tod_store::conversation::ProtocolKind::SmallReview) {
+                    use crate::conversation::mock::Access;
+                    user.interview(InterviewCommand::AddReviewFinding {
+                        node_id: node.parse()?,
+                        conversation_id: Some(conversation.parse()?),
+                        finding: tod_store::review::NewFinding {
+                            severity: "medium".into(),
+                            file: Some("lint.txt".into()),
+                            line: Some(1),
+                            summary: "The small review found a defect.".into(),
+                            detail: None,
+                            root_cause: None,
+                        },
+                    })?;
+                    return Ok(String::new());
+                }
+            }
             let place = crate::conversation::mock::Place {
                 cwd: Some(&turn.cwd),
                 env: &turn.env,
@@ -310,6 +371,9 @@ impl AgentProvider for FakeAgent {
     }
 
     fn send_session_turn(&mut self, turn: SessionTurn) -> anyhow::Result<AgentRunHandle> {
+        if let Some(error) = &self.send_error {
+            anyhow::bail!("{error}");
+        }
         let id = RunId::new();
         self.sessions
             .entry(turn.key.clone())
@@ -354,9 +418,6 @@ impl AgentProvider for FakeAgent {
         Ok(())
     }
 
-    fn interview_status_counts(&self) -> InterviewAgentCounts {
-        InterviewAgentCounts::default()
-    }
 }
 
 fn config(fx: &Fixture) -> ConversationConfig {

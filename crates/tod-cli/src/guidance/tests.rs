@@ -11,7 +11,7 @@ fn cli(root: &Path, env: &[(&str, &str)], args: &[&str]) -> anyhow::Result<Strin
 
 #[test]
 fn the_user_adds_lists_and_removes_and_an_agent_session_is_refused() {
-    let (root, node, _) = crate::tests::data_root();
+    let (root, node) = crate::tests::data_root();
     let id = node.to_string();
     assert_eq!(cli(&root, &[], &["guidance", "list", &id]).unwrap(), "(no guidance selected)");
     cli(&root, &[], &["guidance", "add", &id, "--kind", "skill", "--item", "style"]).unwrap();

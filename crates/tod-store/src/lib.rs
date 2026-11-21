@@ -91,6 +91,6 @@ pub use paths::{
 pub use settings::{
     AgentLaunchByPlatform, AgentPlatform, AgentRole, AgentRoleSettings,
     DEFAULT_LOG_MAX_SIZE_KB, InterviewContextSettings, JourneySettings, LifecycleSettings, MAX_LOG_MAX_SIZE_KB, BotFallback, CiCheckFix, ExhaustedPattern, OnSilence, OwnReviewState, PrReadinessSettings, PrReviewBotSettings, UnrelatedCheck, UnrelatedStanding, unrelated_standing, waived_on_earlier_head, RepoProfile, RepoProfileSetting, VisualDesignSettings,
-    MIN_LOG_MAX_SIZE_KB, PlatformLaunchSettings, QuestionMakerSettings, TerminalSettings,
+    MIN_LOG_MAX_SIZE_KB, PlatformLaunchSettings, TerminalSettings,
     TodSettings, WindowGeometry, WorktreeBackend,
 };

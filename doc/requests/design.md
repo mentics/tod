@@ -1,6 +1,6 @@
 # Requests for the user: fewer, cheaper, clearer, and self-improving
 
-Status: steps 1 to 8 built (lessons and process review: `doc/lifecycle/self-improvement.md`); the self-improvement view (11.4) is deferred. 2026-11-20.
+Status: steps 1 to 8 built (lessons and process review: `doc/lifecycle/self-improvement.md`), and the self-improvement view (11.4, `doc/ui/self-improvement.md`). 2026-11-20.
 
 This replaces how a node asks the user for something today: an agent runs
 `tod-cli decisions ask`, the run stops, and the request sits in the task panel
@@ -212,6 +212,56 @@ lifecycle config key `quick_fix`.
   along so the Fix session does not start from nothing. Each escalation is
   recorded, so how often each check's quick fixes fail can be measured. A
   check whose quick fixes usually fail can be set to skip rung 1.
+
+### 5.1 Review findings are scored, and routed by their scores
+
+Failing checks climb the ladder above, but a reviewer's findings did not:
+every finding went to the full Fix session, and every fix to another
+two-reviewer round. ENG-3557 ran 20 rounds and hit its 60-session budget on
+findings such as "a six-line docstring for a three-line function" and a
+stale comment. Those were nits a reviewer judged against a project rule,
+which no linter could have caught.
+
+**Three scores per finding**, recorded by the reviewer with each finding
+(`tod-cli review`), and shown and editable in the findings panel:
+
+| Score | Values | Meaning |
+|---|---|---|
+| `importance` | `blocker`, `major`, `minor`, `nit` | How much it matters: `blocker` is wrong or breaks an obligation or production; `major` should be fixed before merge; `minor` is worth fixing and fine to leave; `nit` is style, wording or taste |
+| `impact` | `high`, `medium`, `low` | How much harm if it is left: its reach into users, data, production, other code |
+| `complexity` | `mechanical`, `simple`, `involved` | What the fix takes: `mechanical` is a tool or a one-line rule (formatting, length, a rename, a stale comment); `simple` is a local edit with no design; `involved` is design, several files, or tests |
+
+They replace `severity` (migrated: `high` → `blocker`, `medium` → `major`,
+`low` → `minor`; impact from the same, complexity `simple`). A project rule
+broken without harm is at most `minor`; a matter of taste is a `nit`.
+
+**What blocks.** The review gate (`review::review_passed`), the PR's
+`own-review`, the round limit and `fix_escalation` count only `blocker` and
+`major` findings, plus `minor` ones in the first `review.minor_rounds` rounds
+of a stay (default 2). Anything else still open when the review is otherwise
+clean is **left**: a new finding status, `left`, with tod's reason ("nit",
+"minor after round 2"), shown in the findings panel and the Activity. The
+user can reopen one, which makes it block like a `major`.
+
+**Who fixes.** A round's fixes are split by complexity:
+
+- `mechanical` and `simple` findings that will be fixed go together to **one
+  quick fix** (section 5, Haiku), which gets just those findings and the
+  lines they name. Its commit gets the small-change review, never a full
+  round of its own.
+- `involved` findings go to the Fix protocol as today; a Fix commit is what
+  starts the next full round.
+- A `nit` is fixed only when it is `mechanical`, and only by the quick fix.
+  Otherwise it is left at once.
+
+A quick fix that fails passes its findings on to the Fix protocol, as in
+section 5, and records a `ladder` lesson.
+
+**Turning recurring findings into checks.** A `mechanical` finding that
+cites the same rule on three findings (across nodes) files a suggestion
+(section 9) to add a check, with a fix command where one exists, so the next
+one is caught at rung 0 before any reviewer sees it. Reviewers are told that
+what a configured check covers is not theirs to report.
 
 ## 6. Model tiers
 
@@ -576,13 +626,16 @@ is a view:
 - incidents: the number of nodes each one absorbed, and the sessions saved;
 - send-backs, and disputes by the phase they went back to.
 
-### 11.4 The self-improvement view (deferred)
+### 11.4 The self-improvement view (built)
 
-The app will get a place showing the feedback gathered, how it was grouped,
-and what was changed because of it, with diffs. It is **not part of this
-work**: diffs may be shown through Zed, or with features borrowed from other
-projects. Until then, `tod-cli lessons` and the process-review nodes are how
-the loop is seen.
+The status bar's **Lessons** button opens a dialog showing the feedback
+gathered, how it was grouped, what was changed because of it, and the measures
+(`doc/ui/self-improvement.md`). Lessons are sectioned as new, one section per
+process-review run, one per commit or node that acted on them, and declined; the
+Measures tab is the same computation as `tod-cli lessons stats`. A lesson links
+to its node (opening its task panel); an applied commit's changes are shown as
+`git show --stat` text, or its checkout opens in the code editor. The user can
+decline a lesson or reopen a declined one.
 
 ## 12. What this removes or replaces
 
@@ -616,6 +669,10 @@ Each step stands alone and is worth having without the next.
    and session links, Discuss in the chat drawer with the request-session
    labels, highlight to flag, and the closing reflection (section 8).
 8. **Lessons and process review** (section 11), without the view.
+9. **Scored review findings** (5.1): importance, impact and complexity on every
+   finding; only blockers and majors (and minors early) block; mechanical and
+   simple fixes go to one quick fix with the small-change review; recurring
+   mechanical findings suggest a check.
 
 ## 14. Open questions
 

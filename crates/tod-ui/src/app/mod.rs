@@ -50,6 +50,7 @@ pub fn register_main_keyboard_bindings(cx: &mut gpui::App) {
     register_obligations_keyboard_bindings(cx);
     register_plan_steps_keyboard_bindings(cx);
     register_pull_requests_keyboard_bindings(cx);
+    crate::views::self_improvement::register_self_improvement_keyboard_bindings(cx);
     register_settings_keyboard_bindings(cx);
     register_agent_conversation_bindings(cx);
     register_database_keyboard_bindings(cx);

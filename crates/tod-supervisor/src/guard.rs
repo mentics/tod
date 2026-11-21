@@ -17,7 +17,6 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tod_agent::agent_traffic::InterviewAgentCounts;
 use tod_agent::{
     AgentEnvironment, AgentLaunchOptions, AgentProvider, AgentRunHandle, AgentRunState, ReplyPart, RunId,
     SessionTurn,
@@ -221,10 +220,6 @@ impl<P: AgentProvider> AgentProvider for Guarded<P> {
         self.inner.cancel_run(id)
     }
 
-    fn interview_status_counts(&self) -> InterviewAgentCounts {
-        self.inner.interview_status_counts()
-    }
-
     fn set_session_observer(&mut self, observer: tod_agent::SessionObserver) {
         self.inner.set_session_observer(observer)
     }
@@ -327,10 +322,7 @@ mod tests {
             self.cancelled.push(id);
             Ok(())
         }
-        fn interview_status_counts(&self) -> InterviewAgentCounts {
-            InterviewAgentCounts::default()
         }
-    }
 
     fn turn() -> SessionTurn {
         SessionTurn {

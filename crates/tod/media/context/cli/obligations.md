@@ -29,8 +29,7 @@ clears the section.
 An obligation has two phases, set by two flags: `--phase` is the state it was
 **introduced** in and `--acts-in` is the state whose agent **acts on** it.
 The obligations concepts say how to set each. `--acts-in` is left off when it
-is `active`. Listings show it as `acts-in=<state>` when it is not. Inside an interview, an agent's `add` always writes its own session's phase —
-`--phase` there only matters when running `add` outside an interview.
+is `active`. Listings show it as `acts-in=<state>` when it is not.
 
 Every obligation is **live**: verification has to show it in the running work.
 `--code-only <REASON>` marks one that only the code can show (a pure function,

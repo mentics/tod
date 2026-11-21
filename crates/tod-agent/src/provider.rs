@@ -1,5 +1,5 @@
 use crate::agent_launch::AgentLaunchOptions;
-use crate::agent_traffic::{AgentCategory, InterviewAgentCounts};
+use crate::agent_traffic::AgentCategory;
 use crate::devcontainer::AgentEnvironment;
 use crate::platform::AgentPlatform;
 use std::path::PathBuf;
@@ -41,16 +41,12 @@ impl Default for RunId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentRunKind {
-    QuestionMakerReplenishment,
-    AnswerProcessor,
     FleetAgent,
 }
 
 impl AgentRunKind {
     pub(crate) fn traffic_category(self) -> AgentCategory {
         match self {
-            Self::QuestionMakerReplenishment => AgentCategory::QuestionMaker,
-            Self::AnswerProcessor => AgentCategory::AnswerProcessor,
             Self::FleetAgent => AgentCategory::Fleet,
         }
     }
@@ -58,8 +54,6 @@ impl AgentRunKind {
     /// How a run's traffic is listed when its session has no name.
     pub(crate) fn traffic_label(self) -> &'static str {
         match self {
-            Self::QuestionMakerReplenishment => "question-maker",
-            Self::AnswerProcessor => "answer-processor",
             Self::FleetAgent => "fleet-agent",
         }
     }
@@ -72,13 +66,6 @@ pub enum SessionPurpose {
     /// A user-facing chat.
     #[default]
     Chat,
-    /// An interview question maker session.
-    QuestionMaker,
-    /// An interview answer processor session.
-    AnswerProcessor,
-    /// Legacy: the removed drafter. Kept because the interview still maps
-    /// its legacy `Drafter` role here.
-    Drafter,
     /// The conversation view's agent: talks with the user, and acts on the
     /// project through `tod-cli` as the conversation.
     Conversation,
@@ -88,10 +75,7 @@ impl SessionPurpose {
     pub(crate) fn run_kind(self) -> AgentRunKind {
         match self {
             Self::Chat | Self::Conversation => AgentRunKind::FleetAgent,
-            Self::QuestionMaker | Self::Drafter => {
-                AgentRunKind::QuestionMakerReplenishment
-            }
-            Self::AnswerProcessor => AgentRunKind::AnswerProcessor,
+
         }
     }
 }
@@ -270,9 +254,6 @@ pub trait AgentProvider {
     fn respond_to_permission(&mut self, id: RunId, option_id: &str) -> anyhow::Result<()>;
 
     fn cancel_run(&mut self, id: RunId) -> anyhow::Result<()>;
-
-    /// Live in-flight counts for the global agent status bar.
-    fn interview_status_counts(&self) -> InterviewAgentCounts;
 
     /// Report every session started or resumed from now on to `observer`.
     /// Providers with no agent-side sessions (the mock) ignore it.

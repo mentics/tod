@@ -3709,11 +3709,9 @@ impl Autopilot {
             if tod_store::fleet::worktree::is_lock_busy(&err) {
                 return Ok(Some(self.files_busy(fleet, &err)?));
             }
-            return Ok(Some(Outcome::NeedsHuman {
-                reason: NeedsHuman::AgentFailed {
-                    error: format!("{err:#}"),
-                },
-            }));
+            // A failure other nodes share (the agent's login, the model API) parks
+            // with them, as one that came back from the run does.
+            return Ok(Some(self.agent_failed(fleet, format!("{err:#}"))?));
         }
         let conversation_id = driver.conversation_id();
         self.state.current = conversation_id.map(|conversation_id| CurrentStep {
@@ -4022,11 +4020,9 @@ impl Autopilot {
             if tod_store::fleet::worktree::is_lock_busy(&err) {
                 return Ok(Some(self.files_busy(fleet, &err)?));
             }
-            return Ok(Some(Outcome::NeedsHuman {
-                reason: NeedsHuman::AgentFailed {
-                    error: format!("{err:#}"),
-                },
-            }));
+            // A failure other nodes share (the agent's login, the model API) parks
+            // with them, as one that came back from the run does.
+            return Ok(Some(self.agent_failed(fleet, format!("{err:#}"))?));
         }
         Ok(None)
     }

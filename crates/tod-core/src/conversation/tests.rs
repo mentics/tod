@@ -10,7 +10,6 @@ use crate::media::MediaPaths;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tod_agent::agent_traffic::InterviewAgentCounts;
 use tod_agent::{
     AgentLaunchOptions, AgentPlatform, AgentProvider, AgentRunHandle, AgentRunState, RunId,
     SessionPurpose, SessionTurn,
@@ -166,9 +165,6 @@ impl AgentProvider for FakeAgent {
         Ok(())
     }
 
-    fn interview_status_counts(&self) -> InterviewAgentCounts {
-        InterviewAgentCounts::default()
-    }
 }
 
 fn media() -> MediaPaths {

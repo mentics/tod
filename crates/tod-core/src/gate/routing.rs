@@ -1,7 +1,4 @@
-//! Resolves gate criteria for a transition without requiring a live
-//! [`tod_store::fleet::FleetStore`] — mirrors the outer/inner shape of
-//! `interview::routing::interview_work_remains` (outer resolves paths/settings/
-//! connection, inner takes `&Connection` for testability).
+//! Resolves gate criteria for a transition without requiring a live store.
 
 use anyhow::Result;
 use rusqlite::Connection;

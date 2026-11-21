@@ -102,7 +102,6 @@ pub struct Shell {
     history: NavHistory<Location>,
     fleet: Arc<FleetStore>,
     _mutation_socket: Option<tod_store::fleet::mutation_socket::PortFileGuard>,
-    agent: SharedAgent,
     traffic_log: SharedAgentTrafficLog,
     transcript_window: TranscriptWindowControl,
     engagement: tod_agent::SharedEngagementRegistry,
@@ -360,9 +359,6 @@ impl Shell {
                 })
                 .count() as u32;
         }
-        if let Ok(provider) = self.agent.lock() {
-            groups.interview = provider.interview_status_counts();
-        }
         if let Ok(log) = self.traffic_log.lock() {
             groups.traffic_entries = log.entries().len();
         }
@@ -460,6 +456,14 @@ impl Shell {
             tracing::error!("failed to open log window: {err}");
         }
         self.log_unread = crate::views::log_panel::unread();
+        cx.notify();
+    }
+
+    /// Show a node's task panel in the workbench (a link from the
+    /// self-improvement view).
+    fn show_node_in_workbench(&mut self, node: uuid::Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        self.select_view(ShellView::Unified, window, cx);
+        self.unified.update(cx, |unified, cx| unified.show_node(node, window, cx));
         cx.notify();
     }
 
@@ -761,6 +765,24 @@ impl Shell {
                             )
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.open_transcript_window(cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("open-self-improvement")
+                            .outline()
+                            .compact()
+                            .label("Lessons")
+                            .tooltip("What tod learned about its own process: the feedback gathered, how it was grouped, what was changed, and the measures")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                let shell = cx.entity();
+                                crate::views::self_improvement::open_self_improvement_dialog(
+                                    window,
+                                    cx,
+                                    this.fleet.clone(),
+                                    std::rc::Rc::new(move |node, window, cx| {
+                                        shell.update(cx, |shell, cx| shell.show_node_in_workbench(node, window, cx));
+                                    }),
+                                );
                             })),
                     )
                     .child(
@@ -1604,7 +1626,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                         tod_core::logging::buffer::start_agentd_tail(
                             tod_agentd_client::Paths::new(fleet.paths().root()).log(),
                         );
-                        let _ = crate::interview::bootstrap(fleet.clone());
+                        let _ = crate::interview::bootstrap();
                         // Before the tree is built, so no row is ever drawn as
                         // "refreshing…" for a refresh the last run never finished.
                         if let Err(err) = tod_core::generator::clear_interrupted_refreshes(&fleet) {
@@ -1664,7 +1686,6 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 history: NavHistory::new(Location::same_kind),
                                 fleet: fleet.clone(),
                                 _mutation_socket: mutation_socket,
-                                agent: agent.clone(),
                                 traffic_log: traffic_log.clone(),
                                 transcript_window: transcript_window.clone(),
                                 engagement: engagement.clone(),

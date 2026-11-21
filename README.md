@@ -122,7 +122,7 @@ Run from anywhere:
 
 ### Optional: Cursor / Claude skill symlink
 
-Bundled docs are **not** required in `~/.cursor/skills` or `~/.claude/skills` for tod interviews. If you want the same process docs available when editing in Cursor manually:
+Bundled docs are **not** required in `~/.cursor/skills` or `~/.claude/skills` for tod agents. If you want the same process docs available when editing in Cursor manually:
 
 ```bash
 # Windows (PowerShell, run as appropriate for your shell)
@@ -338,7 +338,7 @@ crates/tod-ui/          # all GPUI code
 crates/tod-cli/         # `tod-cli` binary that agents shell out to
 crates/tod-core/        # policy + orchestration shared by UI and CLI
   src/conversation/     # conversation driver, agent context, mock agent
-  src/interview/        # interview flow
+  src/interview/        # shared client, paths, and legacy interview data
   src/process_bundle/   # install discovery, manifest, scope export, prompts
   src/media.rs          # agent context doc resolution
   src/agent_context.rs  # assembles an agent chat's first message

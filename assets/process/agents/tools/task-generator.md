@@ -27,7 +27,6 @@ Return proposals — the caller creates child tasks after human Accept. Do not w
 
 ## Do not
 
-- Run full requirements interviews for each proposed child
 - Advance lifecycle
 - Write obligations directly
 

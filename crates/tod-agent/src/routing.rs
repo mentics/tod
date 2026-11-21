@@ -4,7 +4,7 @@ use super::acp_host::AcpHost;
 use super::cursor_acp::CursorAcpProvider;
 use super::provider::{AgentProvider, AgentRunHandle, RunId, SessionTurn};
 use crate::agent_launch::AgentLaunchOptions;
-use crate::agent_traffic::{InterviewAgentCounts, SharedAgentTrafficLog};
+use crate::agent_traffic::SharedAgentTrafficLog;
 use crate::platform::AgentPlatform;
 use anyhow::Result;
 use std::path::PathBuf;
@@ -33,15 +33,6 @@ impl RoutingAgentProvider {
 
 fn build_host_provider(host: AcpHost, traffic_log: SharedAgentTrafficLog) -> CursorAcpProvider {
     CursorAcpProvider::for_host(host).with_traffic_log(traffic_log)
-}
-
-fn sum_interview_counts(a: InterviewAgentCounts, b: InterviewAgentCounts) -> InterviewAgentCounts {
-    InterviewAgentCounts {
-        question_maker_in_flight: a.question_maker_in_flight + b.question_maker_in_flight,
-        answer_active: a.answer_active + b.answer_active,
-        answer_pool: a.answer_pool + b.answer_pool,
-        answer_max: a.answer_max.max(b.answer_max),
-    }
 }
 
 impl AgentProvider for RoutingAgentProvider {
@@ -121,10 +112,4 @@ impl AgentProvider for RoutingAgentProvider {
         Ok(())
     }
 
-    fn interview_status_counts(&self) -> InterviewAgentCounts {
-        sum_interview_counts(
-            self.cursor.interview_status_counts(),
-            self.claude.interview_status_counts(),
-        )
-    }
 }
