@@ -329,7 +329,7 @@ mod tests {
                             node_id: fx.node,
                             conversation_id: None,
                             finding: NewFinding {
-                                severity: "medium".into(),
+                                importance: "major".into(), impact: "medium".into(), complexity: "simple".into(),
                                 file: Some("src/lib.rs".into()),
                                 line: Some(i as i64 + 1),
                                 summary: format!("Finding {i}"),

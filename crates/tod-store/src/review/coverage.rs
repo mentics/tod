@@ -548,7 +548,7 @@ mod tests {
                 fx.node,
                 Some(fx.review),
                 &NewFinding {
-                    severity: "high".into(),
+                    importance: "blocker".into(), impact: "high".into(), complexity: "simple".into(),
                     summary: "Wrong row".into(),
                     root_cause: Some("first row assumed unique".into()),
                     ..Default::default()
@@ -633,7 +633,7 @@ mod tests {
             .add(
                 other,
                 None,
-                &NewFinding { severity: "low".into(), summary: "x".into(), ..Default::default() },
+                &NewFinding { importance: "minor".into(), impact: "low".into(), complexity: "simple".into(), summary: "x".into(), ..Default::default() },
             )
             .unwrap()
             .id;
@@ -705,7 +705,7 @@ mod tests {
             .add(
                 fx.node,
                 None,
-                &NewFinding { severity: "low".into(), summary: "x".into(), ..Default::default() },
+                &NewFinding { importance: "minor".into(), impact: "low".into(), complexity: "simple".into(), summary: "x".into(), ..Default::default() },
             )
             .unwrap();
         assert!(gaps(&fx.conn, fx.review).unwrap().is_empty());

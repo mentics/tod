@@ -445,7 +445,7 @@ mod tests {
                     node_id: fixture.node_id,
                     conversation_id: None,
                     finding: NewFinding {
-                        severity: "high".into(),
+                        importance: "blocker".into(), impact: "high".into(), complexity: "simple".into(),
                         summary: "Off-by-one in the loop".into(),
                         file: None,
                         line: None,

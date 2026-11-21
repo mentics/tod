@@ -1115,7 +1115,7 @@ mod tests {
             node_id: Uuid::nil(),
             conversation_id: None,
             seq: 1,
-            severity: "high".into(),
+            importance: "blocker".into(), impact: "high".into(), complexity: "simple".into(),
             file: file.map(String::from),
             line,
             summary: "Wrong".into(),

@@ -228,7 +228,7 @@ impl FakeAgent {
                             node_id: node.parse()?,
                             conversation_id: Some(conversation.parse()?),
                             finding: tod_store::review::NewFinding {
-                                severity: "medium".into(),
+                                importance: "major".into(), impact: "medium".into(), complexity: "simple".into(),
                                 file: Some("src/lib.rs".into()),
                                 line: Some(1),
                                 summary: if self.review_growing {
@@ -327,7 +327,7 @@ impl FakeAgent {
                         node_id: node.parse()?,
                         conversation_id: Some(conversation.parse()?),
                         finding: tod_store::review::NewFinding {
-                            severity: "medium".into(),
+                            importance: "major".into(), impact: "medium".into(), complexity: "simple".into(),
                             file: Some("lint.txt".into()),
                             line: Some(1),
                             summary: "The small review found a defect.".into(),
@@ -3261,7 +3261,7 @@ fn pr_draft_with_review_steps_reviews_the_clean_head_once() {
                 node_id: fx.node,
                 conversation_id: None,
                 finding: tod_store::review::NewFinding {
-                    severity: "low".into(),
+                    importance: "minor".into(), impact: "low".into(), complexity: "simple".into(),
                     file: None,
                     line: None,
                     summary: "From the review before the pull request.".into(),
@@ -3310,7 +3310,7 @@ fn seed_review_phase_round(fx: &Fixture, repo_heads: serde_json::Value, finding:
             node_id: fx.node,
             conversation_id: Some(id),
             finding: tod_store::review::NewFinding {
-                severity: "low".into(),
+                importance: "minor".into(), impact: "low".into(), complexity: "simple".into(),
                 file: None,
                 line: None,
                 summary: "Still standing.".into(),
@@ -4197,7 +4197,7 @@ fn a_merge_of_the_base_alone_is_pushed_without_a_review() {
                 node_id: fx.node,
                 conversation_id: None,
                 finding: tod_store::review::NewFinding {
-                    severity: "low".into(),
+                    importance: "minor".into(), impact: "low".into(), complexity: "simple".into(),
                     file: None,
                     line: None,
                     summary: "From the review before the pull request.".into(),
@@ -4335,7 +4335,7 @@ fn a_finding_before_the_pull_request(fx: &Fixture) {
                 node_id: fx.node,
                 conversation_id: None,
                 finding: tod_store::review::NewFinding {
-                    severity: "low".into(),
+                    importance: "minor".into(), impact: "low".into(), complexity: "simple".into(),
                     file: None,
                     line: None,
                     summary: "From the review before the pull request.".into(),
@@ -4485,7 +4485,7 @@ fn seed_unclean_review_saying(fx: &Fixture, summary: &str) {
         node_id: fx.node,
         conversation_id: Some(id),
         finding: tod_store::review::NewFinding {
-            severity: "medium".into(),
+            importance: "major".into(), impact: "medium".into(), complexity: "simple".into(),
             file: None,
             line: None,
             summary: summary.into(),
@@ -5167,7 +5167,7 @@ fn bot_node_in_draft(feed: Arc<BotFeed>, bot_yaml: &str) -> (Fixture, FakeAgent)
                 node_id: fx.node,
                 conversation_id: None,
                 finding: tod_store::review::NewFinding {
-                    severity: "low".into(),
+                    importance: "minor".into(), impact: "low".into(), complexity: "simple".into(),
                     file: None,
                     line: None,
                     summary: "From the review before the pull request.".into(),

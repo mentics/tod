@@ -52,8 +52,8 @@ fn agent_turn(conn: &Connection, conv: Uuid, seq: i64, parts: Option<&str>) {
 
 fn finding(conn: &Connection, node: Uuid, conv: Uuid, seq: i64, summary: &str, status: &str) {
     conn.execute(
-        "INSERT INTO review_findings (id, node_id, conversation_id, seq, severity, file, summary, status, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, 'low', 'a.rs', ?5, ?6, 1, 1)",
+        "INSERT INTO review_findings (id, node_id, conversation_id, seq, importance, file, summary, status, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, 'minor', 'a.rs', ?5, ?6, 1, 1)",
         params![uuid_to_blob(Uuid::new_v4()), uuid_to_blob(node), uuid_to_blob(conv), seq, summary, status],
     )
     .unwrap();

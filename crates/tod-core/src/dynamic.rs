@@ -821,7 +821,7 @@ mod tests {
             node_id: Uuid::nil(),
             conversation_id: None,
             seq: seq as i64,
-            severity: "high".into(),
+            importance: "blocker".into(), impact: "high".into(), complexity: "simple".into(),
             file: Some("a.py".into()),
             line: Some(seq as i64),
             summary: summary.into(),

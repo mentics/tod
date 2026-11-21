@@ -115,14 +115,29 @@ pub const FINDING_DECLINED: &str = "declined";
 /// Not a defect after all: the fix agent's pushback, with a note saying why.
 pub const FINDING_REJECTED: &str = "rejected";
 
+/// Real but not worth another round, or not worth fixing at all: tod set it
+/// aside under the scoring rules (`doc/requests/design.md` 5.1). The response
+/// is tod's reason ("nit", "minor after round 2"). It does not count against
+/// a review; the user can reopen it, which makes it block like a `major`.
+pub const FINDING_LEFT: &str = "left";
+
 /// Every finding status, in the order a status menu lists them.
-pub const FINDING_STATUSES: [&str; 5] = [
+pub const FINDING_STATUSES: [&str; 6] = [
     FINDING_OPEN,
     FINDING_FIXED,
     FINDING_OUT_OF_SCOPE,
     FINDING_DECLINED,
     FINDING_REJECTED,
+    FINDING_LEFT,
 ];
+
+/// Whether a status stands aside from a review's verdict: the user dismissed
+/// the finding (`out_of_scope`, `declined`) or tod left it ([`FINDING_LEFT`]).
+/// Every reader that asks whether a review "recorded nothing that stands"
+/// asks this, so they cannot drift.
+pub fn is_dismissed(status: &str) -> bool {
+    matches!(status, FINDING_OUT_OF_SCOPE | FINDING_DECLINED | FINDING_LEFT)
+}
 
 /// The statuses the user answers a finding with from its menu. `rejected` is
 /// the fix agent's, and needs a note the menu cannot give; a finding already
@@ -138,8 +153,39 @@ pub const USER_FINDING_STATUSES: [&str; 4] = [
 /// or pushes back with a note. Out of scope and declined are the user's call.
 pub const FIX_AGENT_STATUSES: [&str; 2] = [FINDING_FIXED, FINDING_REJECTED];
 
-/// How much a finding matters, most first.
-pub const FINDING_SEVERITIES: [&str; 3] = ["high", "medium", "low"];
+/// How much a finding matters, most first (`doc/requests/design.md` 5.1):
+/// `blocker` is wrong or breaks an obligation or production; `major` should be
+/// fixed before merge; `minor` is worth fixing and fine to leave; `nit` is
+/// style, wording or taste.
+pub const IMPORTANCES: [&str; 4] = ["blocker", "major", "minor", "nit"];
+pub const IMPORTANCE_BLOCKER: &str = "blocker";
+pub const IMPORTANCE_MAJOR: &str = "major";
+pub const IMPORTANCE_MINOR: &str = "minor";
+pub const IMPORTANCE_NIT: &str = "nit";
+
+/// How much harm leaving it does: its reach into users, data, production,
+/// other code. Most first.
+pub const IMPACTS: [&str; 3] = ["high", "medium", "low"];
+
+/// What the fix takes, cheapest first: `mechanical` is a tool or a one-line
+/// rule (formatting, length, a rename, a stale comment); `simple` is a local
+/// edit with no design; `involved` is design, several files, or tests.
+pub const COMPLEXITIES: [&str; 3] = ["mechanical", "simple", "involved"];
+pub const COMPLEXITY_MECHANICAL: &str = "mechanical";
+pub const COMPLEXITY_SIMPLE: &str = "simple";
+pub const COMPLEXITY_INVOLVED: &str = "involved";
+
+/// How the one rule a mechanical finding cites is worded for matching:
+/// case, runs of whitespace and surrounding punctuation do not tell two apart
+/// (`tod-cli review add --rule`). Three findings with the same key, across
+/// nodes, file a suggestion to add a check (`tod_core::review_scoring`).
+pub fn rule_key(rule: &str) -> String {
+    rule.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_matches(|c: char| !c.is_alphanumeric())
+        .to_lowercase()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewFinding {
@@ -150,7 +196,12 @@ pub struct ReviewFinding {
     pub conversation_id: Option<Uuid>,
     /// Order of recording on the node, from 1.
     pub seq: i64,
-    pub severity: String,
+    /// `blocker`, `major`, `minor` or `nit` ([`IMPORTANCES`]).
+    pub importance: String,
+    /// `high`, `medium` or `low` ([`IMPACTS`]).
+    pub impact: String,
+    /// `mechanical`, `simple` or `involved` ([`COMPLEXITIES`]).
+    pub complexity: String,
     /// Repo-relative path, when the finding is about one place.
     pub file: Option<String>,
     pub line: Option<i64>,
@@ -178,9 +229,30 @@ pub struct ReviewFinding {
     /// a finding from before there were two, or recorded outside a review
     /// conversation (a check, the user).
     pub reviewer: Option<Reviewer>,
+    /// The one rule a mechanical finding cites, in the same words each time
+    /// (`tod-cli review add --rule`); `None` for a finding that is not about a
+    /// rule. Three of the same rule file a suggestion to add a check.
+    pub rule: Option<String>,
+    /// The quick fix (`node_quick_fixes.id`) that fixed it and whose commit the
+    /// small-change review found clean: the finding is settled and needs no
+    /// round of its own (`doc/requests/design.md` 5.1). `None` otherwise.
+    pub quick_fix: Option<Uuid>,
 }
 
 impl ReviewFinding {
+    /// Whether it stands aside from a review's verdict ([`is_dismissed`]).
+    pub fn dismissed(&self) -> bool {
+        is_dismissed(&self.status)
+    }
+
+    /// Whether a review that is otherwise done still counts it against the
+    /// review: not dismissed, and not a fix a quick fix made that the small
+    /// review cleared. A fix by the Fix agent still counts: only another
+    /// review can say the change is right.
+    pub fn stands(&self) -> bool {
+        !self.dismissed() && !(self.status == FINDING_FIXED && self.quick_fix.is_some())
+    }
+
     /// `file:line`, `file`, or nothing.
     pub fn location(&self) -> Option<String> {
         let file = self.file.as_deref()?;
@@ -198,7 +270,9 @@ impl ReviewFinding {
 /// What an agent submits.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NewFinding {
-    pub severity: String,
+    pub importance: String,
+    pub impact: String,
+    pub complexity: String,
     #[serde(default)]
     pub file: Option<String>,
     #[serde(default)]
@@ -208,9 +282,27 @@ pub struct NewFinding {
     pub detail: Option<String>,
     #[serde(default)]
     pub root_cause: Option<String>,
+    /// The rule a mechanical finding cites ([`ReviewFinding::rule`]).
+    #[serde(default)]
+    pub rule: Option<String>,
 }
 
-pub const CREATE_TABLE: &str = "
+impl NewFinding {
+    /// A finding scored `importance`, `impact`, `complexity`, with `summary`.
+    pub fn scored(importance: &str, impact: &str, complexity: &str, summary: &str) -> Self {
+        Self {
+            importance: importance.to_string(),
+            impact: impact.to_string(),
+            complexity: complexity.to_string(),
+            summary: summary.to_string(),
+            ..Self::default()
+        }
+    }
+}
+
+/// The table as it was before scoring (schema v44 to v116), which the
+/// migrations that built it still make; v117 rebuilds it as [`CREATE_TABLE`].
+pub const CREATE_TABLE_V116: &str = "
     CREATE TABLE IF NOT EXISTS review_findings (
         id              BLOB PRIMARY KEY NOT NULL,
         node_id         BLOB NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
@@ -235,8 +327,86 @@ pub const CREATE_TABLE: &str = "
     CREATE INDEX IF NOT EXISTS idx_review_findings_node ON review_findings(node_id, seq);
 ";
 
-const COLUMNS: &str = "id, node_id, conversation_id, seq, severity, file, line, summary, detail, \
-     status, response, created_at, updated_at, pr_thread, pr_posted_at, root_cause, reviewer";
+pub const CREATE_TABLE: &str = "
+    CREATE TABLE IF NOT EXISTS review_findings (
+        id              BLOB PRIMARY KEY NOT NULL,
+        node_id         BLOB NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+        conversation_id BLOB REFERENCES conversations(id) ON DELETE SET NULL,
+        seq             INTEGER NOT NULL,
+        importance      TEXT NOT NULL DEFAULT 'major'
+                            CHECK (importance IN ('blocker','major','minor','nit')),
+        impact          TEXT NOT NULL DEFAULT 'medium'
+                            CHECK (impact IN ('high','medium','low')),
+        complexity      TEXT NOT NULL DEFAULT 'simple'
+                            CHECK (complexity IN ('mechanical','simple','involved')),
+        file            TEXT,
+        line            INTEGER,
+        summary         TEXT NOT NULL,
+        detail          TEXT,
+        status          TEXT NOT NULL DEFAULT 'open'
+                            CHECK (status IN ('open','fixed','out_of_scope','declined','rejected','left')),
+        response        TEXT,
+        created_at      INTEGER NOT NULL,
+        updated_at      INTEGER NOT NULL,
+        pr_thread       TEXT,
+        pr_posted_at    INTEGER,
+        root_cause      TEXT,
+        reviewer        TEXT,
+        rule            TEXT,
+        quick_fix       BLOB,
+        UNIQUE (node_id, seq)
+    );
+    CREATE INDEX IF NOT EXISTS idx_review_findings_node ON review_findings(node_id, seq);
+";
+
+/// Schema v117: findings are scored (`importance`, `impact`, `complexity`)
+/// instead of carrying a `severity` (`high` becomes blocker/high, `medium`
+/// major/medium, `low` minor/low; complexity `simple`), may be `left`, and may
+/// cite a `rule` and the `quick_fix` that fixed them. SQLite cannot drop a
+/// column's CHECK, so the table is rebuilt (nothing references it); the
+/// journey and sync triggers are made again by the caller. Idempotent: a
+/// table with no `severity` column is left alone.
+pub fn migrate_to_scored(conn: &Connection) -> Result<()> {
+    let has_severity = conn
+        .prepare("SELECT 1 FROM pragma_table_info('review_findings') WHERE name = 'severity'")?
+        .exists([])?;
+    if !has_severity {
+        conn.execute_batch(CREATE_TABLE)?;
+        return Ok(());
+    }
+    conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch("PRAGMA legacy_alter_table = ON;")?;
+    tx.execute_batch(
+        "DROP INDEX IF EXISTS idx_review_findings_node;
+         ALTER TABLE review_findings RENAME TO review_findings_v116;",
+    )?;
+    tx.execute_batch("PRAGMA legacy_alter_table = OFF;")?;
+    tx.execute_batch(CREATE_TABLE)?;
+    tx.execute_batch(
+        "INSERT INTO review_findings
+             (id, node_id, conversation_id, seq, importance, impact, complexity, file, line,
+              summary, detail, status, response, created_at, updated_at, pr_thread,
+              pr_posted_at, root_cause, reviewer)
+         SELECT id, node_id, conversation_id, seq,
+                CASE severity WHEN 'high' THEN 'blocker' WHEN 'medium' THEN 'major' ELSE 'minor' END,
+                severity, 'simple', file, line,
+                summary, detail, status, response, created_at, updated_at, pr_thread,
+                pr_posted_at, root_cause, reviewer
+         FROM review_findings_v116;
+         DROP TABLE review_findings_v116;",
+    )?;
+    tx.commit()?;
+    conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+    // The rebuilt table lost its journey triggers (the sync ones are remade
+    // by `crate::sync::install`).
+    conn.execute_batch(&crate::journey_changes::create_triggers_sql())?;
+    Ok(())
+}
+
+const COLUMNS: &str = "id, node_id, conversation_id, seq, importance, impact, complexity, file, line, \
+     summary, detail, status, response, created_at, updated_at, pr_thread, pr_posted_at, root_cause, \
+     reviewer, rule, quick_fix";
 
 /// The `pr_thread` and `pr_posted_at` columns (idempotent, no schema bump: the
 /// sync copies only the columns both sides have).
@@ -347,7 +517,9 @@ impl<'a> ReviewRepo<'a> {
         conversation_id: Option<Uuid>,
         finding: &NewFinding,
     ) -> Result<ReviewFinding> {
-        let severity = normalize(&finding.severity, &FINDING_SEVERITIES, "severity")?;
+        let importance = normalize(&finding.importance, &IMPORTANCES, "importance")?;
+        let impact = normalize(&finding.impact, &IMPACTS, "impact")?;
+        let complexity = normalize(&finding.complexity, &COMPLEXITIES, "complexity")?;
         let summary = finding.summary.trim();
         if summary.is_empty() {
             bail!("a finding needs a summary");
@@ -370,6 +542,11 @@ impl<'a> ReviewRepo<'a> {
             .as_deref()
             .map(str::trim)
             .filter(|c| !c.is_empty());
+        let rule = finding
+            .rule
+            .as_deref()
+            .map(|r| r.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|r| !r.is_empty());
         let seq: i64 = self.conn.query_row(
             "SELECT COALESCE(MAX(seq), 0) + 1 FROM review_findings WHERE node_id = ?1",
             params![uuid_to_blob(node_id)],
@@ -379,22 +556,25 @@ impl<'a> ReviewRepo<'a> {
         let now = now_ms();
         self.conn.execute(
             "INSERT INTO review_findings
-             (id, node_id, conversation_id, seq, severity, file, line, summary, detail,
-              status, created_at, updated_at, root_cause, reviewer)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'open', ?10, ?10, ?11,
-                     (SELECT reviewer FROM conversations WHERE id = ?3))",
+             (id, node_id, conversation_id, seq, importance, impact, complexity, file, line,
+              summary, detail, status, created_at, updated_at, root_cause, reviewer, rule)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'open', ?12, ?12, ?13,
+                     (SELECT reviewer FROM conversations WHERE id = ?3), ?14)",
             params![
                 uuid_to_blob(id),
                 uuid_to_blob(node_id),
                 conversation_id.map(uuid_to_blob),
                 seq,
-                severity,
+                importance,
+                impact,
+                complexity,
                 file,
                 finding.line,
                 summary,
                 detail,
                 now,
                 root_cause,
+                rule,
             ],
         )?;
         self.get(id)?.context("finding vanished after insert")
@@ -412,10 +592,65 @@ impl<'a> ReviewRepo<'a> {
         if status == FINDING_REJECTED && response.is_none() {
             bail!("rejecting a finding needs a note saying why it is not a problem");
         }
+        if status == FINDING_LEFT && response.is_none() {
+            bail!("leaving a finding needs the reason it is left");
+        }
+        let was = self.get(id)?.with_context(|| format!("finding {id} not found"))?;
+        // Reopening what tod left is the user saying it matters: it then
+        // blocks like a `major` (a nit or minor is promoted; a blocker stays).
+        let promote = status == FINDING_OPEN
+            && was.status == FINDING_LEFT
+            && matches!(was.importance.as_str(), IMPORTANCE_MINOR | IMPORTANCE_NIT);
         let changed = self.conn.execute(
-            "UPDATE review_findings SET status = ?2, response = ?3, updated_at = ?4
+            "UPDATE review_findings SET status = ?2, response = ?3, updated_at = ?4,
+                 importance = CASE WHEN ?5 THEN 'major' ELSE importance END,
+                 quick_fix = CASE WHEN ?2 = 'open' THEN NULL ELSE quick_fix END
              WHERE id = ?1",
-            params![uuid_to_blob(id), status, response, now_ms()],
+            params![uuid_to_blob(id), status, response, now_ms(), promote],
+        )?;
+        if changed == 0 {
+            bail!("finding {id} not found");
+        }
+        Ok(())
+    }
+
+    /// Change a finding's scores (the user's edit in the findings panel);
+    /// `None` leaves a score as it is. Each is checked like a new finding's.
+    pub fn rescore(
+        &self,
+        id: Uuid,
+        importance: Option<&str>,
+        impact: Option<&str>,
+        complexity: Option<&str>,
+    ) -> Result<()> {
+        let was = self.get(id)?.with_context(|| format!("finding {id} not found"))?;
+        let importance = match importance {
+            Some(v) => normalize(v, &IMPORTANCES, "importance")?.to_string(),
+            None => was.importance,
+        };
+        let impact = match impact {
+            Some(v) => normalize(v, &IMPACTS, "impact")?.to_string(),
+            None => was.impact,
+        };
+        let complexity = match complexity {
+            Some(v) => normalize(v, &COMPLEXITIES, "complexity")?.to_string(),
+            None => was.complexity,
+        };
+        self.conn.execute(
+            "UPDATE review_findings SET importance = ?2, impact = ?3, complexity = ?4, updated_at = ?5
+             WHERE id = ?1",
+            params![uuid_to_blob(id), importance, impact, complexity, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// Mark a finding fixed by quick fix `quick_fix`, whose commit the
+    /// small-change review found clean: `response` points at the commit.
+    pub fn settle_by_quick_fix(&self, id: Uuid, quick_fix: Uuid, response: &str) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE review_findings SET status = 'fixed', response = ?2, quick_fix = ?3, updated_at = ?4
+             WHERE id = ?1",
+            params![uuid_to_blob(id), response.trim(), uuid_to_blob(quick_fix), now_ms()],
         )?;
         if changed == 0 {
             bail!("finding {id} not found");
@@ -530,25 +765,33 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReviewFinding> {
             .map(blob_to_uuid_sql)
             .transpose()?,
         seq: row.get(3)?,
-        severity: row.get(4)?,
-        file: row.get(5)?,
-        line: row.get(6)?,
-        summary: row.get(7)?,
-        detail: row.get(8)?,
-        status: row.get(9)?,
-        response: row.get(10)?,
-        created_at: row.get(11)?,
-        updated_at: row.get(12)?,
-        pr_thread: row.get(13)?,
-        pr_posted_at: row.get(14)?,
-        root_cause: row.get(15)?,
+        importance: row.get(4)?,
+        impact: row.get(5)?,
+        complexity: row.get(6)?,
+        file: row.get(7)?,
+        line: row.get(8)?,
+        summary: row.get(9)?,
+        detail: row.get(10)?,
+        status: row.get(11)?,
+        response: row.get(12)?,
+        created_at: row.get(13)?,
+        updated_at: row.get(14)?,
+        pr_thread: row.get(15)?,
+        pr_posted_at: row.get(16)?,
+        root_cause: row.get(17)?,
         reviewer: row
-            .get::<_, Option<String>>(16)?
+            .get::<_, Option<String>>(18)?
             .map(|r| Reviewer::parse(&r))
             .transpose()
             .map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(16, rusqlite::types::Type::Text, e.into())
+                rusqlite::Error::FromSqlConversionFailure(18, rusqlite::types::Type::Text, e.into())
             })?,
+        rule: row.get(19)?,
+        quick_fix: row
+            .get::<_, Option<Vec<u8>>>(20)?
+            .as_deref()
+            .map(blob_to_uuid_sql)
+            .transpose()?,
     })
 }
 
@@ -584,12 +827,15 @@ mod tests {
 
     fn finding(summary: &str) -> NewFinding {
         NewFinding {
-            severity: "High".into(),
+            importance: "Blocker".into(),
+            impact: "High".into(),
+            complexity: "Involved".into(),
             file: Some("src/lib.rs".into()),
             line: Some(12),
             summary: summary.into(),
             detail: Some("Empty input panics.".into()),
             root_cause: None,
+            rule: None,
         }
     }
 
@@ -600,7 +846,10 @@ mod tests {
         let first = repo.add(fx.node, None, &finding("First")).unwrap();
         let second = repo.add(fx.node, None, &finding("Second")).unwrap();
         assert_eq!((first.seq, second.seq), (1, 2));
-        assert_eq!(first.severity, "high");
+        assert_eq!(
+            (first.importance.as_str(), first.impact.as_str(), first.complexity.as_str()),
+            ("blocker", "high", "involved")
+        );
         assert_eq!(first.status, FINDING_OPEN);
         assert_eq!(first.location().as_deref(), Some("src/lib.rs:12"));
         let listed: Vec<_> = repo
@@ -615,13 +864,19 @@ mod tests {
     }
 
     #[test]
-    fn a_finding_needs_a_summary_a_known_severity_and_a_file_for_its_line() {
+    fn a_finding_needs_a_summary_known_scores_and_a_file_for_its_line() {
         let fx = setup();
         let repo = ReviewRepo::new(&fx.conn);
         let mut bad = finding(" ");
         assert!(repo.add(fx.node, None, &bad).is_err());
         bad = finding("x");
-        bad.severity = "critical".into();
+        bad.importance = "critical".into();
+        assert!(repo.add(fx.node, None, &bad).is_err());
+        bad = finding("x");
+        bad.impact = String::new();
+        assert!(repo.add(fx.node, None, &bad).is_err(), "every score is required");
+        bad = finding("x");
+        bad.complexity = "hard".into();
         assert!(repo.add(fx.node, None, &bad).is_err());
         bad = finding("x");
         bad.file = None;
@@ -644,6 +899,70 @@ mod tests {
         let got = repo.get(id).unwrap().unwrap();
         assert!(got.is_open());
         assert_eq!(got.response, None);
+    }
+
+    /// `left` is tod's own answer and needs its reason; the user reopening one
+    /// makes it block like a `major` (a blocker stays a blocker), and editing
+    /// the scores checks them like a new finding's.
+    #[test]
+    fn a_left_finding_has_a_reason_and_reopening_it_promotes_it() {
+        let fx = setup();
+        let repo = ReviewRepo::new(&fx.conn);
+        let scored = |imp: &str| NewFinding { importance: imp.into(), ..finding(imp) };
+        let nit = repo.add(fx.node, None, &scored("nit")).unwrap().id;
+        let blocker = repo.add(fx.node, None, &scored("blocker")).unwrap().id;
+        assert!(repo.respond(nit, FINDING_LEFT, None).is_err(), "a left finding needs a reason");
+        repo.respond(nit, FINDING_LEFT, Some("nit")).unwrap();
+        repo.respond(blocker, FINDING_LEFT, Some("by hand")).unwrap();
+        let got = repo.get(nit).unwrap().unwrap();
+        assert_eq!((got.status.as_str(), got.response.as_deref()), (FINDING_LEFT, Some("nit")));
+        assert!(got.dismissed() && !got.stands());
+
+        repo.respond(nit, FINDING_OPEN, None).unwrap();
+        repo.respond(blocker, FINDING_OPEN, None).unwrap();
+        let (nit, blocker) = (repo.get(nit).unwrap().unwrap(), repo.get(blocker).unwrap().unwrap());
+        assert!(nit.is_open() && nit.stands());
+        assert_eq!(nit.importance, IMPORTANCE_MAJOR, "reopened, it blocks like a major");
+        assert_eq!(blocker.importance, IMPORTANCE_BLOCKER);
+
+        repo.rescore(nit.id, Some("Minor"), None, Some("mechanical")).unwrap();
+        let got = repo.get(nit.id).unwrap().unwrap();
+        assert_eq!(
+            (got.importance.as_str(), got.impact.as_str(), got.complexity.as_str()),
+            ("minor", "high", "mechanical")
+        );
+        assert!(repo.rescore(nit.id, Some("huge"), None, None).is_err());
+    }
+
+    /// A fix a quick fix made and the small review cleared stands aside from
+    /// the review's verdict; the Fix agent's own `fixed` does not.
+    #[test]
+    fn a_quick_fixed_finding_does_not_stand_but_a_fixers_does() {
+        let fx = setup();
+        let repo = ReviewRepo::new(&fx.conn);
+        let a = repo.add(fx.node, None, &finding("a")).unwrap().id;
+        let b = repo.add(fx.node, None, &finding("b")).unwrap().id;
+        repo.respond(a, FINDING_FIXED, Some("abc")).unwrap();
+        repo.settle_by_quick_fix(b, Uuid::new_v4(), "Quick fix abc123, small review clean").unwrap();
+        assert!(repo.get(a).unwrap().unwrap().stands());
+        let b = repo.get(b).unwrap().unwrap();
+        assert!(!b.stands() && b.status == FINDING_FIXED && b.quick_fix.is_some());
+        // Reopening it forgets the quick fix.
+        repo.respond(b.id, FINDING_OPEN, None).unwrap();
+        assert_eq!(repo.get(b.id).unwrap().unwrap().quick_fix, None);
+    }
+
+    #[test]
+    fn a_rule_is_matched_without_case_spacing_or_trailing_punctuation() {
+        assert_eq!(rule_key("  Docstrings  are at most\n three lines. "), rule_key("docstrings are at most three lines"));
+        assert_ne!(rule_key("one rule"), rule_key("another rule"));
+        let fx = setup();
+        let repo = ReviewRepo::new(&fx.conn);
+        let f = repo
+            .add(fx.node, None, &NewFinding { rule: Some("  Docstrings   at most 3 lines ".into()), ..finding("x") })
+            .unwrap();
+        assert_eq!(f.rule.as_deref(), Some("Docstrings at most 3 lines"));
+        assert_eq!(repo.add(fx.node, None, &NewFinding { rule: Some("  ".into()), ..finding("y") }).unwrap().rule, None);
     }
 
     #[test]

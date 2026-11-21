@@ -111,6 +111,31 @@ fn default_quick_fix_turns() -> u32 {
     DEFAULT_QUICK_FIX_TURNS
 }
 
+/// How many review rounds of a stay count a `minor` finding as blocking
+/// (`review.minor_rounds`, `doc/requests/design.md` 5.1). From the next round
+/// on a minor finding is left, and only blockers and majors block.
+pub const DEFAULT_REVIEW_MINOR_ROUNDS: u32 = 2;
+
+fn default_review_minor_rounds() -> u32 {
+    DEFAULT_REVIEW_MINOR_ROUNDS
+}
+
+/// `review` in `tod.yml`: what a review's scored findings block.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewSettings {
+    /// A `minor` finding blocks in the first this many rounds of a stay
+    /// (default 2; 0 means a minor never blocks). Blockers and majors always
+    /// block; nits never do.
+    #[serde(default = "default_review_minor_rounds")]
+    pub minor_rounds: u32,
+}
+
+impl Default for ReviewSettings {
+    fn default() -> Self {
+        Self { minor_rounds: default_review_minor_rounds() }
+    }
+}
+
 /// The process review (`doc/requests/design.md` 11.2,
 /// `doc/lifecycle/self-improvement.md`): how often tod's daemon groups the new
 /// improvement lessons into a node of its own.
@@ -1218,6 +1243,9 @@ pub struct TodSettings {
     /// How lifecycle phases are judged done.
     #[serde(default)]
     pub lifecycle: LifecycleSettings,
+    /// What a review's scored findings block.
+    #[serde(default)]
+    pub review: ReviewSettings,
     /// The visual-design window.
     #[serde(default)]
     pub visual_design: VisualDesignSettings,
@@ -1267,6 +1295,7 @@ impl Default for TodSettings {
             window_geometry: None,
             journeys: JourneySettings::default(),
             lifecycle: LifecycleSettings::default(),
+            review: ReviewSettings::default(),
             visual_design: VisualDesignSettings::default(),
             pr_readiness: PrReadinessSettings::default(),
             process_review: ProcessReviewSettings::default(),
@@ -1713,6 +1742,7 @@ mod tests {
                 quick_fix_turns: 2,
                 repo_profiles: vec![RepoProfileSetting { repo: "acme/infra".into(), profile: RepoProfile::Merge }],
             },
+            review: ReviewSettings { minor_rounds: 3 },
             visual_design: VisualDesignSettings {
                 browser: Some("C:/chrome/chrome.exe".into()),
             },

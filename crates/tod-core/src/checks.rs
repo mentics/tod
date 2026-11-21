@@ -1296,7 +1296,7 @@ pub fn record_findings_with_notes(fleet: &FleetStore, node: Uuid, failed: &[&Che
                 node_id: node,
                 conversation_id: None,
                 finding: tod_store::review::NewFinding {
-                    severity: "high".to_string(),
+                    importance: "blocker".to_string(), impact: "high".to_string(), complexity: "simple".to_string(),
                     file: None,
                     line: None,
                     summary,

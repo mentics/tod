@@ -1571,7 +1571,7 @@ mod tests {
                 node,
                 Some(conversation.id),
                 &NewFinding {
-                    severity: "medium".into(),
+                    importance: "major".into(), impact: "medium".into(), complexity: "simple".into(),
                     file: Some("src/lib.rs".into()),
                     line: Some(3),
                     summary: "Unchecked unwrap".into(),
@@ -1628,7 +1628,7 @@ mod tests {
             .add(
                 node,
                 Some(first.id),
-                &NewFinding { severity: "high".into(), summary: "Panics on empty input".into(), ..Default::default() },
+                &NewFinding { importance: "blocker".into(), impact: "high".into(), complexity: "simple".into(), summary: "Panics on empty input".into(), ..Default::default() },
             )
             .unwrap();
         finish(first.id);

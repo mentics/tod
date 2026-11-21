@@ -187,7 +187,7 @@ mod tests {
         let risk = review(&conn, node, Some(Reviewer::Risk), Some(main));
         let repo = crate::review::ReviewRepo::new(&conn);
         let finding = |conversation| crate::review::NewFinding {
-            severity: "high".into(),
+            importance: "blocker".into(), impact: "high".into(), complexity: "simple".into(),
             summary: format!("from {conversation}"),
             ..Default::default()
         };

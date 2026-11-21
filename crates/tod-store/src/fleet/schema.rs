@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 114;
+pub const CURRENT_USER_VERSION: i32 = 117;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -845,6 +845,17 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         remove_legacy_interviews(conn)?;
         conn.pragma_update(None, "user_version", 114)?;
     }
+    // 115 and 116 are other steps of `doc/requests/design.md`, built beside
+    // this one.
+    if version < 117 {
+        // Review findings are scored (`doc/requests/design.md` 5.1): importance,
+        // impact and complexity replace severity, a finding may be `left`, and
+        // may cite a rule and the quick fix that settled it
+        // (`crate::review::migrate_to_scored`). Synced (sync copies the
+        // columns both sides have) and journaled, as before.
+        crate::review::migrate_to_scored(conn)?;
+        conn.pragma_update(None, "user_version", 117)?;
+    }
     // Other branches (the task panel) numbered their own steps 66–67 at the
     // same time as 66–70 above, so a store may be past a version without
     // having these. Every one is idempotent: make sure of them all.
@@ -882,6 +893,8 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     crate::review::add_pr_columns(conn)?;
     crate::review::add_root_cause_column(conn)?;
     crate::review::add_reviewer_columns(conn)?;
+    // Idempotent, so a store that skipped 117 for a branch's 115 or 116 has it.
+    crate::review::migrate_to_scored(conn)?;
     conn.execute_batch(crate::review::coverage::CREATE_TABLE)?;
     conn.execute_batch(&crate::journey_changes::review_coverage_triggers_sql())?;
     // A cloud supervisor's heartbeat for a node (`crate::cloud_activity`):
@@ -2035,7 +2048,7 @@ fn migrate_v41_to_v42(conn: &Connection) -> Result<()> {
 /// `review_findings`: what a review conversation's agent found in a node's
 /// change, and the response each gets (`crate::review`).
 fn migrate_v43_to_v44(conn: &Connection) -> Result<()> {
-    conn.execute_batch(crate::review::CREATE_TABLE)?;
+    conn.execute_batch(crate::review::CREATE_TABLE_V116)?;
     Ok(())
 }
 
@@ -2268,7 +2281,7 @@ fn migrate_v45_to_v46(conn: &Connection) -> Result<()> {
         )
         .optional()?;
     let Some(table_sql) = table_sql else {
-        conn.execute_batch(crate::review::CREATE_TABLE)?;
+        conn.execute_batch(crate::review::CREATE_TABLE_V116)?;
         return Ok(());
     };
     if table_sql.contains("'rejected'") {
@@ -2282,7 +2295,7 @@ fn migrate_v45_to_v46(conn: &Connection) -> Result<()> {
          ALTER TABLE review_findings RENAME TO review_findings_v45;",
     )?;
     tx.execute_batch("PRAGMA legacy_alter_table = OFF;")?;
-    tx.execute_batch(crate::review::CREATE_TABLE)?;
+    tx.execute_batch(crate::review::CREATE_TABLE_V116)?;
     tx.execute_batch(
         "INSERT INTO review_findings
              (id, node_id, conversation_id, seq, severity, file, line, summary, detail,
@@ -4537,6 +4550,72 @@ mod tests {
         let path = dir.join("tod.db");
         let conn = open_writer_connection(&path).unwrap();
         (dir, conn)
+    }
+
+    /// v117 replaces `severity` with the three scores, keeps every finding and
+    /// its answer, lets a finding be `left`, and keeps the journey and sync
+    /// triggers working on the rebuilt table.
+    #[test]
+    fn v117_scores_every_finding_from_its_severity_and_keeps_its_triggers() {
+        use crate::outline::uuid_blob::uuid_to_blob;
+        use rusqlite::params;
+        let (_dir, conn) = temp_db();
+        let node_id = uuid::Uuid::new_v4();
+        crate::outline::repos::NodeRepo::new(&conn).create_with_id(node_id, "reviewed", "Reviewed").unwrap();
+        // The table as it was at v116.
+        conn.execute_batch("DROP TABLE review_findings;").unwrap();
+        conn.execute_batch(crate::review::CREATE_TABLE_V116).unwrap();
+        let ids: Vec<uuid::Uuid> = (0..3).map(|_| uuid::Uuid::new_v4()).collect();
+        for (n, (id, severity, status)) in
+            ids.iter().zip(["high", "medium", "low"]).zip(["open", "declined", "fixed"]).map(|((i, s), st)| (i, s, st)).enumerate()
+        {
+            conn.execute(
+                "INSERT INTO review_findings (id, node_id, seq, severity, summary, status, response, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, 'keep me', ?5, 'the answer', 1, 2)",
+                params![uuid_to_blob(*id), uuid_to_blob(node_id), n as i64 + 1, severity, status],
+            )
+            .unwrap();
+        }
+        conn.pragma_update(None, "user_version", 116).unwrap();
+
+        apply_migrations(&conn).unwrap();
+        apply_migrations(&conn).unwrap();
+
+        let rows: Vec<(String, String, String, String, String, Option<String>)> = conn
+            .prepare("SELECT importance, impact, complexity, status, summary, response FROM review_findings ORDER BY seq")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let s = |a: &str, b: &str, c: &str, d: &str| (a.to_string(), b.to_string(), c.to_string(), d.to_string(), "keep me".to_string(), Some("the answer".to_string()));
+        assert_eq!(
+            rows,
+            vec![
+                s("blocker", "high", "simple", "open"),
+                s("major", "medium", "simple", "declined"),
+                s("minor", "low", "simple", "fixed"),
+            ]
+        );
+        let has_severity: bool = conn
+            .query_row("SELECT COUNT(*) > 0 FROM pragma_table_info('review_findings') WHERE name = 'severity'", [], |r| r.get(0))
+            .unwrap();
+        assert!(!has_severity);
+        // `left` is a status now.
+        conn.execute("UPDATE review_findings SET status = 'left', response = 'nit' WHERE id = ?1", params![uuid_to_blob(ids[0])]).unwrap();
+        // The journey and sync triggers are on the new table.
+        for trigger in ["trg_journey_review_findings_update", "trg_sync_review_findings_update"] {
+            let n: i64 = conn
+                .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name = ?1", params![trigger], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 1, "{trigger} was lost");
+        }
+        let journaled: i64 = conn
+            .query_row("SELECT COUNT(*) FROM journey_changes WHERE tbl = 'review_findings' AND op = 'update'", [], |r| r.get(0))
+            .unwrap();
+        assert!(journaled >= 1);
+        let fk: i64 = conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r.get(0)).unwrap();
+        assert_eq!(fk, 0);
     }
 
     #[test]

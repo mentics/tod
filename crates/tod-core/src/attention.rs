@@ -412,7 +412,7 @@ mod tests {
                 node,
                 None,
                 &NewFinding {
-                    severity: "high".to_string(),
+                    importance: "blocker".to_string(), impact: "high".to_string(), complexity: "simple".to_string(),
                     summary: "Off-by-one in the rounding loop".to_string(),
                     ..Default::default()
                 },

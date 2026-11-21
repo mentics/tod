@@ -1813,7 +1813,7 @@ fn a_fix_loops_until_no_finding_is_open() {
                     node_id: fx.node,
                     conversation_id: None,
                     finding: NewFinding {
-                        severity: "high".into(),
+                        importance: "blocker".into(), impact: "high".into(), complexity: "simple".into(),
                         file: Some("src/lib.rs".into()),
                         line: Some(3),
                         summary: summary.into(),
