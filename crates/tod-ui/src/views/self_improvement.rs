@@ -433,6 +433,25 @@ impl SelfImprovement {
         if self.list.cursor_key().is_none() {
             let first = rows.iter().find(|r| r.as_item().is_some()).map(|r| r.key().to_string());
             self.list.set_cursor_key(first);
+        } else if let Some(key) = self.list.cursor_key().map(str::to_string) {
+            // A declined (or reopened) lesson moves to another section, and
+            // a row's key names its section, so the cursor's row is gone:
+            // follow the lesson there, or, when that section is folded, stay
+            // on a neighbouring lesson. Dropping to the first row (a heading)
+            // made the next D act on nothing.
+            if !rows.iter().any(|r| r.key() == key) {
+                let lesson = self.list.cursor_item().map(|row| row.lesson.id);
+                let moved = lesson.and_then(|id| {
+                    rows.iter().find(|r| r.as_item().is_some_and(|row| row.lesson.id == id))
+                });
+                let at = self.list.cursor().unwrap_or(0).min(rows.len().saturating_sub(1));
+                let neighbour = rows[at..]
+                    .iter()
+                    .chain(rows[..at].iter().rev())
+                    .find(|r| r.as_item().is_some());
+                let next = moved.or(neighbour).map(|r| r.key().to_string());
+                self.list.set_cursor_key(next);
+            }
         }
         self.list.set_rows(rows);
     }
@@ -1027,5 +1046,14 @@ mod tests {
         view.update_in(cx, |this, window, cx| this.on_toggle_declined(&SelfImprovementToggleDeclined, window, cx));
         cx.run_until_parked();
         assert_eq!(status(&fleet), STATUS_DECLINED);
+
+        // The cursor followed the lesson into the Declined section, so D
+        // again reopens it (it used to drop to the heading and do nothing).
+        view.read_with(cx, |this, _| {
+            assert!(this.list.cursor_item().is_some(), "the cursor stays on the lesson after it moves section");
+        });
+        view.update_in(cx, |this, window, cx| this.on_toggle_declined(&SelfImprovementToggleDeclined, window, cx));
+        cx.run_until_parked();
+        assert_eq!(status(&fleet), "new");
     }
 }
