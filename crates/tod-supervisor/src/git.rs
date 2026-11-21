@@ -136,8 +136,32 @@ fn push_repo(repo: &Path, expected: Expected) -> Result<bool> {
             bail!("it is on {branch}, but the node's own branch is not known (the checkout is detached), so nothing was pushed")
         }
     }
+    // The remote branch moved on without this checkout (tod's own base merge on
+    // GitHub, a person's push) while it holds nothing the remote lacks: pushing
+    // would be rejected as "fetch first" and end the run, though there is
+    // nothing to send. Take the remote's commits instead (fast-forward only).
+    let remote_ref = format!("refs/heads/{branch}");
+    if !git(repo, &["ls-remote", "--heads", "origin", &remote_ref])?.is_empty() {
+        git(repo, &["fetch", "--quiet", "origin", &remote_ref])?;
+        let theirs = git(repo, &["rev-parse", "FETCH_HEAD"])?;
+        if theirs != git(repo, &["rev-parse", "HEAD"])? && is_ancestor(repo, "HEAD", &theirs)? {
+            git(repo, &["merge", "--ff-only", "--quiet", &theirs])?;
+            return Ok(true);
+        }
+    }
     git(repo, &["push", "--quiet", "-u", "origin", &format!("HEAD:refs/heads/{branch}")])?;
     Ok(true)
+}
+
+/// Whether `ancestor` is reachable from `descendant` (exit 1 is "no", anything
+/// else wrong is an error).
+fn is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
+    let out = Command::new("git").arg("-C").arg(repo).args(["merge-base", "--is-ancestor", ancestor, descendant]).output()?;
+    match out.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => bail!("git merge-base --is-ancestor: {}", String::from_utf8_lossy(&out.stderr).trim()),
+    }
 }
 
 /// One submodule: where it is, the repository that records it, and its path
@@ -272,6 +296,35 @@ mod tests {
         std::fs::write(work.join("kb/test_new.py"), "x").unwrap();
         run(&work.join("kb"), &["add", "."]);
         run(&work.join("kb"), &["commit", "-qm", "the node's work"]);
+    }
+
+    /// Seen live (2026-11-21): tod merged the base into the pull request on
+    /// GitHub, and the supervisor's next boundary push was rejected "fetch
+    /// first" and failed the run, though the checkout held nothing to send.
+    #[test]
+    fn a_remote_branch_that_moved_ahead_is_taken_not_a_failed_push() {
+        let (work, ws_remote, _sub_remote) = fixture();
+        push_branch(&work).unwrap();
+        let root = work.parent().unwrap().to_path_buf();
+        let other = root.join("other");
+        run(&root, &["clone", "-q", ws_remote.to_str().unwrap(), other.to_str().unwrap()]);
+        run(&other, &["checkout", "-q", "task/x"]);
+        std::fs::write(other.join("moved"), "m").unwrap();
+        run(&other, &["add", "."]);
+        run(&other, &["commit", "-qm", "merge of the base, made on GitHub"]);
+        run(&other, &["push", "-q", "origin", "HEAD:task/x"]);
+        push_branch(&work).unwrap();
+        assert_eq!(run(&work, &["rev-parse", "HEAD"]), run(&ws_remote, &["rev-parse", "task/x"]));
+        assert!(work.join("moved").exists());
+        // Diverged (a local commit the remote lacks too) is still an error.
+        std::fs::write(other.join("again"), "m").unwrap();
+        run(&other, &["add", "."]);
+        run(&other, &["commit", "-qm", "another"]);
+        run(&other, &["push", "-q", "origin", "HEAD:task/x"]);
+        std::fs::write(work.join("mine"), "m").unwrap();
+        run(&work, &["add", "."]);
+        run(&work, &["commit", "-qm", "mine"]);
+        assert!(push_branch(&work).is_err());
     }
 
     #[test]
