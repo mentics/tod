@@ -293,6 +293,9 @@ the pre-existing failure (`legacy-lint`, same on the base) is waived and filed a
 a suggestion; a check the agent can fix (`blank-before-last`) is fixed by the
 Haiku quick fix, reviewed by the small review and pushed (`pr_pushes`:
 `mechanical`, `small_review`); a failure the obligations forbid fixing escalates
-to the user. Not induced: the infra rerun of a cancelled job (the node's sandbox
-was retired while it waited, and the webhook did not wake it). See the live-verify
-skill's "Gotchas from the third pass".
+to the user. Not induced then: the infra rerun of a cancelled job. Cause found afterwards: the
+node's sandbox was retired while it waited (by design), and the app replaced a lost
+sandbox only for a running node, so the webhook's mark did nothing; it now looks at
+GitHub and remakes the sandbox when there is work. A cancelled job is also hidden
+while another check fails, and `pr_pushes` rows exist only with "Include review
+steps" on for `pr_draft`. See the live-verify skill's gotchas.

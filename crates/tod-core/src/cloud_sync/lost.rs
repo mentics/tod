@@ -550,7 +550,6 @@ pub fn heal_deleted_flags(fleet: &FleetStore) -> Result<Vec<String>> {
 /// so is a node with no run row at all. Idle waiting nodes whose sandboxes
 /// the idle prune removed must never be remade in bulk.
 fn wanted_to_run(fleet: &FleetStore, rows: Vec<CloudNodeRow>, check: Check) -> Result<Vec<CloudNodeRow>> {
-    use tod_store::run_state::Phase;
     let mut kept = Vec::new();
     for row in rows {
         let state = fleet.read(|conn| tod_store::run_state::get(conn, row.node_id))?;
@@ -565,21 +564,26 @@ fn wanted_to_run(fleet: &FleetStore, rows: Vec<CloudNodeRow>, check: Check) -> R
             continue;
         }
         // A mark the orchestrator brought (`Check::Marked`) means a wake or a
-        // webhook found the sandbox gone. That is not work: a waiting node
-        // (CI, a bot, a timer, the user) stays without a sandbox until a real
-        // stimulus makes one, and only a node whose run is actually at work
-        // (`Working`, `Starting`) gets one here. A look at the listing
-        // (`Check::Full`) is no stimulus at all.
-        let needs = |p: Phase| match check {
-            Check::Marked => run_needs_sandbox(p),
+        // webhook found the sandbox gone. That is not work in itself: a
+        // waiting node (CI, a bot, a timer, the user) stays without a sandbox
+        // until a real stimulus makes one, and a node whose run is actually at
+        // work (`Working`, `Starting`) gets one here. A node waiting on GitHub
+        // is the exception that is *looked at* ([`github_work_waiting`]): the
+        // same look the orchestrator's gate takes says whether the event was
+        // feedback to act on (a failed or cancelled check, a review, a merge),
+        // and then the node has work. A look at the listing (`Check::Full`) is
+        // no stimulus at all.
+        let wanted = match (check, state.map(|s| s.phase)) {
+            (Check::Marked, Some(p)) if run_needs_sandbox(p) => true,
+            (Check::Marked, Some(tod_store::run_state::Phase::Waiting)) => github_work_waiting(fleet, row.node_id),
             // The app's start makes nothing: it cannot tell a node that is
             // still at work from one whose agent finished while it was
             // closed, and a missing sandbox most likely means it finished.
             // It syncs, and a real stimulus (a wake or webhook, an answer,
             // a start) makes the sandbox then.
-            Check::Full => false,
+            _ => false,
         };
-        if !state.is_some_and(|s| needs(s.phase)) {
+        if !wanted {
             tracing::debug!("cloud: node {}'s sandbox is gone; not making another until the node has work to do", row.node_id);
             continue;
         }
@@ -593,6 +597,67 @@ fn wanted_to_run(fleet: &FleetStore, rows: Vec<CloudNodeRow>, check: Check) -> R
 fn run_needs_sandbox(phase: tod_store::run_state::Phase) -> bool {
     use tod_store::run_state::Phase;
     matches!(phase, Phase::Working | Phase::Starting)
+}
+
+/// The least time between two looks at GitHub for one node whose sandbox is
+/// gone ([`github_work_waiting`]): every sync that finds a mark runs the check,
+/// and a node left without a sandbox keeps its mark.
+const LOOK_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+
+static LOOKED: Mutex<Option<HashMap<uuid::Uuid, std::time::Instant>>> = Mutex::new(None);
+
+/// Whether a node that waits on GitHub and has no sandbox now has work for one:
+/// what a webhook (a check that failed or was cancelled, a review, a merge)
+/// found out when it poked a sandbox that was gone. Nothing else can say so,
+/// since the supervisor that would look is the sandbox. It is the look the
+/// orchestrator's gate takes for a due wake
+/// ([`crate::autopilot::check_github`]): feedback, a pull request that is clear
+/// (the node goes on), or the babysitter's own work (running checks, a review
+/// owed) is work; still waiting on a person or the merge is not. Only a node in
+/// a state that waits on GitHub is looked at, at most every [`LOOK_EVERY`].
+/// A look that could not read GitHub is recorded on the node, as the gate does,
+/// and is not work; any other failure is logged and is not work either.
+fn github_work_waiting(fleet: &FleetStore, node: uuid::Uuid) -> bool {
+    use crate::autopilot::{GithubCheck, check_github, look_failed_next_look};
+    let lifecycle = match fleet.get_node(&node.to_string()) {
+        Ok(Some(n)) => n.lifecycle,
+        Ok(None) => return false,
+        Err(err) => {
+            tracing::error!("cloud: reading node {node} to see whether its lost sandbox is wanted: {err:#}");
+            return false;
+        }
+    };
+    let in_review = matches!(lifecycle.as_str(), "pr_draft" | "pr_review");
+    if !in_review && !matches!(lifecycle.as_str(), "approved" | "merged") {
+        return false;
+    }
+    {
+        let mut looked = LOOKED.lock().unwrap_or_else(|e| e.into_inner());
+        let looked = looked.get_or_insert_with(HashMap::new);
+        if looked.get(&node).is_some_and(|at| at.elapsed() < LOOK_EVERY) {
+            return false;
+        }
+        looked.insert(node, std::time::Instant::now());
+    }
+    let root = fleet.paths().root();
+    match check_github(fleet, node, root, &lifecycle) {
+        Ok(GithubCheck::Clear | GithubCheck::Feedback { .. }) => true,
+        // In review, "nothing to wait on" is the babysitter's own work (checks
+        // still running, a review owed), which the gate also wakes the node for;
+        // for a merge or release it only means there is no pull request.
+        Ok(GithubCheck::NothingToWaitOn) => in_review,
+        Ok(GithubCheck::Waiting { .. }) => false,
+        Ok(GithubCheck::Unreadable(why)) => {
+            if let Err(err) = look_failed_next_look(fleet, node, lifecycle == "merged", &why, tod_store::outline::uuid_blob::now_ms()) {
+                tracing::error!("cloud: recording that GitHub could not be read for node {node}: {err:#}");
+            }
+            false
+        }
+        Err(err) => {
+            tracing::error!("cloud: looking at GitHub to see whether node {node}'s lost sandbox is wanted: {err:#}");
+            false
+        }
+    }
 }
 
 /// Whether the check after a sync would replace `node_id`'s lost sandbox:
@@ -2085,6 +2150,94 @@ mod tests {
         run_row(&fx, working);
         assert_eq!(why_not_replaced_at_sync(&fx.fleet, fx.node).unwrap(), None);
         assert_eq!(wanted_to_run(&fx.fleet, vec![row], Check::Marked).unwrap().len(), 1);
+    }
+
+    /// Seen live (2026-11-21, build-test PR #5): a node parked in `pr_draft`
+    /// had its idle sandbox retired, a CI job was cancelled, the webhook marked
+    /// the node's sandbox lost, and nothing made a new one, so tod never reran
+    /// the job. A mark brought while the node waits on GitHub is work exactly
+    /// when the look the orchestrator's gate takes finds feedback.
+    #[test]
+    fn a_waiting_node_whose_webhook_brought_feedback_gets_a_sandbox_and_one_without_does_not() {
+        use tod_store::github::{InfraFailure, PrSnapshot, PrStatus};
+        struct Feed(Mutex<PrSnapshot>);
+        impl crate::pr_readiness::PrFeed for Feed {
+            fn viewer_login(&self) -> Result<String, String> {
+                Ok("tod-test-user".to_string())
+            }
+            fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<PrSnapshot, String> {
+                Ok(self.0.lock().unwrap().clone())
+            }
+        }
+        let status = |checks: &str, failing: &[&str], infra: Vec<InfraFailure>| PrStatus {
+            mergeable: Some(true),
+            mergeable_state: Some("draft".into()),
+            behind_by: Some(0),
+            merged: false,
+            checks: Some(checks.into()),
+            failing_checks: failing.iter().map(|c| c.to_string()).collect(),
+            failing_signatures: Vec::new(),
+            signature_notes: Vec::new(),
+            failing_evidence: Vec::new(),
+            base_failures: Vec::new(),
+            base_notes: Vec::new(),
+            infra_failures: infra,
+            checks_running: false,
+            head_sha: Some("abc1234".into()),
+            head_committed_at: None,
+            draft: true,
+            open: true,
+            reviewers: Vec::new(),
+            base_ref: None,
+            body: None,
+        };
+        let snapshot = |status| PrSnapshot { status, threads: vec![], comments: vec![], reviews: vec![] };
+        let fx = fx();
+        let row = lost_node(&fx);
+        run_row(&fx, crate::run_state::waiting_outside("https://github.com/acme/app/pull/42 to be marked ready for review"));
+        fx.fleet
+            .enqueue_outline(tod_store::outline::OutlineMutation::EnableCapabilities {
+                node_id: fx.node,
+                capabilities: vec![tod_store::outline::Capability::Ticket],
+            })
+            .unwrap();
+        fx.fleet.writer().flush().unwrap();
+        fx.fleet
+            .enqueue(FleetMutation::UpdateTaskLinkedPrs {
+                id: fx.id(),
+                linked_prs: vec!["https://github.com/acme/app/pull/42".into()],
+            })
+            .unwrap();
+        fx.fleet.writer().flush().unwrap();
+        fx.fleet.reload_if_stale().ok();
+        crate::lifecycle::set_lifecycle(&fx.fleet, fx.node, "pr_draft").unwrap();
+
+        // Only waiting for a person to take the draft: no sandbox.
+        let feed = Arc::new(Feed(Mutex::new(snapshot(status("success", &[], Vec::new())))));
+        crate::pr_readiness::set_feed_override(Some(feed.clone()));
+        assert!(
+            wanted_to_run(&fx.fleet, vec![row.clone()], Check::Marked).unwrap().is_empty(),
+            "a webhook that changed nothing the node acts on makes no sandbox"
+        );
+        assert_eq!(why_not_replaced_at_sync(&fx.fleet, fx.node).unwrap().is_some(), true);
+
+        // Its only failing check is a cancelled job: the babysitter reruns it, so the node has work.
+        *LOOKED.lock().unwrap() = None;
+        let cancelled = InfraFailure { check: "LV Slow".into(), job_id: 7, kind: "cancelled".into() };
+        *feed.0.lock().unwrap() = snapshot(status("failure", &["LV Slow"], vec![cancelled]));
+        assert_eq!(wanted_to_run(&fx.fleet, vec![row.clone()], Check::Marked).unwrap().len(), 1);
+
+        // Looked at, not at every sync: a second check inside the window asks GitHub nothing.
+        assert!(wanted_to_run(&fx.fleet, vec![row.clone()], Check::Marked).unwrap().is_empty());
+        // The app's start (`Full`) is never a stimulus.
+        *LOOKED.lock().unwrap() = None;
+        assert!(wanted_to_run(&fx.fleet, vec![row.clone()], Check::Full).unwrap().is_empty());
+
+        // Not in a state that waits on GitHub: never looked at.
+        crate::lifecycle::set_lifecycle(&fx.fleet, fx.node, "planning").unwrap();
+        *LOOKED.lock().unwrap() = None;
+        assert!(wanted_to_run(&fx.fleet, vec![row], Check::Marked).unwrap().is_empty());
+        crate::pr_readiness::set_feed_override(None);
     }
 
     #[test]

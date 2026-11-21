@@ -214,6 +214,36 @@ new gotcha to this file and `doc/live-verification.md` and merge them.
   workflows run against the new base.
 - A node that stops on a request, or waits on others, has its sandbox deleted
   by the daemon within minutes (idle retire); answering a request makes a new
+  one and resumes. Idle retire is by design and loses nothing (the repo is
+  pushed). A GitHub webhook that reaches a retired node used to be dropped (the
+  app replaced a lost sandbox only for a running node); now the app's marked
+  check looks at GitHub (`cloud_sync::lost::github_work_waiting`, at most every
+  30 s per node) and makes a sandbox when there is feedback, a failing check,
+  a cancelled job to rerun, or a merge. It needs the app running: the webhook
+  only marks the node lost, the app acts on the mark.
+- A cancelled job is rerun only by the supervisor's babysit loop, and only when
+  it is the one failing check: another failing check (LV CI fails on the base)
+  hides it. For this case use a PR whose other checks pass.
+- `pr_pushes` is recorded only while "Include review steps" is on for `pr_draft`
+  (`lifecycle_config::resolve_pr_draft_review`, off by default); no rows with it
+  off is not a sync loss. The orchestrator and app copies were compared and match.
+- `tod-cli obligations add` defaults to agent authority, which the proposed agent may delete. `tod-cli lifecycle set <node> planning` starts a node at planning with contradictory obligations to exercise disputes.
+- Checks YAML is imported through the Settings panel.
+- `grep -r` over a worktree matches `.pyc` files; exclude them.
+- Foreground `sleep` over 90s is backgrounded; poll in loops under about 180s.
+
+### Gotchas from the third pass (build-test pull-request half)
+
+- A scenario's own obligations can make a CI failure unfixable: a requirement
+  that mandates the failing text makes triage escalate (correctly) and the node
+  stops with a request. Quick fixes need a failure the obligations allow the
+  agent to fix (here a check wanting a blank line before the README's last line).
+- A requirements-phase obligation cannot be edited from `pr_draft`
+  (`tod-cli obligations update` refuses); change the scenario at the base
+  (`lv-base`) instead, and close and reopen the PR to make `pull_request`
+  workflows run against the new base.
+- A node that stops on a request, or waits on others, has its sandbox deleted
+  by the daemon within minutes (idle retire); answering a request makes a new
   one and resumes. A cancelled job produced while the node waits was NOT woken
   by the webhook within 5 minutes in the verify root, so the infra rerun cannot
   be induced by cancelling a run while the node is parked; cancel while the
