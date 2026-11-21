@@ -52,6 +52,9 @@ struct FakeAgent {
     /// With `review_never_clean`, each review records one more finding than
     /// the one before (the first records one).
     review_growing: bool,
+    /// The scores every `review_never_clean` finding carries, as
+    /// (importance, complexity). `involved` majors by default, so they go to Fix.
+    review_scores: (String, String),
     review_played: std::sync::atomic::AtomicUsize,
     /// The next this-many review turns fail (the agent died) before doing anything.
     review_fails: std::sync::atomic::AtomicUsize,
@@ -95,6 +98,7 @@ impl FakeAgent {
             review_never_clean: false,
             review_root_cause: None,
             review_growing: false,
+            review_scores: ("major".into(), "involved".into()),
             review_played: std::sync::atomic::AtomicUsize::new(0),
             review_fails: std::sync::atomic::AtomicUsize::new(0),
             fix_writes: None,
@@ -228,7 +232,7 @@ impl FakeAgent {
                             node_id: node.parse()?,
                             conversation_id: Some(conversation.parse()?),
                             finding: tod_store::review::NewFinding {
-                                importance: "major".into(), impact: "medium".into(), complexity: "simple".into(),
+                                importance: self.review_scores.0.clone(), impact: "medium".into(), complexity: self.review_scores.1.clone(),
                                 file: Some("src/lib.rs".into()),
                                 line: Some(1),
                                 summary: if self.review_growing {
@@ -3525,6 +3529,94 @@ fn a_quick_fix_that_makes_the_check_pass_needs_no_fix_turn() {
     // The quick fix was given the one failure, not the node's obligations.
     let opening = openings(&fx, ProtocolKind::QuickFix).into_iter().next().expect("a quick fix opening").1;
     assert!(opening.contains("ok.txt is missing"), "{opening}");
+}
+
+fn review_findings_of(fx: &Fixture) -> Vec<tod_store::review::ReviewFinding> {
+    fx.fleet.read(|conn| tod_store::review::ReviewRepo::new(conn).list_for_node(fx.node)).unwrap()
+}
+
+/// A node in `review` whose reviewer records one finding with these scores.
+fn scored_review(importance: &str, complexity: &str, quick_fix_writes: bool) -> (Fixture, FakeAgent) {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    let workspace = fx.root.join("workspace");
+    let mut agent = FakeAgent::new(&fx.fleet);
+    agent.review_never_clean = true;
+    agent.review_scores = (importance.into(), complexity.into());
+    if quick_fix_writes {
+        agent.quick_fix_writes = Some((workspace.join("qf.txt"), "fixed".into()));
+    }
+    (fx, agent)
+}
+
+#[test]
+fn a_simple_finding_goes_to_one_quick_fix_and_needs_no_fix_turn() {
+    let (fx, mut agent) = scored_review("major", "simple", true);
+    let mut pilot = autopilot(&fx, Budget::default());
+    let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
+    assert_eq!(outcome, Outcome::Done, "{:#?}", pilot.state().steps);
+    let rows = quick_fixes_of(&fx);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].source, tod_store::quick_fixes::SOURCE_REVIEW);
+    assert_eq!(rows[0].outcome, tod_store::quick_fixes::OUTCOME_SUCCEEDED, "{rows:?}");
+    assert!(openings(&fx, ProtocolKind::Fix).is_empty(), "no Fix session");
+    let findings = review_findings_of(&fx);
+    assert_eq!(findings.len(), 1, "{findings:#?}");
+    assert_eq!(findings[0].status, tod_store::review::FINDING_FIXED);
+    assert!(findings[0].quick_fix.is_some() && !findings[0].stands(), "{findings:#?}");
+}
+
+#[test]
+fn an_involved_finding_goes_to_fix_not_a_quick_fix() {
+    let (fx, mut agent) = scored_review("major", "involved", false);
+    let mut pilot = autopilot(&fx, Budget::default());
+    let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
+    // The reviewer never comes back clean, so the run ends not converging; what matters is the routing.
+    assert!(matches!(outcome, Outcome::NeedsHuman { .. }), "{outcome:?}");
+    assert!(quick_fixes_of(&fx).is_empty());
+    assert!(openings(&fx, ProtocolKind::QuickFix).is_empty());
+    assert!(!openings(&fx, ProtocolKind::Fix).is_empty());
+}
+
+#[test]
+fn a_nit_that_is_not_mechanical_is_left_at_once() {
+    let (fx, mut agent) = scored_review("nit", "simple", false);
+    let mut pilot = autopilot(&fx, Budget::default());
+    let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
+    assert_eq!(outcome, Outcome::Done, "{:#?}", pilot.state().steps);
+    assert!(quick_fixes_of(&fx).is_empty());
+    assert!(openings(&fx, ProtocolKind::Fix).is_empty());
+    let findings = review_findings_of(&fx);
+    assert_eq!(findings.len(), 1, "{findings:#?}");
+    assert_eq!(findings[0].status, tod_store::review::FINDING_LEFT);
+    assert!(!findings[0].stands());
+}
+
+#[test]
+fn a_mechanical_nit_is_fixed_by_the_quick_fix() {
+    let (fx, mut agent) = scored_review("nit", "mechanical", true);
+    let mut pilot = autopilot(&fx, Budget::default());
+    let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
+    assert_eq!(outcome, Outcome::Done, "{:#?}", pilot.state().steps);
+    let rows = quick_fixes_of(&fx);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].outcome, tod_store::quick_fixes::OUTCOME_SUCCEEDED, "{rows:?}");
+    assert!(openings(&fx, ProtocolKind::Fix).is_empty());
+}
+
+#[test]
+fn a_failed_review_quick_fix_hands_its_findings_to_fix() {
+    // The quick fix makes no commit, so it is escalated and Fix takes the finding.
+    let (fx, mut agent) = scored_review("major", "simple", false);
+    let mut pilot = autopilot(&fx, Budget::default());
+    let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
+    // The reviewer never comes back clean, so the run ends not converging; what matters is the routing.
+    assert!(matches!(outcome, Outcome::NeedsHuman { .. }), "{outcome:?}");
+    let rows = quick_fixes_of(&fx);
+    assert!(!rows.is_empty(), "{rows:?}");
+    assert!(rows.iter().all(|r| r.source == tod_store::quick_fixes::SOURCE_REVIEW), "{rows:?}");
+    assert_eq!(rows[0].outcome, tod_store::quick_fixes::OUTCOME_ESCALATED);
+    assert!(!openings(&fx, ProtocolKind::Fix).is_empty());
 }
 
 #[test]

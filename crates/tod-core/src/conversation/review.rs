@@ -338,7 +338,7 @@ pub fn mock_turn(
             node_id,
             conversation_id: Some(conversation_id),
             finding: NewFinding {
-                importance: "major".to_string(), impact: "medium".to_string(), complexity: "simple".to_string(),
+                importance: "major".to_string(), impact: "medium".to_string(), complexity: "involved".to_string(),
                 file: Some("src/lib.rs".to_string()),
                 line: Some(1),
                 summary: "Mock finding — the mock agent reads no code.".to_string(),
