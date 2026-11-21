@@ -135,6 +135,19 @@ impl ChunkId {
     pub fn activity(entry: usize, first: usize) -> Self {
         Self { entry, part: Some(first), group: true }
     }
+
+    /// What names this chunk's elements: unique per chunk, so an activity
+    /// block and the piece it begins at (both on screen once the block is
+    /// open) never share an element id (a duplicate id panics a debug build's
+    /// accessibility tree).
+    fn element_suffix(&self) -> String {
+        let part = self.part.map_or(-1, |p| p as i64);
+        if self.group {
+            format!("{}-{part}-group", self.entry)
+        } else {
+            format!("{}-{part}", self.entry)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -995,7 +1008,7 @@ impl TranscriptList {
         let highlighted = self.active && self.highlight == Some(id);
         style::chunk_header(h_flex())
             .id(ElementId::Name(
-                format!("chunk-{}-{}", id.entry, id.part.map_or(-1, |p| p as i64)).into(),
+                format!("chunk-{}", id.element_suffix()).into(),
             ))
             .w_full()
             .when(highlighted, style::highlighted)
@@ -1397,7 +1410,7 @@ impl TranscriptList {
         let entry = id.entry;
         let toggle = |label: &'static str, name: &'static str| {
             Button::new(ElementId::Name(
-                format!("{name}-{}-{}", id.entry, id.part.map_or(-1, |p| p as i64)).into(),
+                format!("{name}-{}", id.element_suffix()).into(),
             ))
             .ghost()
             .compact()
@@ -1500,6 +1513,22 @@ impl Render for TranscriptList {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A block of activity and the piece it begins at are both on screen when
+    /// the block is open; their element ids must differ.
+    #[test]
+    fn an_activity_block_and_its_first_piece_have_distinct_element_ids() {
+        let ids = [
+            ChunkId::entry(3),
+            ChunkId::piece(3, 0),
+            ChunkId::piece(3, 2),
+            ChunkId::activity(3, 2),
+            ChunkId::activity(3, 0),
+        ]
+        .map(|c| c.element_suffix());
+        let unique: HashSet<_> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "{ids:?}");
+    }
 
     #[test]
     fn find_hits_cover_collapsed_pieces_and_ignore_case() {
