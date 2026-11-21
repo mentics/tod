@@ -118,3 +118,24 @@ fn an_escalated_quick_fix_writes_one_ladder_lesson() {
     upsert(&conn, &fix).unwrap();
     assert_eq!(list(&conn, None, Some(SOURCE_LADDER)).unwrap().len(), 1);
 }
+
+#[test]
+fn a_declined_lesson_reopens_to_new_or_to_grouped_and_nothing_else_does() {
+    let (conn, node) = setup();
+    let run = Uuid::new_v4();
+    NodeRepo::new(&conn).create_with_id(run, "run", "Run").unwrap();
+    record_fixer_failure(&conn, node, "a", "ka", "x").unwrap();
+    let fresh = list(&conn, None, None).unwrap()[0].id;
+    assert!(run_op(&conn, "user", &Op::Reopen { id: fresh }).is_err(), "a lesson that is not declined has nothing to reopen");
+    run_op(&conn, "user", &Op::Decline { id: fresh }).unwrap();
+    run_op(&conn, "user", &Op::Reopen { id: fresh }).unwrap();
+    assert_eq!(get(&conn, fresh).unwrap().unwrap().status, STATUS_NEW);
+
+    group_into(&conn, &[fresh], run, 10).unwrap();
+    run_op(&conn, "user", &Op::Decline { id: fresh }).unwrap();
+    run_op(&conn, "user", &Op::Reopen { id: fresh }).unwrap();
+    assert_eq!(get(&conn, fresh).unwrap().unwrap().status, STATUS_GROUPED);
+
+    run_op(&conn, "user", &Op::Apply { ids: vec![fresh], applied_ref: "abc1234".into() }).unwrap();
+    assert!(run_op(&conn, "user", &Op::Reopen { id: fresh }).is_err());
+}
