@@ -357,6 +357,57 @@ and stops. For every finding, the reviewer:
 
 The fixer then fixes the class, not the instance (section 7).
 
+**Converging on the cause (2026-11-20).** Live data showed the family still
+arrived one instance per round: ENG-3559 found six of eight findings over three
+rounds, and ENG-3038 (44 findings) kept rewording one cause, so the app's
+"same cause in three rounds" escalation (section 7) almost never fired, since
+it compared the cause text after only case and whitespace were folded. Three
+changes:
+
+1. **The reviewer is shown the causes already found.** The reviewer's
+   assignment (the one part of the opening that differs between reviewers,
+   so the shared cached prefix is unchanged) ends with "Root causes already
+   found on this task": each cause in the words it was first recorded in, its
+   findings with their ids and statuses, and how many rounds answered it
+   `fixed` (`conversation::review::known_causes`). The surface tells the
+   reviewer to give a repeat as `review add --same-cause-as <FINDING_ID>`
+   (the app copies the cause), to assume the class was not swept after an
+   earlier `fixed`, and to record every other caller, path and shape in the
+   same round before anything else.
+2. **Matching by meaning, not by spelling.** `tod_store::review::same_root_cause`
+   treats two causes as one when they share at least three content words and
+   60% of the shorter one's. A finding recorded with a new wording that
+   matches an earlier cause is **filed under the first wording**
+   (`ReviewRepo::add`, `canonical_root_cause`), so the list the fixer sees and
+   `fix_escalation` count agree. Older findings are clustered the same way on
+   read (`CauseClasses`), so nodes already in flight are covered.
+3. **The reply says what is already known**: `review add` tells the reviewer
+   which findings already have the cause and how many rounds already
+   answered it.
+
+#### 6d-2. Scratch files and other leftovers
+
+ENG-3311 spent a fix round and three failing checks on a scratch test
+(`test_zz_scratch_review.py`) a reviewer left in the checkout, and ENG-3559's
+two "Check ... fails" findings were the fixer's own output. Neither is a
+defect in the change.
+
+- **The reviewer** writes scratch tests, scripts and output outside the
+  checkout, edits and commits nothing there, and deletes what it made
+  (`surface/review.md`, "Scratch files stay out of the checkout").
+- **The app** lists the untracked, not-ignored files before a review round
+  starts (`autopilot::converse_review`, baseline in
+  `LoopCounters.review_untracked_before`) and after both reviewers are done
+  (`tod_core::review_leftovers`). The files that are new are removed, and the
+  node's Activity says so. Two reviewers share one worktree, so the baseline
+  and diff are per round, not per reviewer; a file that was already untracked
+  before the round is never touched. A failure to list or remove is an error
+  on the run, not a skipped step.
+- **The fixer** is given the node's configured checks for the files it
+  changed, in their directories, and is told to run them before answering
+  `fixed` and to say what it ran (`conversation::fix::checks_block`,
+  `surface/fix.md`).
+
 #### 6e. A saturation pass before done
 
 After the sweep, the reviewer makes one more pass on the premise that it
@@ -487,7 +538,27 @@ In `crates/tod/media/context/surface/fix.md`:
   across three rounds, or a fix round adds more findings than it closes twice
   in a row, the autopilot sends the task back to `design` itself, with the
   findings as the reason (`tod_core::autopilot`).
+- **Sweep the cause before `fixed`.** The fixer searches every caller, path
+  and shape of the data the cause names, and says in the response what it
+  searched, so the next review can see the class was swept.
+- **Run the project's checks before `fixed`** (6d-2), so a failing formatter
+  or linter is not the next round's finding.
 - **Never push** (section 8).
+
+### 7a. Minors alone do not keep a round going
+
+ENG-3557 ran 20 review rounds (more than $33 of review plus a 60-session
+budget); the last findings were a docstring's length and stale comments. A
+`minor` blocks only in the first `review.minor_rounds` rounds of a stay, but
+within those a round of nothing but minors and nits still sent the task
+through a full Fix and a new full review. Now a minor blocks only when a
+blocker or a major stands in the same round, where the fix for that one
+carries it along at no extra round. A round of minors and nits only is
+settled by the app: `mechanical` and `simple` ones go to the one quick-fix
+session (with its small review, no new full review), an `involved` one is
+`left` with its reason on the node's Activity, and the user can still reopen
+it. The lens and coverage requirements are unchanged: this changes only what
+blocks (`review_scoring::blocks_in`, `lane`; `doc/lifecycle/review-scoring.md`).
 
 ### 8. Nothing reaches the PR unreviewed
 
@@ -666,6 +737,22 @@ rules:
   rounds instead of thirty, it costs far less overall. The miss accounting
   records rounds and cost per node so this can be checked rather than
   assumed.
+- **Estimate for the 2026-11-20 convergence changes (6d, 6d-2, 7a).** From
+  four nodes' recorded review spend (a review session is about $2.5, a round
+  is two of them; these are estimates, not measurements, and the data
+  predates the v117 scoring, which already left some of ENG-3557's minors):
+
+  | Node | Before | What changes | Estimated saving |
+  |---|---|---|---|
+  | ENG-3559 | 12 review sessions, $32.81; 6 of 8 findings one family over 3 rounds | the family is swept in its first round | about 2 rounds, $10 (30%) |
+  | ENG-3038 | 17 rounds, 44 findings, $22.89 | reworded cause now matches, so the 3-round escalation to design fires at round 3 instead of never | rounds 4-17 replaced by one design bounce; large, not estimated |
+  | ENG-3311 | 6 rounds, $19.07 | a scratch test is removed by the app, not found by 3 checks | 1 fix and 1 review round, $5-6 (30%) |
+  | ENG-3557 | 20 rounds, $19.14 review + $14.11 in `pr_draft` | minors alone no longer start a Fix and a full review | up to half of the $33 |
+
+  The first three act on rounds that were avoidable findings, the last on
+  rounds that were avoidable by policy. None weakens a lens or the coverage
+  record. Re-measure on the next nodes with the same numbers (rounds, review
+  sessions, cost per node) before trusting the figures.
 - **Smaller openings.** Selection drops guidance a change does not need.
   `cli/` nouns are already situational. Every turn of a session re-sends the
   whole context, so each line cut from an opening is saved on every turn,

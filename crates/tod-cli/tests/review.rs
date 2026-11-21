@@ -89,6 +89,35 @@ fn a_finding_carries_its_root_cause() {
 }
 
 #[test]
+fn a_cause_found_again_is_filed_in_its_first_wording_and_the_reply_says_so() {
+    let (root, node, review) = setup();
+    let add = |conversation: Uuid, summary: &str, cause: &[&str]| {
+        let mut args = vec![
+            "review", "add", "--importance", "major", "--impact", "high", "--complexity", "simple", "--summary", summary,
+        ];
+        args.extend_from_slice(cause);
+        cli(&root, node, Some(conversation), &args).unwrap()
+    };
+    let first = add(review, "lot", &["--root-cause", "The command's redirect is committed independently of the merge of the group it creates"]);
+    let first_id = first.strip_prefix("ok ").unwrap().to_string();
+    assert!(!first.contains('\n'), "no other finding has the cause yet: {first}");
+    // Same round, other reviewer: the cause is shared, nothing was answered yet.
+    let second = add(review, "lot 2", &["--root-cause", "The command's deprecated-part redirect is committed independently of the merge it is meant to feed"]);
+    assert!(second.contains("root cause: \"The command's redirect is committed independently of the merge of the group it creates\""), "{second}");
+    assert!(second.contains("1 other finding(s) already have this cause (0 answered in an earlier round)"), "{second}");
+    assert!(!second.contains("earlier round and answered"), "{second}");
+    // An earlier round answered the first: a new session finding it again is told to sweep.
+    cli(&root, node, Some(review), &["review", "respond", &first_id, "--status", "fixed", "--response", "done"]).unwrap();
+    let conn = schema::open_writer_connection(FleetPaths::new(&root).unwrap().db()).unwrap();
+    let next = ConversationRepo::new(&conn).create(Focus::Node(node), ProtocolKind::Review, None, None, None).unwrap().id;
+    let third = add(next, "lot 3", &["--same-cause-as", &first_id]);
+    assert!(third.contains("(1 answered in an earlier round)"), "{third}");
+    assert!(third.contains("search every caller, path and data shape"), "{third}");
+    let err = cli(&root, node, Some(next), &["review", "add", "--importance", "major", "--impact", "high", "--complexity", "simple", "--summary", "x", "--root-cause", "a", "--same-cause-as", &first_id]).unwrap_err();
+    assert!(err.contains("not both"), "{err}");
+}
+
+#[test]
 fn done_is_refused_until_the_coverage_is_complete() {
     let (root, node, review) = setup();
     let run = |args: &[&str]| cli(&root, node, Some(review), args);

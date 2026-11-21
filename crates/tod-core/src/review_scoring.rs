@@ -2,7 +2,8 @@
 //! section 5.1; the scores are `tod_store::review`'s).
 //!
 //! **What blocks.** A review stands or falls on blockers and majors, plus
-//! minors in the first `review.minor_rounds` rounds of a stay (default 2). A
+//! minors in the first `review.minor_rounds` rounds of a stay (default 2) that
+//! come with a blocker or a major in the same round. A
 //! nit never blocks. Every reader asks `ReviewFinding::stands`, so the rule
 //! lives in one place: a finding that does not block is settled `left`, with
 //! tod's reason, the moment its round is done ([`route`], then the
@@ -11,6 +12,9 @@
 //! **Who fixes** ([`Lane`]):
 //! - a finding that blocks and is `mechanical` or `simple` goes, with the
 //!   others like it, to ONE quick fix session and the small-change review;
+//! - a `minor` in a round with no blocker or major (a round of minors and
+//!   nits only) never keeps the round going: `mechanical` and `simple` ones go
+//!   to the quick fix, an `involved` one is left ([`blocks_in`]);
 //! - a finding that blocks and is `involved` goes to Fix, as before;
 //! - a `nit` is fixed only when it is `mechanical` (by the quick fix),
 //!   else left at once;
@@ -59,13 +63,43 @@ pub fn blocks(finding: &ReviewFinding, round: u32, minor_rounds: u32) -> bool {
     }
 }
 
-/// The lane of one finding.
-pub fn lane(finding: &ReviewFinding, round: u32, minor_rounds: u32) -> Lane {
+/// Whether a round's findings include one that always blocks (a blocker or a
+/// major). A round without one is a round of minors and nits only.
+pub fn has_serious(findings: &[ReviewFinding]) -> bool {
+    findings.iter().any(|f| matches!(f.importance.as_str(), IMPORTANCE_BLOCKER | IMPORTANCE_MAJOR))
+}
+
+/// [`blocks`], for a finding of a round whose findings do or do not include a
+/// blocker or a major (`serious`, [`has_serious`]). Minors alone never keep a
+/// round going: a minor blocks only when something that always blocks stands
+/// beside it, where the fix that answers that one takes it along at no extra
+/// round. A round of minors and nits only has nothing that must be fixed before
+/// the task moves on, and a fix would only hand the next full review more to
+/// find (ENG-3557: twenty rounds, the last on a docstring's length).
+pub fn blocks_in(finding: &ReviewFinding, round: u32, minor_rounds: u32, serious: bool) -> bool {
+    if finding.importance == IMPORTANCE_MINOR && !serious {
+        return false;
+    }
+    blocks(finding, round, minor_rounds)
+}
+
+/// The lane of one finding of a round that has (`serious`) or has not a
+/// blocker or major among its findings.
+pub fn lane(finding: &ReviewFinding, round: u32, minor_rounds: u32, serious: bool) -> Lane {
     if finding.importance == IMPORTANCE_NIT {
         return if finding.complexity == tod_store::review::COMPLEXITY_MECHANICAL {
             Lane::Quick
         } else {
             Lane::Leave("nit: left as it is".to_string())
+        };
+    }
+    if finding.importance == IMPORTANCE_MINOR && !serious {
+        // Cheap ones are still fixed, by the quick fix with its small review,
+        // which settles them with no new full review; the rest is left.
+        return if finding.complexity == COMPLEXITY_INVOLVED {
+            Lane::Leave(MINOR_ALONE.to_string())
+        } else {
+            Lane::Quick
         };
     }
     if !blocks(finding, round, minor_rounds) {
@@ -74,6 +108,9 @@ pub fn lane(finding: &ReviewFinding, round: u32, minor_rounds: u32) -> Lane {
     }
     if finding.complexity == COMPLEXITY_INVOLVED { Lane::Fix } else { Lane::Quick }
 }
+
+/// Why an involved minor of a round with no blocker or major is left.
+pub const MINOR_ALONE: &str = "minor, and the round found no blocker or major: left as it is, not worth another round";
 
 /// A round's open findings, divided by lane.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -85,9 +122,10 @@ pub struct Routing {
 
 /// Divides `open` findings by lane.
 pub fn route(open: &[ReviewFinding], round: u32, minor_rounds: u32) -> Routing {
+    let serious = has_serious(open);
     let mut routing = Routing::default();
     for finding in open {
-        match lane(finding, round, minor_rounds) {
+        match lane(finding, round, minor_rounds, serious) {
             Lane::Quick => routing.quick.push(finding.clone()),
             Lane::Fix => routing.fix.push(finding.clone()),
             Lane::Leave(reason) => routing.leave.push((finding.clone(), reason)),
@@ -267,6 +305,33 @@ mod tests {
         assert_eq!(late.fix.len(), 1, "a minor is not Fix's after round 2");
         assert_eq!(late.leave.len(), 2);
         assert!(late.leave.iter().any(|(_, why)| why.starts_with("minor after round 2")));
+    }
+
+    #[test]
+    fn minors_alone_do_not_keep_a_round_going() {
+        // ENG-3557's last rounds: a docstring too long, comments gone stale,
+        // and an involved minor, with nothing serious beside them.
+        let only_minors = vec![
+            finding("minor", "mechanical"),
+            finding("minor", "simple"),
+            finding("minor", "involved"),
+            finding("nit", "simple"),
+        ];
+        assert!(!has_serious(&only_minors));
+        let routed = route(&only_minors, 1, 2);
+        assert_eq!(routed.quick.len(), 2, "the cheap minors still go to the quick fix");
+        assert!(routed.fix.is_empty(), "no minor goes to a Fix and so to another full review");
+        assert_eq!(routed.leave.len(), 2);
+        assert!(routed.leave.iter().any(|(f, why)| f.importance == "minor" && why == MINOR_ALONE));
+        assert!(only_minors.iter().all(|f| !blocks_in(f, 1, 2, false)));
+        // Beside a major the minors are answered with it, as before.
+        let mut with_major = only_minors.clone();
+        with_major.push(finding("major", "involved"));
+        assert!(has_serious(&with_major));
+        let routed = route(&with_major, 1, 2);
+        assert_eq!(routed.fix.len(), 2, "the major and the involved minor ride along");
+        assert!(blocks_in(&finding("minor", "simple"), 1, 2, true));
+        assert!(!blocks_in(&finding("minor", "simple"), 3, 2, true), "past the minor rounds it is left even then");
     }
 
     #[test]

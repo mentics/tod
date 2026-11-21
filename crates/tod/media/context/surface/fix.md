@@ -58,6 +58,14 @@ the code it reaches, not only the line each finding points at.
 If fixing it shows you more places with the same cause, fix those too and
 say so in the response.
 
+Search for the cause before you answer `fixed`, not after: every caller of the
+function, every path that reaches the code, and every shape of the data the
+finding names (a `grep` for the call, the field and the key is the minimum).
+Say in the response what you searched and what you found, so the next review
+can see the class was swept. A fix that covers only the line a finding points
+at comes back as the next finding of the same cause, and the task goes round
+again.
+
 ## A redesign is not a fix
 
 Some findings show that the design itself is wrong: an assumption it rests
@@ -112,6 +120,17 @@ and record the counts through the `tests` noun. The fix is not done until a
 run recorded in the same turn has passing tests and no failures or errors.
 Record honestly: a red run is a fine answer while work remains; a run you did
 not make is not.
+
+## Run the project's checks before you answer
+
+The app runs the project's own checks (formatter, linter, quality ratchet, type
+checker) on your commit, and a failure it finds is a new finding and another
+round. The context ends with the checks this task is held to, with the command
+and directory of each. After your last change, and before you answer `fixed`,
+run each check that applies to the files you changed, in its directory, and fix
+what it reports; run a formatter's fix command rather than editing by hand.
+Include what you changed to satisfy a check in the same commit. A check you
+could not run is named in the response, with the reason.
 
 ## The app reads what you record, not your reply
 

@@ -89,8 +89,9 @@ Every review round has two reviewers, each in a session of its own, working
 at the same time on the same change: the **main** reviewer sweeps every lens
 below, and the **risk** reviewer sweeps only the lenses where defects that
 survive review usually live (data assumptions, external systems, persisted
-results, interactions, reach, data writes). The last section of this context,
-**Your assignment**, says which one you are and names your lenses. Everything
+results, interactions, reach, data writes). The section near the end of
+this context, **Your assignment**, says which one you are and names your
+lenses; the root causes already found follow it. Everything
 else here applies to both.
 
 Sweep the lenses your assignment names, and record coverage for each of
@@ -145,11 +146,44 @@ assignment has an entry and the saturation pass (below) is recorded.
 
 For every finding, name its **root cause**: the assumption or pattern that
 made it possible ("the org's supplier id is treated as unique"). Then search
-the change and the code it reaches for every other place that cause holds,
-and record each as its own finding in this round. Give each finding its root
-cause (the `review` noun's `--root-cause`), in the same words for every
-finding that shares it: the fixer is shown them together, so the fix covers
-the class and not one instance.
+the change and the code it reaches for every other place that cause holds:
+every caller, every path and every shape of the data that reaches it, not only
+the one you found it in. Record each as its own finding in this round, each
+with its root cause (the `review` noun's `--root-cause`).
+
+The last section of this context lists **the root causes already found on
+this task**, by earlier rounds and by the other reviewer, in the words they
+were first recorded in. Before you record a finding:
+
+- If its cause is one of them, give it with `--same-cause-as <FINDING_ID>`
+  rather than new words. The app reads causes by wording: the fixer is shown
+  findings of one cause together, and a cause that comes back round after
+  round sends the task back to design. A cause reworded each time is none of
+  that.
+- If an earlier round answered findings of that cause `fixed`, those fixes
+  covered the instances they were shown. Assume the class was not swept:
+  find every other caller, path and shape the earlier fixes did not touch,
+  and record each one in this round, before you record your next instance
+  of anything else. Finding the same family one instance per round is the
+  failure the whole review exists to end.
+- If the cause is not listed, word it as the assumption or pattern itself,
+  not the symptom in the file you are looking at, so the next instance in
+  another file can be worded the same way.
+
+The reply to `review add` says which findings already have the cause.
+
+### Scratch files stay out of the checkout
+
+You may run code to check a hunch, but your working directory is the change
+under review and the project's checks (formatter, linter, quality ratchet)
+read every file in it, untracked ones too. Write any scratch test, script or
+output **outside the checkout** (a directory under the temp dir that you
+create for this session), never inside it. A scratch file left in the
+checkout fails the project's checks and costs the task a whole fix round. Do
+not edit, stage or commit anything in the checkout; delete whatever you
+created before you record the review done. The app lists the untracked files
+a round left, removes them and notes it on the task, and a finding that only
+repeats a check failure is noise.
 
 ### Verification evidence
 

@@ -203,7 +203,11 @@ impl Protocol for ReviewProtocol {
     /// The reviewer's assignment (find-it-first 6h), last in the context so
     /// the two reviewers of a round share everything before it.
     fn opening_tail(&self, env: &ProtocolEnv<'_>) -> Result<Option<String>> {
-        Ok(Some(assignment(env.reviewer()?)))
+        let mut out = assignment(env.reviewer()?);
+        let node = node_id(env)?;
+        let findings = env.fleet.read(|conn| ReviewRepo::new(conn).list_for_node(node))?;
+        out.push_str(&known_causes(&findings));
+        Ok(Some(out))
     }
 
     fn loops(&self) -> bool {
@@ -290,6 +294,57 @@ pub fn assignment(reviewer: Option<Reviewer>) -> String {
             "You are this round's only reviewer. Sweep every lens:\n\n{}\n",
             lenses(Reviewer::Main)
         )),
+    }
+    out
+}
+
+/// The root causes the node's findings already carry, for the reviewer's
+/// opening: each in its first wording, with what became of its findings and
+/// where they are. A reviewer who is shown a cause words its own finding the
+/// same way (the fix escalation and the fixer read causes by wording) and,
+/// having found one instance, sweeps the class before the next one
+/// (`surface/review.md`, "One finding, its whole class"). Empty when no
+/// finding has a cause.
+pub fn known_causes(findings: &[tod_store::review::ReviewFinding]) -> String {
+    let groups: Vec<_> = tod_store::review::group_by_root_cause(findings)
+        .into_iter()
+        .filter(|g| g.root_cause.is_some())
+        .collect();
+    if groups.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "\n# Root causes already found on this task\n\n\
+         These are the causes the task's findings, from earlier rounds and from the other reviewer, \
+         already carry, in the words they were first recorded in. When a defect you find has one of \
+         these causes, record it with `review add --same-cause-as <FINDING_ID>` (any finding listed \
+         for the cause), not with new words. A cause found before and answered `fixed` was fixed \
+         where it was found: **search every caller, path and data shape that reaches it, the places \
+         the earlier fixes did not touch, and record each one now.** A cause that is listed is \
+         never a reason to skip a finding that is really there.\n\n",
+    );
+    for group in &groups {
+        let mut counts: Vec<(&str, usize)> = Vec::new();
+        for finding in &group.findings {
+            match counts.iter_mut().find(|(status, _)| *status == finding.status) {
+                Some((_, n)) => *n += 1,
+                None => counts.push((finding.status.as_str(), 1)),
+            }
+        }
+        let mut files: Vec<&str> = group.findings.iter().filter_map(|f| f.file.as_deref()).collect();
+        files.sort_unstable();
+        files.dedup();
+        out.push_str(&format!(
+            "- \"{}\": {} finding(s) ({}); e.g. {}",
+            group.root_cause.unwrap_or_default(),
+            group.findings.len(),
+            counts.iter().map(|(status, n)| format!("{status} {n}")).collect::<Vec<_>>().join(", "),
+            group.findings.iter().take(3).map(|f| tod_store::interview::short_id(f.id)).collect::<Vec<_>>().join(", "),
+        ));
+        if !files.is_empty() {
+            out.push_str(&format!("; in {}", files.iter().take(4).copied().collect::<Vec<_>>().join(", ")));
+        }
+        out.push('\n');
     }
     out
 }
@@ -399,6 +454,52 @@ mod tests {
     use crate::media::MediaPaths;
     use serde_json::{Value, json};
     use tod_store::conversation::Focus;
+
+    fn finding(summary: &str, cause: Option<&str>, status: &str, file: &str) -> tod_store::review::ReviewFinding {
+        tod_store::review::ReviewFinding {
+            id: Uuid::new_v4(),
+            node_id: Uuid::nil(),
+            conversation_id: None,
+            seq: 1,
+            importance: "major".into(),
+            impact: "high".into(),
+            complexity: "simple".into(),
+            file: Some(file.into()),
+            line: None,
+            summary: summary.into(),
+            detail: None,
+            status: status.into(),
+            response: None,
+            created_at: 0,
+            updated_at: 0,
+            pr_thread: None,
+            pr_posted_at: None,
+            root_cause: cause.map(str::to_string),
+            reviewer: None,
+            rule: None,
+            quick_fix: None,
+        }
+    }
+
+    #[test]
+    fn a_reviewer_is_shown_the_causes_already_found_and_told_to_sweep_them() {
+        assert_eq!(known_causes(&[]), "");
+        assert_eq!(known_causes(&[finding("a", None, "open", "a.py")]), "", "no cause, nothing to show");
+        let first = "V2OrgPart is unique per (org, cofactr_id)";
+        let findings = [
+            finding("a", Some(first), "fixed", "lots.py"),
+            finding("b", None, "open", "x.py"),
+            finding("c", Some(first), "fixed", "base.py"),
+            finding("d", Some("A test mocks the very function it proves"), "open", "t.py"),
+        ];
+        let shown = known_causes(&findings);
+        assert!(shown.contains("# Root causes already found on this task"), "{shown}");
+        assert!(shown.contains("--same-cause-as"), "{shown}");
+        assert!(shown.contains("search every caller, path and data shape"), "{shown}");
+        assert!(shown.contains(&format!("\"{first}\": 2 finding(s) (fixed 2)")), "{shown}");
+        assert!(shown.contains("in base.py, lots.py"), "{shown}");
+        assert!(shown.contains("\"A test mocks the very function it proves\": 1 finding(s) (open 1)"), "{shown}");
+    }
 
     fn decide(report: Option<Value>, continuations: u32, progressed: bool) -> Next {
         let fx = fixture();
