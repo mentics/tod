@@ -106,7 +106,10 @@ This applies to the checks tod runs (`doc/lifecycle/checks.md`) and to a pull
 request's CI checks (`doc/lifecycle/pr-readiness.md`). In order:
 
 1. **Infrastructure.** For a cancelled, timed-out or runner-lost CI job, tod
-   reruns the failed jobs through GitHub, up to a limit (default 2 per head).
+   reruns the failed jobs through GitHub, up to a limit (default 2 per head),
+   whatever else is failing or running: another check's failure goes on its
+   own way (a cancelled job is not in the failing checks then, but is found
+   among the head's check runs unless a newer run of it replaced it).
    No agent turn. A job that passes on rerun is recorded as a flake for that
    check, for later stats.
 2. **Pre-existing.** tod compares with the base branch head (or the latest run

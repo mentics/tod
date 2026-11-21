@@ -2493,7 +2493,8 @@ impl Autopilot {
             // A check that failed for infrastructure, was rerun, and now passes.
             let mut flaked = Vec::new();
             for r in self.state.infra_reruns.iter_mut().filter(|r| r.pr == label && r.head == head && !r.flaked && r.count > 0) {
-                let failing = a.failing_checks.iter().any(|c| c.eq_ignore_ascii_case(&r.check));
+                let failing = a.failing_checks.iter().any(|c| c.eq_ignore_ascii_case(&r.check))
+                    || a.infra_failures.iter().any(|f| f.check.eq_ignore_ascii_case(&r.check));
                 if failing || a.checks_running {
                     continue;
                 }
@@ -2514,10 +2515,14 @@ impl Autopilot {
             if a.checks_running || a.infra_failures.is_empty() {
                 continue;
             }
+            // Whatever else fails goes its usual way (`doc/requests/design.md`
+            // 4.2): a lost job is rerun beside it, and waiting for GitHub to show
+            // the rerun holds the loop only when no other check is failing.
+            let others_to_fix = a
+                .failing_checks
+                .iter()
+                .any(|c| !a.infra_failures.iter().any(|f| f.check.eq_ignore_ascii_case(c)));
             for found in &a.infra_failures {
-                if !a.failing_checks.iter().any(|c| c.eq_ignore_ascii_case(&found.check)) {
-                    continue;
-                }
                 let now = state::now_ms();
                 let at = match self.state.infra_reruns.iter().position(|r| r.pr == label && r.head == head && r.check == found.check) {
                     Some(at) => at,
@@ -2538,7 +2543,7 @@ impl Autopilot {
                 let (count, last) = (self.state.infra_reruns[at].count, self.state.infra_reruns[at].at_ms);
                 if count > 0 && now - last < INFRA_RERUN_SETTLE_MS {
                     // GitHub has not shown the rerun yet: not a failure to hand on.
-                    acted = true;
+                    acted |= !others_to_fix;
                     continue;
                 }
                 if count >= settings.max_infra_reruns {
@@ -2558,7 +2563,7 @@ impl Autopilot {
                         fleet.enqueue(tod_store::fleet::FleetMutation::RecordTimeline(Box::new(TimelineEntry::new(node, KIND_NOTE, phase, title, false, detail))))?;
                         fleet.writer().flush()?;
                         crate::pr_readiness::forget_snapshot(&p.pr);
-                        acted = true;
+                        acted |= !others_to_fix;
                     }
                     Err(err) => {
                         // Counted, so a refusal never repeats without end; the

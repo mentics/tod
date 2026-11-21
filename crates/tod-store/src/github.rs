@@ -1236,6 +1236,12 @@ impl Github {
                 (failing_signatures, signature_notes, failing_evidence, infra_failures) =
                     self.failing_signatures(owner, repo, &failing_checks, &statuses, &runs)?;
                 checks_running = checks_running_in(Some(&statuses), Some(&runs));
+                // A cancelled job is hidden from the failing checks while
+                // another check fails or runs, but it is still the
+                // infrastructure's and is rerun whatever else is going on.
+                for hidden in hidden_cancelled_jobs(&runs, &infra_failures) {
+                    infra_failures.push(hidden);
+                }
                 combine_checks(Some(&statuses), Some(&runs))
             }
             None => None,
@@ -3353,6 +3359,33 @@ fn failing_check_names(statuses: Option<&CombinedStatusRaw>, runs: Option<&Check
     names
 }
 
+/// The unreplaced cancelled GitHub Actions runs in `runs` that are not already
+/// in `known` (the ones [`failing_check_names`] counted as failing): a run
+/// cancelled by an outage looks the same as one a newer push cancelled, so it
+/// is only rerun when nothing replaced it (same app and name, a later start).
+fn hidden_cancelled_jobs(runs: &CheckRunsRaw, known: &[InfraFailure]) -> Vec<InfraFailure> {
+    let all = runs.check_runs.as_slice();
+    let mut out: Vec<InfraFailure> = Vec::new();
+    for run in all {
+        let (Some(name), true) = (run.name.as_ref(), run.status == "completed" && run.conclusion.as_deref() == Some("cancelled")) else {
+            continue;
+        };
+        let is_actions = run.app.as_ref().and_then(|a| a.slug.as_deref()) == Some("github-actions") && run.id != 0;
+        let replaced = all.iter().any(|other| {
+            !std::ptr::eq(other, run)
+                && other.name == run.name
+                && run.app.is_some()
+                && other.app == run.app
+                && matches!((&run.started_at, &other.started_at), (Some(a), Some(b)) if b > a)
+        });
+        if !is_actions || replaced || known.iter().chain(out.iter()).any(|k| &k.check == name) {
+            continue;
+        }
+        out.push(InfraFailure { check: name.clone(), job_id: run.id, kind: "cancelled".to_string() });
+    }
+    out
+}
+
 /// Whether a commit status is `pending` or a check run has not completed.
 fn checks_running_in(statuses: Option<&CombinedStatusRaw>, runs: Option<&CheckRunsRaw>) -> bool {
     statuses.is_some_and(|s| s.statuses.iter().any(|s| s.state == "pending"))
@@ -4596,6 +4629,38 @@ mod tests {
         ]);
         assert!(client(&url, &[]).get_pr_status("o", "r", 1).is_err());
         handle.join().unwrap();
+    }
+
+    /// Design 4.2.1: a cancelled job is rerun whatever else fails or runs;
+    /// only a newer run of the same check (or a run that is not GitHub
+    /// Actions) keeps it out.
+    #[test]
+    fn a_cancelled_job_is_found_for_a_rerun_even_when_another_check_fails_or_runs() {
+        use super::{CheckRunsRaw, InfraFailure, failing_check_names, hidden_cancelled_jobs};
+        let runs = |json: &str| -> CheckRunsRaw { serde_json::from_str(json).unwrap() };
+        let actions = r#""app":{"id":1,"slug":"github-actions"}"#;
+        let r = runs(&format!(
+            r#"{{"check_runs":[
+            {{"id":7,"name":"LV Slow",{actions},"status":"completed","conclusion":"cancelled","started_at":"2026-11-21T10:00:00Z"}},
+            {{"id":8,"name":"LV CI",{actions},"status":"completed","conclusion":"failure","started_at":"2026-11-21T10:00:00Z"}},
+            {{"id":9,"name":"slow-other",{actions},"status":"in_progress","conclusion":null}}]}}"#
+        ));
+        // The failing list holds only the real failure, as before.
+        assert_eq!(failing_check_names(None, Some(&r)), vec!["LV CI".to_string()]);
+        let found = hidden_cancelled_jobs(&r, &[]);
+        assert_eq!(found, vec![InfraFailure { check: "LV Slow".into(), job_id: 7, kind: "cancelled".into() }]);
+        // Already counted as failing: not listed twice.
+        assert!(hidden_cancelled_jobs(&r, &found).is_empty());
+        // Replaced by a newer run of the same check: nothing to rerun.
+        let r = runs(&format!(
+            r#"{{"check_runs":[
+            {{"id":7,"name":"LV Slow",{actions},"status":"completed","conclusion":"cancelled","started_at":"2026-11-21T10:00:00Z"}},
+            {{"id":10,"name":"LV Slow",{actions},"status":"queued","conclusion":null,"started_at":"2026-11-21T10:05:00Z"}}]}}"#
+        ));
+        assert!(hidden_cancelled_jobs(&r, &[]).is_empty());
+        // Not a GitHub Actions job: it cannot be rerun this way.
+        let r = runs(r#"{"check_runs":[{"id":7,"name":"ext","app":{"id":3,"slug":"other"},"status":"completed","conclusion":"cancelled"}]}"#);
+        assert!(hidden_cancelled_jobs(&r, &[]).is_empty());
     }
 
     #[test]

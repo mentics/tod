@@ -5763,6 +5763,22 @@ fn a_job_the_infrastructure_lost_is_rerun_by_tod_and_a_pass_is_noted_as_a_flake(
     assert!(pending_requests(&fx).is_empty());
 }
 
+/// Design 4.2.1: a cancelled job is rerun whatever else is failing, bounded by
+/// `max_infra_reruns`, and the other failure goes its usual way to the agent.
+#[test]
+fn a_cancelled_job_is_rerun_while_another_check_fails_and_the_other_goes_to_the_agent() {
+    let (fx, feed, mut agent, _) = failing_check_node(false);
+    // `terraform` is the real failure; "LV Slow" was cancelled and is not among the failing checks.
+    *feed.infra.lock().unwrap() =
+        Some(tod_store::github::InfraFailure { check: "LV Slow".into(), job_id: 888, kind: "cancelled".into() });
+    *feed.rerun_result.lock().unwrap() = Some(false);
+    run_babysitter(&fx, &mut agent);
+    assert_eq!(*feed.reruns.lock().unwrap(), vec![888], "the cancelled job was rerun once, in the same stay");
+    assert!(agent.turns >= 1, "the real failure still went to the agent");
+    let notes = fx.fleet.read(|conn| Ok(tod_store::node_timeline::TimelineRepo::new(conn).list(fx.node)?)).unwrap();
+    assert!(notes.iter().any(|e| e.title.starts_with("Reran \"LV Slow\"")), "{notes:?}");
+}
+
 /// A rerun GitHub refuses is counted, noted and bounded by `max_infra_reruns`,
 /// and the failure is then the agent's like any other.
 #[test]
