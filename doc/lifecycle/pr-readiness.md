@@ -895,3 +895,48 @@ push whose protocol is `small_review`
 further review. A finding: the commit stays unpushed and its findings stay
 open, and the full review takes it as any unpushed commit of a conversation
 (`pr_pushes::held_for`). In `pr_review` nothing is pushed by the quick fix.
+
+## Who does the work: API, agent, or wait
+
+A node's sandbox is billed while it exists awake, so it is made or woken only
+for established agent work, or work only it can do. Anything tod can do through
+the API runs where the look at GitHub happens, with no sandbox: the
+orchestrator's gate (`github_gate.rs`, for a due wait and for a webhook's wake),
+the app's look for a node whose sandbox is gone (`cloud_sync::lost`), and the
+supervisor when it is awake anyway.
+
+`tod_core::autopilot::api_work::classify` is the one place that sorts an
+`Assessment` into a `Classification`:
+
+| Found | Class | Who acts |
+|---|---|---|
+| a job lost to infrastructure or cancelled (`infra_failures`, `hidden_cancelled_jobs`), reruns left, nothing running | `ApiOnly(RerunInfra)` | tod, API |
+| the branch behind its base, no conflict (when other work, or the housekeeping gap is due in `pr_draft` or once approved) | `ApiOnly(UpdateBranch)` | tod, API (head polled, recorded as a mechanical push) |
+| a review bot that owes its answer and is asked again | `ApiOnly(AskBot)` | tod, API |
+| failing checks that are not infrastructure and not waived as pre-existing, unanswered threads, changes requested, a person's comment, a conflict, a low bot score, tod's own review owed | `AgentWork` | the agent, one wake |
+| checks running, a bot or tod's review being waited for, a rerun settling | `Wait` | nobody: a short poll |
+| the PR is clear (or merged) | `Clear` | the gate advances it |
+
+A cancelled job beside a real failure: the rerun is done now; the agent is
+woken only when nothing is still running, once, with every failure and thread
+together (`Ctx::batch`, set for a look that acts; `Classification::Wait { held }`
+says the agent work is being held). A rerun still settling counts as running.
+GitHub refuses a job rerun while the workflow run goes, so a rerun is never
+tried then.
+
+Two looks read the same PR (`autopilot::Look`): `Observe` (the supervisor's
+babysit loop and Check now) does nothing itself and leaves the API work to the
+supervisor's own steps; `Act` (the gate, the webhook, the app) does it, then
+reads again. The reruns tod made for a head are bounded by `max_infra_reruns` in
+a small ledger beside the node's other state (`<data root>/github-api/<node>.json`,
+`api_work::Ledger`) that every actor reads, so the supervisor and the gate never
+rerun the same job twice; the supervisor's own `rerun_infra_failures` is the same
+code (`api_work::rerun_infra_failures`) and its notes read as before.
+
+A node's pull request whose link never reached the app (a supervisor failed
+before syncing what the agent recorded with `tod-cli pr link`) is found on
+GitHub by the node's repository and branch (`pr_discovery`, one API call at most
+every two minutes, the open one preferred) and linked, with a note on the
+Activity. A clear pull request advances through `lifecycle::check_now` from
+the app when its state has no configured checks (they run in the node's files);
+the orchestrator's gate still pokes for it.

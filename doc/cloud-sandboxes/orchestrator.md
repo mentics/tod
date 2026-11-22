@@ -340,8 +340,19 @@ would reset the sandbox's idle clock, so the workspace's idle prune never takes
 it. The failure is recorded on the node (`look_failed_next_look`: its
 `github:pr:read` wait shows the error, and a failure retrying cannot help, such
 as a 404, puts the node on the user's list as failed) and the wake looks again
-in at most ten minutes, until a look reads GitHub and clears it. Wakes from webhooks,
-answers, and every other wait are not gated. The orchestrator reads GitHub
+in at most ten minutes, until a look reads GitHub and clears it. A GitHub webhook's wake (id `event-<node>`,
+`Wakes::deliver_gated`) passes the same gate, as a wake due now, one per node so a
+burst of events is one look; wakes from answers, Linear and every other wait are
+not gated. The look acts (`Look::Act`): it reruns a job lost to infrastructure
+(a cancelled job included), merges the base into a branch that is behind, asks
+a silent review bot and links a pull request whose link never arrived, all through
+the API with no sandbox; only agent work pokes (failing checks that are not
+infrastructure, threads, a person's comments, a conflict, tod's own review of a
+head), and checks still running are waited for, with the agent woken once with
+everything when they finish (`doc/lifecycle/pr-readiness.md`, "Who does the work").
+A node a run holds is poked as before. A clear pull request is the one case that
+still pokes (the node goes on in its sandbox); a node whose sandbox is gone is
+advanced by the app instead (`cloud_sync::lost`). The orchestrator reads GitHub
 through its own sandbox's proxy, so no token is on its disk or in its
 environment (see GitHub access, below). With `scheduler = "blaxel"` the node's own
 schedule fires on its sandbox and the gate is not in the path.
