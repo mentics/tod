@@ -575,8 +575,17 @@ fn wanted_to_run(fleet: &FleetStore, rows: Vec<CloudNodeRow>, check: Check) -> R
         // and then the node has work. A look at the listing (`Check::Full`) is
         // no stimulus at all.
         let wanted = match (check, state.map(|s| s.phase)) {
-            (Check::Marked, Some(p)) if run_needs_sandbox(p) => true,
-            (Check::Marked, Some(tod_store::run_state::Phase::Waiting)) => github_work_waiting(fleet, row.node_id),
+            (Check::Marked, Some(p)) if run_needs_sandbox(p) => {
+                tracing::info!("cloud: node {} needs a new sandbox: its run is {}", row.node_id, p.as_str());
+                true
+            }
+            (Check::Marked, Some(tod_store::run_state::Phase::Waiting)) => match github_work_waiting(fleet, row.node_id) {
+                Some(why) => {
+                    tracing::info!("cloud: node {} needs a new sandbox: {why}", row.node_id);
+                    true
+                }
+                None => false,
+            },
             // The app's start makes nothing: it cannot tell a node that is
             // still at work from one whose agent finished while it was
             // closed, and a missing sandbox most likely means it finished.
@@ -695,25 +704,25 @@ fn advance_without_a_sandbox(fleet: &FleetStore, node: uuid::Uuid, lifecycle: &s
 /// next state needs no agent ([`advance_without_a_sandbox`]). Only a node in a
 /// state that waits on GitHub is looked at, at most every [`LOOK_EVERY`]. A
 /// look that could not read GitHub is recorded on the node, as the gate does.
-fn github_work_waiting(fleet: &FleetStore, node: uuid::Uuid) -> bool {
+fn github_work_waiting(fleet: &FleetStore, node: uuid::Uuid) -> Option<String> {
     use crate::autopilot::{GithubCheck, GithubLook, check_github_as, look_failed_next_look};
     let lifecycle = match fleet.get_node(&node.to_string()) {
         Ok(Some(n)) => n.lifecycle,
-        Ok(None) => return false,
+        Ok(None) => return None,
         Err(err) => {
             tracing::error!("cloud: reading node {node} to see whether its lost sandbox is wanted: {err:#}");
-            return false;
+            return None;
         }
     };
     let in_review = matches!(lifecycle.as_str(), "pr_draft" | "pr_review");
     if !in_review && !matches!(lifecycle.as_str(), "approved" | "merged") {
-        return false;
+        return None;
     }
     {
         let mut looked = LOOKED.lock().unwrap_or_else(|e| e.into_inner());
         let looked = looked.get_or_insert_with(HashMap::new);
         if looked.get(&node).is_some_and(|at| at.elapsed() < LOOK_EVERY) {
-            return false;
+            return None;
         }
         looked.insert(node, std::time::Instant::now());
     }
@@ -726,14 +735,15 @@ fn github_work_waiting(fleet: &FleetStore, node: uuid::Uuid) -> bool {
                 }
             }
             match wake_for(&found, in_review) {
-                Wake::Make => true,
-                Wake::No => false,
-                Wake::Advance => advance_without_a_sandbox(fleet, node, &lifecycle),
+                Wake::Make => Some(format!("GitHub has agent work for it ({found:?})")),
+                Wake::No => None,
+                Wake::Advance => advance_without_a_sandbox(fleet, node, &lifecycle)
+                    .then(|| "its pull request is clear and the next state needs an agent or checks".to_string()),
             }
         }
         Err(err) => {
             tracing::error!("cloud: looking at GitHub to see whether node {node}'s lost sandbox is wanted: {err:#}");
-            false
+            None
         }
     }
 }
