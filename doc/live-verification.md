@@ -301,3 +301,24 @@ while another check fails, and `pr_pushes` rows exist only with "Include review
 steps" on for `pr_draft`. Both fixes were then confirmed live (build-test, base `lv-base2`: the
 sandbox remade ~12 s after a cancel; the job rerun with and without another failing check;
 `pr_pushes` rows baseline, unreviewed, pushed_by_tod). See the live-verify skill's gotchas.
+
+## Gotchas from the sandbox-free API work pass (2026-11-22)
+
+- Test a base without the self-hosted-runner workflows (the repo's `main` has
+  them and they queue forever, so checks never finish). A base such as
+  `lv-base3` with only hosted `LV CI` (fails while a file `lv-fail` exists) and
+  `LV Slow` (runs about 5 minutes) gives a real failing check beside a running one.
+- A node sandbox is made only for agent work. `tod-sandbox --data-root <root>
+  delete <node sandbox>` simulates a retired one; then watch `tod-sandbox list`
+  stay at zero node sandboxes while tod reruns a cancelled job (`gh run cancel`;
+  the Activity note says `Reran "<job>" ... (cancelled)`; the ledger is
+  `<root>/github-api/<node>.json`).
+- A clear PR in `pr_review` advances to `approved` with no sandbox, so cancel the
+  job before it can; to retest, reset the node's state, but editing the DB with
+  sqlite while the app is down leaves the orchestrator's copy stale (the app
+  can then replace the sandbox from a stale `working` run row). The log line
+  `cloud: node X needs a new sandbox: <why>` in `daemon/agentd.log` names the reason.
+- Launching the app refreshes goldens when its build is newer: that is not a node sandbox.
+- The orchestrator's context-change pokes mark a node whose sandbox is gone as
+  lost; they do not make a sandbox.
+- Orchestrator tests: `Wakes::tick` does not fire due wakes; call `fire_due`.

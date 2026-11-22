@@ -234,3 +234,24 @@ new gotcha to this file and `doc/live-verification.md` and merge them.
   with "fetch first".
 - `pr_pushes` rows written by a supervisor just before its sandbox is retired
   may not be synced; read them after the node has been awake a while.
+
+## Gotchas from the sandbox-free API work pass (2026-11-22)
+
+- Test a base without the self-hosted-runner workflows (the repo's `main` has
+  them and they queue forever, so checks never finish). A base such as
+  `lv-base3` with only hosted `LV CI` (fails while a file `lv-fail` exists) and
+  `LV Slow` (runs about 5 minutes) gives a real failing check beside a running one.
+- A node sandbox is made only for agent work. `tod-sandbox --data-root <root>
+  delete <node sandbox>` simulates a retired one; then watch `tod-sandbox list`
+  stay at zero node sandboxes while tod reruns a cancelled job (`gh run cancel`;
+  the Activity note says `Reran "<job>" ... (cancelled)`; the ledger is
+  `<root>/github-api/<node>.json`).
+- A clear PR in `pr_review` advances to `approved` with no sandbox, so cancel the
+  job before it can; to retest, reset the node's state, but editing the DB with
+  sqlite while the app is down leaves the orchestrator's copy stale (the app
+  can then replace the sandbox from a stale `working` run row). The log line
+  `cloud: node X needs a new sandbox: <why>` in `daemon/agentd.log` names the reason.
+- Launching the app refreshes goldens when its build is newer: that is not a node sandbox.
+- The orchestrator's context-change pokes mark a node whose sandbox is gone as
+  lost; they do not make a sandbox.
+- Orchestrator tests: `Wakes::tick` does not fire due wakes; call `fire_due`.
