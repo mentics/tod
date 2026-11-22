@@ -307,6 +307,20 @@ impl Wakes {
         }
     }
 
+    /// Delivers a wake a webhook made: through the gate when there is one
+    /// (recorded as due now, so the timer's pass looks at GitHub and pokes only
+    /// for agent work; one wake per id, so a burst of events is one look),
+    /// else poked at once. A failure to record it pokes at once.
+    pub fn deliver_gated(&self, wake: Wake) {
+        if self.gate.get().is_none() {
+            return self.poke_now(wake);
+        }
+        if let Err(err) = self.put(Wake { at: now_ms(), ..wake.clone() }) {
+            eprintln!("tod-orchestrator: wakes: record {}: {err:#}", wake.id);
+            self.poke_now(wake);
+        }
+    }
+
     /// Runs the timer forever: fires due wakes, ticks `awake`, and sleeps
     /// until the next wake, a change, or [`MAX_SLEEP`].
     pub fn run_timer(self: &Arc<Self>, clock: &dyn Fn() -> i64, awake: &dyn KeepAwake) {

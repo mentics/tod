@@ -10,6 +10,19 @@
 //! (`tod_core::autopilot::check_github`) against the user's copy of the
 //! database, with the orchestrator's GitHub access (a proxy rule, `TOD_GITHUB_AUTH=proxy`).
 //!
+//! The look is `tod_core::autopilot::check_github_as` with `Look::Act`: it does
+//! what tod can do through the API itself, with no sandbox: rerun a job lost
+//! to infrastructure (a cancelled job, a lost runner), merge the base into a
+//! branch that is behind, ask a silent review bot, link a pull request whose
+//! link never arrived. Only **agent work** pokes ([`GithubCheck::Feedback`]: a
+//! failing check that is not infrastructure, an unanswered thread or a person's
+//! comment, a conflict, tod's own review of a head); checks still running are
+//! waited for (a short poll), and the agent is woken once with everything
+//! when they finish. A wake a webhook made (id `event-<node>`, see
+//! `crate::webhooks`) passes the same gate, so a webhook for a cancelled job
+//! or a branch update does not poke a sleeping sandbox either. A node a run
+//! holds is poked as before (it is awake anyway).
+//!
 //! - Still waiting: the check has recorded the next look; the wake moves to
 //!   it and the sandbox stays asleep, or does not exist. This includes a
 //!   `pr_review` node whose pull request waits only for a person's review:
@@ -31,9 +44,14 @@ use crate::users::Users;
 use crate::wakes::{Verdict, Wake, WakeGate, now_ms};
 use anyhow::{Context, Result};
 use std::sync::Arc;
-use tod_core::autopilot::{GithubCheck, check_github, look_failed_next_look};
+use tod_core::autopilot::{GithubCheck, GithubLook, check_github_as, look_failed_next_look};
 use tod_store::waits::WaitRepo;
 use uuid::Uuid;
+
+/// The id of the wake a GitHub webhook leaves for a node (`event-<node>`).
+pub fn webhook_wake_id(node: &str) -> String {
+    format!("event-{node}")
+}
 
 pub struct GithubGate {
     users: Arc<Users>,
@@ -45,16 +63,25 @@ impl GithubGate {
     }
 
     fn look(&self, wake: &Wake) -> Result<Verdict> {
-        let (Ok(wait_id), Ok(node)) = (Uuid::parse_str(&wake.id), Uuid::parse_str(&wake.node)) else {
+        let Ok(node) = Uuid::parse_str(&wake.node) else {
             return Ok(Verdict::Poke);
         };
+        let from_webhook = wake.id == webhook_wake_id(&wake.node);
         let data = self.users.get(&wake.user)?;
-        let Some(wait) = data.store.read(|conn| WaitRepo::new(conn).get(wait_id))? else {
-            return Ok(Verdict::Poke);
+        let wait = if from_webhook {
+            None
+        } else {
+            let Ok(wait_id) = Uuid::parse_str(&wake.id) else {
+                return Ok(Verdict::Poke);
+            };
+            let Some(wait) = data.store.read(|conn| WaitRepo::new(conn).get(wait_id))? else {
+                return Ok(Verdict::Poke);
+            };
+            if wait.kind != "event" || wait.state != tod_store::waits::WAIT_PENDING || !wait.match_spec.starts_with("github:") {
+                return Ok(Verdict::Poke);
+            }
+            Some(wait)
         };
-        if wait.kind != "event" || wait.state != tod_store::waits::WAIT_PENDING || !wait.match_spec.starts_with("github:") {
-            return Ok(Verdict::Poke);
-        }
         let lifecycle = data
             .store
             .get_node(&node.to_string())?
@@ -64,13 +91,27 @@ impl GithubGate {
         // state that recorded it) is ended here, not poked a sandbox for.
         // The same for a wait recorded in a stay the node has left, even in
         // a state that takes its spec family (the node went back and forward).
-        let stay_ended = match (wait.stay, data.store.read(|conn| tod_store::waits::current_stay(conn, node))?) {
+        // A webhook's wake is for a node in a state that waits on GitHub only.
+        if from_webhook && !matches!(lifecycle.as_str(), "pr_draft" | "pr_review" | "approved" | "merged") {
+            return Ok(Verdict::Poke);
+        }
+        // A node a run holds is awake: the supervisor does its own acting.
+        let now = now_ms();
+        let held = data
+            .store
+            .read(|conn| tod_store::activity::ActivityRepo::new(conn).list_for_nodes(&[node]))?
+            .into_iter()
+            .any(|lease| lease.kind == tod_store::activity::KIND_RUN && lease.is_live(now));
+        if held {
+            return Ok(Verdict::Poke);
+        }
+        let stay_ended = match (wait.as_ref().and_then(|w| w.stay), data.store.read(|conn| tod_store::waits::current_stay(conn, node))?) {
             (Some(recorded), Some(current)) => recorded != current,
             _ => false,
         };
-        if stay_ended
-            || tod_store::waits::spec_states(&wait.match_spec).is_some_and(|allowed| !allowed.contains(&lifecycle.as_str()))
-        {
+        if let Some(wait) = wait.as_ref().filter(|w| {
+            stay_ended || tod_store::waits::spec_states(&w.match_spec).is_some_and(|allowed| !allowed.contains(&lifecycle.as_str()))
+        }) {
             data.store
                 .interview(
                     tod_store::waits::LIFECYCLE_ACTOR,
@@ -83,14 +124,17 @@ impl GithubGate {
             );
             return Ok(Verdict::Drop);
         }
-        match check_github(&data.store, node, &data.root, &lifecycle)? {
+        match check_github_as(&data.store, node, &data.root, &lifecycle, GithubLook::Act)? {
             GithubCheck::Waiting { due_at_ms, what } => {
-                let next = data
+                let next: Option<tod_store::waits::Wait> = data
                     .store
                     .read(|conn| WaitRepo::new(conn).list_pending_for_node(node))?
                     .into_iter()
                     .find(|w| w.kind == "event" && w.match_spec.starts_with("github:"))
-                    .context("the check recorded no wait")?;
+                    .map(Some)
+                    .unwrap_or(None);
+                // A webhook's wake with nothing recorded to look at later is done.
+                let Some(next) = next else { return Ok(Verdict::Drop) };
                 eprintln!("tod-orchestrator: {}'s node {node} still waits on GitHub ({what}); next look {due_at_ms}", wake.user);
                 Ok(Verdict::Later { id: next.id.to_string(), at: due_at_ms })
             }

@@ -258,3 +258,80 @@ fn a_wait_from_a_stay_the_node_has_left_is_ended_not_poked() {
     drop(fleet);
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// A pull request as a webhook finds it: the snapshot and the jobs rerun.
+struct Hook(Mutex<PrSnapshot>, Mutex<Vec<i64>>);
+
+impl PrFeed for Hook {
+    fn viewer_login(&self) -> Result<String, String> {
+        Ok("tod-test-user".to_string())
+    }
+    fn snapshot(&self, _: &NodePr) -> Result<PrSnapshot, String> {
+        Ok(self.0.lock().unwrap().clone())
+    }
+    fn merge(&self, _: &NodePr) -> Result<PrMerge, String> {
+        Err("not read here".into())
+    }
+    fn releases(&self, _: &NodePr, _merge: &PrMerge) -> Result<Vec<Release>, String> {
+        Ok(Vec::new())
+    }
+    fn rerun_job(&self, _: &NodePr, job_id: i64) -> Result<(), String> {
+        self.1.lock().unwrap().push(job_id);
+        Ok(())
+    }
+}
+
+fn hook_snapshot(checks: &str, failing: &[&str], infra: Vec<tod_store::github::InfraFailure>, running: bool) -> PrSnapshot {
+    PrSnapshot {
+        status: tod_store::github::PrStatus {
+            mergeable: Some(true),
+            mergeable_state: Some("blocked".into()),
+            behind_by: Some(0),
+            checks: Some(checks.into()),
+            failing_checks: failing.iter().map(|c| c.to_string()).collect(),
+            infra_failures: infra,
+            checks_running: running,
+            head_sha: Some("abc".into()),
+            open: true,
+            ..Default::default()
+        },
+        threads: Vec::new(),
+        comments: Vec::new(),
+        reviews: Vec::new(),
+    }
+}
+
+/// The webhook's wake (`event-<node>`) goes through the same gate as a due
+/// wait: a cancelled job is rerun by the orchestrator and the sandbox sleeps;
+/// checks still running wait; the agent is woken once, for real work.
+#[test]
+fn a_webhook_for_a_cancelled_job_or_running_checks_wakes_no_sandbox_but_real_work_does() {
+    let Rig { base, fleet, node, wait: _, poked, server, remote: _ } = rig("pr_review", "github:pr:1:review");
+    let cancelled = tod_store::github::InfraFailure { check: "slow".into(), job_id: 7, kind: "cancelled".into() };
+    let feed = Arc::new(Hook(Mutex::new(hook_snapshot("failure", &["slow"], vec![cancelled], false)), Mutex::new(Vec::new())));
+    set_feed_override(Some(feed.clone()));
+    let wake = || Wake { id: format!("event-{node}"), user: "alice".into(), node: node.to_string(), sandbox: "node-x".into(), at: 0 };
+
+    // Cancelled only: rerun through the API, no poke.
+    server.wakes().deliver_gated(wake());
+    server.wakes().fire_due(now_ms() + 1000);
+    assert!(poked.lock().unwrap().is_empty(), "a cancelled job wakes no sandbox");
+    assert_eq!(*feed.1.lock().unwrap(), vec![7], "tod reran it itself");
+
+    // A real failure while another check runs: waits, no poke.
+    *feed.0.lock().unwrap() = hook_snapshot("failure", &["lint"], Vec::new(), true);
+    server.wakes().deliver_gated(wake());
+    server.wakes().fire_due(now_ms() + 1000);
+    assert!(poked.lock().unwrap().is_empty(), "running checks are waited for");
+
+    // The run ended: one poke, for the failure.
+    *feed.0.lock().unwrap() = hook_snapshot("failure", &["lint"], Vec::new(), false);
+    server.wakes().deliver_gated(wake());
+    server.wakes().fire_due(now_ms() + 1000);
+    assert_eq!(*poked.lock().unwrap(), ["node-x"]);
+    assert_eq!(*feed.1.lock().unwrap(), vec![7], "nothing more was rerun");
+
+    set_feed_override(None);
+    drop(fleet);
+    let _ = std::fs::remove_dir_all(&base);
+}

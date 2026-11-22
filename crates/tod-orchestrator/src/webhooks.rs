@@ -528,13 +528,22 @@ fn route_user(users: &Users, wakes: &Wakes, user: &str, event: &Event, payload: 
             }
         }
         if let Some(sandbox) = &t.sandbox {
-            wakes.poke_now(Wake {
-                id: format!("event-{}", t.node),
+            let wake = Wake {
+                id: crate::github_gate::webhook_wake_id(&t.node.to_string()),
                 user: user.to_string(),
                 node: t.node.to_string(),
                 sandbox: sandbox.clone(),
                 at: 0,
-            });
+            };
+            if event.source == "github" {
+                // Through the gate, as a due wake: tod acts through the API
+                // for what it can (a cancelled job, a branch behind) and wakes
+                // the sandbox only for agent work. One wake per node, so a
+                // burst of events is one look.
+                wakes.deliver_gated(wake);
+            } else {
+                wakes.poke_now(wake);
+            }
         }
         eprintln!("tod-orchestrator: webhook {} for {user}'s node {}", event.summary, t.node);
         out.push(Routed { user: user.to_string(), node: t.node.to_string(), satisfied, poked: t.sandbox.is_some() });

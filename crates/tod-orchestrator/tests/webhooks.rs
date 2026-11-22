@@ -121,6 +121,7 @@ fn deliveries_are_verified_then_routed_by_branch_and_by_wait() {
 
     // By branch: A's check suite.
     let resp = server.handle(&delivery(Some(&secret), "check_suite", &checks));
+    server.wakes().fire_due(tod_orchestrator::wakes::now_ms() + 1000); // the timer's pass: the gate, then the poke
     assert_eq!(resp.status, 200, "{}", String::from_utf8_lossy(&resp.body));
     assert_eq!(*poked.lock().unwrap(), ["node-a"]);
     assert_eq!(events(&remote, a), ["github:branch:feat/a:checks:success"]);
@@ -132,6 +133,7 @@ fn deliveries_are_verified_then_routed_by_branch_and_by_wait() {
     let review = serde_json::json!({"action":"submitted","review":{"state":"approved"},
         "pull_request":{"number":42,"head":{"ref":"someone-elses"}}});
     let resp = server.handle(&delivery(Some(&secret), "pull_request_review", &review));
+    server.wakes().fire_due(tod_orchestrator::wakes::now_ms() + 1000); // the timer's pass: the gate, then the poke
     assert_eq!(resp.status, 200, "{}", String::from_utf8_lossy(&resp.body));
     assert_eq!(*poked.lock().unwrap(), ["node-b"]);
     assert_eq!(wait_state(&remote, wait_b), "satisfied");
@@ -199,12 +201,14 @@ fn a_node_with_linked_pull_requests_hears_only_its_own_repository_and_releases()
     };
     // A release of acme/app whose notes do not name PR 12: nobody hears it.
     let resp = server.handle(&delivery(Some(&secret), "release", &release("acme/app", "Other things (#99)")));
+    server.wakes().fire_due(tod_orchestrator::wakes::now_ms() + 1000); // the timer's pass: the gate, then the poke
     assert_eq!(resp.status, 200, "{}", String::from_utf8_lossy(&resp.body));
     assert!(poked.lock().unwrap().is_empty());
     assert_eq!(wait_state(&remote, wait_a), "pending");
 
     // One that does name it: only the node whose PR 12 is in acme/app.
     let resp = server.handle(&delivery(Some(&secret), "release", &release("acme/app", "Fix it (#12)")));
+    server.wakes().fire_due(tod_orchestrator::wakes::now_ms() + 1000); // the timer's pass: the gate, then the poke
     assert_eq!(resp.status, 200, "{}", String::from_utf8_lossy(&resp.body));
     assert_eq!(*poked.lock().unwrap(), ["node-a"]);
     assert_eq!(wait_state(&remote, wait_a), "satisfied");
@@ -215,6 +219,7 @@ fn a_node_with_linked_pull_requests_hears_only_its_own_repository_and_releases()
     let review = serde_json::json!({"action":"submitted","repository":{"full_name":"acme/elsewhere"},
         "review":{"state":"approved"},"pull_request":{"number":12,"head":{"ref":"x"}}});
     assert_eq!(server.handle(&delivery(Some(&secret), "pull_request_review", &review)).status, 200);
+    server.wakes().fire_due(tod_orchestrator::wakes::now_ms() + 1000); // the timer's pass: the gate, then the poke
     assert!(poked.lock().unwrap().is_empty());
 
     // By branch: a push to `task/same` in acme/other reaches only B.
@@ -222,11 +227,13 @@ fn a_node_with_linked_pull_requests_hears_only_its_own_repository_and_releases()
         serde_json::json!({"ref":"refs/heads/task/same","repository":{"full_name":repo}})
     };
     assert_eq!(server.handle(&delivery(Some(&secret), "push", &push("Acme/Other"))).status, 200);
+    server.wakes().fire_due(tod_orchestrator::wakes::now_ms() + 1000); // the timer's pass: the gate, then the poke
     assert_eq!(*poked.lock().unwrap(), ["node-b"]);
     assert!(events(&remote, a).iter().all(|k| !k.contains("push")));
     // And one in a repository neither node has linked reaches nobody.
     poked.lock().unwrap().clear();
     assert_eq!(server.handle(&delivery(Some(&secret), "push", &push("acme/elsewhere"))).status, 200);
+    server.wakes().fire_due(tod_orchestrator::wakes::now_ms() + 1000); // the timer's pass: the gate, then the poke
     assert!(poked.lock().unwrap().is_empty());
 
     drop(fleet);
@@ -302,6 +309,7 @@ fn a_branch_name_in_another_repository_is_ignored() {
     // acme/a's event reaches its node, and the unknown one (nothing wider than
     // before for it), never acme/b's.
     let resp = server.handle(&delivery(Some(&secret), "check_suite", &checks("Acme/A")));
+    server.wakes().fire_due(tod_orchestrator::wakes::now_ms() + 1000); // the timer's pass: the gate, then the poke
     assert_eq!(resp.status, 200, "{}", String::from_utf8_lossy(&resp.body));
     let mut got = poked.lock().unwrap().clone();
     got.sort();
@@ -310,6 +318,7 @@ fn a_branch_name_in_another_repository_is_ignored() {
     // A repository no node records reaches only the unknown one.
     poked.lock().unwrap().clear();
     server.handle(&delivery(Some(&secret), "check_suite", &checks("other/repo")));
+    server.wakes().fire_due(tod_orchestrator::wakes::now_ms() + 1000); // the timer's pass: the gate, then the poke
     assert_eq!(*poked.lock().unwrap(), ["node-old"]);
 
     let remote = orch.join("users").join("alice").join("tod.db");
@@ -367,9 +376,11 @@ fn a_node_hears_the_repository_of_its_pull_request_not_only_its_checkouts() {
             "check_suite":{"head_branch":"task/fix","conclusion":"success","pull_requests":[]}})
     };
     server.handle(&delivery(Some(&secret), "check_suite", &checks("acme/kb")));
+    server.wakes().fire_due(tod_orchestrator::wakes::now_ms() + 1000); // the timer's pass: the gate, then the poke
     assert_eq!(*poked.lock().unwrap(), ["node-sub"], "the pull request's repository reaches the node");
     poked.lock().unwrap().clear();
     server.handle(&delivery(Some(&secret), "check_suite", &checks("acme/flagship")));
+    server.wakes().fire_due(tod_orchestrator::wakes::now_ms() + 1000); // the timer's pass: the gate, then the poke
     assert!(poked.lock().unwrap().is_empty(), "its checkout's repository is not one it has a pull request in");
     drop(fleet);
     let _ = std::fs::remove_dir_all(&base);
