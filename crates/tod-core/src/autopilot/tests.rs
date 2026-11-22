@@ -6382,3 +6382,89 @@ fn pr_review_feedback_is_reviewed_before_it_is_pushed_and_not_flagged() {
     assert!(pushes.iter().all(|(verdict, _)| verdict != "unreviewed"), "{pushes:?}");
     assert!(failed_notes(&fx).is_empty(), "{:?}", failed_notes(&fx));
 }
+
+/// Seen live (2026-11-21): a supervisor failed before syncing, so the pull
+/// request the agent had opened (`tod-cli pr link`) never reached the app and
+/// nothing looked at it. A look that acts finds the node's pull request on
+/// GitHub from its repository and branch, with no sandbox, and links it; the
+/// supervisor's own look (observing) does not.
+#[test]
+fn a_pull_request_whose_link_never_arrived_is_found_on_github_by_the_nodes_branch() {
+    use tod_store::github::{PrSnapshot, PrStatus, PullState, PullSummary};
+    struct Feed;
+    impl crate::pr_readiness::PrFeed for Feed {
+        fn viewer_login(&self) -> Result<String, String> {
+            Ok("tod-test-user".to_string())
+        }
+        fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<PrSnapshot, String> {
+            Ok(PrSnapshot {
+                status: PrStatus {
+                    mergeable: Some(true),
+                    mergeable_state: Some("draft".into()),
+                    behind_by: Some(0),
+                    draft: true,
+                    open: true,
+                    ..Default::default()
+                },
+                threads: vec![],
+                comments: vec![],
+                reviews: vec![],
+            })
+        }
+        fn branch_prs(&self, owner: &str, repo: &str, branch: &str) -> Result<Vec<PullSummary>, String> {
+            assert_eq!((owner, repo, branch), ("acme", "app", "task/x"));
+            let pull = |number: i64, state| PullSummary {
+                number,
+                title: "t".into(),
+                url: format!("https://github.com/acme/app/pull/{number}"),
+                state,
+                author: None,
+                head: branch.into(),
+                base: "main".into(),
+                updated_at: "2026-11-21T10:00:00Z".into(),
+            };
+            Ok(vec![pull(3, PullState::Closed), pull(9, PullState::Open)])
+        }
+    }
+    let fx = bare();
+    retire_outside_criteria(&fx);
+    crate::pr_readiness::set_feed_override(Some(Arc::new(Feed)));
+    fx.fleet
+        .enqueue_outline(OutlineMutation::EnableCapabilities { node_id: fx.node, capabilities: vec![Capability::Ticket] })
+        .unwrap();
+    fx.fleet.writer().flush().unwrap();
+    fx.fleet
+        .enqueue(tod_store::fleet::FleetMutation::UpdateTaskBranch { id: fx.node.to_string(), branch: Some("task/x".into()) })
+        .unwrap();
+    fx.fleet.writer().flush().unwrap();
+    fx.fleet.reload_if_stale().ok();
+    lifecycle::set_lifecycle(&fx.fleet, fx.node, "pr_draft").unwrap();
+    {
+        let conn = rusqlite::Connection::open(fx.fleet.paths().db()).unwrap();
+        tod_store::cloud_nodes::upsert(&conn, fx.node, "tod-x-abc123", "alice", 1).unwrap();
+        tod_store::cloud_nodes::set_ownership(
+            &conn,
+            fx.node,
+            &tod_store::cloud_nodes::Ownership { workspace: None, owner_client: None, repo: Some("acme/app".into()) },
+        )
+        .unwrap();
+    }
+    fx.fleet.reload_if_stale().ok();
+    let linked = |fx: &Fixture| {
+        fx.fleet.read(|conn| tod_store::github::NodePrRepo::new(conn).read(fx.node)).unwrap().prs.len()
+    };
+
+    // The supervisor's own look never links.
+    let found = super::check_github_as(&fx.fleet, fx.node, &fx.root, "pr_draft", super::GithubLook::Observe).unwrap();
+    assert!(matches!(found, super::GithubCheck::NothingToWaitOn), "{found:?}");
+    assert_eq!(linked(&fx), 0);
+
+    // The look that acts links the open one (not the closed one), and goes on.
+    let found = super::check_github_as(&fx.fleet, fx.node, &fx.root, "pr_draft", super::GithubLook::Act).unwrap();
+    assert!(matches!(found, super::GithubCheck::Waiting { .. }), "{found:?}");
+    let links = fx.fleet.read(|conn| tod_store::github::NodePrRepo::new(conn).read(fx.node)).unwrap();
+    assert_eq!(links.prs.iter().map(|p| p.pr_number).collect::<Vec<_>>(), vec![9]);
+    let notes = fx.fleet.read(|conn| Ok(tod_store::node_timeline::TimelineRepo::new(conn).list(fx.node)?)).unwrap();
+    assert!(notes.iter().any(|e| e.title.starts_with("Linked https://github.com/acme/app/pull/9")), "{notes:?}");
+    crate::pr_readiness::set_feed_override(None);
+}

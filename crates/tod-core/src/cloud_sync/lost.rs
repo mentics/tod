@@ -563,6 +563,7 @@ fn wanted_to_run(fleet: &FleetStore, rows: Vec<CloudNodeRow>, check: Check) -> R
         if left_the_cloud(fleet, row.node_id)? {
             continue;
         }
+        discover_pull_request(fleet, row.node_id);
         // A mark the orchestrator brought (`Check::Marked`) means a wake or a
         // webhook found the sandbox gone. That is not work in itself: a
         // waiting node (CI, a bot, a timer, the user) stays without a sandbox
@@ -590,6 +591,25 @@ fn wanted_to_run(fleet: &FleetStore, rows: Vec<CloudNodeRow>, check: Check) -> R
         kept.push(row);
     }
     Ok(kept)
+}
+
+/// A node whose sandbox is gone may have opened its pull request there and
+/// failed before its link was synced (seen live, 2026-11-21): GitHub is asked
+/// for the pull request on the node's branch ([`crate::pr_discovery`], one API
+/// call at most every two minutes, no sandbox) and it is linked. Only for a
+/// node in a state that has one. A failed look is logged and tried again.
+fn discover_pull_request(fleet: &FleetStore, node: uuid::Uuid) {
+    let in_pr_states = fleet
+        .get_node(&node.to_string())
+        .ok()
+        .flatten()
+        .is_some_and(|n| matches!(n.lifecycle.as_str(), "pr" | "pr_draft" | "pr_review" | "approved"));
+    if !in_pr_states {
+        return;
+    }
+    if let Err(err) = crate::pr_discovery::discover_if_unlinked(fleet, node, fleet.paths().root()) {
+        tracing::error!("cloud: looking for node {node}'s pull request on GitHub: {err:#}");
+    }
 }
 
 /// Whether a run in `phase` is at work, so a check after a sync replaces its

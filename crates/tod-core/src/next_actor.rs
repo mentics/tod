@@ -667,6 +667,22 @@ fn run_end(facts: &Facts<'_>) -> Option<(YouReason, i64)> {
         } else {
             "its sandbox is gone; a new one is made when the node next has work, or Start makes one now".to_string()
         };
+        // The run's own stop says why it ended, and that is what the user
+        // needs; the sandbox's state is beside it, never over it (seen live:
+        // a failed supervisor's reason hidden behind "sandbox is gone").
+        if let Some(row) = run_state
+            && let Some(why) = crate::run_state::you_reason(row)
+        {
+            let beside = if lost.deleted_by_user { "its sandbox was deleted" } else { "its sandbox is gone" };
+            return Some((
+                match why {
+                    YouReason::Failed { error } => YouReason::Failed { error: format!("{error} ({beside})") },
+                    YouReason::Stopped { reason } => YouReason::Stopped { reason: format!("{reason} ({beside})") },
+                    other => other,
+                },
+                row.since,
+            ));
+        }
         return Some((YouReason::Stopped { reason }, lost.since));
     }
     if let Some(answer) = facts.stop_answer {
@@ -2308,8 +2324,15 @@ mod tests {
         c.run_state = Some(row(Phase::Stopped, crate::run_state::kind::FAILED, "could not make a new one: quota", 900, 950));
         let NextActor::You { why: YouReason::Failed { error }, .. } = standing(&c).actor else { panic!("{:?}", standing(&c).actor) };
         assert!(error.contains("quota"), "{error}");
-        c.run_state = Some(row(Phase::Stopped, crate::run_state::kind::FAILED, "old failure", 100, 200));
-        assert!(matches!(standing(&c).actor, NextActor::You { why: YouReason::Stopped { .. }, .. }), "an older failure does not hide the loss");
+        // A failure from before the loss is still the real reason: it is shown,
+        // with the sandbox's state beside it (seen live, 2026-11-21: "sandbox
+        // is gone" stood over the supervisor's own failure).
+        c.run_state = Some(row(Phase::Stopped, crate::run_state::kind::FAILED, "push failed: fetch first", 100, 200));
+        let NextActor::You { why: YouReason::Failed { error }, .. } = standing(&c).actor else { panic!("{:?}", standing(&c).actor) };
+        assert!(error.contains("push failed: fetch first") && error.contains("sandbox is gone"), "{error}");
+        // No stop recorded: the sandbox's state alone.
+        c.run_state = Some(row(Phase::Working, crate::run_state::kind::WORKING, "x", 100, 200));
+        assert!(matches!(standing(&c).actor, NextActor::You { why: YouReason::Stopped { .. }, .. }));
     }
 
     /// The app's `starting` row, then a runner's stop, each written the way

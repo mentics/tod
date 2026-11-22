@@ -527,6 +527,28 @@ fn a_replaced_sandbox_records_what_its_checkout_holds_of_the_nodes_work() {
     assert!(!note.failed);
 }
 
+/// Seen live (2026-11-21): the Activity showed "Sandbox replaced: work check"
+/// three times in a row. The same finding straight after itself is noted once;
+/// a different one (or one after another event) is noted again.
+#[test]
+fn an_identical_replacement_note_is_not_repeated_straight_after_itself() {
+    let fx = setup();
+    workspace_is_a_clone(&fx);
+    in_review_with_done_steps(&fx);
+    let notes = |fx: &Fixture| {
+        fx.fleet
+            .read(|c| tod_store::node_timeline::TimelineRepo::new(c).list(fx.node))
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.title == crate::lost_work::REPLACED_TITLE)
+            .count()
+    };
+    crate::lost_work::record_replacement(&fx.fleet, fx.node, "box-1", "box-2").unwrap();
+    crate::lost_work::record_replacement(&fx.fleet, fx.node, "box-2", "box-3").unwrap();
+    crate::lost_work::record_replacement(&fx.fleet, fx.node, "box-3", "box-4").unwrap();
+    assert_eq!(notes(&fx), 1);
+}
+
 /// Shepherd gap 63: every repository "Unknown" must not read "No submodule
 /// commits were lost" (ENG-3311's five notes said both).
 #[test]

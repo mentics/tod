@@ -730,10 +730,24 @@ pub fn record_replacement(fleet: &FleetStore, node: Uuid, old: &str, new: &str) 
         }
     };
     tracing::info!("cloud: node {node}: {detail}");
+    // The same finding again straight after itself (a sandbox replaced three
+    // times in a row, seen live) adds nothing: the Activity says it once.
+    let latest = fleet.read(|conn| Ok(tod_store::node_timeline::TimelineRepo::new(conn).list(node)?.pop()))?;
+    if latest.is_some_and(|e| e.title == REPLACED_TITLE && e.failed == failed && without_names(&e.detail) == without_names(&detail)) {
+        tracing::info!("cloud: node {node}: the replacement note would repeat the last one; not recorded again");
+        return Ok(lost);
+    }
     let entry = TimelineEntry::new(node, KIND_NOTE, &state, REPLACED_TITLE, failed, detail);
     fleet.enqueue(FleetMutation::RecordTimeline(Box::new(entry)))?;
     fleet.writer().flush()?;
     Ok(lost)
+}
+
+/// A replacement note's detail without the two sandbox names, which differ
+/// each time, so two notes that say the same thing compare equal.
+fn without_names(detail: &str) -> String {
+    let Some((_, rest)) = detail.split_once(" was replaced by ") else { return detail.to_string() };
+    rest.split_once(char::is_whitespace).map_or(String::new(), |(_, after)| after.to_string())
 }
 
 /// Reopen the implementation of a node [`check`] found lost: back to `active`
