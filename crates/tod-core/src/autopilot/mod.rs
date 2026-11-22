@@ -24,9 +24,11 @@
 //! conversation that was in progress instead of starting another.
 
 pub(crate) mod github_wait;
+pub mod api_work;
 mod process_review;
 mod quick_fix;
 mod triage;
+pub use api_work::{ApiAction, Classification, classify};
 pub use github_wait::{
     GithubCheck, PUSH_WAIT_SPEC, PushRetrier, branch_push_failed, push_retry_delay_ms, branch_push_ok, check_github, check_now, github_look_failed, look_failed_next_look, read_wait_spec,
     retry_delay_ms,
@@ -45,6 +47,7 @@ use crate::conversation::driver::{
 use crate::conversation::protocol::protocol_for;
 use crate::lifecycle;
 use state::{PendingGroups, PrChange};
+use api_work::BotStep;
 use crate::lifecycle_next::{NextStep, Standing, next_step};
 use crate::phase::PhaseStanding;
 use tod_store::phase::PhaseRepo;
@@ -484,10 +487,6 @@ pub const PR_HOUSEKEEPING_GAP: Duration = Duration::from_secs(30 * 60);
 /// live: two or three agent sessions per merge, all night.
 const PR_HOUSEKEEPING_LIMIT: u32 = 8;
 
-/// How long after asking GitHub to rerun a CI job the failure it still shows is
-/// taken to be the old one (`Autopilot::rerun_infra_failures`).
-const INFRA_RERUN_SETTLE_MS: i64 = 120_000;
-
 /// How often tod's configured fixer runs for one failing CI check of a pull
 /// request (`Autopilot::run_ci_fixers`).
 const CI_FIX_ATTEMPTS: u32 = 2;
@@ -509,17 +508,6 @@ enum BranchUpdate {
     /// A branch was updated on GitHub: look at the pull requests again.
     Updated,
     /// The run stops (GitHub failed, or the user stopped it).
-    Stop(Outcome),
-}
-
-/// What `Autopilot::bot_waiting` did.
-enum BotStep {
-    /// Nothing more: park, or poll.
-    Go,
-    /// tod went on without a silent bot by itself (decided by tod): read the
-    /// pull request again with the bot out of the settings.
-    Reread,
-    /// The run stops (GitHub failed).
     Stop(Outcome),
 }
 
@@ -2110,20 +2098,9 @@ impl Autopilot {
         }
     }
 
-    /// What waiting for a review bot owes (`doc/lifecycle/pr-readiness.md`,
-    /// "A bot that stays silent"), once nothing else is outstanding:
-    ///
-    /// - a bot asked as often as allowed that still has not reviewed the head
-    ///   raises the node's one request ([`crate::bot_silence`]); the run goes
-    ///   on (and parks while it is pending). A bot whose request is pending,
-    ///   answered, or held back by "Keep waiting" raises nothing;
-    /// - each review that is due is asked for, by posting the
-    ///   settings' `ask` comment (retried by the client when GitHub hiccups).
-    ///   A failure to post is a failed look at GitHub, handled where those are
-    ///   ([`github_wait::github_look_failed`]), never dropped.
-    ///
-    /// `asked` keeps what this run posted, so one head is asked at most once
-    /// per count whatever the next read shows.
+    /// What waiting for a review bot owes: see [`api_work::bot_waiting`], which
+    /// the orchestrator's and the app's look at GitHub run too, with no
+    /// sandbox.
     fn bot_waiting(
         &mut self,
         fleet: &FleetStore,
@@ -2131,108 +2108,7 @@ impl Autopilot {
         live: &[crate::pr_readiness::LivePr],
         asked: &mut std::collections::HashSet<String>,
     ) -> Result<BotStep> {
-        use crate::bot_silence::{self, Tried};
-        // A silent bot tod went on without by itself this look: the pull
-        // request is read again with it out of the settings.
-        let mut settled = false;
-        let node = self.node;
-        let now = chrono::Utc::now();
-        let mut silent: Vec<Tried> = Vec::new();
-        for p in live {
-            for report in p.assessment.silent_bots() {
-                let name = &report.settings.name;
-                let at = match silent.iter().position(|t| t.bot.eq_ignore_ascii_case(name)) {
-                    Some(at) => at,
-                    None => {
-                        silent.push(Tried {
-                            bot: name.clone(),
-                            prs: Vec::new(),
-                            asks: 0,
-                            last_ask_at: None,
-                            last_activity_at: None,
-                            exhausted: false,
-                            auto_proceed: true,
-                        });
-                        silent.len() - 1
-                    }
-                };
-                let tried = &mut silent[at];
-                tried.prs.push(crate::pr_readiness::pr_label(&p.pr));
-                tried.asks = tried.asks.max(report.asks);
-                tried.last_ask_at = tried.last_ask_at.max(report.last_ask_at);
-                tried.last_activity_at = tried.last_activity_at.max(report.reviewed_at);
-                tried.exhausted |= report.exhausted;
-                // One bot that asks the user keeps the request for the bot.
-                tried.auto_proceed &= report.settings.on_silence == tod_store::OnSilence::Proceed;
-            }
-        }
-        for tried in silent {
-            let standing = fleet.read(|conn| bot_silence::standing(conn, node, &tried.bot))?;
-            if !bot_silence::should_ask(standing, now) {
-                continue;
-            }
-            if tried.auto_proceed {
-                tracing::info!(%node, bot = %tried.bot, asks = tried.asks, "a review bot stayed silent: going on without it (decided by tod)");
-                bot_silence::settle_without(fleet, node, &tried)?;
-                crate::incident::notice(
-                    fleet,
-                    node,
-                    &format!("bot_silent:{}", tried.bot),
-                    &format!("{} is not reviewing", tried.bot),
-                    &format!("silent on {}", tried.prs.join(", ")),
-                )?;
-                settled = true;
-                continue;
-            }
-            // The same bot silent on several nodes' pull requests is one
-            // notice in the status bar (`crate::incident`), not a fleet's worth.
-            crate::incident::notice(
-                fleet,
-                node,
-                &format!("bot_silent:{}", tried.bot),
-                &format!("{} is not reviewing", tried.bot),
-                &format!("silent on {}", tried.prs.join(", ")),
-            )?;
-            tracing::info!(%node, bot = %tried.bot, asks = tried.asks, "a review bot stayed silent: asking the user");
-            fleet
-                .interview(
-                    "autopilot",
-                    InterviewCommand::AskDecision {
-                        node_id: node,
-                        conversation_id: None,
-                        protocol: Some(bot_silence::PROTOCOL.to_string()),
-                        decision: bot_silence::new_decision(&tried),
-                    },
-                )
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            // The run does not stop on it: a bot that has gone quiet often
-            // answers a later ask. It parks on the bot's review instead
-            // ([`Self::park_for_silent_bots`]); a review withdraws the question
-            // ([`Self::tend_silence_questions`]).
-        }
-        if settled {
-            return Ok(BotStep::Reread);
-        }
-        for p in live {
-            for ask in p.assessment.asks_due() {
-                let key = format!(
-                    "{}|{}|{}|{}",
-                    p.pr.url,
-                    ask.bot,
-                    p.head_sha.as_deref().unwrap_or(""),
-                    ask.asks
-                );
-                if !asked.insert(key) {
-                    continue;
-                }
-                tracing::info!(%node, bot = %ask.bot, pr = %p.pr.url, asks = ask.asks, "asking a review bot for a review");
-                if let Err(err) = feed.post_comment(&p.pr, &ask.text) {
-                    return Ok(BotStep::Stop(github_wait::github_look_failed(fleet, node, false, &err)?));
-                }
-                crate::pr_readiness::forget_snapshot(&p.pr);
-            }
-        }
-        Ok(BotStep::Go)
+        api_work::bot_waiting(fleet, self.node, feed, live, asked)
     }
 
     /// Records, once per bot, pull request and head, that a bot was given up
@@ -2465,13 +2341,10 @@ impl Autopilot {
         Ok(asked)
     }
 
-    /// A CI job that was cancelled, timed out or lost its runner is the
-    /// infrastructure's failure, not the change's: tod asks GitHub to run it
-    /// again (no agent turn), at most `settings.max_infra_reruns` times per
-    /// check and head. A check that passes after a rerun is noted in the
-    /// Activity as a flake. Returns whether it acted or is waiting for a rerun
-    /// it asked for (the loop then reads the pull request again). A rerun
-    /// GitHub refuses is noted, counted, and left to the agent as work.
+    /// A CI job that was cancelled, timed out or lost its runner is rerun
+    /// (`doc/requests/design.md` 4.2): see [`api_work::rerun_infra_failures`],
+    /// which the orchestrator's and the app's look at GitHub run too, with no
+    /// sandbox. The reruns are counted in this run's state.
     fn rerun_infra_failures(
         &mut self,
         fleet: &FleetStore,
@@ -2480,106 +2353,14 @@ impl Autopilot {
         settings: &tod_store::PrReadinessSettings,
         phase: &str,
     ) -> Result<bool> {
-        use tod_store::node_timeline::{KIND_NOTE, TimelineEntry};
         let node = self.node;
-        let mut acted = false;
-        for p in live {
-            let a = &p.assessment;
-            let Some(head) = a.head_sha.clone() else { continue };
-            if a.merged || head.is_empty() {
-                continue;
-            }
-            let label = crate::pr_readiness::pr_label(&p.pr);
-            // A check that failed for infrastructure, was rerun, and now passes.
-            let mut flaked = Vec::new();
-            for r in self.state.infra_reruns.iter_mut().filter(|r| r.pr == label && r.head == head && !r.flaked && r.count > 0) {
-                let failing = a.failing_checks.iter().any(|c| c.eq_ignore_ascii_case(&r.check))
-                    || a.infra_failures.iter().any(|f| f.check.eq_ignore_ascii_case(&r.check));
-                if failing || a.checks_running {
-                    continue;
-                }
-                r.flaked = true;
-                flaked.push((r.check.clone(), r.count));
-            }
-            for (check, count) in flaked {
-                let title = format!("Flake: \"{check}\" on {label} passed on rerun");
-                let detail = format!(
-                    "The check \"{check}\" failed for the infrastructure's reasons at {} and passed when tod ran it again ({count} rerun{}). Recorded as a flake of that check.",
-                    head.chars().take(7).collect::<String>(),
-                    if count == 1 { "" } else { "s" },
-                );
-                fleet.enqueue(tod_store::fleet::FleetMutation::RecordTimeline(Box::new(TimelineEntry::new(node, KIND_NOTE, phase, title, false, detail))))?;
-                fleet.writer().flush()?;
-                self.save()?;
-            }
-            if a.checks_running || a.infra_failures.is_empty() {
-                continue;
-            }
-            // Whatever else fails goes its usual way (`doc/requests/design.md`
-            // 4.2): a lost job is rerun beside it, and waiting for GitHub to show
-            // the rerun holds the loop only when no other check is failing.
-            let others_to_fix = a
-                .failing_checks
-                .iter()
-                .any(|c| !a.infra_failures.iter().any(|f| f.check.eq_ignore_ascii_case(c)));
-            for found in &a.infra_failures {
-                let now = state::now_ms();
-                let at = match self.state.infra_reruns.iter().position(|r| r.pr == label && r.head == head && r.check == found.check) {
-                    Some(at) => at,
-                    None => {
-                        self.state.infra_reruns.push(state::InfraRerun {
-                            pr: label.clone(),
-                            head: head.clone(),
-                            check: found.check.clone(),
-                            count: 0,
-                            at_ms: 0,
-                            flaked: false,
-                        });
-                        let over = self.state.infra_reruns.len().saturating_sub(state::MECHANICAL_KEPT);
-                        self.state.infra_reruns.drain(..over);
-                        self.state.infra_reruns.len() - 1
-                    }
-                };
-                let (count, last) = (self.state.infra_reruns[at].count, self.state.infra_reruns[at].at_ms);
-                if count > 0 && now - last < INFRA_RERUN_SETTLE_MS {
-                    // GitHub has not shown the rerun yet: not a failure to hand on.
-                    acted |= !others_to_fix;
-                    continue;
-                }
-                if count >= settings.max_infra_reruns {
-                    continue;
-                }
-                let what = format!("\"{}\" on {label} ({})", found.check, found.kind);
-                match feed.rerun_job(&p.pr, found.job_id) {
-                    Ok(()) => {
-                        self.state.infra_reruns[at].count += 1;
-                        self.state.infra_reruns[at].at_ms = now;
-                        self.save()?;
-                        let title = format!("Reran {what}: tod asked GitHub to run the job again ({} of {})", count + 1, settings.max_infra_reruns);
-                        let detail = format!(
-                            "The job failed for the infrastructure's reasons ({}), not the change's, so no agent is sent for it.",
-                            found.kind
-                        );
-                        fleet.enqueue(tod_store::fleet::FleetMutation::RecordTimeline(Box::new(TimelineEntry::new(node, KIND_NOTE, phase, title, false, detail))))?;
-                        fleet.writer().flush()?;
-                        crate::pr_readiness::forget_snapshot(&p.pr);
-                        acted |= !others_to_fix;
-                    }
-                    Err(err) => {
-                        // Counted, so a refusal never repeats without end; the
-                        // failure is the agent's work once the count is spent.
-                        self.state.infra_reruns[at].count += 1;
-                        self.state.infra_reruns[at].at_ms = 0;
-                        self.save()?;
-                        let title = format!("Could not rerun {what}");
-                        let entry = TimelineEntry::new(node, KIND_NOTE, phase, title, true, format!("GitHub refused the rerun: {err}"));
-                        fleet.enqueue(tod_store::fleet::FleetMutation::RecordTimeline(Box::new(entry)))?;
-                        fleet.writer().flush()?;
-                    }
-                }
-            }
-        }
-        Ok(acted)
+        let mut ledger = std::mem::take(&mut self.state.infra_reruns);
+        let result = api_work::rerun_infra_failures(fleet, node, feed, live, settings, phase, &mut ledger, &mut |l| {
+            self.state.infra_reruns = l.to_vec();
+            self.save()
+        });
+        self.state.infra_reruns = ledger;
+        result
     }
 
     /// A failing CI check with a configured fixer (`pr_readiness.check_fixes`)

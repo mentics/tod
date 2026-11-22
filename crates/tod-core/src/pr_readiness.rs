@@ -2790,6 +2790,18 @@ pub trait PrFeed: Send + Sync {
     ) -> Result<Vec<tod_store::github::RecentPr>, String> {
         Ok(Vec::new())
     }
+    /// The pull requests from `branch` of `owner/repo` into it, in any state,
+    /// most recently updated first: how a node's pull request is found when
+    /// its link never reached this machine ([`crate::pr_discovery`]). A feed
+    /// with no such listing says none.
+    fn branch_prs(
+        &self,
+        _owner: &str,
+        _repo: &str,
+        _branch: &str,
+    ) -> Result<Vec<tod_store::github::PullSummary>, String> {
+        Ok(Vec::new())
+    }
     /// The branches of the pull request's repository that start with
     /// `prefix` and have no pull request in any state. A feed with no such
     /// listing says none.
@@ -2881,6 +2893,12 @@ impl PrFeed for GithubFeed {
 
     fn update_branch(&self, pr: &tod_store::github::NodePr) -> Result<(), String> {
         self.0.update_pr_branch(&pr.owner, &pr.repo, pr.pr_number).map_err(|err| err.to_string())
+    }
+
+    fn branch_prs(&self, owner: &str, repo: &str, branch: &str) -> Result<Vec<tod_store::github::PullSummary>, String> {
+        self.0
+            .list_branch_prs(&tod_store::github::GithubRepo { owner: owner.to_string(), repo: repo.to_string() }, branch)
+            .map_err(|err| format!("listing the pull requests of {owner}/{repo} from {branch}: {err}"))
     }
 
     fn changed_files(&self, pr: &tod_store::github::NodePr) -> Result<Vec<tod_store::github::PrFile>, String> {

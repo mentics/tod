@@ -15,7 +15,7 @@
 //! failed read) is not waited on: the run goes on to the gate, which says
 //! why it fails, as it always did.
 
-use super::{Autopilot, Outcome};
+use super::{Autopilot, Outcome, api_work};
 use crate::release_watch::release_carrying;
 use anyhow::Result;
 use tod_store::fleet::FleetStore;
@@ -75,7 +75,35 @@ pub fn check_github(
     data_root: &std::path::Path,
     lifecycle: &str,
 ) -> Result<GithubCheck> {
-    let found = look_at_github(fleet, node, data_root, lifecycle)?;
+    check_github_as(fleet, node, data_root, lifecycle, Look::Observe)
+}
+
+/// Who is looking, which decides what the look does besides reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Look {
+    /// The supervisor (or the task panel's Check now): it is awake already and
+    /// does the API actions and the agent's work itself, so the look only says
+    /// where the pull request stands.
+    Observe,
+    /// A look made for a node with no run awake (the orchestrator's wake gate
+    /// and webhooks, the app for a node whose sandbox is gone): it does what
+    /// tod does through GitHub's API (rerun a lost CI job, update a branch from
+    /// its base, ask a review bot), says `Waiting` for what is only waited for
+    /// (checks running, a bot's review, agent work held back until the checks
+    /// finish), and says `Feedback` only for work that needs an agent
+    /// (`api_work::classify`). A sandbox is for that, and nothing else.
+    Act,
+}
+
+/// [`check_github`] as `look` (see [`Look`]).
+pub fn check_github_as(
+    fleet: &FleetStore,
+    node: uuid::Uuid,
+    data_root: &std::path::Path,
+    lifecycle: &str,
+    look: Look,
+) -> Result<GithubCheck> {
+    let found = look_at_github(fleet, node, data_root, lifecycle, look)?;
     // A look that read GitHub ends any failure recorded for an earlier one.
     if !matches!(found, GithubCheck::Unreadable(_)) {
         clear_read_failures(fleet, node)?;
@@ -342,14 +370,18 @@ fn look_at_github(
     node: uuid::Uuid,
     data_root: &std::path::Path,
     lifecycle: &str,
+    look: Look,
 ) -> Result<GithubCheck> {
     let releasing = match lifecycle {
         "approved" => false,
         "merged" => true,
-        "pr_draft" => return check_ready_for_review(fleet, node, data_root),
-        "pr_review" => return check_in_review(fleet, node, data_root),
+        "pr_draft" => return check_ready_for_review(fleet, node, data_root, look),
+        "pr_review" => return check_in_review(fleet, node, data_root, look),
         _ => return Ok(GithubCheck::NothingToWaitOn),
     };
+    if look == Look::Act {
+        crate::pr_discovery::discover_if_unlinked(fleet, node, data_root)?;
+    }
     let links = fleet.read(|conn| NodePrRepo::new(conn).read(node))?;
     if links.prs.is_empty() || !links.unrecognized.is_empty() {
         return Ok(GithubCheck::NothingToWaitOn);
@@ -419,13 +451,138 @@ fn look_at_github(
     Ok(GithubCheck::Waiting { what, due_at_ms })
 }
 
+/// What the front half of a look at a pull request in review found
+/// ([`review_front`]).
+enum Front {
+    /// The look is over.
+    Done(GithubCheck),
+    /// Only a person's review (or nothing) is missing: the state decides what
+    /// that means.
+    Settled { live: Vec<crate::pr_readiness::LivePr>, plan: api_work::Classification },
+}
+
+/// The look both review states share: reads the pull requests as the
+/// babysitter does, says (`api_work::classify`) what is the API's, what an
+/// agent's and what only waited for, and, for an [`Look::Act`] look, does the
+/// API's part. What it leaves is a person's review or nothing: [`Front::Settled`].
+#[allow(clippy::too_many_arguments)]
+fn review_front(
+    fleet: &FleetStore,
+    node: uuid::Uuid,
+    data_root: &std::path::Path,
+    feed: &dyn crate::pr_readiness::PrFeed,
+    prs: &[NodePr],
+    settings: &tod_store::PrReadinessSettings,
+    answered_at: Option<chrono::DateTime<chrono::Utc>>,
+    state: &str,
+    look: Look,
+) -> Result<Front> {
+    use api_work::Classification;
+    let before_review = state == "pr_draft";
+    let mut acted = false;
+    loop {
+        let live = match crate::pr_readiness::live_answered(feed, prs, settings, answered_at) {
+            Ok(live) => live,
+            Err(err) => return Ok(Front::Done(GithubCheck::Unreadable(err))),
+        };
+        super::note_draft_skipped(fleet, node, &live, state)?;
+        // tod's own review of a head is an agent session: owed in `pr_draft`.
+        let own_review_owed = before_review
+            && !matches!(
+                fleet.read(|conn| crate::pr_draft_review::owed(conn, node, &live, feed))?,
+                crate::pr_draft_review::Owed::Clear
+            );
+        let ledger = api_work::Ledger::load(data_root, node)?;
+        let plan = api_work::classify(
+            &live,
+            &api_work::Ctx {
+                settings,
+                infra_reruns: &ledger.infra_reruns,
+                now_ms: chrono::Utc::now().timestamp_millis(),
+                base_updated_at_ms: ledger.base_updated_at_ms,
+                housekeeping_gap_ms: super::PR_HOUSEKEEPING_GAP.as_millis() as i64,
+                before_review,
+                own_review_owed,
+                batch: look == Look::Act,
+            },
+        );
+        // Do what the API does, once, then read again: what it did shows.
+        let has_api = match &plan {
+            Classification::ApiOnly(_) => true,
+            Classification::AgentWork { api, .. } => !api.is_empty(),
+            // Bots are tended (asked, or the user asked once) while waiting.
+            Classification::Wait { .. } => true,
+            Classification::Clear => false,
+        };
+        if look == Look::Act && has_api && !acted {
+            acted = true;
+            match api_work::act(fleet, node, data_root, feed, &live, settings, &plan, state)? {
+                Ok(done) if done.changed => continue,
+                Ok(_) => {}
+                Err(why) => return Ok(Front::Done(GithubCheck::Unreadable(why))),
+            }
+        }
+        match plan {
+            Classification::AgentWork { work, own_review, .. } => {
+                cancel_github_waits(fleet, node)?;
+                let mut what = if work.is_empty() { String::new() } else { work_description(&work) };
+                if own_review {
+                    if !what.is_empty() {
+                        what.push_str(", ");
+                    }
+                    what.push_str("tod's own review of the head is owed");
+                }
+                return Ok(Front::Done(GithubCheck::Feedback { what }));
+            }
+            Classification::ApiOnly(actions) => {
+                if look == Look::Observe {
+                    // A branch behind its base is housekeeping the supervisor does
+                    // itself, and changes nothing about what is waited on.
+                    if actions.iter().all(|a| matches!(a, api_work::ApiAction::UpdateBranch { .. })) {
+                        return Ok(Front::Settled { live, plan: Classification::ApiOnly(actions) });
+                    }
+                    return Ok(Front::Done(GithubCheck::NothingToWaitOn));
+                }
+                let what = format!(
+                    "tod did {}; looking at the result",
+                    actions.iter().map(api_work::ApiAction::describe).collect::<Vec<_>>().join(", ")
+                );
+                let due = chrono::Utc::now().timestamp_millis() + api_work::SETTLE_POLL_MS;
+                record_poll_wait_for(fleet, node, &live, &[crate::pr_readiness::Wait::ChecksRunning], &what, due)?;
+                return Ok(Front::Done(GithubCheck::Waiting { what, due_at_ms: due }));
+            }
+            Classification::Wait { waits, held } if !api_work::only_human_review(&waits) => {
+                if look == Look::Observe {
+                    return Ok(Front::Done(GithubCheck::NothingToWaitOn));
+                }
+                let mut what = super::wait_description(&waits);
+                if held {
+                    what.push_str("; the agent is woken once with everything when they finish");
+                }
+                let after = if api_work::short_poll(&live, &waits) { api_work::POLL_MS } else { 0 };
+                let due = if after > 0 {
+                    chrono::Utc::now().timestamp_millis() + after
+                } else {
+                    crate::wait_cadence::next_check(chrono::Utc::now(), &settings.review_schedule).timestamp_millis()
+                };
+                record_poll_wait_for(fleet, node, &live, &waits, &what, due)?;
+                return Ok(Front::Done(GithubCheck::Waiting { what, due_at_ms: due }));
+            }
+            plan => return Ok(Front::Settled { live, plan }),
+        }
+    }
+}
+
 /// The `pr_draft` state's wait: the draft the `pr` state opened is marked
 /// ready for review and has a person on it, which the `pr_draft → pr_review` gate asks and
 /// only a person can do. Waits on the first linked pull request that is not
 /// there yet; a webhook for it (`github:pr:<n>:ready_for_review`, or
 /// `:review_requested` once it is out of draft) wakes the run sooner than
 /// the scheduled look.
-fn check_ready_for_review(fleet: &FleetStore, node: uuid::Uuid, data_root: &std::path::Path) -> Result<GithubCheck> {
+fn check_ready_for_review(fleet: &FleetStore, node: uuid::Uuid, data_root: &std::path::Path, look: Look) -> Result<GithubCheck> {
+    if look == Look::Act {
+        crate::pr_discovery::discover_if_unlinked(fleet, node, data_root)?;
+    }
     let links = fleet.read(|conn| NodePrRepo::new(conn).read(node))?;
     if links.prs.is_empty() || !links.unrecognized.is_empty() {
         // The `pr` agent opens it.
@@ -436,30 +593,18 @@ fn check_ready_for_review(fleet: &FleetStore, node: uuid::Uuid, data_root: &std:
     };
     let settings = crate::pr_readiness::settings_for_node(fleet, node, data_root)?;
     let answered_at = crate::pr_readiness::agent_answered_at(fleet, node)?;
-    // The babysitter's own work comes first: a bot's review or running checks
-    // it polls for, and what tod's own review still owes the pull request
-    // (findings to post, to fix, a head to review). Recording the wait for a
-    // person here would end the run before that work is done, and the wake
-    // would go to the review cadence instead of the sandbox.
-    let live = match crate::pr_readiness::live_answered(feed.as_ref(), &links.prs, &settings, answered_at) {
-        Ok(live) => live,
-        Err(err) => return Ok(GithubCheck::Unreadable(err)),
+    // The babysitter's own work comes first: what only an agent can do
+    // (feedback, a failing check, tod's own review of a head) is [`Feedback`];
+    // what tod does through the API is done by an [`Look::Act`] look; a bot's
+    // review or running checks are waited for. Recording the wait for a
+    // person here would end the run before that work is done.
+    let front = review_front(fleet, node, data_root, feed.as_ref(), &links.prs, &settings, answered_at, "pr_draft", look)?;
+    let Front::Settled { .. } = front else {
+        let Front::Done(found) = front else { unreachable!() };
+        return Ok(found);
     };
-    super::note_draft_skipped(fleet, node, &live, "pr_draft")?;
-    if let crate::pr_readiness::Next::Wait(waits) = crate::pr_readiness::overall(&live)
-        && waits.iter().any(|w| !matches!(w, crate::pr_readiness::Wait::HumanReview))
-    {
-        return Ok(GithubCheck::NothingToWaitOn);
-    }
-    if !matches!(
-        fleet.read(|conn| crate::pr_draft_review::owed(conn, node, &live, feed.as_ref()))?,
-        crate::pr_draft_review::Owed::Clear
-    ) {
-        return Ok(GithubCheck::NothingToWaitOn);
-    }
     let mut pending: Option<(&NodePr, String, &str)> = None;
     let mut standing: Vec<String> = Vec::new();
-    let mut feedback: Vec<String> = Vec::new();
     for pr in &links.prs {
         let label = crate::pr_readiness::pr_label(pr);
         let snapshot = match feed.snapshot(pr) {
@@ -467,18 +612,6 @@ fn check_ready_for_review(fleet: &FleetStore, node: uuid::Uuid, data_root: &std:
             Err(err) => return Ok(GithubCheck::Unreadable(format!("{label} not readable: {err}"))),
         };
         let status = &snapshot.status;
-        // Feedback on the pull request, a draft included, is the agent's
-        // work whether or not a person has taken it yet. Comments that
-        // report no problem (a bot's score above its threshold) are not.
-        let work = match crate::pr_readiness::assess(feed.as_ref(), pr, &snapshot, &settings, chrono::Utc::now()) {
-            Ok(assessment) => assessment,
-            Err(err) => return Ok(GithubCheck::Unreadable(format!("{label}: {err}"))),
-        }
-        .answered_through(answered_at)
-            .work();
-        if !work.is_empty() && !only_behind(&work) {
-            feedback.push(format!("{label}: {}", work_description(&work)));
-        }
         if crate::gate::derived::ready_for_review(&pr.url, status).is_err() {
             standing.push(format!("{label} still a draft"));
             pending.get_or_insert((pr, format!("{} to be marked ready for review", pr.url), "ready_for_review"));
@@ -499,10 +632,6 @@ fn check_ready_for_review(fleet: &FleetStore, node: uuid::Uuid, data_root: &std:
                 standing.push(format!("{label} ready for review"));
             }
         }
-    }
-    if !feedback.is_empty() {
-        cancel_github_waits(fleet, node)?;
-        return Ok(GithubCheck::Feedback { what: feedback.join("; ") });
     }
     let Some((pr, what, event)) = pending else {
         cancel_github_waits(fleet, node)?;
@@ -543,20 +672,24 @@ pub(super) fn review_wait_of(live: &[crate::pr_readiness::LivePr]) -> (String, S
     (spec, what)
 }
 
-/// `pr_review`: reads the pull requests as the babysitter does. When the
-/// only thing missing is a person's review, that is the wait ([`Waiting`],
-/// recorded at the review cadence): the orchestrator's gate absorbs it, so a
-/// pull request awaiting a person does not wake the sandbox. Work for the
-/// agent is [`Feedback`]. A bot's review or running checks are the
-/// babysitter's own short poll: left to it ([`NothingToWaitOn`]), as is a
-/// pull request that is clear or merged ([`Clear`]).
+/// `pr_review`: reads the pull requests as the babysitter does
+/// ([`review_front`]). When the only thing missing is a person's review, that
+/// is the wait ([`Waiting`], recorded at the review cadence): the
+/// orchestrator's gate absorbs it, so a pull request awaiting a person does
+/// not wake the sandbox. Work for an agent is [`Feedback`]; a pull request
+/// that is clear or merged is [`Clear`]. What the API does (a lost CI job
+/// rerun, a branch updated, a bot asked) is done by an [`Look::Act`] look;
+/// running checks and a bot's review are a short [`Waiting`] there, and
+/// [`NothingToWaitOn`] for the supervisor that polls them in place.
 ///
 /// [`Waiting`]: GithubCheck::Waiting
 /// [`Feedback`]: GithubCheck::Feedback
 /// [`NothingToWaitOn`]: GithubCheck::NothingToWaitOn
 /// [`Clear`]: GithubCheck::Clear
-fn check_in_review(fleet: &FleetStore, node: uuid::Uuid, data_root: &std::path::Path) -> Result<GithubCheck> {
-    use crate::pr_readiness::{Next, Wait};
+fn check_in_review(fleet: &FleetStore, node: uuid::Uuid, data_root: &std::path::Path, look: Look) -> Result<GithubCheck> {
+    if look == Look::Act {
+        crate::pr_discovery::discover_if_unlinked(fleet, node, data_root)?;
+    }
     let links = fleet.read(|conn| NodePrRepo::new(conn).read(node))?;
     if links.prs.is_empty() || !links.unrecognized.is_empty() {
         return Ok(GithubCheck::NothingToWaitOn);
@@ -566,51 +699,21 @@ fn check_in_review(fleet: &FleetStore, node: uuid::Uuid, data_root: &std::path::
     };
     let settings = crate::pr_readiness::settings_for_node(fleet, node, data_root)?;
     let answered_at = crate::pr_readiness::agent_answered_at(fleet, node)?;
-    let live = match crate::pr_readiness::live_answered(feed.as_ref(), &links.prs, &settings, answered_at) {
-        Ok(live) => live,
-        Err(err) => return Ok(GithubCheck::Unreadable(err)),
-    };
-    super::note_draft_skipped(fleet, node, &live, "pr_review")?;
-    match crate::pr_readiness::overall(&live) {
-        Next::Merged | Next::Clear => {
-            cancel_github_waits(fleet, node)?;
-            Ok(GithubCheck::Clear)
-        }
-        // Only behind its base, and a person's review is the one thing waited
-        // for: that is the review wait, not work to wake the sandbox for.
-        Next::Work(work) if only_behind(&work) && waits_only_on_a_person(&live) => {
-            let (spec, what) = review_wait_of(&live);
-            let due_at_ms = record_github_wait(fleet, node, spec, "github:pr:", &settings, &what)?;
-            Ok(GithubCheck::Waiting { what, due_at_ms })
-        }
-        Next::Work(work) => {
-            cancel_github_waits(fleet, node)?;
-            Ok(GithubCheck::Feedback { what: work_description(&work) })
-        }
-        Next::Wait(waits) if waits.iter().all(|w| matches!(w, Wait::HumanReview)) => {
-            let (spec, what) = review_wait_of(&live);
-            let due_at_ms = record_github_wait(fleet, node, spec, "github:pr:", &settings, &what)?;
-            Ok(GithubCheck::Waiting { what, due_at_ms })
-        }
-        Next::Wait(_) => Ok(GithubCheck::NothingToWaitOn),
+    match review_front(fleet, node, data_root, feed.as_ref(), &links.prs, &settings, answered_at, "pr_review", look)? {
+        Front::Done(found) => Ok(found),
+        Front::Settled { live, plan } => match plan {
+            api_work::Classification::Clear => {
+                cancel_github_waits(fleet, node)?;
+                Ok(GithubCheck::Clear)
+            }
+            _ => {
+                // Only a person's review is missing.
+                let (spec, what) = review_wait_of(&live);
+                let due_at_ms = record_github_wait(fleet, node, spec, "github:pr:", &settings, &what)?;
+                Ok(GithubCheck::Waiting { what, due_at_ms })
+            }
+        },
     }
-}
-
-/// Whether `work` is only "merge the base in". That is housekeeping, not
-/// feedback: a pull request that is merely behind and waits on a person must not
-/// wake its sandbox each time the base moves (a busy base moves all day, and each
-/// wake resets the sandbox's idle clock, so the workspace's idle prune never takes
-/// it). The base is merged in when something else wakes the node: the person's
-/// review, a comment, a failing check.
-fn only_behind(work: &[crate::pr_readiness::Work]) -> bool {
-    !work.is_empty() && work.iter().all(|w| matches!(w, crate::pr_readiness::Work::Behind))
-}
-
-/// Whether the only thing `live`'s pull requests wait for is a person's review.
-fn waits_only_on_a_person(live: &[crate::pr_readiness::LivePr]) -> bool {
-    use crate::pr_readiness::Wait;
-    let waits: Vec<Wait> = live.iter().flat_map(|p| p.assessment.waits()).collect();
-    !waits.is_empty() && waits.iter().all(|w| matches!(w, Wait::HumanReview))
 }
 
 /// What `work` asks of the agent, in words.
@@ -673,45 +776,7 @@ impl Autopilot {
         detail: &str,
         due_at_ms: i64,
     ) -> Result<()> {
-        use crate::pr_readiness::Wait;
-        let number_waiting = |matches: &dyn Fn(&Wait) -> bool| {
-            live.iter()
-                .find(|p| p.assessment.waits().iter().any(matches))
-                .map(|p| p.pr.pr_number)
-        };
-        let Some(first) = waits.first() else {
-            return Ok(());
-        };
-        let spec = match first {
-            Wait::BotReview { bot, .. } | Wait::OwnReview { bot } => {
-                let n = number_waiting(
-                    &|w| matches!(w, Wait::BotReview { bot: b, .. } | Wait::OwnReview { bot: b } if b == bot),
-                );
-                bot_review_spec(n, bot)
-            }
-            Wait::ChecksRunning => checks_spec(number_waiting(&|w| matches!(w, Wait::ChecksRunning))),
-            Wait::GitHub => format!("github:pr:{}:github", number_waiting(&|w| matches!(w, Wait::GitHub)).unwrap_or(0)),
-            // A person's review is recorded by `wait_for_review`.
-            Wait::HumanReview => return Ok(()),
-        };
-        let pending = fleet.read(|conn| WaitRepo::new(conn).list_pending_for_node(self.node))?;
-        if let Some(same) = pending.iter().find(|w| tod_store::waits::normalize_spec(&w.match_spec) == spec) {
-            fleet
-                .interview(ACTOR, InterviewCommand::RescheduleWait { wait_id: same.id, due_at: due_at_ms })
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            return Ok(());
-        }
-        cancel_waits(fleet, self.node, |old| old.starts_with("github:pr:"))?;
-        fleet
-            .interview(
-                ACTOR,
-                InterviewCommand::RecordWait {
-                    node_id: self.node,
-                    wait: NewWait::event(spec, due_at_ms).with_detail(detail),
-                },
-            )
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        Ok(())
+        record_poll_wait_for(fleet, self.node, live, waits, detail, due_at_ms)
     }
 
     /// The run has something to do (or nothing left to wait for): the polled
@@ -730,6 +795,63 @@ impl Autopilot {
         detail: &str,
     ) -> Result<i64> {
         record_github_wait(fleet, self.node, spec, replaces, settings, detail)
+    }
+}
+
+/// While GitHub is polled (a bot's review, checks), the node still waits on
+/// something outside, and says so: records that wait, due at the next poll,
+/// replacing the last poll's. Without it the node would read as having
+/// nothing in progress. The supervisor's poll and the sandbox-free look
+/// ([`Look::Act`]) record the same wait.
+pub(super) fn record_poll_wait_for(
+    fleet: &FleetStore,
+    node: uuid::Uuid,
+    live: &[crate::pr_readiness::LivePr],
+    waits: &[crate::pr_readiness::Wait],
+    detail: &str,
+    due_at_ms: i64,
+) -> Result<()> {
+    {
+        use crate::pr_readiness::Wait;
+        let number_waiting = |matches: &dyn Fn(&Wait) -> bool| {
+            live.iter()
+                .find(|p| p.assessment.waits().iter().any(matches))
+                .map(|p| p.pr.pr_number)
+                .or_else(|| live.first().map(|p| p.pr.pr_number))
+        };
+        let Some(first) = waits.first() else {
+            return Ok(());
+        };
+        let spec = match first {
+            Wait::BotReview { bot, .. } | Wait::OwnReview { bot } => {
+                let n = number_waiting(
+                    &|w| matches!(w, Wait::BotReview { bot: b, .. } | Wait::OwnReview { bot: b } if b == bot),
+                );
+                bot_review_spec(n, bot)
+            }
+            Wait::ChecksRunning => checks_spec(number_waiting(&|w| matches!(w, Wait::ChecksRunning))),
+            Wait::GitHub => format!("github:pr:{}:github", number_waiting(&|w| matches!(w, Wait::GitHub)).unwrap_or(0)),
+            // A person's review is recorded by `wait_for_review`.
+            Wait::HumanReview => return Ok(()),
+        };
+        let pending = fleet.read(|conn| WaitRepo::new(conn).list_pending_for_node(node))?;
+        if let Some(same) = pending.iter().find(|w| tod_store::waits::normalize_spec(&w.match_spec) == spec) {
+            fleet
+                .interview(ACTOR, InterviewCommand::RescheduleWait { wait_id: same.id, due_at: due_at_ms })
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            return Ok(());
+        }
+        cancel_waits(fleet, node, |old| old.starts_with("github:pr:"))?;
+        fleet
+            .interview(
+                ACTOR,
+                InterviewCommand::RecordWait {
+                    node_id: node,
+                    wait: NewWait::event(spec, due_at_ms).with_detail(detail),
+                },
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(())
     }
 }
 
