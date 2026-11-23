@@ -39,11 +39,19 @@ pub const TOD_ADAPTERS_DIR_ENV: &str = "TOD_ADAPTERS_DIR";
 /// under the OS's local (not roaming) data directory. One per machine, not
 /// per data root, so data roots share it.
 pub fn claude_adapter_dir() -> Option<PathBuf> {
+    adapter_dir("claude-agent-acp")
+}
+
+pub fn codex_adapter_dir() -> Option<PathBuf> {
+    adapter_dir("codex-acp")
+}
+
+fn adapter_dir(name: &str) -> Option<PathBuf> {
     let base = match std::env::var_os(TOD_ADAPTERS_DIR_ENV).filter(|v| !v.is_empty()) {
         Some(dir) => PathBuf::from(dir),
         None => dirs::data_local_dir()?.join("tod").join("adapters"),
     };
-    Some(base.join("claude-agent-acp"))
+    Some(base.join(name))
 }
 
 /// The environment variable the daemon is started with: the directory of the

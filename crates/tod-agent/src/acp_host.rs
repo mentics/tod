@@ -61,10 +61,7 @@ impl AcpHost {
     pub fn resolve_bin(self) -> Result<PathBuf> {
         match self {
             Self::Cursor => resolve_cursor_bin(),
-            Self::OpenAi => match std::env::var_os("TOD_CODEX_ACP_BIN").filter(|path| !path.is_empty()) {
-                Some(path) => Ok(path.into()),
-                None => resolve_new_bin("codex-acp", "Install @agentclientprotocol/codex-acp"),
-            },
+            Self::OpenAi => crate::codex_adapter::resolve_bin(),
             Self::Google => resolve_new_bin("gemini", "Install Gemini CLI"),
             Self::Claude => resolve_claude_acp_bin(),
         }
@@ -112,7 +109,7 @@ fn first_existing(candidates: &[PathBuf]) -> Option<PathBuf> {
     candidates.iter().find(|p| p.is_file()).cloned()
 }
 
-fn resolve_new_bin(name: &str, install: &str) -> Result<PathBuf> {
+pub(crate) fn resolve_new_bin(name: &str, install: &str) -> Result<PathBuf> {
     resolve_via_login_shell(name)
         .or_else(|| {
             std::env::split_paths(&std::env::var_os("PATH")?)
@@ -313,6 +310,23 @@ pub fn spawn_acp_process(
         command.env(key, value);
     }
 
+    #[cfg(unix)]
+    if host == AcpHost::OpenAi && agent_bin.parent().and_then(Path::file_name).is_some_and(|name| name == ".bin") {
+        // The npm launcher uses env(1) to find Node. The desktop app may
+        // have found npm in its user's login shell rather than on its PATH.
+        let path = env.iter().rev().find(|(key, _)| key == "PATH")
+            .map(|(_, value)| std::ffi::OsString::from(value))
+            .or_else(|| std::env::var_os("PATH")).unwrap_or_default();
+        let mut dirs: Vec<_> = std::env::split_paths(&path).collect();
+        if !dirs.iter().any(|dir| dir.join("node").is_file())
+            && let Some(node) = resolve_via_login_shell("node")
+            && let Some(dir) = node.parent()
+        {
+            dirs.push(dir.to_path_buf());
+            command.env("PATH", std::env::join_paths(dirs)?);
+        }
+    }
+
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -334,13 +348,14 @@ pub fn container_agent_bin(
     container: &crate::devcontainer::PreparedContainer,
 ) -> Result<String> {
     let (candidates, install): (&[&str], &str) = match host {
+        AcpHost::OpenAi => {
+            let script = ["-c".to_string(), crate::codex_adapter::INSTALL_SCRIPT.to_string()];
+            let command = container.command("sh", &script)?;
+            return crate::codex_adapter::installed_path(command, &format!("dev container `{}`", container.name));
+        }
         AcpHost::Claude => (
             &[crate::claude_adapter::BIN],
             "npm install -g @agentclientprotocol/claude-agent-acp (and sign in to `claude` there)",
-        ),
-        AcpHost::OpenAi => (
-            &["codex-acp"],
-            "npm install -g @agentclientprotocol/codex-acp (and sign in to Codex there)",
         ),
         AcpHost::Google => anyhow::bail!(
             "{} ACP is not supported in remote environments",
@@ -364,13 +379,10 @@ pub fn container_agent_bin(
 /// The ACP agent for `host` in a cloud sandbox.
 pub fn sandbox_agent_bin(host: AcpHost, launch: &crate::sandbox::SandboxLaunch) -> Result<String> {
     let (candidates, install): (&[&str], &str) = match host {
+        AcpHost::OpenAi => return launch.codex_adapter(),
         AcpHost::Claude => (
             &[crate::claude_adapter::BIN],
             "create the sandbox with `tod-sandbox create <name> --agents`, then sign in to `claude` there",
-        ),
-        AcpHost::OpenAi => (
-            &["codex-acp"],
-            "npm install -g @agentclientprotocol/codex-acp (and sign in to Codex there)",
         ),
         AcpHost::Google => anyhow::bail!(
             "{} ACP is not supported in remote environments",

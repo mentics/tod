@@ -7535,6 +7535,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "chrono",
+ "fs2",
  "libc",
  "rusqlite",
  "serde",

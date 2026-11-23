@@ -148,11 +148,13 @@ it.
 
 ### Run TOD with Codex
 
-Install `@agentclientprotocol/codex-acp` and sign in with `codex login` in the
-environment that will run the agent. The desktop app and daemon find
-`codex-acp` on PATH or use `TOD_CODEX_ACP_BIN` when set. Choose **OpenAI**
-under **Settings → Default Agent** for lifecycle work or under **Chat Agent**
-for chat. The `auto` model uses the adapter's default.
+Choose **OpenAI** under **Settings → Default Agent** for lifecycle work or
+under **Chat Agent** for chat. The `auto` model uses the adapter's default.
+TOD installs Codex ACP and the Codex CLI on demand on the desktop, in dev
+containers, and in cloud sandboxes. It checks the managed install for updates
+when opening a new session, at most once a day after a successful check.
+The environment needs Node.js and npm. `TOD_CODEX_ACP_BIN` selects a custom
+adapter executable for host runs.
 
 Set a task's preference under its **Agent** capability, or choose a provider
 for a specific step under **Lifecycle Config**. When Claude or Codex reports
@@ -173,11 +175,15 @@ A node already parked on a quota wait from an older build can be resumed by
 finding the wait with `tod-cli wait list --node <NODE>` and cancelling it with
 `tod-cli wait cancel <WAIT_ID>` on the same data root.
 
-Dev containers need the adapter and a Codex sign-in inside the container.
-Cloud node setup installs the adapter and sends the coding-agent settings to
-the supervisor. Sign in from the node's sandbox (for example `codex login
---device-auth`), then resume. The sandbox has its own login and quota file.
-Build the updated Linux supervisor with
+Sign in to Codex as the user running the agent in each environment. In a dev
+container or cloud sandbox, open its shell and run `codex login --device-auth`.
+Use TOD's managed CLI if `codex` is absent from PATH:
+
+```sh
+"${XDG_DATA_HOME:-$HOME/.local/share}/tod/adapters/codex-acp/node_modules/.bin/codex" login --device-auth
+```
+
+Each sandbox has its own login and quota file. Build the Linux supervisor with
 `scripts/build-sandbox-binaries.sh` for cloud use.
 
 Gemini remains available for local chat through Gemini CLI.

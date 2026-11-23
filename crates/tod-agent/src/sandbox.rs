@@ -21,7 +21,7 @@ const FIND_PROGRAM_LIMIT: Duration = Duration::from_secs(90);
 
 /// Runs `command` and collects its output, killing it and returning an error
 /// naming `what` if it has not finished within `limit`.
-fn output_within(mut command: Command, limit: Duration, what: &str) -> Result<Output> {
+pub(crate) fn output_within(mut command: Command, limit: Duration, what: &str) -> Result<Output> {
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -144,6 +144,12 @@ impl SandboxLaunch {
             bail!("could not reach sandbox {}: {}", self.sandbox, String::from_utf8_lossy(&out.stderr).trim());
         }
         Ok(stdout)
+    }
+
+    pub(crate) fn codex_adapter(&self) -> Result<String> {
+        let mut command = self.launcher_command();
+        command.args(["exec", &self.sandbox, "--", "sh", "-lc", crate::codex_adapter::INSTALL_SCRIPT]);
+        crate::codex_adapter::installed_path(command, &format!("cloud sandbox `{}`", self.sandbox))
     }
 
     /// `program args…` in the sandbox, over stdio, as `tod-sandbox agent`

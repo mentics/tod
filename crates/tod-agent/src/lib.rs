@@ -9,6 +9,7 @@ mod acp_host;
 pub mod agent_launch;
 pub mod agent_traffic;
 pub mod claude_adapter;
+pub mod codex_adapter;
 mod cursor_acp;
 pub mod devcontainer;
 pub mod exit_diagnosis;

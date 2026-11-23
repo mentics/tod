@@ -81,6 +81,7 @@ pub fn run(data_root: &Path) -> Result<bool> {
     tod_store::paths::set_data_root(data_root.to_path_buf());
     tod_store::fleet::sandbox::set_data_root(data_root);
     tod_agent::claude_adapter::set_local_dir(tod_store::install::claude_adapter_dir());
+    tod_agent::codex_adapter::set_local_dir(tod_store::install::codex_adapter_dir());
     let mock = std::env::var("TOD_AGENTD_AGENT").is_ok_and(|v| v.eq_ignore_ascii_case("mock"));
     let backend = if mock {
         AgentBackend::Mock
