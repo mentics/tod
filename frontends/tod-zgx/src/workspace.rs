@@ -294,18 +294,32 @@ impl Workspace {
         records
     }
 
-    pub fn palette(&self, invoked: Option<&str>, actions_only: bool) -> Palette {
+    pub fn palette(
+        &self,
+        invoked: Option<&str>,
+        actions_only: bool,
+        extra: Vec<Item>,
+        collection: Option<&str>,
+    ) -> Palette {
         let focused = self.record(&self.cursor).map(|record| &record.item);
-        let context = Context {
-            focused: focused.map(|item| item.id.clone()),
-            selected: self.selected.iter().cloned().collect(),
-            scope: focused.and_then(|item| item.scope.clone()),
+        let context = if let Some(id) = collection {
+            Context {
+                focused: Some(id.into()),
+                ..Default::default()
+            }
+        } else {
+            Context {
+                focused: focused.map(|item| item.id.clone()),
+                selected: self.selected.iter().cloned().collect(),
+                scope: focused.and_then(|item| item.scope.clone()),
+            }
         };
         let actions = actions_only.then(|| context.targets(invoked));
         Palette::new(
             self.records
                 .iter()
                 .map(|record| record.item.clone())
+                .chain(extra)
                 .collect(),
             self.commands.clone(),
             context,

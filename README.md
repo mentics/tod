@@ -2,6 +2,8 @@
 
 Task and agent management desktop application.
 
+The [redesign specifications](doc/redesign/README.md) track proposed product behavior. The [standalone ZGX frontend](frontends/tod-zgx/README.md) exercises the command palette and collection panels in one app.
+
 ## Prerequisites
 
 - **Rust:** stable toolchain (latest stable at clone time). Edition **2024**.

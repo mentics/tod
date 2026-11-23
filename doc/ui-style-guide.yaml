@@ -133,6 +133,20 @@ styles:
     overflow: single-line
     color: "status-<tone>"
     background: "status-<tone> at 15%"
+  # Item type and item status have separate glyph positions. Type uses a
+  # neutral foreground. A status pairs a distinguishable glyph with a
+  # semantic tone and has a text label available on focus as well as hover.
+  item-type-icon:
+    icon: icon-set
+    width: item-icon
+    height: item-icon
+    color: text-muted
+  item-status-icon:
+    extends: item-type-icon
+    color: "status-<tone>"
+  # F1 opens the shared keyboard reference from anywhere, even in a text
+  # field. Question mark also opens it outside text entry. Show the current
+  # bindings and actions for the focused panel. Return focus on close.
   shortcut-badge:
     extends: badge
     anchor: bottom-right of target
@@ -676,6 +690,7 @@ tokens:
     group-row: 28px
     group-indent: 16px
     mark-gutter: 24px
+    item-icon: 16px
     # The graspable strip past the last row, where a drag means "the end".
     drop-strip: 28px
     # A timestamp column: wide enough for a wall-clock time.

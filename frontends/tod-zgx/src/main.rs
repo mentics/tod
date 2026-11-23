@@ -1,3 +1,4 @@
+mod collection;
 #[cfg(feature = "live")]
 mod live;
 mod workspace;
@@ -28,9 +29,17 @@ const ROW_HEIGHT: f32 = 44.;
 const HEADING_HEIGHT: f32 = 26.;
 const RESULTS_HEIGHT: f32 = 319.;
 
+#[derive(Clone, Copy, PartialEq)]
+enum Surface {
+    Workspace,
+    Collections,
+}
+
 #[derive(Clone)]
 struct App {
     workspace: Signal<Workspace>,
+    collections: Option<collection::Panels>,
+    surface: Signal<Surface>,
     palette: Signal<Option<Palette>>,
     open: Signal<bool>,
     draft: Signal<String>,
@@ -50,10 +59,14 @@ impl App {
         self.draft.set(String::new());
         self.error.set(String::new());
         self.scroll.set(0.);
-        self.palette.set(Some(
-            self.workspace
-                .with(|workspace| workspace.palette(invoked, actions)),
-        ));
+        let extra = self
+            .collections
+            .as_ref()
+            .map_or_else(Vec::new, |panels| panels.search_items().collect());
+        let collection = (self.surface.get() == Surface::Collections).then_some(collection::ID);
+        self.palette.set(Some(self.workspace.with(|workspace| {
+            workspace.palette(invoked, actions, extra, collection)
+        })));
         self.open.set(true);
     }
 
@@ -65,8 +78,25 @@ impl App {
 
     fn focus_list(&self) {
         if let Some(list) = self.list.borrow().as_ref() {
-            list.focus();
+            if !list.focus() {
+                let later = list.clone();
+                list.after_layout(move || {
+                    later.focus();
+                });
+            }
         }
+    }
+
+    fn show_collections(&self) {
+        if let Some(panels) = &self.collections {
+            self.surface.set(Surface::Collections);
+            panels.focus();
+        }
+    }
+
+    fn show_workspace(&self) {
+        self.surface.set(Surface::Workspace);
+        self.focus_list();
     }
 
     fn escape(&self) {
@@ -113,6 +143,30 @@ impl App {
             self.show_page(palette);
             return;
         };
+        if let Some(panels) = &self.collections {
+            match &effect {
+                Effect::Open(id) if panels.contains(id) => {
+                    self.open.set(false);
+                    self.surface.set(Surface::Collections);
+                    panels.open_item(id);
+                    return;
+                }
+                Effect::Run {
+                    command: "edit-collection",
+                    targets,
+                } if targets.as_slice() == [collection::ID] => {
+                    let mut workspace = self.workspace.get();
+                    workspace.record_use("edit-collection");
+                    self.save_frequency(&mut workspace);
+                    self.workspace.set(workspace);
+                    self.open.set(false);
+                    self.surface.set(Surface::Collections);
+                    panels.open_config();
+                    return;
+                }
+                _ => {}
+            }
+        }
         #[cfg(feature = "live")]
         if let Some((command, task)) = self
             .backend
@@ -140,6 +194,14 @@ impl App {
             return;
         }
         let navigation = matches!(effect, Effect::Open(_));
+        let opens_workspace = navigation
+            || matches!(
+                &effect,
+                Effect::Run {
+                    command: "shortcuts" | "conversation",
+                    ..
+                }
+            );
         let mut workspace = self.workspace.get();
         match workspace.apply(effect) {
             Ok(()) => {
@@ -148,8 +210,8 @@ impl App {
                 }
                 self.workspace.set(workspace);
                 self.open.set(false);
-                if navigation {
-                    self.focus_list();
+                if opens_workspace {
+                    self.show_workspace();
                 }
             }
             Err(error) => {
@@ -259,7 +321,7 @@ impl App {
             workspace.message = error;
         }
         self.workspace.set(workspace);
-        self.focus_list();
+        self.show_workspace();
     }
 }
 
@@ -574,14 +636,91 @@ fn list_is_empty(workspace: &Workspace) -> bool {
     workspace.visible_tasks().is_empty()
 }
 
+fn workspace_view(app: &App) -> View {
+    let chips = app.workspace.clone();
+    let chip_app = app.clone();
+    let detail = app.workspace.clone();
+    let message = app.workspace.clone();
+    column().id("task-workspace").w_full().h_full().gap(14.)
+        .child(switch(move || chips.get(), move |workspace, _| {
+            row().gap(6.).children(workspace.collections().map(|record| {
+                let id = record.item.id.clone();
+                let app = chip_app.clone();
+                control(record.item.title.clone()).bg(rgb(if workspace.collection == id { ACCENT } else { PANEL }))
+                    .on_click(move || app.open_item(id.clone()))
+            }))
+        }))
+        .child(row().gap(18.).grow()
+            .child(task_list(app))
+            .child(switch(move || detail.get(), move |workspace, _| {
+                let (title, body) = if workspace.detail == "shortcuts" {
+                    ("Keyboard shortcuts".into(), "⌘/Ctrl+K searches across tod. Arrow keys move by row. Option/Alt+↑/↓ moves by section. Enter opens or runs. Shift+Enter opens actions. Esc goes back.".into())
+                } else if workspace.detail == "conversation" {
+                    ("Agent conversation".into(), workspace.conversation.join(" · "))
+                } else {
+                    workspace.record(&workspace.detail).map_or((String::new(), String::new()), |record| {
+                        (record.item.title.clone(), record.description.clone())
+                    })
+                };
+                column().w(290.).p(14.).gap(8.).rounded(7.).bg(rgb(PANEL))
+                    .child(text(title).text_size(20.).text_wrap(true))
+                    .child(text(body).text_wrap(true).text_color(rgb(MUTED)))
+            })))
+        .child(text_signal(move || message.with(|workspace| workspace.message.clone())).text_color(rgb(MUTED)))
+}
+
+fn surface_style(active: &Signal<Surface>, surface: Surface) -> Styles {
+    if active.get() == surface {
+        Styles::new()
+    } else {
+        Styles::new().hidden()
+    }
+}
+
+fn surface_tabs(app: &App) -> View {
+    let tasks = app.clone();
+    let collections = app.clone();
+    let active_tasks = app.surface.clone();
+    let active_collections = app.surface.clone();
+    row()
+        .gap(5.)
+        .child(
+            control("Tasks")
+                .id("show-tasks")
+                .reactive_style(move || {
+                    Styles::new().bg(rgb(if active_tasks.get() == Surface::Workspace {
+                        ACCENT
+                    } else {
+                        PANEL
+                    }))
+                })
+                .on_click(move || tasks.show_workspace()),
+        )
+        .child(
+            control("Collection panels")
+                .id("show-collections")
+                .reactive_style(move || {
+                    Styles::new().bg(rgb(if active_collections.get() == Surface::Collections {
+                        ACCENT
+                    } else {
+                        PANEL
+                    }))
+                })
+                .on_click(move || collections.show_collections()),
+        )
+}
+
 fn mount(
     cx: &mut WindowContext,
     workspace: Workspace,
     usage_path: Option<PathBuf>,
+    collection_data: Option<&collection::Data>,
     #[cfg(feature = "live")] backend: Option<live::Backend>,
 ) -> (App, ViewHandle) {
     let app = App {
         workspace: cx.ui.signal(workspace),
+        collections: collection_data.map(|data| collection::Panels::new(cx, data)),
+        surface: cx.ui.signal(Surface::Workspace),
         palette: cx.ui.signal(None),
         open: cx.ui.signal(false),
         draft: cx.ui.signal(String::new()),
@@ -598,54 +737,69 @@ fn mount(
     let shortcut = app.clone();
     let search = app.clone();
     let context = app.clone();
-    let chips = app.workspace.clone();
-    let chip_app = app.clone();
-    let detail = app.workspace.clone();
-    let message = app.workspace.clone();
-    let mode = app.workspace.with(Workspace::label);
-    let view = cx.render(column().takes_unfocused_keys().w_full().h_full().p(23.).gap(14.)
-        .bg(rgb(BACKGROUND)).text_color(rgb(INK)).text_size(14.)
-        .on_event(move |event| {
-            if event.phase != EventPhase::Bubble
-                && let InputEvent::KeyDown { key: Key::Character(key), modifiers, repeat: false } = &event.event
-                && modifiers.primary_shortcut() && key.eq_ignore_ascii_case("k") && !shortcut.open.get() {
-                shortcut.open(None, false);
-                event.prevent_default();
-                event.stop_propagation();
-            }
-        })
-        .child(row().items_center().gap(10.)
-            .child(text("tod").text_size(23.))
-            .child(text(mode).text_color(rgb(MUTED)).grow())
-            .child(control("Actions…  ⇧Enter").on_click(move || context.open(None, true)))
-            .child(control(if cfg!(target_os = "macos") { "Search  ⌘K" } else { "Search  Ctrl+K" })
-                .id("open-palette").on_click(move || search.open(None, false))))
-        .child(switch(move || chips.get(), move |workspace, _| {
-            row().gap(6.).children(workspace.collections().map(|record| {
-                let id = record.item.id.clone();
-                let app = chip_app.clone();
-                control(record.item.title.clone()).bg(rgb(if workspace.collection == id { ACCENT } else { PANEL }))
-                    .on_click(move || app.open_item(id.clone()))
-            }))
-        }))
-        .child(row().gap(18.).grow()
-            .child(task_list(&app))
-            .child(switch(move || detail.get(), move |workspace, _| {
-                let (title, body) = if workspace.detail == "shortcuts" {
-                    ("Keyboard shortcuts".into(), "⌘/Ctrl+K searches across tod. Arrow keys move by row. Option/Alt+↑/↓ moves by section. Enter opens or runs. Shift+Enter opens actions. Esc goes back.".into())
-                } else if workspace.detail == "conversation" {
-                    ("Agent conversation".into(), workspace.conversation.join(" · "))
-                } else {
-                    workspace.record(&workspace.detail).map_or((String::new(), String::new()), |record| {
-                        (record.item.title.clone(), record.description.clone())
-                    })
-                };
-                column().w(290.).p(14.).gap(8.).rounded(7.).bg(rgb(PANEL))
-                    .child(text(title).text_size(20.).text_wrap(true))
-                    .child(text(body).text_wrap(true).text_color(rgb(MUTED)))
-            })))
-        .child(text_signal(move || message.with(|workspace| workspace.message.clone())).text_color(rgb(MUTED)))
-        .child(palette_view(&app)));
+    let tasks_screen = app.surface.clone();
+    let mut screens = overlay().grow().min_h(0.).child(
+        workspace_view(&app)
+            .reactive_style(move || surface_style(&tasks_screen, Surface::Workspace)),
+    );
+    let mut header = row()
+        .items_center()
+        .gap(10.)
+        .child(text("tod").text_size(23.));
+    if let Some(panels) = &app.collections {
+        let collections_screen = app.surface.clone();
+        screens = screens.child(
+            panels
+                .view(cx)
+                .reactive_style(move || surface_style(&collections_screen, Surface::Collections)),
+        );
+        header = header.child(surface_tabs(&app));
+    } else {
+        header = header.child(text(app.workspace.with(Workspace::label)).text_color(rgb(MUTED)));
+    }
+    let view = cx.render(
+        column()
+            .takes_unfocused_keys()
+            .w_full()
+            .h_full()
+            .p(16.)
+            .gap(12.)
+            .bg(rgb(BACKGROUND))
+            .text_color(rgb(INK))
+            .text_size(14.)
+            .on_event(move |event| {
+                if event.phase != EventPhase::Bubble
+                    && let InputEvent::KeyDown {
+                        key: Key::Character(key),
+                        modifiers,
+                        repeat: false,
+                    } = &event.event
+                    && modifiers.primary_shortcut()
+                    && key.eq_ignore_ascii_case("k")
+                    && !shortcut.open.get()
+                {
+                    shortcut.open(None, false);
+                    event.prevent_default();
+                    event.stop_propagation();
+                }
+            })
+            .child(
+                header
+                    .child(div().grow())
+                    .child(control("Actions…  ⇧Enter").on_click(move || context.open(None, true)))
+                    .child(
+                        control(if cfg!(target_os = "macos") {
+                            "Search  ⌘K"
+                        } else {
+                            "Search  Ctrl+K"
+                        })
+                        .id("open-palette")
+                        .on_click(move || search.open(None, false)),
+                    ),
+            )
+            .child(screens)
+            .child(palette_view(&app)),
+    );
     (app, view)
 }
 
@@ -673,11 +827,24 @@ fn save_usage(
     Ok(())
 }
 
+#[cfg(feature = "agent-socket")]
+fn start_socket(cx: &mut WindowContext, view: ViewHandle) -> std::io::Result<()> {
+    use zgx_script::{ScriptHost, inspect};
+    let host = ScriptHost::inline(&cx.ui.runtime, "tod ZGX", "");
+    let session = inspect::Session::new(&cx.ui, view, &host, None);
+    let tasks = cx.tasks.clone();
+    let server = inspect::serve(session, "tod ZGX", move |serve| tasks.spawn(serve))?;
+    eprintln!("ZGX inspection socket at {}", server.path().display());
+    cx.on_closed(move || drop(server));
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../.local/agent/scratchpad/tod-zgx/palette-usage.json");
     let mut smoke = false;
     let mut data_root: Option<PathBuf> = None;
+    let mut collection_state = None;
     let mut args = std::env::args_os().skip(1);
     while let Some(arg) = args.next() {
         if arg == "--smoke-test" {
@@ -686,6 +853,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             data_root = Some(args.next().ok_or("--data-root needs a directory")?.into());
         } else if arg == "--state" {
             path = args.next().ok_or("--state needs a file")?.into();
+        } else if arg == "--collection-state" {
+            collection_state = Some(args.next().ok_or("--collection-state needs a file")?.into());
         } else {
             return Err(format!("Unknown argument {}", arg.to_string_lossy()).into());
         }
@@ -712,14 +881,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         Workspace::demo(frequency)
     };
+    let demo = workspace.label() == "Command palette demo";
+    let collection_data = demo
+        .then(|| collection::Data::load(collection_state, smoke))
+        .transpose()?;
+    #[cfg(feature = "agent-socket")]
+    let socket = zgx_script::inspect::asked();
+    #[cfg(feature = "agent-socket")]
+    let socket_error = Rc::new(RefCell::new(None));
+    #[cfg(feature = "agent-socket")]
+    let socket_result = socket_error.clone();
+    #[cfg(feature = "agent-socket")]
+    if socket {
+        zgx_script::inspect::prepare();
+    }
     let smoke_result = Rc::new(std::cell::Cell::new(false));
     let result = smoke_result.clone();
     Application::new()
         .window(WindowOptions {
             title: "tod · ZGX".into(),
-            width: 930.,
-            height: 640.,
-            min_size: Some((690., 550.)),
+            width: if demo { 1160. } else { 930. },
+            height: if demo { 750. } else { 640. },
+            min_size: Some((if demo { 960. } else { 690. }, 550.)),
             ..Default::default()
         })
         .run(move |cx| {
@@ -727,9 +910,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 cx,
                 workspace.clone(),
                 (!smoke).then(|| path.clone()),
+                collection_data.as_ref(),
                 #[cfg(feature = "live")]
                 backend.clone(),
             );
+            #[cfg(feature = "agent-socket")]
+            if socket && let Err(error) = start_socket(cx, view.clone()) {
+                socket_result.replace(Some(error));
+                cx.window.close();
+                return;
+            }
             if smoke {
                 let window = cx.window.clone();
                 let ui = cx.ui.downgrade();
@@ -738,8 +928,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     zgx::timer::sleep(Duration::from_millis(350)).await;
                     let passed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         let ui = &mut ui.upgrade().expect("native ZGX window");
-                        if app.workspace.with(Workspace::label) == "Command palette demo" {
+                        if demo {
                             smoke_test(ui, &app, &view);
+                            combined_smoke_test(ui, &app, &view);
                         } else {
                             live_smoke_test(ui, &app, &view);
                         }
@@ -747,14 +938,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .is_ok();
                     result.set(passed);
                     if passed {
-                        println!("Native ZGX palette flow passed");
+                        println!(
+                            "Native ZGX {} checks passed",
+                            if demo {
+                                "palette and collection"
+                            } else {
+                                "live palette"
+                            }
+                        );
                     }
                     window.close();
                 });
             }
         })?;
+    #[cfg(feature = "agent-socket")]
+    if let Some(error) = socket_error.take() {
+        return Err(error.into());
+    }
     if smoke && !smoke_result.get() {
-        return Err("Native ZGX palette smoke test failed".into());
+        return Err("Native ZGX smoke test failed".into());
     }
     Ok(())
 }
@@ -912,4 +1114,39 @@ fn press(ui: &mut zgx::widgets::Ui, key: Key, modifiers: Modifiers) {
     });
     ui.dispatch(InputEvent::KeyUp { key, modifiers });
     ui.prepare_frame();
+}
+
+fn combined_smoke_test(ui: &mut zgx::widgets::Ui, app: &App, view: &ViewHandle) {
+    let primary = Modifiers {
+        meta: cfg!(target_os = "macos"),
+        control: !cfg!(target_os = "macos"),
+        ..Default::default()
+    };
+    let ordinary = Modifiers::default();
+    press(ui, Key::Character("k".into()), primary);
+    ui.dispatch(InputEvent::Text("design work".into()));
+    let palette = app.current().unwrap();
+    assert_eq!(
+        palette.rows()[palette.active().unwrap()].effect,
+        Effect::Open(collection::ID.into())
+    );
+    press(ui, Key::Enter, ordinary);
+    assert_eq!(ui.input.focused(), view.find("Left-collection-pane"));
+
+    press(ui, Key::Character("k".into()), primary);
+    ui.dispatch(InputEvent::Text("edit collection".into()));
+    let palette = app.current().unwrap();
+    assert_eq!(
+        palette.rows()[palette.active().unwrap()].effect,
+        Effect::Run {
+            command: "edit-collection",
+            targets: vec![collection::ID.into()]
+        }
+    );
+    press(ui, Key::Enter, ordinary);
+    assert_eq!(ui.input.focused(), view.find("Left-chip-strip"));
+    press(ui, Key::Escape, ordinary);
+    app.show_collections();
+    ui.prepare_frame();
+    app.collections.as_ref().unwrap().smoke_test(ui, view);
 }
