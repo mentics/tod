@@ -28,7 +28,7 @@ use tod_agent::SharedAgent;
 use tod_agentd_client::Event;
 use tod_core::attention;
 use tod_core::autopilot::local::{FAILED_PREFIX, Live, LocalEvent, LocalRun, PAUSED, Request, RunnerState, STOPPED};
-use tod_core::autopilot::{AutopilotState, Budget, Outcome};
+use tod_core::autopilot::{AutopilotState, Budget, NeedsHuman, Outcome};
 use tod_core::conversation::ConversationConfig;
 use tod_core::next_actor::{self, NextActor, NodeStanding, YouReason};
 use tod_core::runner_place::RunnerPlace;
@@ -287,7 +287,7 @@ impl Runners {
 
     fn load_saved_slots(&self) {
         let root = self.inner.store.paths().root().to_path_buf();
-        for (node, state) in load_saved(&root) {
+        for (node, mut state) in load_saved(&root) {
             // A node deleted from the store holds no slot: its saved run file
             // is left on disk (not ours to delete), noted once here.
             match self.node_exists(node) {
@@ -318,6 +318,9 @@ impl Runners {
                     tracing::error!(%node, "could not tell where the saved run belongs, so it is not resumed: {err:#}");
                     continue;
                 }
+            }
+            if let Err(err) = self.adopt_saved_quota_wait(node, &mut state) {
+                tracing::error!(%node, "could not restore the saved quota wait: {err:#}");
             }
             // Older builds saved a handover as stopped until their final
             // branch push returned. A quiet check may still say it is
@@ -363,6 +366,59 @@ impl Runners {
                 }
             }
         }
+    }
+
+    /// Older local runs stored a quota rejection as an agent failure with
+    /// no wake. The current row must still describe that failure before we
+    /// schedule a retry. If a restart split the checkpoint save and row
+    /// write, the saved timer can finish publishing the same transition.
+    fn adopt_saved_quota_wait(&self, node: Uuid, state: &mut AutopilotState) -> Result<()> {
+        use tod_core::run_state::{self, kind};
+        use tod_store::run_state::Phase;
+
+        let Some(saved) = state.outcome.as_ref() else { return Ok(()) };
+        let (wait, failed) = match saved {
+            Outcome::NeedsHuman { reason: NeedsHuman::AgentFailed { error } } => {
+                let Some(wait) = Outcome::acp_quota_wait(error) else { return Ok(()) };
+                (wait, Some(error.as_str()))
+            }
+            wait if wait.acp_quota_due_at().is_some() => (wait.clone(), None),
+            _ => return Ok(()),
+        };
+        let due_at_ms = wait.acp_quota_due_at().expect("quota wait");
+        let fleet = &self.inner.store;
+        let failed_since = fleet.read(|conn| {
+            let Some(row) = tod_store::run_state::get(conn, node)? else { return Ok(None) };
+            if row.writer != "local" || row.phase != Phase::Stopped || row.reason_kind != kind::FAILED {
+                return Ok(None);
+            }
+            let matching = failed.map_or_else(
+                || Outcome::acp_quota_wait(&row.reason_text).as_ref() == Some(&wait),
+                |error| error == row.reason_text,
+            );
+            if !matching
+                || tod_store::phase::PhaseRepo::new(conn).current_state(node)?.as_deref().is_none_or(|state| state == "done")
+                || !tod_store::decisions::DecisionRepo::new(conn).list_pending_for_node(node)?.is_empty()
+            {
+                return Ok(None);
+            }
+            Ok(Some(row.since))
+        })?;
+        let Some(failed_since) = failed_since else { return Ok(()) };
+        if failed.is_some() {
+            let previous = state.outcome.replace(wait.clone());
+            if let Err(err) = state.save(fleet.paths().root(), node) {
+                state.outcome = previous;
+                return Err(err);
+            }
+        }
+        run_state::record(fleet, node, run_state::for_outcome(&wait, run_state::Words::local()), "local")?;
+        tracing::info!(
+            %node, due_at_ms,
+            failed_for_ms = now_ms().saturating_sub(failed_since).max(0),
+            "restored the retry for a saved agent quota failure"
+        );
+        Ok(())
     }
 
     /// Start a run that is due: one that ended to wait and whose time has
@@ -660,7 +716,9 @@ impl Runners {
                 }
                 match &slot.outcome {
                     Some(Outcome::Waiting { due_at_ms, .. }) if *due_at_ms <= now => due.push(*node),
-                    Some(Outcome::Waiting { .. }) => parked.push((*node, slot.since)),
+                    Some(wait @ Outcome::Waiting { .. }) if wait.acp_quota_due_at().is_none() => {
+                        parked.push((*node, slot.since));
+                    }
                     Some(Outcome::NeedsHuman { reason }) if reason.is_request() => {
                         requests.push((*node, matches!(reason, tod_core::autopilot::NeedsHuman::Decision { .. })))
                     }
@@ -1091,6 +1149,9 @@ impl Runners {
                 }
                 if slot.desired.stop_reason().is_some() || saved_stop {
                     tracing::info!(%node, "not starting the run on its own: the user paused or stopped it");
+                    return Ok(());
+                }
+                if saved.outcome.as_ref().and_then(Outcome::acp_quota_due_at).is_some_and(|at| at > now_ms()) {
                     return Ok(());
                 }
             }
@@ -1530,6 +1591,134 @@ mod tests {
     fn standing_of(fx: &Fixture) -> NodeStanding {
         fx.runners.inner.store.reload_if_stale().unwrap();
         next_actor::compute(&fx.runners.inner.store, &fx.root).unwrap().remove(&fx.node).expect("Lifecycle")
+    }
+
+    fn save_legacy_quota_failure(fx: &Fixture, reset_secs: Option<i64>) -> AutopilotState {
+        let mut data = serde_json::json!({"errorKind": "rate_limit"});
+        if let Some(secs) = reset_secs {
+            data["rateLimit"] = serde_json::json!({
+                "status": "rejected", "resetsAt": secs, "rateLimitType": "seven_day"
+            });
+        }
+        let error = format!("ACP error -32603: Internal error: You've hit your weekly limit · resets 10am (UTC) ({data})");
+        let failed = Outcome::NeedsHuman { reason: NeedsHuman::AgentFailed { error } };
+        let saved = AutopilotState {
+            current: Some(tod_core::autopilot::CurrentStep {
+                protocol: "implement".into(),
+                lifecycle: "active".into(),
+                conversation_id: Uuid::new_v4(),
+                skill_group: 0,
+                partner: None,
+            }),
+            sessions: 7,
+            active_ms: 40_000,
+            outcome: Some(failed.clone()),
+            ..AutopilotState::fresh()
+        };
+        saved.save(&fx.root, fx.node).unwrap();
+        tod_core::run_state::record(
+            &fx.runners.inner.store,
+            fx.node,
+            tod_core::run_state::for_outcome(&failed, tod_core::run_state::Words::local()),
+            "local",
+        )
+        .unwrap();
+        saved
+    }
+
+    #[test]
+    fn legacy_agent_quota_uses_the_saved_reset_and_keeps_run_progress() {
+        for reset_in_secs in [600, -60] {
+            let fx = fixture();
+            let now = now_ms();
+            let reset = now / 1_000 + reset_in_secs;
+            let saved = save_legacy_quota_failure(&fx, Some(reset));
+            let store = &fx.runners.inner.store;
+            let next = Runners::new(store.clone(), fx.runners.inner.agent.clone());
+            next.load_saved_slots();
+            let mut expected = saved.clone();
+            let Outcome::NeedsHuman { reason: NeedsHuman::AgentFailed { error } } = saved.outcome.as_ref().unwrap() else {
+                unreachable!();
+            };
+            expected.outcome = Outcome::acp_quota_wait(error);
+            assert_eq!(AutopilotState::load(&fx.root, fx.node).unwrap(), expected);
+            assert_eq!(
+                next.inner.slots.lock().unwrap()[&fx.node].outcome.as_ref().and_then(Outcome::acp_quota_due_at),
+                Some(reset * 1_000)
+            );
+            let row = store.read(|conn| tod_store::run_state::get(conn, fx.node)).unwrap().unwrap();
+            assert_eq!(row.reason_kind, tod_core::run_state::kind::WAITING_OUTSIDE);
+            assert!(row.reason_text.contains("trying again when it resets"));
+            assert!(!row.reason_text.contains("ACP error"));
+            next.start_due();
+            if reset_in_secs > 0 {
+                // Even a stale candidate from another automatic wake may
+                // not start the run before the saved quota reset.
+                next.start_auto(fx.node).unwrap();
+                assert_eq!(AutopilotState::load(&fx.root, fx.node).unwrap(), expected);
+                assert_eq!(next.inner.slots.lock().unwrap()[&fx.node].desired, Desired::Unset);
+            } else {
+                // The fixture has no media bundle. A failed start proves the
+                // past timer was actually dispatched by the normal tick.
+                assert!(matches!(
+                    AutopilotState::load(&fx.root, fx.node).unwrap().outcome,
+                    Some(Outcome::Stopped { reason }) if reason.contains("Media bundle")
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn a_saved_quota_wait_repairs_its_status_after_an_interrupted_adoption() {
+        let fx = fixture();
+        let mut saved = save_legacy_quota_failure(&fx, Some(now_ms() / 1_000 + 600));
+        let Outcome::NeedsHuman { reason: NeedsHuman::AgentFailed { error } } = saved.outcome.take().unwrap() else {
+            unreachable!();
+        };
+        saved.outcome = Outcome::acp_quota_wait(&error);
+        saved.save(&fx.root, fx.node).unwrap();
+        fx.runners.load_saved_slots();
+        let row = fx.runners.inner.store.read(|conn| tod_store::run_state::get(conn, fx.node)).unwrap().unwrap();
+        assert_eq!(row.reason_kind, tod_core::run_state::kind::WAITING_OUTSIDE);
+        assert_eq!(AutopilotState::load(&fx.root, fx.node).unwrap(), saved);
+    }
+
+    #[test]
+    fn legacy_quota_adoption_preserves_a_later_user_stop_or_open_decision_and_requires_a_reset() {
+        use tod_core::run_state::{self, Words};
+        use tod_store::interview::InterviewCommand;
+        for held in [Some(PAUSED), Some(STOPPED), None] {
+            let fx = fixture();
+            let saved = save_legacy_quota_failure(&fx, Some(now_ms() / 1_000 + 600));
+            let store = &fx.runners.inner.store;
+            if let Some(reason) = held {
+                let stopped = Outcome::Stopped { reason: reason.into() };
+                run_state::record(store, fx.node, run_state::for_outcome(&stopped, Words::local()), "local").unwrap();
+            } else {
+                store.interview(
+                    "agent",
+                    InterviewCommand::AskDecision {
+                        node_id: fx.node,
+                        conversation_id: None,
+                        protocol: None,
+                        decision: tod_store::decisions::NewDecision {
+                            question: "Which limit should apply?".into(),
+                            options: vec!["One".into(), "Two".into()],
+                            ..Default::default()
+                        },
+                    },
+                )
+                .unwrap();
+            }
+            fx.runners.load_saved_slots();
+            fx.runners.start_due();
+            assert_eq!(AutopilotState::load(&fx.root, fx.node).unwrap(), saved);
+        }
+        let fx = fixture();
+        let saved = save_legacy_quota_failure(&fx, None);
+        fx.runners.load_saved_slots();
+        fx.runners.start_due();
+        assert_eq!(AutopilotState::load(&fx.root, fx.node).unwrap(), saved);
     }
 
     #[test]

@@ -103,6 +103,24 @@ pub enum Outcome {
     Waiting { what: String, due_at_ms: i64 },
 }
 
+impl Outcome {
+    const ACP_QUOTA_WAIT: &str = "the agent's usage limit; trying again when it resets";
+
+    /// A Claude ACP quota failure with a concrete reset can use a timed wait.
+    pub fn acp_quota_wait(error: &str) -> Option<Self> {
+        let due_at_ms = tod_store::incident_class::acp_rate_limit_reset_ms(error).filter(|at| *at > 0)?;
+        Some(Self::Waiting { what: Self::ACP_QUOTA_WAIT.into(), due_at_ms })
+    }
+
+    /// Unlike a review wait, this timer cannot be woken early by a bot answer.
+    pub fn acp_quota_due_at(&self) -> Option<i64> {
+        match self {
+            Self::Waiting { what, due_at_ms } if what == Self::ACP_QUOTA_WAIT => Some(*due_at_ms),
+            _ => None,
+        }
+    }
+}
+
 /// Where a run is when it calls its [`StepHook`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Boundary {
@@ -1214,13 +1232,14 @@ impl Autopilot {
         /// Retries of a first sighting before it is the user's after all.
         const RETRIES: u32 = 3;
         let now = state::now_ms();
-        if let Some(due_at_ms) = tod_store::incident_class::acp_rate_limit_reset_ms(&error).filter(|at| *at > now) {
+        if let Some(wait @ Outcome::Waiting { due_at_ms, .. }) = Outcome::acp_quota_wait(&error)
+            && due_at_ms > now
+        {
             // Probing this account before its reset would only spend a retry.
-            let what = "the agent's usage limit; trying again when it resets".to_string();
             return if self.external_wait_scheduler {
-                self.wait_until(fleet, due_at_ms, what)
+                self.wait_until(fleet, due_at_ms, Outcome::ACP_QUOTA_WAIT.into())
             } else {
-                Ok(Outcome::Waiting { what, due_at_ms })
+                Ok(wait)
             };
         }
         let observed = crate::incident::observe(
