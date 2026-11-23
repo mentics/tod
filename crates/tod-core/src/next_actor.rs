@@ -401,7 +401,7 @@ pub fn for_nodes(
     // Cloud nodes: a sandbox that is gone, and the answer to the latest stop
     // question (only for a node whose sandbox is there to be stopped).
     let mut lost: HashMap<Uuid, CloudLost> = HashMap::new();
-    let mut supervised: std::collections::HashSet<Uuid> = cloud.keys().copied().collect();
+    let mut supervised = std::collections::HashSet::new();
     let mut stop_answers: HashMap<Uuid, StopAnswer> = HashMap::new();
     for row in tod_store::cloud_nodes::list(conn)?.into_iter().filter(|r| node_ids.contains(&r.node_id)) {
         supervised.insert(row.node_id);
@@ -434,6 +434,16 @@ pub fn for_nodes(
         let Some((lifecycle, entered_at)) = lifecycles.get(&node_id) else {
             continue;
         };
+        let run_state = run_states.get(&node_id);
+        // A node can have a retained heartbeat from its former sandbox.
+        // A clearly newer local row supersedes that heartbeat, including its
+        // stop reason and its evidence that the runner is supervised.
+        let cloud = cloud.get(&node_id).filter(|beat| {
+            run_state.is_none_or(|row| {
+                row.writer != crate::run_state::LOCAL_WRITER
+                    || beat.heartbeat_at + RUN_STATE_SKEW_MS >= row.updated_at
+            })
+        });
         let standing = derive(&Facts {
             node_id,
             lifecycle,
@@ -441,10 +451,10 @@ pub fn for_nodes(
             attention: attention.get(&node_id).unwrap_or(&no_attention),
             waits: waits.get(&node_id).map(Vec::as_slice).unwrap_or(&[]),
             leases: leases.get(&node_id).map(Vec::as_slice).unwrap_or(&[]),
-            cloud: cloud.get(&node_id),
+            cloud,
             cloud_lost: lost.get(&node_id).copied(),
-            supervised: supervised.contains(&node_id),
-            run_state: run_states.get(&node_id),
+            supervised: cloud.is_some() || supervised.contains(&node_id),
+            run_state,
             stop_answer: stop_answers.get(&node_id),
             run: inputs.runs.get(&node_id).unwrap_or(&no_run),
             problems: problems.get(&node_id).map(Vec::as_slice).unwrap_or(&[]),
@@ -1938,6 +1948,74 @@ mod tests {
         let NextActor::Others { wait } = &got[&waiting].actor else { panic!("not others") };
         assert_eq!(wait.kind, WaitKind::HumanReview);
         assert_eq!(wait.detail.as_deref(), Some("a review of o/r#3"));
+    }
+
+    #[test]
+    fn for_nodes_ignores_an_old_cloud_stop_while_the_local_runner_waits() {
+        use crate::run_state::{LOCAL_WRITER, kind};
+        use tod_store::run_state::{Draft, RESUMABLE_BY_RUNNER, RESUMABLE_BY_YOU};
+
+        let fx = fixture();
+        let id = node(&fx.conn, "moved-to-local", Some("active"));
+        let retry = "Claude quota retry 2 of 3";
+        let since = NOW - 1_000;
+        let due_at_ms = NOW + 60_000;
+        tod_store::cloud_activity::idle_stopped(&fx.conn, id, Some("cloud Git fetch failed"), NOW - 86_400_000).unwrap();
+        let local_wait = Draft {
+            phase: Phase::Waiting,
+            reason_kind: kind::WAITING_OUTSIDE.into(),
+            reason_text: retry.into(),
+            resumable_by: RESUMABLE_BY_RUNNER.into(),
+        };
+        tod_store::run_state::set(&fx.conn, id, &local_wait, LOCAL_WRITER, since).unwrap();
+        let mut inputs = Inputs { now_ms: NOW, ..Default::default() };
+        inputs.runs.insert(
+            id,
+            RunFacts {
+                last_outcome: Some((Outcome::Waiting { what: retry.into(), due_at_ms }, since)),
+                ..Default::default()
+            },
+        );
+        let get_actor = || for_nodes(&fx.conn, &[id], &inputs).unwrap().remove(&id).unwrap().actor;
+        let NextActor::Others { wait } = get_actor() else { panic!("the node is waiting on a local retry") };
+        assert_eq!(wait.detail.as_deref(), Some(retry));
+        assert_eq!(wait.next_check_ms, Some(due_at_ms));
+
+        let local_stop = Draft {
+            phase: Phase::Stopped,
+            reason_kind: kind::FAILED.into(),
+            reason_text: "local Git fetch failed".into(),
+            resumable_by: RESUMABLE_BY_YOU.into(),
+        };
+        tod_store::run_state::set(&fx.conn, id, &local_stop, LOCAL_WRITER, NOW).unwrap();
+        assert_eq!(get_actor(), you(YouReason::Failed { error: local_stop.reason_text }, NOW));
+    }
+
+    #[test]
+    fn for_nodes_keeps_idle_cloud_stops_for_legacy_and_newer_supervisor_runs() {
+        let fx = fixture();
+        let legacy = node(&fx.conn, "legacy-cloud", Some("active"));
+        let moved = node(&fx.conn, "moved-to-cloud", Some("active"));
+        tod_store::run_state::set(
+            &fx.conn,
+            moved,
+            &tod_store::run_state::Draft {
+                phase: Phase::Waiting,
+                reason_kind: crate::run_state::kind::WAITING_OUTSIDE.into(),
+                reason_text: "a local retry".into(),
+                resumable_by: tod_store::run_state::RESUMABLE_BY_RUNNER.into(),
+            },
+            crate::run_state::LOCAL_WRITER,
+            NOW - 10_000,
+        )
+        .unwrap();
+        for id in [legacy, moved] {
+            tod_store::cloud_activity::idle_stopped(&fx.conn, id, Some("cloud Git fetch failed"), NOW).unwrap();
+        }
+        let standings = for_nodes(&fx.conn, &[legacy, moved], &Inputs { now_ms: NOW, ..Default::default() }).unwrap();
+        for id in [legacy, moved] {
+            assert_eq!(standings[&id].actor, you(YouReason::Stopped { reason: "cloud Git fetch failed".into() }, NOW));
+        }
     }
 
     /// A node parked on an incident is waited on by others, not the user's:
