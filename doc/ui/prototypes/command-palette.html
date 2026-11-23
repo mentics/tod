@@ -1,0 +1,630 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tod · Command palette prototype</title>
+<style>
+  :root {
+    color-scheme: light;
+    font: 15px/1.5 system-ui, sans-serif;
+    color: #232924;
+    background: #f7f8f3;
+    --line: #dbe0d6;
+    --muted: #505e55;
+    --accent: #215d43;
+    --selected: #e6f0e6;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; }
+  button, input { font: inherit; }
+  button { color: inherit; cursor: pointer; }
+  button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  header, footer, .toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+  body > header { min-height: 68px; padding: 12px clamp(18px, 5vw, 80px); border-bottom: 1px solid var(--line); background: #fff; }
+  .brand { display: flex; align-items: center; gap: 12px; }
+  .brand strong { font-size: 23px; letter-spacing: -.07em; }
+  .brand span, small, .muted { color: var(--muted); }
+  .control { display: inline-flex; align-items: center; gap: 8px; padding: 6px 10px; border: 1px solid var(--line); border-radius: 7px; background: #fff; }
+  kbd { font: 12px ui-monospace, monospace; white-space: nowrap; }
+  .control kbd, footer kbd { border: 1px solid var(--line); background: #f7f8f3; padding: 1px 4px; border-radius: 4px; }
+  main { display: grid; grid-template-columns: minmax(320px, 1fr) minmax(240px, .8fr); gap: 18px; max-width: 1150px; margin: 34px auto; padding: 0 20px; }
+  .panel { background: #fff; border: 1px solid var(--line); border-radius: 12px; min-width: 0; padding: 20px; }
+  h1, h2, h3, p { margin: 0; }
+  h1, h2 { font-size: 20px; letter-spacing: -.025em; }
+  h3 { font-size: 13px; color: var(--muted); }
+  .toolbar { margin-bottom: 16px; }
+  .collections { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 14px; }
+  .collections button[aria-current] { background: var(--selected); border-color: #b7cebd; }
+  .group { margin: 12px 0 4px; }
+  .task { display: flex; align-items: center; gap: 8px; border-top: 1px solid var(--line); padding: 4px 8px; }
+  .task:has(input:checked) { background: var(--selected); }
+  .task input { accent-color: var(--accent); }
+  .task button { background: none; border: 0; text-align: left; padding: 7px 3px; flex: 1; }
+  .task button[aria-current] { color: var(--accent); font-weight: 650; }
+  .task small { text-align: right; }
+  #detail h2 { margin-bottom: 10px; }
+  #detail p + p { margin-top: 12px; }
+  #activity { min-height: 24px; margin-top: 14px; color: var(--accent); }
+  dialog { width: min(680px, calc(100% - 28px)); padding: 0; border: 1px solid #bec9be; border-radius: 14px; color: inherit; background: white; box-shadow: 0 18px 72px #15291b38; margin: min(12vh, 95px) auto auto; }
+  dialog::backdrop { background: #24342c60; }
+  dialog header { padding: 14px 16px 0; }
+  dialog header h2 { font-size: 15px; letter-spacing: 0; }
+  .search { padding: 10px 16px 12px; border-bottom: 1px solid var(--line); }
+  #query { width: 100%; padding: 9px 10px; border: 1px solid #b8c5b8; border-radius: 6px; background: #fcfdfa; color: inherit; font-size: 16px; }
+  #results { padding: 4px 8px 8px; max-height: min(51vh, 420px); overflow: auto; }
+  .result-group h3 { padding: 10px 8px 3px; }
+  .result { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 43px; padding: 6px 9px; border-radius: 6px; cursor: pointer; }
+  .result > div { min-width: 0; }
+  .result[aria-selected="true"] { background: var(--selected); box-shadow: inset 3px 0 var(--accent); }
+  .result[aria-disabled="true"] { color: var(--muted); }
+  .result small { display: block; overflow-wrap: anywhere; }
+  .result .kind { white-space: nowrap; }
+  .empty { padding: 18px 9px; color: var(--muted); }
+  .feedback { color: #8d3026; padding: 0 16px; }
+  .feedback:empty { display: none; }
+  dialog footer { border-top: 1px solid var(--line); padding: 9px 16px 10px; background: #fafbf8; color: var(--muted); }
+  .key-help { display: flex; align-items: center; flex-wrap: wrap; gap: 9px 13px; }
+  [hidden] { display: none !important; }
+  @media (max-width: 700px) { main { grid-template-columns: minmax(0, 1fr); margin-top: 18px; } }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand"><strong>tod</strong><span>Command palette prototype</span></div>
+  <div class="toolbar" style="margin:0">
+    <button class="control" id="reset">Reset demo</button>
+    <button class="control" id="open-palette">Search <kbd id="open-key">Ctrl K</kbd></button>
+  </div>
+</header>
+<main>
+  <section class="panel" aria-labelledby="workspace-title">
+    <div class="toolbar"><h1 id="workspace-title">Tasks</h1><button class="control" id="task-actions">Actions… <kbd>Shift Enter</kbd></button></div>
+    <nav class="collections" id="collections" aria-label="Collections"></nav>
+    <div id="task-list"></div>
+    <p id="activity" role="status"></p>
+  </section>
+  <section class="panel" id="detail" aria-label="Detail"></section>
+</main>
+<dialog id="palette" aria-labelledby="palette-title">
+  <header><h2 id="palette-title">Search tod</h2><button class="control" id="close-palette" aria-label="Close palette">Esc</button></header>
+  <div class="search">
+    <input id="query" type="text" role="combobox" aria-controls="results" aria-expanded="true" aria-autocomplete="list" aria-label="Search tod" placeholder="Search commands, items, and collections" autocomplete="off" spellcheck="false">
+  </div>
+  <div id="results" role="listbox" aria-label="Search results"></div>
+  <p class="feedback" id="feedback" role="alert"></p>
+  <footer>
+    <div class="key-help"><span><kbd>↑ ↓</kbd> Move</span><span><kbd>Alt ↑ ↓</kbd> Section</span><span><kbd>Enter</kbd> <span id="enter-label">Open</span></span></div>
+    <button class="control" id="result-actions">Actions… <kbd>Shift Enter</kbd></button>
+  </footer>
+</dialog>
+<script>
+"use strict";
+
+const tasks = [
+  { id: "sync", name: "Fix sync retries", project: "Sync", status: "Running", description: "Retry transient failures without creating duplicate jobs." },
+  { id: "policy", name: "Review retry policy", project: "Sync", status: "Needs a decision", description: "Decide which failure types can be retried automatically." },
+  { id: "logs", name: "Trace failed webhooks", project: "Sync", status: "Error", description: "Find out why delivery stopped after reconnecting." },
+  { id: "import", name: "Validate catalog imports", project: "Catalog", status: "Running", description: "Check imported records before publishing them." },
+  { id: "index", name: "Rebuild search index", project: "Catalog", status: "Error", description: "Recover records missing from the search index." },
+];
+const items = [
+  ...tasks.map(task => ({ ...task, kind: "Task" })),
+  { id: "contract", name: "Offline sync contract", project: "Sync", kind: "Product definition", description: "Defines what users can do offline and how changes reconcile." },
+  { id: "run", name: "Retry worker", project: "Sync", related: "sync", kind: "Agent run", description: "Active agent run for Fix sync retries." },
+  { id: "lessons", name: "Review recurring failures", project: "Catalog", kind: "Process improvement", description: "Review which recent failures could be prevented by a shared check." },
+];
+const collections = [
+  { id: "all", name: "All tasks", matches: () => true, group: "project" },
+  { id: "decisions", name: "Needs my decision", matches: task => task.status === "Needs a decision" },
+  { id: "errors", name: "Errors", matches: task => task.status === "Error", group: "project" },
+  { id: "pinned", name: "Pinned tasks", matches: task => state.pinned.has(task.id) },
+  { id: "sync-tasks", name: "Sync tasks", project: "Sync", matches: task => task.project === "Sync" },
+].map(entry => ({ ...entry, kind: "Collection" }));
+
+const $ = id => document.getElementById(id);
+const modal = $("palette");
+const query = $("query");
+const results = $("results");
+const mac = /Mac|iPhone|iPad/.test(navigator.platform);
+$("open-key").textContent = mac ? "⌘ K" : "Ctrl K";
+if (mac) document.querySelector(".key-help span:nth-child(2) kbd").textContent = "⌥ ↑ ↓";
+const storageKey = "tod-command-palette-prototype-v1";
+const initialHistory = { pin: 14, shortcuts: 5, pause: 3, chat: 2 };
+let history = readHistory();
+let state;
+let workspaceFocus;
+let context;
+let actionsTarget;
+let previousSearch;
+let sections;
+let rows;
+let activeId;
+let paintedQuery;
+let menu;
+let wasPressed;
+
+function readHistory() {
+  try {
+    return { ...initialHistory, ...JSON.parse(localStorage.getItem(storageKey) || "{}") };
+  } catch (error) {
+    console.warn("Could not read demo command history", error);
+    return { ...initialHistory };
+  }
+}
+
+function recordUse(command) {
+  history[command] = (history[command] || 0) + 1;
+  try {
+    localStorage.setItem(storageKey, JSON.stringify(history));
+  } catch (error) {
+    return " Command history could not be saved in this browser.";
+  }
+  return "";
+}
+
+function reset() {
+  state = {
+    selected: new Set(), pinned: new Set(), paused: new Set(),
+    detail: items[0], collection: collections[0], cursor: "sync",
+  };
+  workspaceFocus = "sync";
+  renderWorkspace();
+}
+const byId = id => items.find(item => item.id === id);
+const escapeHtml = value => String(value).replace(/[&<>"']/g, character => ({
+  "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+})[character]);
+const statusOf = task => state.paused.has(task.id) ? "Paused" : task.status;
+const describeTarget = target => target.length === 1 ? target[0].name : `${target.length} selected tasks`;
+const selectedItems = () => [...state.selected].map(byId);
+const commands = [
+  { id: "shortcuts", label: "Keyboard shortcuts", aliases: "key bindings hotkeys help", run: () => {
+    state.detail = { name: "Keyboard shortcuts", kind: "tod", description: "Cmd/Ctrl+K opens search. Up and Down move by result. Option/Alt+Up or Down moves by section. Enter opens or runs. Shift+Enter shows actions. Escape goes back." };
+    return "Opened keyboard shortcuts.";
+  } },
+  { id: "palette", label: "Search tod", aliases: "command palette find global search", run: () => {
+    state.detail = { name: "Search tod", kind: "tod", description: "Use Cmd/Ctrl+K to search commands, items, and collections from anywhere in the workspace." };
+    return "Opened search help.";
+  } },
+  { id: "pause", label: "Pause runner", aliases: "suspend stop agent", type: "Task", availability: target =>
+    target.length !== 1 ? "Choose one task" : statusOf(target[0]) === "Running" ? "" : "Requires a running task",
+    run: ([task]) => {
+      state.paused.add(task.id);
+      return `Paused runner for ${task.name}.`;
+    } },
+  { id: "resume", label: "Resume runner", aliases: "restart continue agent", type: "Task", availability: target =>
+    target.length !== 1 ? "Choose one task" : state.paused.has(target[0].id) ? "" : "Requires a paused task",
+    run: ([task]) => {
+      state.paused.delete(task.id);
+      return `Resumed runner for ${task.name}.`;
+    } },
+  { id: "pin", label: "Pin task", plural: "Pin tasks", aliases: "bookmark favorite save", type: "Task",
+    run: target => {
+      target.forEach(task => state.pinned.add(task.id));
+      return `Pinned ${target.map(task => task.name).join(", ")} to Pinned tasks.`;
+    } },
+  { id: "chat", label: "Open agent conversation", aliases: "chat discuss talk assistant", type: "Task",
+    run: target => {
+      state.detail = { name: "Agent conversation", kind: "Conversation", description: target.map(task => task.name).join(" · ") };
+      return "Opened a mock conversation for the displayed targets.";
+    } },
+  { id: "edit", label: "Edit collection", aliases: "rules filter sort group configure", type: "Collection",
+    run: ([collection]) => {
+      state.detail = { name: collection.name, kind: "Collection config", description: collection.id === "pinned"
+        ? "Manual membership. Sorted by task name."
+        : `Dynamic membership. Sorted by task name${collection.group ? ", grouped by project" : ""}.` };
+      return `Opened the mock config for ${collection.name}.`;
+    } },
+];
+
+function switchCollection(collection) {
+  state.collection = collection;
+  state.selected.clear();
+  state.cursor = null;
+  workspaceFocus = "collection";
+}
+
+function renderWorkspace() {
+  $("workspace-title").textContent = state.collection.name;
+  $("collections").innerHTML = collections.map(collection => `<button class="control" data-collection="${collection.id}" ${collection === state.collection ? 'aria-current="true"' : ""}>${escapeHtml(collection.name)}</button>`).join("");
+  const visible = items.filter(item => item.kind === "Task" && state.collection.matches(item))
+    .sort((left, right) => (state.collection.group ? left.project.localeCompare(right.project) : 0) || left.name.localeCompare(right.name));
+  let group = "";
+  $("task-list").innerHTML = visible.map(task => {
+    const heading = state.collection.group && group !== task.project ? `<h3 class="group">${escapeHtml(task.project)}</h3>` : "";
+    group = task.project;
+    return `${heading}<div class="task" data-task="${task.id}" data-group="${state.collection.group ? task.project : ""}">
+      <input type="checkbox" data-select="${task.id}" aria-label="Select ${escapeHtml(task.name)}" ${state.selected.has(task.id) ? "checked" : ""}>
+      <button data-item="${task.id}" ${state.detail.id === task.id ? 'aria-current="true"' : ""}>${escapeHtml(task.name)}</button>
+      <small>${escapeHtml(statusOf(task))}</small></div>`;
+  }).join("") || '<p class="muted">No tasks in this collection.</p>';
+  const detail = state.detail;
+  $("detail").innerHTML = `<p class="muted">${escapeHtml(detail.kind)}${detail.project ? ` · ${escapeHtml(detail.project)}` : ""}</p>
+    <h2>${escapeHtml(detail.name)}</h2><p>${escapeHtml(detail.description)}</p>
+    ${detail.kind === "Task" ? `<p class="muted">${escapeHtml(statusOf(detail))}${state.pinned.has(detail.id) ? " · Pinned" : ""}</p>` : ""}`;
+}
+
+function snapshot(explicit) {
+  const focused = byId(workspaceFocus);
+  const target = explicit || (state.selected.size ? selectedItems() : focused ? [focused] : [state.collection]);
+  const projects = new Set(target.map(item => item.project));
+  const project = projects.size === 1 ? target[0].project : undefined;
+  return { target, project, collection: state.collection };
+}
+
+function openPalette({ explicit, actions = false } = {}) {
+  if (modal.open) return;
+  wasPressed = document.activeElement;
+  context = snapshot(explicit);
+  actionsTarget = actions ? context.target : null;
+  previousSearch = null;
+  activeId = null;
+  paintedQuery = null;
+  query.value = "";
+  $("feedback").textContent = "";
+  modal.showModal();
+  paint();
+  query.focus();
+}
+
+function restoreWorkspaceFocus() {
+  if (wasPressed?.isConnected) {
+    wasPressed.focus();
+    return;
+  }
+  const row = state.cursor && document.querySelector(`[data-item="${state.cursor}"]`);
+  (row || $("open-palette")).focus();
+}
+
+function back() {
+  if (previousSearch) {
+    actionsTarget = null;
+    query.value = previousSearch.query;
+    activeId = previousSearch.id;
+    paintedQuery = query.value;
+    previousSearch = null;
+    $("feedback").textContent = "";
+    paint();
+    query.focus();
+    return;
+  }
+  modal.close();
+  restoreWorkspaceFocus();
+}
+
+function showActions(row) {
+  if (!row?.item) return;
+  previousSearch = { query: query.value, id: row.id };
+  actionsTarget = [row.item];
+  query.value = "";
+  activeId = null;
+  paintedQuery = null;
+  $("feedback").textContent = "";
+  paint();
+  query.focus();
+}
+
+function candidates() {
+  const { target, project, collection } = context;
+  const commandTargets = actionsTarget
+    ? [actionsTarget]
+    : [target, ...items.filter(item => item.kind === "Task" && !target.some(member => member.id === item.id)).map(item => [item])];
+  if (!actionsTarget) {
+    for (const candidate of [collection, ...collections.filter(entry => entry !== collection)]) {
+      if (!target.includes(candidate)) commandTargets.push([candidate]);
+    }
+  }
+  const rows = [];
+  for (const command of commands) {
+    if (!command.type) {
+      if (!actionsTarget) rows.push({ id: command.id, label: command.label, command, scope: 2, target: [] });
+      continue;
+    }
+    for (const members of commandTargets) {
+      if (!members.every(member => member.kind === command.type)) continue;
+      const local = members === (actionsTarget || target) || members[0] === collection;
+      const scope = local ? 0 : project && members[0].project === project ? 1 : 2;
+      const unavailable = command.availability?.(members) || "";
+      rows.push({ id: `${command.id}-${members.map(member => member.id).join("-")}`,
+        label: members.length > 1 && command.plural ? command.plural : command.label,
+        command, scope, target: members, unavailable, local });
+    }
+  }
+  if (actionsTarget) return rows;
+  for (const item of [...items, ...collections]) {
+    const scope = target.includes(item) || target.some(member => member.id === item.related)
+      ? 0 : project && item.project === project ? 1 : 2;
+    rows.push({ id: `open-${item.id}`, label: item.name, item, scope });
+  }
+  return rows;
+}
+
+const normalized = text => text.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+
+function distance(left, right) {
+  let previous = Array.from({ length: right.length + 1 }, (_, index) => index);
+  for (let i = 1; i <= left.length; i++) {
+    const current = [i];
+    for (let j = 1; j <= right.length; j++) {
+      current.push(Math.min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + Number(left[i - 1] !== right[j - 1])));
+    }
+    previous = current;
+  }
+  return previous[right.length];
+}
+
+function orderedScore(needle, label) {
+  let start = 0;
+  let points = 0;
+  const tokens = needle.split(" ");
+  for (const token of tokens) {
+    // Single-letter words in a spaced abbreviation represent initials.
+    const index = tokens.length > 1 && token.length === 1
+      ? [...label].findIndex((letter, position) => position >= start && letter === token && (position === 0 || label[position - 1] === " "))
+      : label.indexOf(token, start);
+    if (index !== -1) {
+      points += index === 0 || label[index - 1] === " " ? 8 : 4;
+      points += Math.min(token.length, 8) * 2;
+      start = index + token.length;
+      continue;
+    }
+    if (tokens.length > 1 && token.length === 1) return 0;
+    let last = -2;
+    for (const letter of token) {
+      const position = label.indexOf(letter, start);
+      if (position === -1 || (tokens.length > 1 && last >= 0 && position - last > 3)) return 0;
+      points += position === 0 || label[position - 1] === " " ? 5 : position === last + 1 ? 4 : 2;
+      last = position;
+      start = position + 1;
+    }
+  }
+  return Math.min(73, 45 + points / needle.replaceAll(" ", "").length * 3);
+}
+
+function match(needle, value) {
+  const text = normalized(value);
+  if (!text) return 0;
+  if (text === needle) return 110;
+  if (text.startsWith(needle)) return 95;
+  if (text.includes(` ${needle}`)) return 87;
+  if (text.includes(needle)) return 80;
+  const score = orderedScore(needle, text);
+  if (score) return score;
+  const words = text.split(" ");
+  const tokens = needle.split(" ");
+  const candidates = tokens.length === 1 ? words : [text];
+  return needle.length >= 5 && candidates.some(word => distance(needle, word) <= (tokens.length > 1 ? 2 : 1)) ? 53 : 0;
+}
+
+function score(row, needle) {
+  const frequency = row.command ? Math.min(6, Math.log2(1 + (history[row.command.id] || 0))) : 0;
+  if (!needle) return 10 + frequency + (row.item ? 2 : 0) - (row.unavailable ? 12 : 0);
+  const name = match(needle, row.label);
+  const alias = match(needle, row.command?.aliases || "");
+  const target = row.target?.map(item => item.name).join(" ") || row.item?.project || "";
+  const combined = target && match(needle, `${row.label} ${target}`);
+  const quality = Math.max(name, alias ? alias - 16 : 0, combined ? combined - 11 : 0);
+  return quality ? quality + frequency - (row.unavailable ? 13 : 0) : 0;
+}
+
+function paint() {
+  const needle = normalized(query.value);
+  const target = actionsTarget || context.target;
+  const heading = actionsTarget ? `Actions for ${describeTarget(target)}` : "Search tod";
+  $("palette-title").textContent = heading;
+  query.setAttribute("aria-label", heading);
+  query.placeholder = actionsTarget ? "Search actions" : "Search commands, items, and collections";
+  const labels = [describeTarget(target), context.project ? `${context.project} project` : "", "Everywhere"];
+  sections = labels.map((label, scope) => ({ label, scope, rows: [] }));
+  for (const row of candidates()) {
+    if (!needle && (row.unavailable || (row.command?.type && !row.local))) continue;
+    if (needle && row.unavailable && !row.local) continue;
+    row.score = score(row, needle);
+    if (row.score > 0) sections[row.scope].rows.push(row);
+  }
+  const order = new Map((paint.lastSections || [0, 1, 2]).map((scope, index) => [scope, index]));
+  sections = sections.filter(section => section.rows.length);
+  for (const section of sections) {
+    section.rows.sort((left, right) => right.score - left.score || left.label.localeCompare(right.label) || left.id.localeCompare(right.id));
+  }
+  if (needle) {
+    // Start with the previous order and swap neighbors only for a clear lead.
+    sections.sort((left, right) => (order.get(left.scope) ?? 3) - (order.get(right.scope) ?? 3));
+    for (let index = 1; index < sections.length; index++) {
+      for (let position = index; position > 0; position--) {
+        const left = sections[position - 1];
+        const right = sections[position];
+        if (right.rows[0].score - left.rows[0].score < 13) break;
+        [sections[position - 1], sections[position]] = [right, left];
+      }
+    }
+  }
+  paint.lastSections = [...sections.map(section => section.scope), ...[0, 1, 2].filter(scope => !sections.some(section => section.scope === scope))];
+  rows = sections.flatMap(section => section.rows);
+  const keep = paintedQuery === query.value && rows.some(row => row.id === activeId);
+  if (!keep) activeId = rows[0]?.id;
+  paintedQuery = query.value;
+  results.innerHTML = sections.map(section => `<div class="result-group" role="group" aria-labelledby="scope-${section.scope}">
+    <h3 id="scope-${section.scope}">${escapeHtml(section.label)}</h3>
+    ${section.rows.map(row => {
+      const title = row.target?.length ? describeTarget(row.target) : row.item?.project || "";
+      const names = row.target?.map(item => item.name).join(", ");
+      const detail = [title, row.unavailable].filter(Boolean).join(" · ");
+      return `<div class="result" id="result-${row.id}" data-result="${row.id}" role="option" aria-selected="false" ${row.unavailable ? 'aria-disabled="true"' : ""}>
+        <div><strong>${escapeHtml(row.label)}</strong>${detail ? `<small>${escapeHtml(detail)}${row.target?.length > 1 ? ` · ${escapeHtml(names)}` : ""}</small>` : ""}</div>
+        <small class="kind">${row.item?.kind || "Command"}</small></div>`;
+    }).join("")}</div>`).join("") || '<p class="empty" role="status">No matches. Try fewer letters or a different word.</p>';
+  highlight(activeId);
+}
+
+function highlight(id) {
+  activeId = id;
+  const row = rows.find(entry => entry.id === id);
+  results.querySelector('[aria-selected="true"]')?.setAttribute("aria-selected", "false");
+  if (row) {
+    const option = $(`result-${row.id}`);
+    option.setAttribute("aria-selected", "true");
+    query.setAttribute("aria-activedescendant", option.id);
+    option.scrollIntoView({ block: "nearest" });
+  } else {
+    query.removeAttribute("aria-activedescendant");
+  }
+  $("result-actions").hidden = !row?.item;
+  $("enter-label").textContent = row?.command ? "Run" : "Open";
+}
+
+function move(direction, bySection) {
+  const index = rows.findIndex(row => row.id === activeId);
+  if (index === -1) return;
+  if (!bySection) {
+    highlight(rows[Math.max(0, Math.min(rows.length - 1, index + direction))].id);
+    return;
+  }
+  const section = sections.findIndex(group => group.rows.some(row => row.id === activeId));
+  const destination = sections[section + direction];
+  if (destination) highlight(destination.rows[0].id);
+}
+
+function execute(row) {
+  if (!row) return;
+  if (row.unavailable) {
+    $("feedback").textContent = row.unavailable === "Choose one task"
+      ? "Choose one task by returning to search and opening Actions for that task."
+      : row.unavailable;
+    return;
+  }
+  let message;
+  if (row.command) {
+    const unavailable = row.command.availability?.(row.target);
+    if (unavailable) {
+      $("feedback").textContent = unavailable;
+      return;
+    }
+    message = row.command.run(row.target) + recordUse(row.command.id);
+  } else if (row.item.kind === "Collection") {
+    switchCollection(row.item);
+    message = `Opened ${row.item.name}.`;
+  } else {
+    state.detail = row.item;
+    if (row.item.kind === "Task") {
+      state.cursor = row.item.id;
+      workspaceFocus = row.item.id;
+    }
+    message = `Opened ${row.item.name}.`;
+  }
+  modal.close();
+  renderWorkspace();
+  $("activity").textContent = message;
+  restoreWorkspaceFocus();
+}
+
+query.addEventListener("input", () => {
+  $("feedback").textContent = "";
+  paint();
+});
+query.addEventListener("keydown", event => {
+  if (event.isComposing) return;
+  if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+    event.preventDefault();
+    move(event.key === "ArrowDown" ? 1 : -1, event.altKey);
+  } else if (event.key === "Enter") {
+    event.preventDefault();
+    const row = rows.find(entry => entry.id === activeId);
+    if (event.shiftKey) showActions(row);
+    else execute(row);
+  }
+});
+modal.addEventListener("cancel", event => { event.preventDefault(); back(); });
+$("close-palette").addEventListener("click", back);
+$("result-actions").addEventListener("click", () => showActions(rows.find(row => row.id === activeId)));
+results.addEventListener("mousedown", event => {
+  if (event.target.closest("[data-result]")) event.preventDefault();
+});
+results.addEventListener("click", event => {
+  const id = event.target.closest("[data-result]")?.dataset.result;
+  if (id) {
+    highlight(id);
+    execute(rows.find(row => row.id === id));
+  }
+});
+
+$("open-palette").addEventListener("click", () => openPalette());
+$("task-actions").addEventListener("click", () => openPalette({ actions: true }));
+$("reset").addEventListener("click", () => {
+  history = { ...initialHistory };
+  let message = "Demo reset.";
+  try {
+    localStorage.removeItem(storageKey);
+  } catch (error) {
+    message += " Saved command history could not be cleared.";
+  }
+  reset();
+  $("activity").textContent = message;
+});
+$("collections").addEventListener("focusin", () => { workspaceFocus = "collection"; });
+$("collections").addEventListener("click", event => {
+  const id = event.target.closest("[data-collection]")?.dataset.collection;
+  if (!id) return;
+  switchCollection(collections.find(collection => collection.id === id));
+  renderWorkspace();
+  document.querySelector(`[data-collection="${id}"]`).focus();
+});
+$("task-list").addEventListener("focusin", event => {
+  const id = event.target.closest("[data-task]")?.dataset.task;
+  if (id) {
+    workspaceFocus = id;
+    state.cursor = id;
+  }
+});
+$("task-list").addEventListener("keydown", event => {
+  if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+  const current = event.target.closest("[data-task]");
+  if (!current) return;
+  event.preventDefault();
+  const direction = event.key === "ArrowDown" ? 1 : -1;
+  const taskRows = [...$("task-list").querySelectorAll("[data-task]")];
+  let destination;
+  if (event.altKey) {
+    const firstInGroup = taskRows.filter((row, index) => index === 0 || row.dataset.group !== taskRows[index - 1].dataset.group);
+    const groupIndex = firstInGroup.findIndex(row => row.dataset.group === current.dataset.group);
+    destination = firstInGroup[groupIndex + direction];
+  } else {
+    destination = taskRows[taskRows.indexOf(current) + direction];
+  }
+  destination?.querySelector("button").focus();
+});
+$("task-list").addEventListener("change", event => {
+  const id = event.target.dataset.select;
+  if (!id) return;
+  if (event.target.checked) state.selected.add(id);
+  else state.selected.delete(id);
+});
+$("task-list").addEventListener("click", event => {
+  const id = event.target.closest("[data-item]")?.dataset.item;
+  if (!id) return;
+  state.detail = byId(id);
+  state.cursor = id;
+  workspaceFocus = id;
+  renderWorkspace();
+  document.querySelector(`[data-item="${id}"]`).focus();
+});
+$("task-list").addEventListener("contextmenu", event => {
+  const id = event.target.closest("[data-task]")?.dataset.task;
+  if (!id) return;
+  event.preventDefault();
+  openPalette({ explicit: state.selected.has(id) ? selectedItems() : [byId(id)], actions: true });
+});
+document.addEventListener("keydown", event => {
+  if ((event.metaKey || event.ctrlKey) && !event.altKey && event.key.toLowerCase() === "k") {
+    event.preventDefault();
+    if (!modal.open) openPalette();
+  } else if (!modal.open && event.shiftKey && event.key === "Enter" && event.target.closest("#task-list, #collections")) {
+    event.preventDefault();
+    openPalette({ actions: true });
+  }
+});
+reset();
+</script>
+</body>
+</html>

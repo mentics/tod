@@ -1,0 +1,29 @@
+[workspace]
+
+[package]
+name = "tod-zgx"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[features]
+live = ["dep:tokio", "dep:tod-core", "dep:tod-store"]
+
+# Match the ZGX revision and host patches used by the separate zgx-chat experiment.
+[dependencies]
+tod-palette = { path = "../../crates/tod-palette" }
+tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
+tod-core = { path = "../../crates/tod-core", optional = true }
+tod-store = { path = "../../crates/tod-store", optional = true }
+serde_json = "1"
+zgx = { git = "https://github.com/zeronsh/zgx", rev = "b8f298b6b9d1a363adf9e21655334a6e260dc4c7" }
+zgx-desktop = { git = "https://github.com/zeronsh/zgx", rev = "b8f298b6b9d1a363adf9e21655334a6e260dc4c7" }
+
+[patch.crates-io]
+wgpu-hal = { git = "https://github.com/zeronsh/zgx", rev = "b8f298b6b9d1a363adf9e21655334a6e260dc4c7" }
+winit = { git = "https://github.com/zeronsh/zgx", rev = "b8f298b6b9d1a363adf9e21655334a6e260dc4c7" }
+accesskit_macos = { git = "https://github.com/zeronsh/zgx", rev = "b8f298b6b9d1a363adf9e21655334a6e260dc4c7" }
+accesskit_consumer = { git = "https://github.com/zeronsh/zgx", rev = "b8f298b6b9d1a363adf9e21655334a6e260dc4c7" }
+accesskit_atspi_common = { git = "https://github.com/zeronsh/zgx", rev = "b8f298b6b9d1a363adf9e21655334a6e260dc4c7" }
+accesskit_unix = { git = "https://github.com/zeronsh/zgx", rev = "b8f298b6b9d1a363adf9e21655334a6e260dc4c7" }
+accesskit_windows = { git = "https://github.com/zeronsh/zgx", rev = "b8f298b6b9d1a363adf9e21655334a6e260dc4c7" }

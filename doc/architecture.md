@@ -308,6 +308,12 @@ so a crash never leaves one awake. `doc/files-locations.md`,
 
 ## The user interface
 
+The [standalone ZGX frontend](../frontends/tod-zgx/README.md) hosts the
+redesigned command palette in a separate Cargo workspace. Its live adapter
+uses the existing store and runner APIs. The framework-independent
+`tod-palette` crate owns the palette model and fuzzy matching. The independent build keeps ZGX dependency patches
+local to its frontend.
+
 `tod-ui` is GPUI with `gpui-component`. The **unified view**
 (`unified/`) is the workbench: column one is always the node tree, and
 panels (task, details, obligations, plan, findings, settings, transcript)
