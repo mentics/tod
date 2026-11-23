@@ -333,7 +333,12 @@ fn watch_lifetime(shared: Arc<Shared>, root: std::path::PathBuf, port: u16) {
         if shared.quit.load(Ordering::SeqCst) {
             return;
         }
-        let runs = shared.runners.snapshot().iter().filter(|r| r.running || r.pausing).count();
+        let root_exists = root.exists();
+        let has_work = root_exists
+            && shared.runners.has_active_or_scheduled_work().unwrap_or_else(|err| {
+                tracing::warn!("tod-agentd: cannot check scheduled work before idle exit: {err:#}");
+                true
+            });
         // A connection that is open now is a client now.
         let last = if shared.clients.load(Ordering::SeqCst) > 0 {
             Instant::now()
@@ -346,7 +351,7 @@ fn watch_lifetime(shared: Arc<Shared>, root: std::path::PathBuf, port: u16) {
             let program = std::env::var_os("TOD_PROGRAM_DIR").map(std::path::PathBuf::from);
             lifetime::stale_reason(Paths::new(&root).dir(), &exe, program.as_deref())
         });
-        if let Some(reason) = lifetime::should_exit(Instant::now(), last, runs, polls, root.exists(), stale.as_deref(), idle) {
+        if let Some(reason) = lifetime::should_exit(Instant::now(), last, has_work, polls, root_exists, stale.as_deref(), idle) {
             tracing::info!("tod-agentd: exiting: {reason}");
             shared.quit.store(true, Ordering::SeqCst);
             // Wake the accept loop so it sees the flag.

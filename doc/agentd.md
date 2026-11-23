@@ -143,14 +143,16 @@ the reason logged at info):
 - when its data root directory no longer exists; or
 - when no client (app or `tod-cli`) has been connected for the idle period
   (6 hours; `TOD_AGENTD_IDLE_SECS` overrides it) **and** no run is in
-  progress **and** it is not serving the database broker. A root whose
-  `sandboxes.toml` declares a `[[database]]` keeps its daemon up while the app
+  progress or scheduled locally **and** it is not serving the database broker.
+  A root whose `sandboxes.toml` declares a `[[database]]` keeps its daemon up while the app
   is closed: answering a cloud node's `tod-cli db` is that feature
   (`doc/cloud-sandboxes/database-access.md`). An unreadable `sandboxes.toml`
-  counts as declaring one; or
+  counts as declaring one. Timed local waits, such as an agent quota reset,
+  keep the daemon available until it can wake the run. A paused, stopped,
+  or user-blocked node does not keep the daemon up; or
 - when a newer build exists and no client has been connected for 30 minutes
-  (`lifetime::STALE_GRACE`) **and** no run is in progress, broker or not: a
-  newer build copy sits beside it in `daemon/`, or the `tod-agentd` it was
+  (`lifetime::STALE_GRACE`) **and** no run is in progress or scheduled locally,
+  broker or not: a newer build copy sits beside it in `daemon/`, or the `tod-agentd` it was
   started from (`TOD_PROGRAM_DIR`) was rebuilt or updated since. Nothing
   restarts an old build nobody uses, and one left serving the broker kept
   polling the orchestrator on old rules (and kept its sandbox awake).

@@ -30,15 +30,14 @@ pub fn idle_limit() -> Duration {
 ///
 /// - the data root directory is gone: always;
 /// - no client (app or `tod-cli`) since `last_client` for `idle`, and no run
-///   in progress, and the daemon is not holding the database broker's poll
-///   for a root that declares databases (that is a feature: it answers while
-///   the app is closed);
+///   in progress or scheduled locally, and the daemon is not serving the
+///   database broker for a root that declares databases;
 /// - `stale` (a newer build exists, [`stale_reason`]) and no client for
-///   [`STALE_GRACE`] and no run: whatever the broker does.
+///   [`STALE_GRACE`] and no active or scheduled run: whatever the broker does.
 pub fn should_exit(
     now: Instant,
     last_client: Instant,
-    runs: usize,
+    has_work: bool,
     polls_broker: bool,
     root_exists: bool,
     stale: Option<&str>,
@@ -47,19 +46,19 @@ pub fn should_exit(
     if !root_exists {
         return Some("its data root no longer exists".into());
     }
-    if runs > 0 {
+    if has_work {
         return None;
     }
     let quiet = now.saturating_duration_since(last_client);
     if let Some(why) = stale
         && quiet >= STALE_GRACE
     {
-        return Some(format!("{why}, and no client for {} s and no runs", quiet.as_secs()));
+        return Some(format!("{why}, and no client for {} s and no active or scheduled runs", quiet.as_secs()));
     }
     if polls_broker {
         return None;
     }
-    (quiet >= idle).then(|| format!("no client for {} s, no runs, and no database broker to serve", quiet.as_secs()))
+    (quiet >= idle).then(|| format!("no client for {} s, no active or scheduled runs, and no database broker to serve", quiet.as_secs()))
 }
 
 /// Why `running` (this daemon's own executable) is outdated, if it is: a
@@ -123,22 +122,22 @@ mod tests {
     #[test]
     fn exits_when_the_root_is_gone_whatever_else_holds() {
         let now = Instant::now();
-        assert!(should_exit(now, now, 3, true, false, None, IDLE).is_some());
+        assert!(should_exit(now, now, true, true, false, None, IDLE).is_some());
     }
 
     #[test]
     fn stays_while_a_client_is_recent_a_run_is_going_or_the_broker_is_polled() {
         let last = Instant::now();
         let later = last + Duration::from_secs(1000);
-        assert!(should_exit(last + Duration::from_secs(50), last, 0, false, true, None, IDLE).is_none());
-        assert!(should_exit(later, last, 1, false, true, None, IDLE).is_none());
-        assert!(should_exit(later, last, 0, true, true, None, IDLE).is_none());
+        assert!(should_exit(last + Duration::from_secs(50), last, false, false, true, None, IDLE).is_none());
+        assert!(should_exit(later, last, true, false, true, None, IDLE).is_none());
+        assert!(should_exit(later, last, false, true, true, None, IDLE).is_none());
     }
 
     #[test]
     fn exits_when_idle_with_nothing_to_do() {
         let last = Instant::now();
-        let reason = should_exit(last + Duration::from_secs(100), last, 0, false, true, None, IDLE).expect("idle long enough");
+        let reason = should_exit(last + Duration::from_secs(100), last, false, false, true, None, IDLE).expect("idle long enough");
         assert!(reason.contains("no client"), "{reason}");
     }
 
@@ -148,11 +147,11 @@ mod tests {
         let stale = Some("a newer build exists");
         let before = last + STALE_GRACE - Duration::from_secs(1);
         let after = last + STALE_GRACE;
-        assert!(should_exit(before, last, 0, true, true, stale, IDLE).is_none());
-        let reason = should_exit(after, last, 0, true, true, stale, IDLE).expect("stale and unused");
+        assert!(should_exit(before, last, false, true, true, stale, IDLE).is_none());
+        let reason = should_exit(after, last, false, true, true, stale, IDLE).expect("stale and unused");
         assert!(reason.contains("newer build"), "{reason}");
-        assert!(should_exit(after, last, 1, true, true, stale, IDLE).is_none(), "never with a run going");
-        assert!(should_exit(after, last, 0, true, true, None, IDLE).is_none(), "a current build keeps serving");
+        assert!(should_exit(after, last, true, true, true, stale, IDLE).is_none(), "never with a run going");
+        assert!(should_exit(after, last, false, true, true, None, IDLE).is_none(), "a current build keeps serving");
     }
 
     #[test]

@@ -1348,6 +1348,54 @@ impl Runners {
         slots.iter().map(|(node, slot)| Inner::state(*node, slot)).collect()
     }
 
+    /// Whether exiting would leave work without a daemon to serve it. A due
+    /// timer still counts until the scheduler starts it or clears it.
+    pub(crate) fn has_active_or_scheduled_work(&self) -> Result<bool> {
+        use tod_store::run_state::{self, Phase, RESUMABLE_BY_RUNNER};
+
+        let scheduled: Vec<_> = {
+            let slots = self.inner.slots.lock().expect("runner slots");
+            if slots.values().any(|slot| slot.run.is_some() || slot.starting) {
+                return Ok(true);
+            }
+            slots
+                .iter()
+                .filter_map(|(&node, slot)| match &slot.outcome {
+                    Some(Outcome::Waiting { what, .. }) if slot.desired.stop_reason().is_none() => Some((node, what.clone())),
+                    _ => None,
+                })
+                .collect()
+        };
+        let store = &self.inner.store;
+        for (node, what) in scheduled {
+            if read_user_stop(store.paths().root(), node)?.is_some() || RunnerPlace::of(store, node)? != RunnerPlace::Local {
+                continue;
+            }
+            let eligible = store.read(|conn| {
+                if tod_store::phase::PhaseRepo::new(conn).current_state(node)?.as_deref().is_none_or(|state| state == "done") {
+                    return Ok(false);
+                }
+                // The current row may supersede an old timer. A saved-only
+                // checkpoint can still be picked up by the local scheduler.
+                if run_state::get(conn, node)?.is_some_and(|row| {
+                    row.phase != Phase::Waiting
+                        || row.reason_kind != tod_core::run_state::kind::WAITING_OUTSIDE
+                        || row.resumable_by != RESUMABLE_BY_RUNNER
+                        || row.reason_text != what
+                }) {
+                    return Ok(false);
+                }
+                Ok(attention::for_node(conn, node)?.waiting_since.is_none())
+            })?;
+            if eligible {
+                return Ok(true);
+            }
+        }
+        // The scheduler may have started a due slot while we were reading
+        // the store. Its working row then supersedes the waiting row above.
+        Ok(self.inner.slots.lock().expect("runner slots").values().any(|slot| slot.run.is_some() || slot.starting))
+    }
+
     /// A feed of runner state changes, starting with every node's state now.
     pub fn subscribe(&self) -> mpsc::Receiver<Event> {
         let (tx, rx) = mpsc::channel();
@@ -1761,6 +1809,76 @@ mod tests {
                     Some(Outcome::Stopped { reason }) if reason.contains("Media bundle")
                 ));
             }
+        }
+    }
+
+    #[test]
+    fn an_unattended_quota_wait_keeps_the_daemon_alive_until_the_user_stops_it() {
+        use crate::lifetime::{DEFAULT_IDLE, should_exit};
+        use std::time::Instant;
+
+        for desired in [Desired::Pause, Desired::Stop] {
+            let fx = fixture();
+            let reset = now_ms() / 1_000 + 24 * 60 * 60;
+            save_legacy_quota_failure(&fx, Some(reset));
+            fx.runners.load_saved_slots();
+
+            let last_client = Instant::now();
+            let check = last_client + DEFAULT_IDLE;
+            let has_work = fx.runners.has_active_or_scheduled_work().unwrap();
+            assert!(has_work, "a quota reset is scheduled locally");
+            assert!(should_exit(check, last_client, has_work, false, true, None, DEFAULT_IDLE).is_none());
+            assert!(should_exit(check, last_client, has_work, false, true, Some("new build"), DEFAULT_IDLE).is_none());
+
+            fx.runners.user_stop(fx.node, desired).unwrap();
+            let has_work = fx.runners.has_active_or_scheduled_work().unwrap();
+            assert!(!has_work);
+            assert!(should_exit(check, last_client, has_work, false, true, None, DEFAULT_IDLE).is_some());
+        }
+    }
+
+    #[test]
+    fn obsolete_timers_and_manual_work_do_not_keep_the_daemon_alive() {
+        use tod_core::run_state;
+        use tod_store::interview::InterviewCommand;
+
+        for supersession in ["stop marker", "stopped row", "request", "sandbox", "done"] {
+            let fx = fixture();
+            let reset = now_ms() / 1_000 + 24 * 60 * 60;
+            save_legacy_quota_failure(&fx, Some(reset));
+            fx.runners.load_saved_slots();
+            assert!(fx.runners.has_active_or_scheduled_work().unwrap());
+
+            let store = &fx.runners.inner.store;
+            match supersession {
+                "stop marker" => write_user_stop(&fx.root, fx.node, STOPPED).unwrap(),
+                "stopped row" => {
+                    run_state::record(store, fx.node, run_state::left_stopped("left stopped"), "local").unwrap();
+                }
+                "request" => {
+                    store.interview(
+                        "agent",
+                        InterviewCommand::AskDecision {
+                            node_id: fx.node,
+                            conversation_id: None,
+                            protocol: None,
+                            decision: tod_store::decisions::NewDecision {
+                                question: "What should the run do next?".into(),
+                                options: vec!["Continue".into(), "Stop".into()],
+                                ..Default::default()
+                            },
+                        },
+                    )
+                    .unwrap();
+                }
+                "sandbox" => move_to_sandbox(&fx),
+                "done" => {
+                    store.enqueue_outline(OutlineMutation::SetLifecycle { node_id: fx.node, state: "done".into() }).unwrap();
+                    store.writer().flush().unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(!fx.runners.has_active_or_scheduled_work().unwrap(), "{supersession}");
         }
     }
 
