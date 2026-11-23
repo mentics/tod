@@ -44,6 +44,43 @@ pub fn checks_spec(number: Option<i64>) -> String {
     format!("github:pr:{}:checks", number.unwrap_or(0))
 }
 
+const CI_REQUEST_WAIT: &str = "checking whether CI still needs an answer";
+
+/// Keep looking at CI while a run is waiting for an answer about a check.
+/// The next deadline covers missed webhooks. The check's ordinary GitHub
+/// event also wakes the orchestrator's API-only look sooner.
+pub fn record_ci_request_wait(
+    fleet: &FleetStore,
+    node: uuid::Uuid,
+    lifecycle: &str,
+) -> Result<Option<i64>> {
+    use crate::check_unrelated::{RECHECK_MS, babysits_ci, pending};
+    if !babysits_ci(lifecycle) {
+        return Ok(None);
+    }
+    let questions = fleet.read(|conn| pending(conn, node))?;
+    let Some(number) = questions
+        .iter()
+        .find_map(|(_, pr, _, _)| pr.rsplit_once('#').and_then(|(_, n)| n.parse().ok()))
+    else {
+        return Ok(None);
+    };
+    let spec = checks_spec(Some(number));
+    let due = chrono::Utc::now().timestamp_millis() + RECHECK_MS;
+    if let Some(wait) = fleet.read(|conn| WaitRepo::new(conn).list_pending_for_node(node))?
+        .into_iter().find(|w| tod_store::waits::normalize_spec(&w.match_spec) == spec)
+    {
+        fleet.interview(ACTOR, InterviewCommand::RescheduleWait { wait_id: wait.id, due_at: due })?;
+    } else {
+        cancel_waits(fleet, node, |old| old.starts_with("github:pr:") && !old.ends_with(":read"))?;
+        fleet.interview(
+            ACTOR,
+            InterviewCommand::RecordWait { node_id: node, wait: NewWait::event(spec, due).with_detail(CI_REQUEST_WAIT) },
+        )?;
+    }
+    Ok(Some(due))
+}
+
 /// What looking at a node's linked pull requests found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GithubCheck {
@@ -485,6 +522,12 @@ fn review_front(
             Ok(live) => live,
             Err(err) => return Ok(Front::Done(GithubCheck::Unreadable(err))),
         };
+        let open_ci_requests = if look == Look::Act {
+            let questions = fleet.read(|conn| crate::check_unrelated::pending(conn, node))?;
+            crate::check_unrelated::reconcile(fleet, node, state, &live, settings, questions)?
+        } else {
+            0
+        };
         super::note_draft_skipped(fleet, node, &live, state)?;
         // tod's own review of a head is an agent session: owed in `pr_draft`.
         let own_review_owed = before_review
@@ -521,6 +564,12 @@ fn review_front(
                 Ok(_) => {}
                 Err(why) => return Ok(Front::Done(GithubCheck::Unreadable(why))),
             }
+        }
+        if open_ci_requests > 0
+            && matches!(plan, Classification::Clear | Classification::Wait { .. })
+            && let Some(due_at_ms) = record_ci_request_wait(fleet, node, state)?
+        {
+            return Ok(Front::Done(GithubCheck::Waiting { what: CI_REQUEST_WAIT.to_string(), due_at_ms }));
         }
         match plan {
             Classification::AgentWork { work, own_review, .. } => {

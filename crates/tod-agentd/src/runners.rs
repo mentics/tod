@@ -78,6 +78,8 @@ struct Slot {
     /// The node was seen waiting on the user since the run stopped for a
     /// request: once it no longer is, the run continues.
     seen_waiting: bool,
+    /// Earliest time to look at GitHub again for this pending CI request.
+    next_ci_recheck: i64,
 }
 
 struct Inner {
@@ -680,7 +682,30 @@ impl Runners {
                 return;
             }
         };
+        let ci_questions = match self.inner.store.read(|conn| {
+            let questions = tod_store::decisions::DecisionRepo::new(conn).list_pending_for_nodes(&ids)?;
+            let mut nodes = std::collections::HashSet::new();
+            for question in questions {
+                if tod_core::check_unrelated::key_of(&question).is_some()
+                    && tod_store::phase::PhaseRepo::new(conn)
+                        .current_state(question.node_id)?
+                        .as_deref()
+                        .is_some_and(tod_core::check_unrelated::babysits_ci)
+                {
+                    nodes.insert(question.node_id);
+                }
+            }
+            Ok(nodes)
+        }) {
+            Ok(nodes) => nodes,
+            Err(err) => {
+                tracing::error!("could not read pending CI requests: {err:#}");
+                std::collections::HashSet::new()
+            }
+        };
+        let now = now_ms();
         let mut resume = Vec::new();
+        let mut ci_due = Vec::new();
         {
             let mut slots = self.inner.slots.lock().expect("runner slots");
             for (node, is_decision) in request_nodes {
@@ -688,6 +713,10 @@ impl Runners {
                 let is_waiting = waiting.get(&node).is_some_and(|a| a.waiting_since.is_some());
                 if is_waiting {
                     slot.seen_waiting = true;
+                    if is_decision && ci_questions.contains(&node) && now >= slot.next_ci_recheck {
+                        slot.next_ci_recheck = now + tod_core::check_unrelated::RECHECK_MS;
+                        ci_due.push(node);
+                    }
                 } else if slot.seen_waiting || is_decision {
                     // A run that stopped on a question was stopped because a
                     // decision was pending, so one that is no longer pending
@@ -706,6 +735,18 @@ impl Runners {
             if let Err(err) = self.start_auto(node) {
                 tracing::error!(%node, "could not continue after the answer: {err:#}");
             }
+        }
+        for node in ci_due {
+            let store = self.inner.store.clone();
+            // Do not block the reconciler with GitHub I/O. If the request
+            // clears, the next tick resumes it through the normal path.
+            std::thread::spawn(move || {
+                match tod_core::check_unrelated::recheck(&store, node, store.paths().root()) {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(why)) => tracing::warn!(%node, "could not read GitHub to recheck a pending CI request: {why}"),
+                    Err(err) => tracing::error!(%node, "could not recheck a pending CI request: {err:#}"),
+                }
+            });
         }
     }
 
@@ -1529,6 +1570,70 @@ mod tests {
             "{:?}",
             slot.outcome
         );
+    }
+
+    #[test]
+    fn saved_ci_request_is_rechecked_when_due_and_an_ordinary_request_is_not() {
+        use tod_core::autopilot::NeedsHuman;
+        use tod_core::check_unrelated::{PROTOCOL, options};
+        use tod_store::decisions::NewDecision;
+        use tod_store::interview::InterviewCommand;
+
+        for ci in [true, false] {
+            let fx = fixture();
+            let store = &fx.runners.inner.store;
+            store.enqueue_outline(OutlineMutation::SetLifecycle { node_id: fx.node, state: "pr_review".into() }).unwrap();
+            store.writer().flush().unwrap();
+            store.interview(
+                "test",
+                InterviewCommand::AskDecision {
+                    node_id: fx.node,
+                    conversation_id: None,
+                    protocol: ci.then(|| PROTOCOL.to_string()),
+                    decision: NewDecision {
+                        question: "What should the pull request do?".into(),
+                        options: if ci {
+                            options("acme/app#42", "migrations", "abcdef", "")
+                        } else {
+                            vec!["Option A".into(), "Option B".into()]
+                        },
+                        ..Default::default()
+                    },
+                },
+            ).unwrap();
+            let mut slots = fx.runners.inner.slots.lock().unwrap();
+            let slot = slots.entry(fx.node).or_default();
+            slot.outcome = Some(Outcome::NeedsHuman { reason: NeedsHuman::Decision { pending: 1 } });
+            slot.next_ci_recheck = now_ms() + 60_000;
+            drop(slots);
+            fx.runners.start_due();
+            let mut slots = fx.runners.inner.slots.lock().unwrap();
+            let slot = slots.get_mut(&fx.node).unwrap();
+            assert!(matches!(slot.outcome, Some(Outcome::NeedsHuman { .. })));
+            // A freshly restored slot has no in-memory recheck deadline.
+            slot.next_ci_recheck = 0;
+            drop(slots);
+
+            fx.runners.start_due();
+            let slots = fx.runners.inner.slots.lock().unwrap();
+            let slot = &slots[&fx.node];
+            assert!(matches!(slot.outcome, Some(Outcome::NeedsHuman { .. })));
+            assert!(slot.run.is_none(), "a recheck does not start the runner");
+            assert_eq!(slot.next_ci_recheck > now_ms(), ci);
+            drop(slots);
+
+            let pending = || store.read(|conn| tod_store::decisions::DecisionRepo::new(conn).list_pending_for_node(fx.node))
+                .unwrap().len();
+            if ci {
+                // No linked PR in this fixture: the background look withdraws
+                // the request, leaving the next tick to resume the runner.
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                while pending() > 0 && std::time::Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            assert_eq!(pending(), usize::from(!ci));
+        }
     }
 
     /// Gap 67: the run row said "waiting on 1 question(s)" for 27 hours after
