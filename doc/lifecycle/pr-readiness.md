@@ -636,9 +636,11 @@ request*.
   run loop and `babysit` leave the open question out of the pending count);
   the run waits on the user only when nothing else is left. A turn is excused
   as "asked" only by a question that turn raised, not by one already pending.
-- A pending question whose check no longer fails, or whose pull request is
-  merged or unlinked, is withdrawn with a note
-  (`Autopilot::tend_unrelated_check_questions`).
+- tod keeps checking while it waits for an answer about CI. The local daemon
+  checks at most once every five minutes. Cloud runs schedule a five-minute
+  check, with GitHub events prompting an earlier look. If the check clears
+  or its pull request is merged or unlinked, tod withdraws the request with
+  a note and logs its age. Other questions stay open.
 - A standing is keyed by check, pull request and **failure signature**
   (`github::failure_signature`: the conclusion, the failing Actions step, and
   the failure text itself: all of the check run's annotations (paged), else

@@ -24,6 +24,7 @@
 //! conversation that was in progress instead of starting another.
 
 pub(crate) mod github_wait;
+pub use github_wait::record_ci_request_wait;
 pub mod api_work;
 mod process_review;
 mod quick_fix;
@@ -454,6 +455,9 @@ pub struct Autopilot {
     /// The least time between two rounds whose only work is merging a moved
     /// base branch in ([`PR_HOUSEKEEPING_GAP`]).
     housekeeping_gap: Duration,
+    /// The supervisor wakes from wait rows, and the local daemon wakes from
+    /// the due time in the saved outcome.
+    external_wait_scheduler: bool,
     state: AutopilotState,
     /// Set by the user's request for a new session ([`AutopilotState::fresh_session`]):
     /// the next conversation is a new one, never a reopened one. Taken by
@@ -527,6 +531,7 @@ impl Autopilot {
             poll: Duration::from_millis(500),
             pr_poll: PR_POLL,
             housekeeping_gap: PR_HOUSEKEEPING_GAP,
+            external_wait_scheduler: false,
             state,
             fresh_session,
             lost_checked: None,
@@ -537,6 +542,12 @@ impl Autopilot {
             pilot.start_fresh_session()?;
         }
         Ok(pilot)
+    }
+
+    /// Record provider reset timers for the supervisor's wait scheduler.
+    pub fn with_external_wait_scheduler(mut self) -> Self {
+        self.external_wait_scheduler = true;
+        self
     }
 
     /// How often a pull request being waited on is read again.
@@ -1200,6 +1211,16 @@ impl Autopilot {
         use tod_store::incidents::Verdict;
         /// Retries of a first sighting before it is the user's after all.
         const RETRIES: u32 = 3;
+        let now = state::now_ms();
+        if let Some(due_at_ms) = tod_store::incident_class::acp_rate_limit_reset_ms(&error).filter(|at| *at > now) {
+            // Probing this account before its reset would only spend a retry.
+            let what = "the agent's usage limit; trying again when it resets".to_string();
+            return if self.external_wait_scheduler {
+                self.wait_until(fleet, due_at_ms, what)
+            } else {
+                Ok(Outcome::Waiting { what, due_at_ms })
+            };
+        }
         let observed = crate::incident::observe(
             fleet,
             self.node,
@@ -1214,7 +1235,6 @@ impl Autopilot {
                 }
             }
             Verdict::Retry if observed.attempt <= RETRIES => {
-                let now = chrono::Utc::now().timestamp_millis();
                 let due_at_ms = now + 60_000i64 * (1i64 << observed.attempt.min(5));
                 return Ok(Outcome::Waiting {
                     what: format!("the agent turn failed ({} of {RETRIES} retries): {error}", observed.attempt),
@@ -1268,17 +1288,20 @@ impl Autopilot {
 
     fn wait_for_files(&self, fleet: &FleetStore, what: String) -> Result<Outcome> {
         const RETRY_MS: i64 = 60_000;
-        let now = chrono::Utc::now().timestamp_millis();
+        self.wait_until(fleet, state::now_ms() + RETRY_MS, what)
+    }
+
+    fn wait_until(&self, fleet: &FleetStore, due_at_ms: i64, what: String) -> Result<Outcome> {
         fleet
             .interview(
                 "autopilot",
                 tod_store::interview::InterviewCommand::RecordWait {
                     node_id: self.node,
-                    wait: tod_store::waits::NewWait::until(now + RETRY_MS).with_detail(&what),
+                    wait: tod_store::waits::NewWait::until(due_at_ms).with_detail(&what),
                 },
             )
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        Ok(Outcome::Waiting { what, due_at_ms: now + RETRY_MS })
+        Ok(Outcome::Waiting { what, due_at_ms })
     }
 
     /// Settle the gate and advance through it: the `GateCheck` step.
@@ -2570,104 +2593,10 @@ impl Autopilot {
     /// when GitHub could not be read, a failed look like any other: the
     /// question is left as it is.
     fn tend_unrelated_check_questions(&self, fleet: &FleetStore) -> Result<(Option<Outcome>, usize)> {
-        use crate::pr_readiness;
-        use tod_store::node_timeline::{KIND_NOTE, TimelineEntry};
-        let node = self.node;
-        let questions = fleet.read(|conn| Ok(crate::check_unrelated::pending(conn, node)?))?;
-        if questions.is_empty() {
-            return Ok((None, 0));
+        match crate::check_unrelated::recheck(fleet, self.node, &self.config.data_root)? {
+            Ok(open) => Ok((None, open)),
+            Err(error) => Ok((Some(github_wait::github_look_failed(fleet, self.node, false, &error)?), 0)),
         }
-        let settings = pr_readiness::settings_for_node(fleet, node, &self.config.data_root)?;
-        let links = fleet.read(|conn| tod_store::github::NodePrRepo::new(conn).read(node))?;
-        let Some(feed) = pr_readiness::feed_for(&self.config.data_root) else {
-            return Ok((Some(github_wait::github_look_failed(fleet, node, false, "GitHub credentials are not set up")?), 0));
-        };
-        let live = match pr_readiness::live(feed.as_ref(), &links.prs, &settings) {
-            Ok(live) => live,
-            Err(err) => return Ok((Some(github_wait::github_look_failed(fleet, node, false, &err)?), 0)),
-        };
-        let state = lifecycle::current_state(fleet, node)?;
-        let mut open = 0usize;
-        for (decision, pr, check, head) in questions {
-            // The user may have answered the same failure on another node
-            // since this was raised: that answer covers this one too.
-            if let Some(p) = live.iter().find(|p| pr_readiness::pr_label(&p.pr).eq_ignore_ascii_case(&pr)) {
-                let signature = crate::check_unrelated::signature_of(&decision);
-                if p.assessment.failing_checks.iter().any(|c| c.eq_ignore_ascii_case(&check)) {
-                    let carried = fleet.read(|conn| {
-                        Ok(crate::check_unrelated::carried_on_elsewhere(conn, node, &pr, &check, &signature)?)
-                    })?;
-                    if let Some(carried) = carried {
-                        crate::check_unrelated::inherit(fleet, node, decision.id, &carried, &pr, &check, &state)?;
-                        continue;
-                    }
-                }
-            }
-            let live_pr = live.iter().find(|p| pr_readiness::pr_label(&p.pr).eq_ignore_ascii_case(&pr));
-            let why = match live_pr {
-                None => format!("{pr} is no longer linked to the node"),
-                Some(p) if p.assessment.merged => format!("{pr} is merged"),
-                Some(p) if !p.assessment.failing_checks.iter().any(|c| c.eq_ignore_ascii_case(&check)) => {
-                    format!("\"{check}\" no longer fails on {pr}")
-                }
-                // The agent judged an earlier commit: a push since may be the
-                // one that broke the check, so it is judged again.
-                // ...unless it still fails the same way (same signature): the
-                // question stands, and so does its answer, for the new head.
-                Some(p)
-                    if !p.assessment.head_sha.as_deref().unwrap_or_default().eq_ignore_ascii_case(&head)
-                        && !same_failure(&decision, &check, &p.assessment) =>
-                {
-                    format!("{pr} has a new head since the agent judged \"{check}\"")
-                }
-                Some(_) => {
-                    // The agent said again, on this head, that the check is
-                    // not the change's, and the user once said to carry on
-                    // without it on this pull request: apply that, and say so.
-                    // Only the agent's own attestation counts: a question tod
-                    // raised (a base failure, two quiet turns) is the user's
-                    // to answer again for a head whose failure is not known
-                    // to be the same.
-                    if crate::check_unrelated::raised_of(&decision) == crate::check_unrelated::Raised::Agent
-                        && tod_store::settings::waived_on_earlier_head(
-                        &settings.unrelated_checks,
-                        &pr,
-                        &check,
-                        &head,
-                        &crate::check_unrelated::signature_of(&decision),
-                    ) {
-                        tracing::info!(%node, %pr, %check, "carrying an earlier carry-on forward to the new head");
-                        fleet
-                            .interview(
-                                "autopilot",
-                                InterviewCommand::AnswerDecision { decision_id: decision.id, option: Some(1), text: None },
-                            )
-                            .map_err(|e| anyhow::anyhow!("{e}"))?;
-                        let title = format!("Carried on without \"{check}\" on {pr}: you said so for an earlier commit");
-                        let detail = format!(
-                            "The agent said again, for the new head, that \"{check}\" is not this change's. Its question: {}",
-                            decision.question
-                        );
-                        let entry = TimelineEntry::new(node, KIND_NOTE, &state, title, false, detail);
-                        fleet.enqueue(tod_store::fleet::FleetMutation::RecordTimeline(Box::new(entry)))?;
-                        fleet.writer().flush()?;
-                    } else {
-                        open += 1;
-                    }
-                    continue;
-                }
-            };
-            tracing::info!(%node, %pr, %check, "a failing check the agent called unrelated is gone: withdrawing the question");
-            fleet
-                .interview("autopilot", InterviewCommand::WithdrawDecision { decision_id: decision.id })
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let title = format!("Request withdrawn: {why}");
-            let detail = format!("{why}. Withdrawn: \"{}\"", decision.question);
-            let entry = TimelineEntry::new(node, KIND_NOTE, &state, title, false, detail);
-            fleet.enqueue(tod_store::fleet::FleetMutation::RecordTimeline(Box::new(entry)))?;
-            fleet.writer().flush()?;
-        }
-        Ok((None, open))
     }
 
     /// Withdraws the node's pending requests about a review bot that does
@@ -4175,19 +4104,6 @@ fn short_waits(waits: Vec<crate::pr_readiness::Wait>) -> Vec<crate::pr_readiness
         }
     }
     short
-}
-
-/// Whether `check` still fails the way the check-unrelated question
-/// `decision` was raised about (both signatures known and equal).
-fn same_failure(decision: &tod_store::decisions::Decision, check: &str, assessment: &crate::pr_readiness::Assessment) -> bool {
-    let asked = crate::check_unrelated::signature_of(decision);
-    let now = assessment
-        .failing_signatures
-        .iter()
-        .find(|(n, _)| n.eq_ignore_ascii_case(check))
-        .map(|(_, s)| s.as_str())
-        .unwrap_or_default();
-    !asked.is_empty() && asked == now
 }
 
 /// Whether `question` names the pull request `number`: `#6680`,

@@ -5640,6 +5640,40 @@ fn a_question_for_a_check_that_passes_again_is_withdrawn() {
 }
 
 #[test]
+fn github_wake_withdraws_a_cleared_check_request_without_running_the_agent() {
+    let (fx, feed, mut agent, _) = failing_check_node(true);
+    assert!(matches!(run_babysitter(&fx, &mut agent), Outcome::NeedsHuman { .. }));
+    let ordinary = fx.fleet.interview(
+        ACTOR_USER,
+        InterviewCommand::AskDecision {
+            node_id: fx.node,
+            conversation_id: None,
+            protocol: None,
+            decision: tod_store::decisions::NewDecision {
+                question: "Which design should we ship?".into(),
+                options: vec!["A".into(), "B".into()],
+                ..Default::default()
+            },
+        },
+    ).unwrap();
+    let due = record_ci_request_wait(&fx.fleet, fx.node, "pr_review").unwrap().unwrap();
+    let waits = fx.fleet.read(|conn| tod_store::waits::WaitRepo::new(conn).list_pending_for_node(fx.node)).unwrap();
+    assert!(waits.iter().any(|w| w.match_spec == "github:pr:42:checks" && w.due_at == due));
+
+    let look = || check_github_as(&fx.fleet, fx.node, &fx.root, "pr_review", GithubLook::Act).unwrap();
+    assert!(matches!(look(), GithubCheck::Waiting { .. }));
+    assert_eq!(pending_requests(&fx).len(), 2, "an actual failure still needs an answer");
+
+    feed.fixed.store(true, std::sync::atomic::Ordering::SeqCst);
+    look();
+    let left = pending_requests(&fx);
+    assert_eq!(left.len(), 1, "the ordinary question stays open");
+    assert_eq!(left[0].id.to_string(), ordinary["id"].as_str().unwrap());
+    assert_eq!(unrelated_decisions(&fx)[0].status, "withdrawn");
+    assert_eq!(agent.turns, 1);
+}
+
+#[test]
 fn two_quiet_turns_on_a_failing_check_become_one_request_not_a_stop() {
     // Gap 73: this used to stop the run `pr_stuck` with "open the log". The
     // user is asked once, naming the check, and the run waits for the answer.

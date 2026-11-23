@@ -822,7 +822,7 @@ pub fn wake(config: Config) -> Result<Woke> {
         .collect();
     consume_requests(&store, &taken, &consumer)?;
     let run = Autopilot::new(conversation, config.node, budget)
-        .map(|pilot| pilot.with_poll_interval(config.poll))
+        .map(|pilot| pilot.with_poll_interval(config.poll).with_external_wait_scheduler())
         .and_then(|mut pilot| {
             // The user asked (Resume, a new session, a fresh budget): a stop at
             // a round limit starts a fresh set of rounds. A wake nobody asked
@@ -929,14 +929,26 @@ pub fn wake(config: Config) -> Result<Woke> {
             replica.lock().unwrap_or_else(|e| e.into_inner()).push()?;
         });
 
+    // A request about CI remains visible for an answer, and its checks event
+    // keeps the orchestrator looking at GitHub after this supervisor exits.
+    let run = run.and_then(|outcome| {
+        let recheck_ci = if matches!(&outcome, Outcome::NeedsHuman { reason: NeedsHuman::Decision { .. } }) {
+            let state = tod_core::lifecycle::current_state(&store, config.node)?;
+            tod_core::autopilot::record_ci_request_wait(&store, config.node, &state)?.is_some()
+        } else {
+            false
+        };
+        Ok((outcome, recheck_ci))
+    });
+
     // Whatever happened, leave the orchestrator and the branch with it. The
     // heartbeat ends first, so that the push below carries the run's end.
     let stopped = match &run {
-        Ok(outcome) => woke_reason(&Woke::Ran(outcome.clone()), &budget),
+        Ok((outcome, _)) => woke_reason(&Woke::Ran(outcome.clone()), &budget),
         Err(err) => Some(format!("the supervisor failed: {err:#}")),
     };
     let state = match &run {
-        Ok(outcome) => tod_core::run_state::for_outcome(
+        Ok((outcome, _)) => tod_core::run_state::for_outcome(
             outcome,
             tod_core::run_state::Words {
                 budget: &|limit| budget_reason(limit, &budget),
@@ -960,7 +972,7 @@ pub fn wake(config: Config) -> Result<Woke> {
     if let Some(follow) = follow {
         follow.stop();
     }
-    let outcome = run?;
+    let (outcome, recheck_ci) = run?;
     pushed?;
     ended?;
     // Last of all: the run's end and the checkpoint are recorded first, but a
@@ -972,7 +984,7 @@ pub fn wake(config: Config) -> Result<Woke> {
         waits::save_count(&config.state_dir, waits::AGENT_FAILURES_FILE, 0)?;
         waits::save_count(&config.state_dir, waits::STEPS_AT_FAILURE_FILE, 0)?;
     }
-    if matches!(outcome, Outcome::Stopped { .. } | Outcome::Waiting { .. }) {
+    if recheck_ci || matches!(outcome, Outcome::Stopped { .. } | Outcome::Waiting { .. }) {
         schedule(&store, &config)?;
     } else if let Some(scheduler) = &config.scheduler {
         // An orderly end that needs no wake: clear the retry.

@@ -44,6 +44,14 @@ use uuid::Uuid;
 /// The `protocol` the request is recorded with.
 pub const PROTOCOL: &str = "check_unrelated";
 
+/// Recheck a parked CI request even without a GitHub webhook.
+pub const RECHECK_MS: i64 = 5 * 60 * 1000;
+
+/// States in which the babysitter can reconcile CI requests.
+pub fn babysits_ci(lifecycle: &str) -> bool {
+    matches!(lifecycle, "pr_draft" | "pr_review")
+}
+
 /// The option that fixes the check in this pull request.
 pub const FIX_HERE: &str = "Fix it in this pull request";
 
@@ -344,6 +352,153 @@ pub fn pending(conn: &rusqlite::Connection, node: Uuid) -> anyhow::Result<Vec<(D
         .into_iter()
         .filter_map(|d| key_of(&d).map(|(pr, check, head)| (d, pr, check, head)))
         .collect())
+}
+
+/// Read GitHub and reconcile a node's CI requests without preparing files,
+/// launching an agent, or starting the run's time budget. The inner error
+/// is a failed GitHub look, so the caller can handle its own retry policy.
+pub fn recheck(
+    fleet: &tod_store::fleet::FleetStore,
+    node: Uuid,
+    data_root: &std::path::Path,
+) -> anyhow::Result<Result<usize, String>> {
+    use crate::pr_readiness;
+    let questions = fleet.read(|conn| pending(conn, node))?;
+    if questions.is_empty() {
+        return Ok(Ok(0));
+    }
+    let state = crate::lifecycle::current_state(fleet, node)?;
+    if !babysits_ci(&state) {
+        return Ok(Ok(0));
+    }
+    let settings = pr_readiness::settings_for_node(fleet, node, data_root)?;
+    let links = fleet.read(|conn| tod_store::github::NodePrRepo::new(conn).read(node))?;
+    let live = if links.prs.is_empty() {
+        Vec::new()
+    } else {
+        let Some(feed) = pr_readiness::feed_for(data_root) else {
+            return Ok(Err("GitHub credentials are not set up".into()));
+        };
+        match pr_readiness::live(feed.as_ref(), &links.prs, &settings) {
+            Ok(live) => live,
+            Err(error) => return Ok(Err(error)),
+        }
+    };
+    Ok(Ok(reconcile(fleet, node, &state, &live, &settings, questions)?))
+}
+
+/// Reconcile CI questions against the same live PR assessment used by the
+/// babysitter and by an API-only GitHub wake. Returns the number still open.
+pub(crate) fn reconcile(
+    fleet: &tod_store::fleet::FleetStore,
+    node: Uuid,
+    state: &str,
+    live: &[crate::pr_readiness::LivePr],
+    settings: &PrReadinessSettings,
+    questions: Vec<(Decision, String, String, String)>,
+) -> anyhow::Result<usize> {
+    use crate::pr_readiness;
+    use tod_store::interview::InterviewCommand;
+    use tod_store::node_timeline::{KIND_NOTE, TimelineEntry};
+    let mut open = 0usize;
+    for (decision, pr, check, head) in questions {
+        // The user may have answered the same failure on another node
+        // since this was raised: that answer covers this one too.
+        if let Some(p) = live.iter().find(|p| pr_readiness::pr_label(&p.pr).eq_ignore_ascii_case(&pr)) {
+            let signature = signature_of(&decision);
+            if p.assessment.failing_checks.iter().any(|c| c.eq_ignore_ascii_case(&check)) {
+                let carried = fleet.read(|conn| {
+                    Ok(carried_on_elsewhere(conn, node, &pr, &check, &signature)?)
+                })?;
+                if let Some(carried) = carried {
+                    inherit(fleet, node, decision.id, &carried, &pr, &check, state)?;
+                    continue;
+                }
+            }
+        }
+        let live_pr = live.iter().find(|p| pr_readiness::pr_label(&p.pr).eq_ignore_ascii_case(&pr));
+        let why = match live_pr {
+            None => format!("{pr} is no longer linked to the node"),
+            Some(p) if p.assessment.merged => format!("{pr} is merged"),
+            Some(p) if !p.assessment.failing_checks.iter().any(|c| c.eq_ignore_ascii_case(&check)) => {
+                format!("\"{check}\" no longer fails on {pr}")
+            }
+            // The agent judged an earlier commit: a push since may be the
+            // one that broke the check, so it is judged again.
+            // ...unless it still fails the same way (same signature): the
+            // question stands, and so does its answer, for the new head.
+            Some(p)
+                if !p.assessment.head_sha.as_deref().unwrap_or_default().eq_ignore_ascii_case(&head)
+                    && !same_failure(&decision, &check, &p.assessment) =>
+            {
+                format!("{pr} has a new head since the agent judged \"{check}\"")
+            }
+            Some(_) => {
+                // The agent said again, on this head, that the check is
+                // not the change's, and the user once said to carry on
+                // without it on this pull request: apply that, and say so.
+                // Only the agent's own attestation counts: a question tod
+                // raised (a base failure, two quiet turns) is the user's
+                // to answer again for a head whose failure is not known
+                // to be the same.
+                if raised_of(&decision) == Raised::Agent
+                    && tod_store::settings::waived_on_earlier_head(
+                        &settings.unrelated_checks,
+                        &pr,
+                        &check,
+                        &head,
+                        &signature_of(&decision),
+                    )
+                {
+                    tracing::info!(%node, %pr, %check, "carrying an earlier carry-on forward to the new head");
+                    fleet
+                        .interview(
+                            "autopilot",
+                            InterviewCommand::AnswerDecision { decision_id: decision.id, option: Some(1), text: None },
+                        )
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    let title = format!("Carried on without \"{check}\" on {pr}: you said so for an earlier commit");
+                    let detail = format!(
+                        "The agent said again, for the new head, that \"{check}\" is not this change's. Its question: {}",
+                        decision.question
+                    );
+                    let entry = TimelineEntry::new(node, KIND_NOTE, state, title, false, detail);
+                    fleet.enqueue(tod_store::fleet::FleetMutation::RecordTimeline(Box::new(entry)))?;
+                    fleet.writer().flush()?;
+                } else {
+                    open += 1;
+                }
+                continue;
+            }
+        };
+        let request_age_ms = chrono::Utc::now().timestamp_millis().saturating_sub(decision.created_at);
+        tracing::info!(
+            %node, %pr, %check, request = %decision.id, request_age_ms, %why,
+            "a failing check the agent called unrelated is gone: withdrawing the question"
+        );
+        fleet
+            .interview("autopilot", InterviewCommand::WithdrawDecision { decision_id: decision.id })
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let title = format!("Request withdrawn: {why}");
+        let detail = format!("{why}. Withdrawn: \"{}\"", decision.question);
+        let entry = TimelineEntry::new(node, KIND_NOTE, state, title, false, detail);
+        fleet.enqueue(tod_store::fleet::FleetMutation::RecordTimeline(Box::new(entry)))?;
+        fleet.writer().flush()?;
+    }
+    Ok(open)
+}
+
+/// Whether `check` still fails the way the check-unrelated question
+/// `decision` was raised about (both signatures known and equal).
+fn same_failure(decision: &tod_store::decisions::Decision, check: &str, assessment: &crate::pr_readiness::Assessment) -> bool {
+    let asked = crate::check_unrelated::signature_of(decision);
+    let now = assessment
+        .failing_signatures
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(check))
+        .map(|(_, s)| s.as_str())
+        .unwrap_or_default();
+    !asked.is_empty() && asked == now
 }
 
 /// The answer another node's user gave that covers a failure
