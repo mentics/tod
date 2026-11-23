@@ -105,6 +105,23 @@ pub struct AcpQuotaRetries {
     pub weekly: u8,
 }
 
+impl AcpQuotaRetries {
+    /// Count one scheduled quota check. Returns its attempt and limit, or
+    /// the limit alone if this window's checks have already been exhausted.
+    pub fn reserve(&mut self, window: tod_store::incident_class::AcpUsageWindow) -> std::result::Result<(u8, u8), u8> {
+        use tod_store::incident_class::AcpUsageWindow;
+        let (attempt, max) = match window {
+            AcpUsageWindow::FiveHour => (&mut self.five_hour, 5),
+            AcpUsageWindow::Weekly => (&mut self.weekly, 7),
+        };
+        if *attempt >= max {
+            return Err(max);
+        }
+        *attempt += 1;
+        Ok((*attempt, max))
+    }
+}
+
 /// How many entries of [`AutopilotState::infra_reruns`] and
 /// [`AutopilotState::ci_fix_attempts`] are kept.
 pub const MECHANICAL_KEPT: usize = 32;

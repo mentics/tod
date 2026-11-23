@@ -116,6 +116,18 @@ impl Outcome {
         Some(Self::Waiting { what: Self::ACP_QUOTA_WAIT.into(), due_at_ms })
     }
 
+    /// The next check appointment for a usage window with an unknown reset,
+    /// scheduled one retry interval after the failure.
+    pub fn acp_quota_check_after(window: tod_store::incident_class::AcpUsageWindow, failed_at_ms: i64) -> (i64, &'static str) {
+        use tod_store::incident_class::AcpUsageWindow;
+        const HOUR_MS: i64 = 60 * 60 * 1000;
+        let (delay_ms, what) = match window {
+            AcpUsageWindow::FiveHour => (HOUR_MS, Self::ACP_QUOTA_HOURLY_WAIT),
+            AcpUsageWindow::Weekly => (24 * HOUR_MS, Self::ACP_QUOTA_DAILY_WAIT),
+        };
+        (failed_at_ms.saturating_add(delay_ms), what)
+    }
+
     /// Unlike a review wait, this timer cannot be woken early by a bot answer.
     pub fn acp_quota_due_at(&self) -> Option<i64> {
         match self {
@@ -1245,7 +1257,7 @@ impl Autopilot {
     /// (`crate::incident`, `doc/lifecycle/incidents.md`). Anything else is the
     /// task's own failure, for its owner.
     fn agent_failed(&mut self, fleet: &FleetStore, error: String) -> Result<Outcome> {
-        use tod_store::incident_class::{AcpUsageWindow, acp_usage_window_without_reset};
+        use tod_store::incident_class::acp_usage_window_without_reset;
         use tod_store::incidents::Verdict;
         /// Retries of a first sighting before it is the user's after all.
         const RETRIES: u32 = 3;
@@ -1257,23 +1269,17 @@ impl Autopilot {
             return self.schedule_agent_quota_retry(fleet, due_at_ms, what);
         }
         if let Some(window) = acp_usage_window_without_reset(&error) {
-            const HOUR_MS: i64 = 60 * 60 * 1000;
-            // Check over at most one full subscription window. These are
-            // intervals between probes, not a date inferred from the message.
-            let retries = &mut self.state.acp_quota_retries;
-            let (attempt, max, delay_ms, what) = match window {
-                AcpUsageWindow::FiveHour => (&mut retries.five_hour, 5, HOUR_MS, Outcome::ACP_QUOTA_HOURLY_WAIT),
-                AcpUsageWindow::Weekly => (&mut retries.weekly, 7, 24 * HOUR_MS, Outcome::ACP_QUOTA_DAILY_WAIT),
+            let (attempt, max) = match self.state.acp_quota_retries.reserve(window) {
+                Ok(reserved) => reserved,
+                Err(max) => {
+                    tracing::warn!(node = %self.node, ?window, max, "timed agent quota retries exhausted");
+                    let error = format!("The agent still reports its usage limit after {max} timed retries. {error}");
+                    return Ok(Outcome::NeedsHuman { reason: NeedsHuman::AgentFailed { error } });
+                }
             };
-            if *attempt >= max {
-                tracing::warn!(node = %self.node, ?window, max, "timed agent quota retries exhausted");
-                let error = format!("The agent still reports its usage limit after {max} timed retries. {error}");
-                return Ok(Outcome::NeedsHuman { reason: NeedsHuman::AgentFailed { error } });
-            }
-            *attempt += 1;
-            let due_at_ms = now.saturating_add(delay_ms);
+            let (due_at_ms, what) = Outcome::acp_quota_check_after(window, now);
             tracing::info!(
-                node = %self.node, ?window, attempt = *attempt, max, due_at_ms,
+                node = %self.node, ?window, attempt, max, due_at_ms,
                 "scheduled an agent quota check because the provider gave no exact reset"
             );
             return self.schedule_agent_quota_retry(fleet, due_at_ms, what.into());
