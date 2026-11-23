@@ -22,12 +22,12 @@ COMMANDS:
     list    <NODE>
     enable  <NODE> <CAP>...
     disable <NODE> <CAP>
-    set     <NODE> agent [--platform claude|cursor] [--model <TEXT>] [--effort <TEXT>]
+    set     <NODE> agent [--platform claude|codex|cursor|google] [--model <TEXT>] [--effort <TEXT>]
     set     <NODE> files [--location <NAME|ID>] [--branch <TEXT>]
     set     <NODE> ticket [--ticket <ID>] [--pr <URL>]...
     set     <NODE> tags (--tags <A,B,..> | --add <TAG> | --remove <TAG>)
     set     <NODE> generator --source <TYPE> --config <JSON>
-    set     <NODE> lifecycle-config (--phase <PHASE> [--skills <A,B,..>] [--model <TEXT>] [--effort <TEXT>] | --clear <PHASE> | --pr-draft-review on|off|inherit)
+    set     <NODE> lifecycle-config (--phase <PHASE> [--skills <A,B,..>] [--platform <NAME>] [--model <TEXT>] [--effort <TEXT>] | --clear <PHASE> | --pr-draft-review on|off|inherit)
     set     <NODE> groups --lifecycle <true|false>
 
 `list` shows the enabled capabilities and each one's settings. `enable` adds
@@ -275,6 +275,9 @@ fn list(inv: &Invocation, node: Uuid) -> anyhow::Result<String> {
                                 None => {}
                             }
                             if let Some(agent) = agents.get(phase) {
+                                if let Some(platform) = agent.platform {
+                                    parts.push(format!("provider {}", platform.label()));
+                                }
                                 if let Some(model) = &agent.model {
                                     parts.push(format!("model {model}"));
                                 }
@@ -357,6 +360,16 @@ fn merged(args: &Args, flag: &str, old: Option<String>) -> Option<String> {
     }
 }
 
+fn parse_agent_platform(value: &str) -> anyhow::Result<Option<tod_store::AgentPlatform>> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    tod_store::agent_launch::parse_platform(value).map(Some).ok_or_else(|| {
+        anyhow::anyhow!("unknown provider `{value}` (expected claude, codex, cursor, or google)")
+    })
+}
+
 fn set(inv: &Invocation, node: Uuid, args: &Args) -> anyhow::Result<String> {
     let cap = parse_cap(
         args.positional
@@ -372,12 +385,12 @@ fn set(inv: &Invocation, node: Uuid, args: &Args) -> anyhow::Result<String> {
     }
     let mutation = match cap {
         Capability::Agent => {
-            let platform = merged(args, "--platform", s.agent_platform);
-            if let Some(p) = &platform {
-                if !matches!(p.as_str(), "claude" | "cursor") {
-                    anyhow::bail!("--platform must be claude or cursor");
-                }
-            }
+            let platform = match args.get("--platform") {
+                Some(value) => parse_agent_platform(value)?.map(|provider| {
+                    tod_store::agent_launch::platform_storage(provider).to_string()
+                }),
+                None => s.agent_platform,
+            };
             OutlineMutation::SetNodeAgent {
                 node_id: node,
                 platform,
@@ -504,19 +517,22 @@ fn set(inv: &Invocation, node: Uuid, args: &Args) -> anyhow::Result<String> {
                 write(inv, OutlineMutation::SetNodeLifecyclePrDraftReview { node_id: node, pr_draft_review })?;
                 return Ok(format!("set {}", cap.as_str()));
             }
-            let (names, model, effort) = (args.get("--skills"), args.get("--model"), args.get("--effort"));
+            let (names, platform, model, effort) = (args.get("--skills"), args.get("--platform"), args.get("--model"), args.get("--effort"));
             // The two halves are separate rows' columns, so a change to one
             // is one mutation; both change only when both are given.
             let mut mutations = Vec::new();
             match (args.get("--phase"), args.get("--clear")) {
-                (Some(phase), None) if names.is_some() || model.is_some() || effort.is_some() => {
+                (Some(phase), None) if names.is_some() || platform.is_some() || model.is_some() || effort.is_some() => {
                     phase_ok(phase)?;
                     if let Some(names) = names {
                         skills.insert(phase.to_string(), tod_store::lifecycle_config::parse_list(names)?);
                         mutations.push(OutlineMutation::SetNodeLifecycleConfig { node_id: node, skills });
                     }
-                    if model.is_some() || effort.is_some() {
+                    if platform.is_some() || model.is_some() || effort.is_some() {
                         let agent = agents.entry(phase.to_string()).or_default();
+                        if let Some(platform) = platform {
+                            agent.platform = parse_agent_platform(platform)?;
+                        }
                         if let Some(model) = model {
                             agent.model = Some(model.to_string()).filter(|m| !m.trim().is_empty());
                         }
@@ -534,7 +550,7 @@ fn set(inv: &Invocation, node: Uuid, args: &Args) -> anyhow::Result<String> {
                     mutations.push(OutlineMutation::SetNodeLifecycleAgents { node_id: node, agents });
                 }
                 _ => anyhow::bail!(
-                    "give `--phase <PHASE>` with `--skills <A,B,..>`, `--model <TEXT>` and/or `--effort <TEXT>`, `--clear <PHASE>`, or `--pr-draft-review on|off|inherit`"
+                    "give `--phase <PHASE>` with `--skills`, `--platform`, `--model` or `--effort`, `--clear <PHASE>`, or `--pr-draft-review on|off|inherit`"
                 ),
             }
             let last = mutations.pop().expect("at least one mutation");

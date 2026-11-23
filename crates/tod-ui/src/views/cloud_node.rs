@@ -107,11 +107,11 @@ pub fn stop_and_delete_sandbox<T: 'static>(
     });
 }
 
-/// Start `node_id` under its supervisor off the UI thread, making its sandbox
-/// when it has none; `on_update` hears each step and the result.
-pub fn run_in_cloud<T: 'static>(
+/// Submit work using the same sandbox and supervisor rules as the CLI.
+pub fn submit_work<T: 'static>(
     fleet: Arc<FleetStore>,
     node_id: String,
+    kind: Option<&'static str>,
     cx: &mut Context<T>,
     on_update: impl Fn(&mut T, CloudUpdate, &mut Context<T>) + 'static,
 ) {
@@ -120,35 +120,15 @@ pub fn run_in_cloud<T: 'static>(
         let mut progress = |msg: &str| {
             let _ = tx.send_blocking(CloudUpdate::Progress(msg.to_string()));
         };
-        let started = cloud_jobs::run_in_cloud(&fleet, &root, &node_id, &mut progress);
+        let started = cloud_jobs::submit_work_tracked(&fleet, &root, &node_id, kind, &mut progress);
         if let Some(node) = started.accepted {
             let _ = tx.send_blocking(CloudUpdate::Accepted(node));
+            if let Err(message) = started.result {
+                let _ = tx.send_blocking(CloudUpdate::failed(message));
+            }
+        } else {
+            let _ = tx.send_blocking(CloudUpdate::of(started.result));
         }
-        if let Err(msg) = started.result {
-            let _ = tx.send_blocking(CloudUpdate::failed(msg));
-        }
-    });
-}
-
-/// Record the user's request of `kind` for `node_id`'s supervisor (a new
-/// session, a fresh budget, going on) and wake it, off the UI thread
-/// (`cloud_sync::wake_node_tracked_requesting`): the sandbox is not touched
-/// beyond a request file and a poke.
-pub fn request<T: 'static>(
-    fleet: Arc<FleetStore>,
-    node_id: String,
-    kind: &'static str,
-    cx: &mut Context<T>,
-    on_update: impl Fn(&mut T, CloudUpdate, &mut Context<T>) + 'static,
-) {
-    let (what, _) = cloud_jobs::request_words(kind);
-    spawn(cx, on_update, move |tx| {
-        let root = fleet.paths().root().to_path_buf();
-        let _ = tx.send_blocking(CloudUpdate::Progress(format!("Asking the supervisor for {what}…")));
-        let mut progress = |msg: &str| {
-            let _ = tx.send_blocking(CloudUpdate::Progress(msg.to_string()));
-        };
-        let _ = tx.send_blocking(CloudUpdate::of(cloud_jobs::request(&fleet, &root, &node_id, kind, &mut progress)));
     });
 }
 

@@ -40,7 +40,7 @@ use gpui::{
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::{ActiveTheme, Icon, IconName, Selectable, Sizable};
 use tod_core::conversation::context::focus_selection;
-use tod_core::conversation::{ConversationConfig, ConversationDriver, ConversationStatus, SharedAgentAccess};
+use tod_core::conversation::{ConversationConfig, ConversationDriver, ConversationService, ConversationStatus, SharedAgentAccess};
 use tod_store::conversation::{
     ConversationRepo, ConversationSummary, Focus, ProtocolKind, Turn, TurnRole,
 };
@@ -541,8 +541,7 @@ impl ChatDrawer {
             let (driver, result) = cx
                 .background_executor()
                 .spawn(async move {
-                    let result = driver
-                        .send_with_images(&fleet, &mut SharedAgentAccess(&agent), &text, images)
+                    let result = ConversationService::send_driver(&mut driver, &fleet, &mut SharedAgentAccess(&agent), &text, images)
                         .map_err(|e| format!("{e:#}"));
                     (driver, result)
                 })
@@ -562,6 +561,7 @@ impl ChatDrawer {
         let conversation = driver.conversation_id();
         self.agent_runs.update(cx, |runs, cx| {
             runs.put_back(slot, driver);
+            if runs.take_cancel(slot) { runs.stop(slot, cx); }
             cx.notify();
         });
         match result {
@@ -605,15 +605,14 @@ impl ChatDrawer {
         let protocol = self.protocol;
         let fleet = self.fleet.clone();
         self.agent_runs.update(cx, |runs, cx| {
-            let result = runs.ensure(focus, protocol, conversation_id, move || {
-                let config = config?;
-                match conversation_id {
-                    Some(id) => {
-                        ConversationDriver::open(config, &fleet, id).map_err(|e| format!("{e:#}"))
-                    }
-                    None => Ok(ConversationDriver::new(config, focus, protocol)),
-                }
-            });
+            let result = if let Some(ix) = runs.find_index(focus, protocol, conversation_id) {
+                Ok(ix)
+            } else { config.and_then(|config| {
+                runs.open(config, &fleet, focus, protocol, conversation_id)
+                    .map_err(|e| format!("{e:#}"))?;
+                runs.find_index(focus, protocol, conversation_id)
+                    .ok_or_else(|| "conversation slot disappeared".to_string())
+            }) };
             cx.notify();
             result
         })
@@ -710,13 +709,9 @@ impl ChatDrawer {
     }
 
     fn reload(&mut self, cx: &mut Context<Self>) {
-        let turns = match self.conversation_id {
-            Some(id) => self
-                .fleet
-                .read(|conn| ConversationRepo::new(conn).turns(id))
-                .unwrap_or_default(),
-            None => Vec::new(),
-        };
+        let turns = ConversationService::read_snapshot(&self.fleet, self.conversation_id, self.status.clone())
+            .map(|(turns, _)| turns)
+            .unwrap_or_default();
         let root = self.fleet.paths().root();
         let mut entries: Vec<Entry> = turns.iter().map(|turn| entry_of(turn, root)).collect();
         // The turn in flight, one line per step so far.

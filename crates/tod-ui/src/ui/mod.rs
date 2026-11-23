@@ -2,7 +2,6 @@ pub mod actionable;
 pub mod editable_secret_list;
 pub mod agent_chat;
 pub mod agent_runs;
-pub(crate) mod driver_slot;
 pub mod off_thread;
 pub mod claude_adapter;
 pub mod agent_conversation;

@@ -41,6 +41,8 @@ fn parse_platform(platform: Option<&str>) -> Option<AgentPlatform> {
     match platform {
         Some("claude") => Some(AgentPlatform::Claude),
         Some("cursor") => Some(AgentPlatform::Cursor),
+        Some("open_ai") | Some("openai") => Some(AgentPlatform::OpenAi),
+        Some("google") => Some(AgentPlatform::Google),
         _ => None,
     }
 }

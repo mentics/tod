@@ -339,7 +339,7 @@ impl SettingField {
     }
 }
 
-const PLATFORM_ORDER: [AgentPlatform; 2] = [AgentPlatform::Claude, AgentPlatform::Cursor];
+const PLATFORM_ORDER: [AgentPlatform; 4] = [AgentPlatform::Claude, AgentPlatform::Cursor, AgentPlatform::OpenAi, AgentPlatform::Google];
 /// Platform, model, effort — the dropdowns in one agent role row.
 const AGENT_ROW_COLUMNS: usize = 3;
 /// The fields edited as text, each in its own input (`SettingsView::text_input`).

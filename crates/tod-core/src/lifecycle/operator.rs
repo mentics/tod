@@ -37,6 +37,24 @@ pub fn user_move(node: Uuid, state: &str, reason: Option<&str>) -> OutlineMutati
     }
 }
 
+/// Apply the same user move through the caller's transport and verify that
+/// it landed. The GUI's store writer and the CLI's interview client provide
+/// their own write/read operations, preserving their actor and routing rules.
+pub fn perform_user_move(
+    node: Uuid,
+    state: &str,
+    reason: Option<&str>,
+    write: impl FnOnce(OutlineMutation) -> Result<()>,
+    read_state: impl FnOnce() -> Result<String>,
+) -> Result<String> {
+    write(user_move(node, state, reason))?;
+    let now = read_state()?;
+    if now != state {
+        bail!("asked to move the node to `{state}`, but it is in `{now}`");
+    }
+    Ok(now)
+}
+
 /// [`user_move`] made by the answer to the request `decision`, which stays
 /// pending until its answer is recorded.
 pub fn user_move_answering(node: Uuid, state: &str, reason: Option<&str>, decision: Uuid) -> OutlineMutation {
@@ -120,5 +138,25 @@ mod tests {
         }
         refuse_agent_session(|_| None).unwrap();
         refuse_agent_session(|_| Some("  ".into())).unwrap();
+    }
+
+    #[test]
+    fn user_move_keeps_the_reason_and_checks_the_written_state() {
+        let node = Uuid::new_v4();
+        let now = perform_user_move(node, "design", Some("why"), |mutation| {
+            match mutation {
+                OutlineMutation::SetLifecycleByUser { node_id, state, reason, keep_decision } => {
+                    assert_eq!(node_id, node);
+                    assert_eq!(state, "design");
+                    assert_eq!(reason.as_deref(), Some("why"));
+                    assert!(keep_decision.is_none());
+                }
+                _ => panic!("expected a user move"),
+            }
+            Ok(())
+        }, || Ok("design".into())).unwrap();
+        assert_eq!(now, "design");
+        let error = perform_user_move(node, "design", None, |_| Ok(()), || Ok("active".into())).unwrap_err();
+        assert!(error.to_string().contains("but it is in `active`"));
     }
 }

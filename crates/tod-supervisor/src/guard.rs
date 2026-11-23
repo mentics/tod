@@ -191,7 +191,7 @@ impl<P: AgentProvider> AgentProvider for Guarded<P> {
                 let text = reply.clone().unwrap_or_else(|| self.reply_text(key.as_deref()));
                 // Only a reply that is nothing but the limit: work that
                 // mentions one is still work.
-                if text.len() < 400 && crate::usage_limit::detect(&text, 0).is_some() {
+                if tod_core::conversation::quota::banner(&text, 0).is_some() {
                     return Some(AgentRunState::Failure(text.trim().to_string()));
                 }
                 state

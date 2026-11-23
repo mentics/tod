@@ -1,6 +1,6 @@
 //! What a conversation's agent launches with: platform, model, and effort.
 //!
-//! For a lifecycle conversation, the Lifecycle config's model and effort for
+//! For a lifecycle conversation, the Lifecycle config's platform, model, and effort for
 //! its phase (`lifecycle_config::resolve_agent`, from the nearest node that
 //! sets each) win. Under them, the focus node's Agent capability (its own, or
 //! the nearest ancestor's) decides whatever it sets; the rest follows the
@@ -9,7 +9,7 @@
 //! for every turn, so a change to any of them applies to the next one.
 
 use std::path::Path;
-use tod_agent::AgentLaunchOptions;
+use tod_agent::{AgentLaunchOptions, AgentPlatform};
 use tod_agent::agent_launch::{coerce_effort, coerce_model};
 use tod_store::conversation::{Focus, ProtocolKind};
 use tod_store::fleet::FleetStore;
@@ -96,7 +96,7 @@ pub fn phase_for(
 }
 
 /// `fallback` with whatever the focus node's Agent capability sets over it,
-/// and the Lifecycle config's model and effort for `phase` over that.
+/// and the Lifecycle config's agent settings for `phase` over that.
 /// A failure to read them is logged and `fallback` used: for showing what a
 /// launch would be. A launch itself uses [`try_for_focus`].
 pub fn for_focus(
@@ -132,20 +132,37 @@ pub fn try_for_focus(
         let configured = fleet
             .read(|conn| lifecycle_config::resolve_agent(conn, node, phase))
             .map_err(|err| err.context(format!("reading node {node}'s Lifecycle config for the {phase} phase")))?;
+        let inherited_effort = options.effort.clone();
         // The guidance selector only matches descriptions against a change
         // summary: unless its key says otherwise, it runs on the small model
         // at low effort, whatever the node's Agent capability says.
         // The quick fix and the small review are the cheap rungs too
         // (`lifecycle_config::default_agent`).
-        let (default_model, default_effort) = match lifecycle_config::default_agent(phase) {
-            Some((model, effort)) => (Some(model), Some(effort)),
-            None => (None, None),
-        };
-        if let Some(model) = configured.model.map(|(m, _)| m).or(default_model.map(str::to_string)) {
-            options.model = coerce_model(options.platform, &model);
+        if let Some((platform, _)) = configured.platform.filter(|(platform, _)| *platform != options.platform) {
+            options = super::quota::equivalent(&options).filter(|launch| launch.platform == platform)
+                .unwrap_or_else(|| AgentLaunchOptions::for_platform(platform));
         }
-        if let Some(effort) = configured.effort.map(|(e, _)| e).or(default_effort.map(str::to_string)) {
-            options.effort = coerce_effort(options.platform, &effort);
+        let presets = lifecycle_config::default_agent(phase);
+        let model = configured.model.as_ref().map(|(model, _)| model.as_str())
+            .or(presets.map(|(model, _)| model));
+        let effort = configured.effort.as_ref().map(|(effort, _)| effort.as_str())
+            .or(presets.map(|(_, effort)| effort));
+        if let Some(model) = model {
+            let previous_platform = match options.platform {
+                AgentPlatform::OpenAi if tod_agent::agent_launch::CLAUDE_MODELS.contains(&model)
+                    || model.starts_with("claude-") => Some(AgentPlatform::Claude),
+                AgentPlatform::Claude if model.starts_with("gpt-") => Some(AgentPlatform::OpenAi),
+                _ => None,
+            };
+            if let Some(platform) = previous_platform {
+                let effort = coerce_effort(platform, effort.unwrap_or(&inherited_effort));
+                let previous = AgentLaunchOptions::from_settings(platform, model, effort);
+                return Ok(super::quota::equivalent(&previous).unwrap_or(options));
+            }
+            options.model = coerce_model(options.platform, model);
+        }
+        if let Some(effort) = effort {
+            options.effort = coerce_effort(options.platform, effort);
         }
     }
     Ok(options)
@@ -238,6 +255,48 @@ mod tests {
         (root, store, node)
     }
 
+    #[test]
+    fn phase_provider_keeps_existing_claude_model_intent_and_leaves_other_phases_alone() {
+        let (root, store, node) = store_with_node();
+        store.enqueue_outline(OutlineMutation::EnableCapabilities {
+            node_id: node,
+            capabilities: vec![Capability::Agent],
+        }).unwrap();
+        store.enqueue(FleetMutation::UpsertNodeAgent {
+            node_id: node.to_string(),
+            platform: Some("claude".into()),
+            model: Some("sonnet".into()),
+            effort: Some("max".into()),
+        }).unwrap();
+        store.enqueue_outline(OutlineMutation::EnableCapabilities {
+            node_id: node,
+            capabilities: vec![Capability::LifecycleConfig],
+        }).unwrap();
+        store.enqueue_outline(OutlineMutation::SetNodeLifecycleAgents {
+            node_id: node,
+            agents: [("implement".into(), tod_store::lifecycle_config::PhaseAgent {
+                platform: Some(AgentPlatform::OpenAi), model: Some("sonnet".into()), effort: Some("high".into()),
+            })].into(),
+        }).unwrap();
+        store.writer().flush().unwrap();
+        let settings = TodSettings::default();
+        let focus = Focus::Node(node);
+        assert_eq!(resolve(&store, &settings, focus, ProtocolKind::Implementation),
+            AgentLaunchOptions::from_settings(AgentPlatform::OpenAi, "gpt-5.6-sol", "medium"));
+        assert_eq!(resolve(&store, &settings, focus, ProtocolKind::Chat),
+            AgentLaunchOptions::from_settings(AgentPlatform::Claude, "sonnet", "max"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_guidance_uses_an_available_model_instead_of_the_claude_preset() {
+        let (_, store, node) = store_with_node();
+        let mut settings = TodSettings::default();
+        settings.set_platform_for(AgentRole::Default, AgentPlatform::OpenAi);
+        let launch = resolve(&store, &settings, Focus::Node(node), ProtocolKind::Guidance);
+        assert_eq!(launch, AgentLaunchOptions::from_settings(AgentPlatform::OpenAi, "gpt-5.6-luna", "low"));
+    }
+
     fn settings() -> TodSettings {
         let mut settings = TodSettings::default();
         for role in [AgentRole::Default, AgentRole::Chat] {
@@ -308,9 +367,9 @@ mod tests {
             })
             .unwrap();
         let agents: Agents = [
-            ("review".to_string(), PhaseAgent { model: Some("opus".into()), effort: None }),
-            ("proposed".to_string(), PhaseAgent { model: None, effort: Some("max".into()) }),
-            ("implement".to_string(), PhaseAgent { model: Some("not-a-model".into()), effort: None }),
+            ("review".to_string(), PhaseAgent { platform: None, model: Some("opus".into()), effort: None }),
+            ("proposed".to_string(), PhaseAgent { platform: None, model: None, effort: Some("max".into()) }),
+            ("implement".to_string(), PhaseAgent { platform: None, model: Some("not-a-model".into()), effort: None }),
         ]
         .into();
         store.enqueue_outline(OutlineMutation::SetNodeLifecycleAgents { node_id: node, agents }).unwrap();
@@ -368,13 +427,13 @@ mod tests {
         };
         let at = |kind| resolve(&store, &settings(), Focus::Node(node), kind);
         // Only `verify` set: the evaluator runs with it.
-        set([("verify".to_string(), PhaseAgent { model: Some("sonnet".into()), effort: Some("high".into()) })].into());
+        set([("verify".to_string(), PhaseAgent { platform: None, model: Some("sonnet".into()), effort: Some("high".into()) })].into());
         let evaluate = at(ProtocolKind::Evaluate);
         assert_eq!((evaluate.model.as_str(), evaluate.effort.as_str()), ("sonnet", "high"));
         // Its own model wins; the effort it leaves unset is still `verify`'s.
         set([
-            ("verify".to_string(), PhaseAgent { model: Some("sonnet".into()), effort: Some("high".into()) }),
-            (VERIFY_EVALUATE.to_string(), PhaseAgent { model: Some("opus".into()), effort: None }),
+            ("verify".to_string(), PhaseAgent { platform: None, model: Some("sonnet".into()), effort: Some("high".into()) }),
+            (VERIFY_EVALUATE.to_string(), PhaseAgent { platform: None, model: Some("opus".into()), effort: None }),
         ]
         .into());
         let evaluate = at(ProtocolKind::Evaluate);
@@ -426,12 +485,12 @@ mod tests {
             store.reload_if_stale().ok();
         };
         let risk = || resolve_reviewer(&store, &settings(), focus, ProtocolKind::Review, Some(Reviewer::Risk));
-        set([("review".to_string(), PhaseAgent { model: Some("sonnet".into()), effort: Some("high".into()) })].into());
+        set([("review".to_string(), PhaseAgent { platform: None, model: Some("sonnet".into()), effort: Some("high".into()) })].into());
         let launch = risk();
         assert_eq!((launch.model.as_str(), launch.effort.as_str()), ("sonnet", "high"));
         set([
-            ("review".to_string(), PhaseAgent { model: Some("sonnet".into()), effort: Some("high".into()) }),
-            (REVIEW_RISK.to_string(), PhaseAgent { model: Some("opus".into()), effort: None }),
+            ("review".to_string(), PhaseAgent { platform: None, model: Some("sonnet".into()), effort: Some("high".into()) }),
+            (REVIEW_RISK.to_string(), PhaseAgent { platform: None, model: Some("opus".into()), effort: None }),
         ]
         .into());
         let launch = risk();
@@ -472,7 +531,7 @@ mod tests {
         assert_eq!((implement.model.as_str(), implement.effort.as_str()), ("opus", "high"));
         // The key's own model wins; the effort it leaves unset stays low.
         let agents: Agents =
-            [(GUIDANCE.to_string(), PhaseAgent { model: Some("sonnet".into()), effort: None })].into();
+            [(GUIDANCE.to_string(), PhaseAgent { platform: None, model: Some("sonnet".into()), effort: None })].into();
         store.enqueue_outline(OutlineMutation::SetNodeLifecycleAgents { node_id: node, agents }).unwrap();
         store.writer().flush().unwrap();
         store.reload_if_stale().ok();

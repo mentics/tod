@@ -80,6 +80,15 @@ fn waiting_what(outcome: &Outcome) -> String {
     }
 }
 
+fn exhaust_codex(fx: &Fixture, reset_at_ms: i64) {
+    crate::conversation::quota::remember(
+        fx.fleet.paths().root(),
+        AgentPlatform::OpenAi,
+        &crate::conversation::quota::UsageLimit { reset_at_ms, parsed: true },
+        state::now_ms(),
+    ).unwrap();
+}
+
 #[test]
 fn claude_quota_waits_until_the_structured_reset_on_start_and_on_turn_failure() {
     let reset_secs = chrono::Utc::now().timestamp() + 3600;
@@ -93,6 +102,7 @@ fn claude_quota_waits_until_the_structured_reset_on_start_and_on_turn_failure() 
         if start_failure {
             agent.send_error = Some(error.clone());
         } else {
+            exhaust_codex(&fx, reset_secs * 1000 + 60_000);
             agent.fail_turns = Some(error.clone());
         }
         let mut pilot = node_pilot(&fx, fx.node);
@@ -136,6 +146,7 @@ fn a_bare_weekly_quota_checks_daily_on_local_start_and_supervised_turn_failure()
         let mut pilot = node_pilot(&fx, fx.node);
         if supervised {
             pilot = pilot.with_external_wait_scheduler();
+            exhaust_codex(&fx, state::now_ms() + 2 * DAY_MS);
             agent.fail_turns = Some(BARE_WEEKLY_QUOTA.into());
         } else {
             agent.send_error = Some(BARE_WEEKLY_QUOTA.into());
@@ -156,6 +167,25 @@ fn a_bare_weekly_quota_checks_daily_on_local_start_and_supervised_turn_failure()
         assert_eq!(node_pilot(&fx, fx.node).state().acp_quota_retries.weekly, 1);
         assert_eq!(pending_for(&fx, fx.node), 0);
     }
+}
+
+#[test]
+fn two_exhausted_providers_schedule_the_earliest_reset_before_launch() {
+    let fx = setup();
+    let now = state::now_ms();
+    let codex_reset = now + 60_000;
+    exhaust_codex(&fx, codex_reset);
+    crate::conversation::quota::remember(
+        fx.fleet.paths().root(),
+        AgentPlatform::Claude,
+        &crate::conversation::quota::UsageLimit { reset_at_ms: now + 120_000, parsed: true },
+        now,
+    ).unwrap();
+
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let outcome = run_node(&fx, fx.node, &mut agent);
+    assert_eq!(outcome.acp_quota_due_at(), Some(codex_reset));
+    assert_eq!(agent.turns, 0);
 }
 
 #[test]

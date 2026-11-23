@@ -2866,9 +2866,9 @@ fn phase_model_and_effort_resolve_field_by_field_from_the_nearest_node() {
     };
     set(
         top,
-        [("review".to_string(), PhaseAgent { model: Some("opus".into()), effort: Some("high".into()) })].into(),
+        [("review".to_string(), PhaseAgent { platform: None, model: Some("opus".into()), effort: Some("high".into()) })].into(),
     );
-    set(mid, [("review".to_string(), PhaseAgent { model: Some("sonnet".into()), effort: None })].into());
+    set(mid, [("review".to_string(), PhaseAgent { platform: None, model: Some("sonnet".into()), effort: None })].into());
     // Saving skills on the same node leaves the model and effort alone.
     store
         .enqueue_outline(OutlineMutation::SetNodeLifecycleConfig {

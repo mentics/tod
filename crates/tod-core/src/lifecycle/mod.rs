@@ -58,21 +58,23 @@ pub fn set_lifecycle_by_user(fleet: &FleetStore, node: Uuid, state: &str) -> Res
 /// write that did not land is an error: the caller (the chip, a request's
 /// answer) must not go on as if the node had moved.
 pub fn set_lifecycle_by_user_because(fleet: &FleetStore, node: Uuid, state: &str, reason: Option<&str>) -> Result<()> {
-    write_user_move(fleet, operator::user_move(node, state, reason), state)
+    operator::perform_user_move(node, state, reason, |mutation| write_user_move(fleet, mutation, state), || {
+        fleet.reload_if_stale()?;
+        current_state(fleet, node)
+    })?;
+    Ok(())
 }
 
+// A decision's move preserves the still-pending decision in the mutation.
+// It is recorded before the answer, so it cannot use the ordinary move
+// constructor in `perform_user_move`.
 fn write_user_move(fleet: &FleetStore, mutation: OutlineMutation, state: &str) -> Result<()> {
     let OutlineMutation::SetLifecycleByUser { node_id: node, .. } = &mutation else {
         anyhow::bail!("not a user move");
     };
     let node = *node;
-    fleet
-        .enqueue_outline(mutation)
-        .map_err(|err| anyhow::anyhow!("{err:#}"))?;
-    fleet
-        .writer()
-        .flush()
-        .map_err(|err| anyhow::anyhow!("the move to `{state}` was not written: {err:#}"))?;
+    fleet.enqueue_outline(mutation).map_err(|err| anyhow::anyhow!("{err:#}"))?;
+    fleet.writer().flush().map_err(|err| anyhow::anyhow!("the move to `{state}` was not written: {err:#}"))?;
     push_to_ticket(fleet, node, state);
     Ok(())
 }
@@ -86,7 +88,7 @@ pub fn restart_stay(fleet: &FleetStore, node: Uuid) -> Result<String> {
     fleet
         .enqueue_outline(OutlineMutation::RestartLifecycleStay { node_id: node })
         .map_err(|err| anyhow::anyhow!("{err:#}"))?;
-    let _ = fleet.writer().flush();
+    fleet.writer().flush().context("save the restarted lifecycle stay")?;
     Ok(state)
 }
 

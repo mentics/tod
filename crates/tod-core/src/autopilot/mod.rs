@@ -110,9 +110,10 @@ impl Outcome {
     const ACP_QUOTA_DAILY_WAIT: &str =
         "the agent's weekly usage limit (no exact reset reported, checking daily)";
 
-    /// A Claude ACP quota failure with a concrete reset can use a timed wait.
+    /// A provider quota failure or an exhausted pair has a timed retry.
     pub fn acp_quota_wait(error: &str) -> Option<Self> {
-        let due_at_ms = tod_store::incident_class::acp_rate_limit_reset_ms(error)?;
+        let due_at_ms = tod_store::incident_class::acp_rate_limit_reset_ms(error)
+            .or_else(|| crate::conversation::quota::scheduled_reset(error))?;
         Some(Self::Waiting { what: Self::ACP_QUOTA_WAIT.into(), due_at_ms })
     }
 
@@ -120,12 +121,11 @@ impl Outcome {
     /// scheduled one retry interval after the failure.
     pub fn acp_quota_check_after(window: tod_store::incident_class::AcpUsageWindow, failed_at_ms: i64) -> (i64, &'static str) {
         use tod_store::incident_class::AcpUsageWindow;
-        const HOUR_MS: i64 = 60 * 60 * 1000;
-        let (delay_ms, what) = match window {
-            AcpUsageWindow::FiveHour => (HOUR_MS, Self::ACP_QUOTA_HOURLY_WAIT),
-            AcpUsageWindow::Weekly => (24 * HOUR_MS, Self::ACP_QUOTA_DAILY_WAIT),
+        let what = match window {
+            AcpUsageWindow::FiveHour => Self::ACP_QUOTA_HOURLY_WAIT,
+            AcpUsageWindow::Weekly => Self::ACP_QUOTA_DAILY_WAIT,
         };
-        (failed_at_ms.saturating_add(delay_ms), what)
+        (crate::conversation::quota::check_after(window, failed_at_ms), what)
     }
 
     /// Unlike a review wait, this timer cannot be woken early by a bot answer.

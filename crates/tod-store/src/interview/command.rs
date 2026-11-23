@@ -90,6 +90,8 @@ pub enum InterviewCommand {
         agent_session_id: Option<String>,
         #[serde(default)]
         session_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        launch: Option<tod_agent::AgentLaunchOptions>,
     },
     /// Record the context the conversation's first turn sent.
     SetConversationOpeningContext {
@@ -567,11 +569,13 @@ pub fn execute(
             conversation_id,
             agent_session_id,
             session_name,
+            launch,
         } => {
-            crate::conversation::ConversationRepo::new(conn).set_agent_session(
+            crate::conversation::ConversationRepo::new(conn).set_agent_session_with_launch(
                 *conversation_id,
                 agent_session_id.as_deref(),
                 session_name.as_deref(),
+                launch.as_ref(),
             )?;
             Ok(json!({}))
         }

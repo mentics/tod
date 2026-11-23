@@ -52,13 +52,11 @@ use replica::Replica;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tod_agent::{AgentLaunchOptions, AgentPlatform};
 use guard::{Guarded, Guards, OnFailure};
 use tod_core::autopilot::{Autopilot, Boundary, Budget, BudgetLimit, NeedsHuman, Outcome, StepHook};
 use tod_core::conversation::driver::{AgentAccess, ConversationConfig, ConversationDriver};
 use tod_core::media::MediaPaths;
 use tod_store::fleet::FleetStore;
-use tod_store::settings::InterviewContextSettings;
 use transcripts::{Mirror, TranscriptStore};
 use uuid::Uuid;
 
@@ -764,12 +762,14 @@ pub fn wake(config: Config) -> Result<Woke> {
     };
 
     let data_root = replica.lock().unwrap_or_else(|e| e.into_inner()).root().to_path_buf();
+    let paths = tod_store::TodPaths::at(&data_root);
+    let settings = tod_store::TodSettings::load(&paths)?;
     let conversation = ConversationConfig {
         data_root: data_root.clone(),
         media: config.media.clone(),
-        launch: AgentLaunchOptions::for_platform(AgentPlatform::Claude),
-        settings_path: None,
-        context: InterviewContextSettings::default(),
+        launch: settings.launch_options_for(tod_store::AgentRole::Default),
+        settings_path: Some(paths.settings_path()),
+        context: settings.interview_context,
     };
     // From here the autopilot runs: say so to the app, and keep saying it.
     let beating = phase("first heartbeat", began, &progress, || {

@@ -624,13 +624,14 @@ fn a_cloud_node_is_working_only_while_its_supervisor_is_beating() {
 }
 
 #[test]
-fn the_supervisor_gets_the_release_profiles_and_nothing_else() {
+fn the_supervisor_gets_release_profiles_and_coding_agent_settings() {
     use tod_store::settings::{RepoProfile, RepoProfileSetting};
     let dir = tod_test_util::scratch_dir(format!("tod-supervisor-settings-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     let mut settings = tod_store::TodSettings::default();
     settings.lifecycle.repo_profiles = vec![RepoProfileSetting { repo: "acme/*".into(), profile: RepoProfile::Merge }];
     settings.pr_readiness.max_rounds = 7;
+    settings.set_platform_for(tod_store::AgentRole::Default, tod_agent::AgentPlatform::OpenAi);
     settings.log_max_size_kb = 4321;
     settings.save(&tod_store::TodPaths::at(&dir)).unwrap();
 
@@ -641,6 +642,7 @@ fn the_supervisor_gets_the_release_profiles_and_nothing_else() {
     let seen = tod_store::TodSettings::load(&tod_store::TodPaths::at(&sandbox_root)).unwrap();
     assert_eq!(seen.lifecycle.profile_for("acme", "app"), RepoProfile::Merge);
     assert_eq!(seen.pr_readiness.max_rounds, 7);
+    assert_eq!(seen.platform_for(tod_store::AgentRole::Default), tod_agent::AgentPlatform::OpenAi);
     assert_eq!(seen.log_max_size_kb, tod_store::TodSettings::default().log_max_size_kb);
     let _ = std::fs::remove_dir_all(&dir);
 }

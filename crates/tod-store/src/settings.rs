@@ -1059,6 +1059,10 @@ pub struct AgentLaunchByPlatform {
     pub claude: PlatformLaunchSettings,
     #[serde(default = "default_cursor_launch")]
     pub cursor: PlatformLaunchSettings,
+    #[serde(default = "default_openai_launch")]
+    pub open_ai: PlatformLaunchSettings,
+    #[serde(default = "default_google_launch")]
+    pub google: PlatformLaunchSettings,
 }
 
 fn default_claude_launch() -> PlatformLaunchSettings {
@@ -1069,11 +1073,16 @@ fn default_cursor_launch() -> PlatformLaunchSettings {
     PlatformLaunchSettings::for_platform(AgentPlatform::Cursor)
 }
 
+fn default_openai_launch() -> PlatformLaunchSettings { PlatformLaunchSettings::for_platform(AgentPlatform::OpenAi) }
+fn default_google_launch() -> PlatformLaunchSettings { PlatformLaunchSettings::for_platform(AgentPlatform::Google) }
+
 impl Default for AgentLaunchByPlatform {
     fn default() -> Self {
         Self {
             claude: default_claude_launch(),
             cursor: default_cursor_launch(),
+            open_ai: default_openai_launch(),
+            google: default_google_launch(),
         }
     }
 }
@@ -1083,6 +1092,8 @@ impl AgentLaunchByPlatform {
         match platform {
             AgentPlatform::Claude => &self.claude,
             AgentPlatform::Cursor => &self.cursor,
+            AgentPlatform::OpenAi => &self.open_ai,
+            AgentPlatform::Google => &self.google,
         }
     }
 
@@ -1090,6 +1101,8 @@ impl AgentLaunchByPlatform {
         match platform {
             AgentPlatform::Claude => &mut self.claude,
             AgentPlatform::Cursor => &mut self.cursor,
+            AgentPlatform::OpenAi => &mut self.open_ai,
+            AgentPlatform::Google => &mut self.google,
         }
     }
 }
@@ -1449,6 +1462,25 @@ impl TodSettings {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dynamic_provider_choices_survive_settings_roundtrip() {
+        let mut settings = super::TodSettings::default();
+        for platform in [super::AgentPlatform::OpenAi, super::AgentPlatform::Google] {
+            settings.set_platform_for(super::AgentRole::Chat, platform);
+            settings.set_model_for(super::AgentRole::Chat, "adapter-model");
+            settings.set_effort_for(super::AgentRole::Chat, "adapter-effort");
+            let restored: super::TodSettings = serde_yaml::from_str(&serde_yaml::to_string(&settings).unwrap()).unwrap();
+            assert_eq!(restored.model_for(super::AgentRole::Chat), "adapter-model");
+            assert_eq!(restored.effort_for(super::AgentRole::Chat), "adapter-effort");
+        }
+    }
+    #[test]
+    fn legacy_platform_settings_get_new_provider_defaults() {
+        let settings: super::AgentLaunchByPlatform = serde_yaml::from_str("claude:\n  model: sonnet\n  effort: high\ncursor:\n  model: auto\n  effort: auto\n").unwrap();
+        assert_eq!(settings.claude.model, "sonnet");
+        assert_eq!(settings.open_ai.model, "auto");
+        assert_eq!(settings.google.model, "auto");
+    }
     use super::*;
     use crate::paths::{clear_data_root_override, set_data_root};
     use std::fs;
@@ -1659,6 +1691,7 @@ mod tests {
                         model: "composer-2.5".into(),
                         effort: "low".into(),
                     },
+                    ..AgentLaunchByPlatform::default()
                 },
             },
             chat_agent: AgentRoleSettings::default(),
