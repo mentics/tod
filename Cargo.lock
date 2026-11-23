@@ -7705,6 +7705,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "tod-palette"
+version = "0.1.0"
+
+[[package]]
 name = "tod-problems"
 version = "0.1.0"
 dependencies = [
