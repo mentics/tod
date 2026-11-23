@@ -52,6 +52,14 @@ pub struct AutopilotState {
     pub steps: Vec<StepRecord>,
     /// How the last run stopped; `None` while one runs.
     pub outcome: Option<Outcome>,
+    /// The quota wait to restore after a local branch retry takes over the
+    /// next wake. The branch and the agent can be ready at different times.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_after_push: Option<Outcome>,
+    /// Retries already scheduled for each renewable ACP usage window.
+    /// Retained across wakes, cleared when a turn succeeds.
+    #[serde(default)]
+    pub acp_quota_retries: AcpQuotaRetries,
     /// The user asked for the next run's agent to start a new session
     /// instead of continuing or reopening one; the run clears it as it
     /// starts ([`super::Autopilot::new`]).
@@ -89,6 +97,29 @@ pub struct AutopilotState {
     /// (`super::Autopilot::run_ci_fixers`), per (pull request, check).
     #[serde(default)]
     pub ci_fix_attempts: Vec<CiFixAttempt>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcpQuotaRetries {
+    pub five_hour: u8,
+    pub weekly: u8,
+}
+
+impl AcpQuotaRetries {
+    /// Count one scheduled quota check. Returns its attempt and limit, or
+    /// the limit alone if this window's checks have already been exhausted.
+    pub fn reserve(&mut self, window: tod_store::incident_class::AcpUsageWindow) -> std::result::Result<(u8, u8), u8> {
+        use tod_store::incident_class::AcpUsageWindow;
+        let (attempt, max) = match window {
+            AcpUsageWindow::FiveHour => (&mut self.five_hour, 5),
+            AcpUsageWindow::Weekly => (&mut self.weekly, 7),
+        };
+        if *attempt >= max {
+            return Err(max);
+        }
+        *attempt += 1;
+        Ok((*attempt, max))
+    }
 }
 
 /// How many entries of [`AutopilotState::infra_reruns`] and
@@ -314,6 +345,8 @@ impl AutopilotState {
             current: None,
             steps: Vec::new(),
             outcome: None,
+            quota_after_push: None,
+            acp_quota_retries: AcpQuotaRetries::default(),
             fresh_session: false,
             loops: LoopCounters::default(),
             pending_groups: None,
@@ -353,6 +386,8 @@ impl AutopilotState {
         state.loops.clear();
         state.loops.review_floor_ms = now_ms();
         state.outcome = None;
+        state.quota_after_push = None;
+        state.acp_quota_retries = AcpQuotaRetries::default();
         state.save(data_root, node)
     }
 

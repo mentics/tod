@@ -16,7 +16,7 @@
 
 use super::{Autopilot, AutopilotState, Boundary, Budget, Outcome, PushRetrier, StepHook, Turn};
 use crate::conversation::driver::{ConversationConfig, ConversationStatus, SharedAgentAccess};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::thread::JoinHandle;
@@ -185,30 +185,41 @@ impl LocalRun {
                     } else if user_go_on {
                         pilot.user_go_on()?;
                     }
-                    let outcome = pilot.run_with(&fleet, &mut SharedAgentAccess(&agent), &mut hook);
-                    // Before the run stops for a wait, a request, or the end.
-                    // A failure is recorded on the node, never only logged
-                    // (`push_at_run_end`); a boundary push that already failed
-                    // in this run is not asked again, so one outage is one
-                    // attempt on the node's wait, not two.
-                    let outcome = match outcome {
-                        Ok(outcome) => push_at_run_end(&fleet, &data_root, node, outcome, hook.push_failed)?,
-                        Err(err) => {
-                            // The run's own error is the one shown; a push
-                            // that could not even be recorded is said beside it.
-                            let pushed = if hook.push_failed {
-                                Ok(None)
-                            } else {
-                                match super::holds_change(&fleet, node) {
-                                    Ok(true) => Ok(None),
-                                    Ok(false) => push_branch_as(&fleet, node, PushRetrier::NextPush),
-                                    Err(err) => Err(err),
-                                }
-                            };
-                            return Err(match pushed {
-                                Err(push) => err.context(format!("(and the branch push could not be recorded: {push:#})")),
-                                Ok(_) => err,
-                            });
+                    let quota = pilot.state().quota_after_push.as_ref().filter(|wait| {
+                        !user_go_on && !renew_budget && wait.acp_quota_due_at().is_some_and(|at| at > super::state::now_ms())
+                    });
+                    let outcome = if let Some(wait) = quota.cloned() {
+                        let outcome = retry_push_during_quota(&fleet, &mut hook, wait)?;
+                        if outcome.acp_quota_due_at().is_some() {
+                            pilot.state.quota_after_push = None;
+                        }
+                        pilot.finish(outcome)?
+                    } else {
+                        let outcome = pilot.run_with(&fleet, &mut SharedAgentAccess(&agent), &mut hook);
+                        // Before the run stops for a wait, a request, or the end.
+                        // A failure is recorded on the node, never only logged
+                        // (`push_at_run_end`); a boundary push that already failed
+                        // in this run is not asked again, so one outage is one
+                        // attempt on the node's wait, not two.
+                        match outcome {
+                            Ok(outcome) => push_at_run_end(&fleet, &data_root, node, outcome, hook.push_failed)?,
+                            Err(err) => {
+                                // The run's own error is the one shown; a push
+                                // that could not even be recorded is said beside it.
+                                let pushed = if hook.push_failed {
+                                    Ok(None)
+                                } else {
+                                    match super::holds_change(&fleet, node) {
+                                        Ok(true) => Ok(None),
+                                        Ok(false) => push_branch_as(&fleet, node, PushRetrier::NextPush),
+                                        Err(err) => Err(err),
+                                    }
+                                };
+                                return Err(match pushed {
+                                    Err(push) => err.context(format!("(and the branch push could not be recorded: {push:#})")),
+                                    Ok(_) => err,
+                                });
+                            }
                         }
                     };
                     // A transient push failure at a step boundary stopped the
@@ -560,15 +571,44 @@ pub(crate) fn push_at_run_end(
     let retrier = if resumed { PushRetrier::Run } else { PushRetrier::NextPush };
     match push_branch_as(fleet, node, retrier)? {
         Some(Outcome::Waiting { what, due_at_ms }) => {
+            let push_due_at_ms = due_at_ms;
             let due_at_ms = match &outcome {
                 Outcome::Waiting { due_at_ms: own, .. } => due_at_ms.min(*own),
                 _ => due_at_ms,
             };
             let waiting = Outcome::Waiting { what, due_at_ms };
-            save_outcome(data_root, node, &waiting)?;
+            let mut state = AutopilotState::load(data_root, node)?;
+            if let Some(quota_due_at_ms) = outcome.acp_quota_due_at() {
+                tracing::info!(%node, push_due_at_ms, quota_due_at_ms, "branch retry scheduled during an agent quota wait");
+                state.quota_after_push = Some(outcome);
+            }
+            state.outcome = Some(waiting.clone());
+            state.save(data_root, node)?;
             Ok(waiting)
         }
         _ => Ok(outcome),
+    }
+}
+
+/// An earlier branch wake can push and update the retry count. Only the
+/// quota wake (or an explicit Resume) can get back to an agent turn.
+fn retry_push_during_quota(
+    fleet: &FleetStore,
+    hook: &mut Hook<'_, impl FnMut(LocalEvent)>,
+    quota: Outcome,
+) -> Result<Outcome> {
+    let stopped = match hook.at(fleet, Boundary::Wait)? {
+        Some(reason) => Some(reason),
+        None => hook.at(fleet, Boundary::Step)?,
+    };
+    match stopped {
+        Some(reason) if reason == PUSH_RETRY => {
+            let (what, due_at_ms) = hook.push_retry.take().context("the failed branch push has no retry time")?;
+            let quota_at = quota.acp_quota_due_at().context("the saved quota wait has no deadline")?;
+            Ok(Outcome::Waiting { what, due_at_ms: due_at_ms.min(quota_at) })
+        }
+        Some(reason) => Ok(Outcome::Stopped { reason }),
+        None => Ok(quota),
     }
 }
 

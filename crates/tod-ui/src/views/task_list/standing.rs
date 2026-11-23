@@ -21,6 +21,9 @@ use tod_core::runner_status::format_elapsed;
 use tod_core::task::model::{
     ListWorkingSet, SortKey, TaskItem, filter_and_sort_tasks,
 };
+use tod_store::incident_class::{
+    AcpUsageWindow, acp_rate_limit_reset_ms, acp_usage_window_without_reset,
+};
 
 /// The four ways a node can be placed for the summary strip and its filters
 /// (the persisted [`ActorBucket`]). A node that is `Done` (or has no
@@ -327,6 +330,24 @@ pub fn wait_kind_label(kind: WaitKind) -> &'static str {
     }
 }
 
+/// Present recognized Claude quota failures without the diagnostic ACP envelope.
+fn quota_failure(error: &str) -> Option<(&'static str, String)> {
+    if let Some(reset) = acp_rate_limit_reset_ms(error).and_then(DateTime::from_timestamp_millis) {
+        return Some((
+            "Claude usage limit reached",
+            format!(
+                "Resume after the reported reset on {}.",
+                reset.with_timezone(&Local).format("%a %b %-d, %Y at %H:%M %Z")
+            ),
+        ));
+    }
+    let title = match acp_usage_window_without_reset(error)? {
+        AcpUsageWindow::FiveHour => "Claude 5-hour usage limit reached",
+        AcpUsageWindow::Weekly => "Claude weekly usage limit reached",
+    };
+    Some((title, "Check Claude for the reset time, then resume.".into()))
+}
+
 pub fn you_reason_label(why: &YouReason) -> String {
     match why {
         YouReason::Request { count, ended } => {
@@ -343,7 +364,10 @@ pub fn you_reason_label(why: &YouReason) -> String {
                 None => asked,
             }
         }
-        YouReason::Failed { error } => format!("failed: {error}"),
+        YouReason::Failed { error } => match quota_failure(error) {
+            Some((title, guidance)) => format!("{title}. {guidance}"),
+            None => format!("failed: {error}"),
+        },
         YouReason::Stopped { reason } => format!("stopped: {reason}"),
         YouReason::Paused => "paused".to_string(),
         YouReason::NotStarted => "not started".to_string(),
@@ -444,10 +468,12 @@ fn error_part(text: impl Into<String>) -> RunnerPart {
     RunnerPart { text: text.into(), tone: PartTone::Error }
 }
 
-/// How an ended run reads beside a request: the failure or stop, with its text.
-fn end_parts(ended: &YouReason) -> Vec<RunnerPart> {
-    match ended {
-        YouReason::Failed { error } => vec![error_part("failed"), error_part(error.clone())],
+fn you_parts(why: &YouReason) -> Vec<RunnerPart> {
+    match why {
+        YouReason::Failed { error } => match quota_failure(error) {
+            Some((title, guidance)) => vec![error_part(title), part(guidance)],
+            None => vec![error_part("failed"), error_part(error.clone())],
+        },
         YouReason::Stopped { reason } => vec![error_part("stopped"), error_part(reason.clone())],
         other => vec![part(format!("on you: {}", you_reason_label(other)))],
     }
@@ -469,7 +495,7 @@ pub fn runner_parts(standing: &NodeStanding, now_ms: i64) -> Vec<RunnerPart> {
             // in the error style, then the request.
             let why = match why {
                 YouReason::Request { ended: Some(ended), count } => {
-                    parts.extend(end_parts(ended));
+                    parts.extend(you_parts(ended));
                     parts.push(part(format!(
                         "and {}",
                         you_reason_label(&YouReason::Request { count: *count, ended: None })
@@ -477,7 +503,7 @@ pub fn runner_parts(standing: &NodeStanding, now_ms: i64) -> Vec<RunnerPart> {
                     None
                 }
                 YouReason::Permission { ended: Some(ended), title } => {
-                    parts.extend(end_parts(ended));
+                    parts.extend(you_parts(ended));
                     parts.push(part(format!(
                         "and {}",
                         you_reason_label(&YouReason::Permission { title: title.clone(), ended: None })
@@ -486,17 +512,8 @@ pub fn runner_parts(standing: &NodeStanding, now_ms: i64) -> Vec<RunnerPart> {
                 }
                 other => Some(other),
             };
-            match why {
-                None => {}
-                Some(YouReason::Failed { error }) => {
-                    parts.push(error_part("failed"));
-                    parts.push(error_part(error.clone()));
-                }
-                Some(YouReason::Stopped { reason }) => {
-                    parts.push(error_part("stopped"));
-                    parts.push(error_part(reason.clone()));
-                }
-                Some(other) => parts.push(part(format!("on you: {}", you_reason_label(other)))),
+            if let Some(why) = why {
+                parts.extend(you_parts(why));
             }
             parts.push(part(format!("waiting {}", age(*since))));
             if let Some(d) = &standing.deferred {
@@ -793,6 +810,68 @@ mod tests {
             "failed: auth failed"
         );
         assert_eq!(you_reason_label(&YouReason::Request { count: 3, ended: None }), "3 requests to answer");
+    }
+
+    #[test]
+    fn legacy_claude_quota_failures_show_the_window_and_resume_guidance() {
+        for (error, title) in [
+            (
+                r#"ACP error -32603: Internal error: You've hit your weekly limit · resets 10am (UTC) ({"errorKind":"rate_limit"})"#,
+                "Claude weekly usage limit reached",
+            ),
+            (
+                r#"opening session: ACP error -32603: Internal error: You've hit your 5-hour limit · resets 8:10pm (UTC) ({"errorKind":"rate_limit"})"#,
+                "Claude 5-hour usage limit reached",
+            ),
+        ] {
+            let failure = YouReason::Failed { error: error.into() };
+            let guidance = "Check Claude for the reset time, then resume.";
+            assert_eq!(
+                runner_parts(&you(failure.clone(), 0), 1000)[..2],
+                [error_part(title), part(guidance)]
+            );
+            let request = YouReason::Request { count: 1, ended: Some(Box::new(failure)) };
+            let standing = you(request, 0);
+            assert_eq!(
+                runner_parts(&standing, 1000)[..3],
+                [error_part(title), part(guidance), part("and 1 request to answer")]
+            );
+            assert_eq!(
+                tooltip_lines(&standing, 1000)[0],
+                format!("On you: 1 request to answer; the run also ended, {title}. {guidance}")
+            );
+        }
+    }
+
+    #[test]
+    fn a_claude_quota_failure_localizes_only_the_active_structured_reset() {
+        let error = r#"ACP error -32603: Internal error: You've hit your weekly limit · resets 10am (UTC) ({"errorKind":"rate_limit","rateLimit":{"rateLimitType":"seven_day","resetsAt":1795514400,"unifiedWindows":{"five_hour":{"status":"allowed","resetsAt":1795436400}}}})"#;
+        let failure = YouReason::Failed { error: error.into() };
+        let reset = DateTime::from_timestamp(1_795_514_400, 0).unwrap().with_timezone(&Local);
+        let guidance = format!(
+            "Resume after the reported reset on {}.",
+            reset.format("%a %b %-d, %Y at %H:%M %Z")
+        );
+        let standing = you(failure, 0);
+        assert_eq!(
+            runner_parts(&standing, 1000)[..2],
+            [error_part("Claude usage limit reached"), part(&guidance)]
+        );
+        assert_eq!(
+            tooltip_lines(&standing, 1000)[0],
+            format!("On you: Claude usage limit reached. {guidance}")
+        );
+    }
+
+    #[test]
+    fn ordinary_acp_rate_errors_keep_their_diagnostics() {
+        let error = r#"ACP error -32603: Too many requests ({"errorKind":"rate_limit"})"#;
+        let why = YouReason::Failed { error: error.into() };
+        assert_eq!(you_reason_label(&why), format!("failed: {error}"));
+        assert_eq!(
+            runner_parts(&you(why, 0), 1000)[..2],
+            [error_part("failed"), error_part(error)]
+        );
     }
 
     #[test]

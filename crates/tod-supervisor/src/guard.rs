@@ -245,6 +245,11 @@ pub fn on_failure(error: &str, failures: u32, guards: &Guards, now_ms: i64) -> O
     if tod_core::skills_context::is_missing_skill(error) {
         return OnFailure::Config;
     }
+    // Autopilot returns a failed outcome for a known ACP usage window
+    // without an exact reset only after the window's retries are exhausted.
+    if tod_store::incident_class::acp_usage_window_without_reset(error).is_some() {
+        return OnFailure::Ask;
+    }
     if let Some(limit) = crate::usage_limit::detect(error, now_ms) {
         return OnFailure::UsageLimit(limit);
     }
@@ -402,6 +407,8 @@ mod tests {
         assert_eq!(on_failure("agent hung: x", 1, &guards, 0), OnFailure::Backoff { until_ms: 60_000 });
         assert_eq!(on_failure("boom", 2, &guards, 0), OnFailure::Backoff { until_ms: 120_000 });
         assert_eq!(on_failure("boom", 3, &guards, 0), OnFailure::Ask);
+        let exhausted = r#"ACP error -32603: Weekly limit reached, resets 10am (UTC) ({"errorKind":"rate_limit"})"#;
+        assert_eq!(on_failure(exhausted, 1, &guards, 0), OnFailure::Ask);
         assert!(matches!(
             on_failure("Claude usage limit reached|1800000000", 3, &guards, 0),
             OnFailure::UsageLimit(_)

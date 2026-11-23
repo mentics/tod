@@ -105,17 +105,37 @@ pub enum Outcome {
 
 impl Outcome {
     const ACP_QUOTA_WAIT: &str = "the agent's usage limit; trying again when it resets";
+    const ACP_QUOTA_HOURLY_WAIT: &str =
+        "the agent's 5-hour usage limit (no exact reset reported, checking hourly)";
+    const ACP_QUOTA_DAILY_WAIT: &str =
+        "the agent's weekly usage limit (no exact reset reported, checking daily)";
 
     /// A Claude ACP quota failure with a concrete reset can use a timed wait.
     pub fn acp_quota_wait(error: &str) -> Option<Self> {
-        let due_at_ms = tod_store::incident_class::acp_rate_limit_reset_ms(error).filter(|at| *at > 0)?;
+        let due_at_ms = tod_store::incident_class::acp_rate_limit_reset_ms(error)?;
         Some(Self::Waiting { what: Self::ACP_QUOTA_WAIT.into(), due_at_ms })
+    }
+
+    /// The next check appointment for a usage window with an unknown reset,
+    /// scheduled one retry interval after the failure.
+    pub fn acp_quota_check_after(window: tod_store::incident_class::AcpUsageWindow, failed_at_ms: i64) -> (i64, &'static str) {
+        use tod_store::incident_class::AcpUsageWindow;
+        const HOUR_MS: i64 = 60 * 60 * 1000;
+        let (delay_ms, what) = match window {
+            AcpUsageWindow::FiveHour => (HOUR_MS, Self::ACP_QUOTA_HOURLY_WAIT),
+            AcpUsageWindow::Weekly => (24 * HOUR_MS, Self::ACP_QUOTA_DAILY_WAIT),
+        };
+        (failed_at_ms.saturating_add(delay_ms), what)
     }
 
     /// Unlike a review wait, this timer cannot be woken early by a bot answer.
     pub fn acp_quota_due_at(&self) -> Option<i64> {
         match self {
-            Self::Waiting { what, due_at_ms } if what == Self::ACP_QUOTA_WAIT => Some(*due_at_ms),
+            Self::Waiting { what, due_at_ms }
+                if matches!(what.as_str(), Self::ACP_QUOTA_WAIT | Self::ACP_QUOTA_HOURLY_WAIT | Self::ACP_QUOTA_DAILY_WAIT) =>
+            {
+                Some(*due_at_ms)
+            }
             _ => None,
         }
     }
@@ -619,6 +639,7 @@ impl Autopilot {
         self.state.active_ms = 0;
         self.state.active_since_ms = None;
         self.state.sessions = 0;
+        self.state.acp_quota_retries = Default::default();
         // Rounds on the pull request count from here (they are in `loops`):
         // the user has seen why it stopped and wants it to go on. This also
         // clears the base-merge gap timestamp and count: a click of the user
@@ -633,8 +654,8 @@ impl Autopilot {
     /// stopped at a round limit, the rounds count from now, as the stop's
     /// text promises ("run it again for a fresh set of rounds"). Automatic
     /// wakes (a retry timer, a poke, a restart) must not call this, or a
-    /// limit would never hold. Any other kind of stop leaves the counters
-    /// as they are.
+    /// limit would never hold. An explicit resume after exhausting quota
+    /// retries also restores the retry allowance.
     pub fn user_go_on(&mut self) -> Result<()> {
         let limit_stop = matches!(
             &self.state.outcome,
@@ -645,6 +666,13 @@ impl Autopilot {
             })
         );
         if !limit_stop {
+            if matches!(&self.state.outcome, Some(Outcome::NeedsHuman {
+                reason: NeedsHuman::AgentFailed { error }
+            }) if tod_store::incident_class::acp_usage_window_without_reset(error).is_some())
+            {
+                self.state.acp_quota_retries = Default::default();
+                self.save()?;
+            }
             return Ok(());
         }
         let loops = &mut self.state.loops;
@@ -757,6 +785,7 @@ impl Autopilot {
         // Called again after it stopped: the user has presumably dealt with
         // what it stopped for.
         self.state.outcome = None;
+        self.state.quota_after_push = None;
         // The user's explicit requests on the node (`tod_store::node_requests`)
         // are consumed as the run starts: the first boundary of a local runner.
         // One for a new session starts in one, as the saved flag does.
@@ -1227,20 +1256,33 @@ impl Autopilot {
     /// backoff until a second node shows it is shared
     /// (`crate::incident`, `doc/lifecycle/incidents.md`). Anything else is the
     /// task's own failure, for its owner.
-    fn agent_failed(&self, fleet: &FleetStore, error: String) -> Result<Outcome> {
+    fn agent_failed(&mut self, fleet: &FleetStore, error: String) -> Result<Outcome> {
+        use tod_store::incident_class::acp_usage_window_without_reset;
         use tod_store::incidents::Verdict;
         /// Retries of a first sighting before it is the user's after all.
         const RETRIES: u32 = 3;
         let now = state::now_ms();
-        if let Some(wait @ Outcome::Waiting { due_at_ms, .. }) = Outcome::acp_quota_wait(&error)
+        if let Some(Outcome::Waiting { due_at_ms, what }) = Outcome::acp_quota_wait(&error)
             && due_at_ms > now
         {
             // Probing this account before its reset would only spend a retry.
-            return if self.external_wait_scheduler {
-                self.wait_until(fleet, due_at_ms, Outcome::ACP_QUOTA_WAIT.into())
-            } else {
-                Ok(wait)
+            return self.schedule_agent_quota_retry(fleet, due_at_ms, what);
+        }
+        if let Some(window) = acp_usage_window_without_reset(&error) {
+            let (attempt, max) = match self.state.acp_quota_retries.reserve(window) {
+                Ok(reserved) => reserved,
+                Err(max) => {
+                    tracing::warn!(node = %self.node, ?window, max, "timed agent quota retries exhausted");
+                    let error = format!("The agent still reports its usage limit after {max} timed retries. {error}");
+                    return Ok(Outcome::NeedsHuman { reason: NeedsHuman::AgentFailed { error } });
+                }
             };
+            let (due_at_ms, what) = Outcome::acp_quota_check_after(window, now);
+            tracing::info!(
+                node = %self.node, ?window, attempt, max, due_at_ms,
+                "scheduled an agent quota check because the provider gave no exact reset"
+            );
+            return self.schedule_agent_quota_retry(fleet, due_at_ms, what.into());
         }
         let observed = crate::incident::observe(
             fleet,
@@ -1265,6 +1307,14 @@ impl Autopilot {
             _ => {}
         }
         Ok(Outcome::NeedsHuman { reason: NeedsHuman::AgentFailed { error } })
+    }
+
+    fn schedule_agent_quota_retry(&self, fleet: &FleetStore, due_at_ms: i64, what: String) -> Result<Outcome> {
+        if self.external_wait_scheduler {
+            self.wait_until(fleet, due_at_ms, what)
+        } else {
+            Ok(Outcome::Waiting { what, due_at_ms })
+        }
     }
 
     /// The steps the incident machinery owes this node before its own work:
@@ -3522,6 +3572,7 @@ impl Autopilot {
                         return Ok(Some(self.agent_failed(fleet, error)?));
                     }
                     ConversationEvent::TurnFinished { error: None } => {
+                        self.state.acp_quota_retries = Default::default();
                         finished = true;
                         turn_ended = true;
                     }
@@ -3707,6 +3758,7 @@ impl Autopilot {
                             return Ok(Some(self.agent_failed(fleet, error)?));
                         }
                         ConversationEvent::TurnFinished { error: None } => {
+                            self.state.acp_quota_retries = Default::default();
                             finished = true;
                             turn_ended = true;
                         }

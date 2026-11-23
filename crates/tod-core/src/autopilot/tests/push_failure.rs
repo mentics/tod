@@ -237,6 +237,75 @@ fn a_transient_run_end_failure_leaves_no_wait_nothing_retries() {
     assert!(push_waits(&fx)[0].due_at <= *due_at_ms + 1, "the wait is due when its retrier is");
 }
 
+fn local_wake(fx: &Fixture, user_go_on: bool) -> Outcome {
+    let agent: tod_agent::SharedAgent =
+        Arc::new(std::sync::Mutex::new(Box::new(FakeAgent::new(&fx.fleet))));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let run = crate::autopilot::local::LocalRun::start_with(
+        fx.fleet.clone(),
+        agent,
+        config(fx),
+        fx.node,
+        Budget { max_sessions: 0, ..Budget::default() },
+        false,
+        user_go_on,
+        Some(Duration::ZERO),
+        move |event| {
+            if let LocalEvent::Finished(result) = event {
+                tx.send(result).unwrap();
+            }
+        },
+    )
+    .unwrap();
+    let outcome = rx.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
+    run.join();
+    outcome
+}
+
+#[test]
+fn a_branch_retry_saves_the_commit_and_restores_the_provider_wait_without_a_turn() {
+    for (what, user_go_on) in [(Outcome::ACP_QUOTA_WAIT, false), (Outcome::ACP_QUOTA_DAILY_WAIT, true)] {
+        let fx = setup();
+        let outage = Outage::new(&fx);
+        outage.down();
+        let root = fx.fleet.paths().root();
+        let quota_at = state::now_ms() + 24 * 60 * 60 * 1000;
+        let quota = Outcome::Waiting { what: what.into(), due_at_ms: quota_at };
+        let first = push_at_run_end(&fx.fleet, root, fx.node, quota.clone(), false).unwrap();
+        assert!(matches!(&first, Outcome::Waiting { due_at_ms, .. } if *due_at_ms < quota_at));
+        let saved = AutopilotState::load(root, fx.node).unwrap();
+        assert_eq!(saved.outcome, Some(first));
+        assert_eq!(saved.quota_after_push.as_ref(), Some(&quota));
+        assert_eq!(push_waits(&fx)[0].attempt, 1);
+
+        // The new runner reloads the checkpoint at each simulated wake.
+        // Another failed push counts once and leaves the same quota deadline.
+        let retry = local_wake(&fx, false);
+        assert!(matches!(&retry, Outcome::Waiting { due_at_ms, .. } if *due_at_ms < quota_at));
+        assert_eq!(push_waits(&fx)[0].attempt, 2);
+        assert_eq!(AutopilotState::load(root, fx.node).unwrap().quota_after_push.as_ref(), Some(&quota));
+
+        // Recovery saves the branch at its own wake. Entering the normal
+        // autopilot here would exhaust the zero-session budget.
+        outage.up();
+        assert_eq!(local_wake(&fx, false), quota);
+        assert!(log_of(&outage.origin, "task/x").contains("the fix"));
+        assert!(push_waits(&fx).is_empty());
+        let mut saved = AutopilotState::load(root, fx.node).unwrap();
+        assert_eq!(saved.outcome.as_ref(), Some(&quota));
+        assert!(saved.quota_after_push.is_none(), "the quota is the primary wake again");
+
+        if !user_go_on {
+            // Advance the saved clock without sleeping. An automatic quota
+            // wake now takes the normal path, as does an explicit Resume.
+            saved.outcome = Some(Outcome::Waiting { what: what.into(), due_at_ms: 0 });
+            saved.save(root, fx.node).unwrap();
+        }
+        assert!(matches!(local_wake(&fx, user_go_on), Outcome::BudgetExhausted { .. }));
+        assert!(AutopilotState::load(root, fx.node).unwrap().quota_after_push.is_none());
+    }
+}
+
 #[test]
 fn a_remote_that_moved_between_the_look_and_the_push_is_refetched_and_decided_again() {
     let fx = setup();

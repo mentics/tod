@@ -9,6 +9,10 @@ use crate::incident;
 use tod_store::incidents::{self, Op, Passed};
 
 const AUTH: &str = "ACP error: Failed to authenticate. API Error: 401 invalid x-api-key";
+const BARE_WEEKLY_QUOTA: &str =
+    r#"ACP error -32603: Internal error: You've hit your weekly limit · resets 10am (UTC) ({"errorKind":"rate_limit"})"#;
+const BARE_FIVE_HOUR_QUOTA: &str =
+    r#"ACP error -32603: Internal error: You've hit your 5-hour limit · resets 8:10pm (UTC) ({"errorKind":"rate_limit"})"#;
 
 /// A second node a run can be made on, in the same fleet and workspace.
 fn pilot_node(fx: &Fixture, title: &str) -> Uuid {
@@ -110,16 +114,75 @@ fn claude_quota_waits_until_the_structured_reset_on_start_and_on_turn_failure() 
 }
 
 #[test]
-fn claude_quota_without_a_future_reset_uses_the_incident_retry() {
+fn an_unclassified_acp_429_still_uses_the_incident_retry() {
     incident::set_enabled(true);
     let fx = setup();
     retire_outside_criteria(&fx);
     let mut agent = FakeAgent::new(&fx.fleet);
-    agent.fail_turns = Some(r#"ACP error -32603: Internal error ({"errorKind":"rate_limit"})"#.into());
+    agent.fail_turns = Some(r#"ACP error -32603: Too many requests ({"errorKind":"rate_limit"})"#.into());
     let outcome = run_node(&fx, fx.node, &mut agent);
     assert!(waiting_what(&outcome).contains("1 of 3 retries"), "{outcome:?}");
     assert_eq!(pending_for(&fx, fx.node), 0);
     incident::set_enabled(false);
+}
+
+#[test]
+fn a_bare_weekly_quota_checks_daily_on_local_start_and_supervised_turn_failure() {
+    const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+    for supervised in [false, true] {
+        let fx = setup();
+        retire_outside_criteria(&fx);
+        let mut agent = FakeAgent::new(&fx.fleet);
+        let mut pilot = node_pilot(&fx, fx.node);
+        if supervised {
+            pilot = pilot.with_external_wait_scheduler();
+            agent.fail_turns = Some(BARE_WEEKLY_QUOTA.into());
+        } else {
+            agent.send_error = Some(BARE_WEEKLY_QUOTA.into());
+        }
+        let before = state::now_ms();
+        let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
+        let due = outcome.acp_quota_due_at().expect("provider timer");
+        assert!((before + DAY_MS..=state::now_ms() + DAY_MS).contains(&due), "{outcome:?}");
+        assert!(waiting_what(&outcome).contains("checking daily"), "{outcome:?}");
+        let waits = fx
+            .fleet
+            .read(|conn| tod_store::waits::WaitRepo::new(conn).list_pending_for_node(fx.node))
+            .unwrap();
+        assert_eq!(
+            waits.iter().find(|wait| wait.kind == tod_store::waits::KIND_UNTIL).map(|wait| wait.due_at),
+            supervised.then_some(due),
+        );
+        assert_eq!(node_pilot(&fx, fx.node).state().acp_quota_retries.weekly, 1);
+        assert_eq!(pending_for(&fx, fx.node), 0);
+    }
+}
+
+#[test]
+fn quota_retries_survive_restart_and_stop_at_each_windows_own_limit() {
+    const HOUR_MS: i64 = 60 * 60 * 1000;
+    let fx = setup();
+    // Restore the checkpoint before each probe without waiting actual hours.
+    // Changing the active window never replenishes the other window's count.
+    for (error, retries, delay_ms) in [(BARE_FIVE_HOUR_QUOTA, 5, HOUR_MS), (BARE_WEEKLY_QUOTA, 7, 24 * HOUR_MS)] {
+        for _ in 0..retries {
+            let mut pilot = node_pilot(&fx, fx.node);
+            let before = state::now_ms();
+            let outcome = pilot.agent_failed(&fx.fleet, error.into()).unwrap();
+            let due = outcome.acp_quota_due_at().expect("provider timer");
+            assert!((before + delay_ms..=state::now_ms() + delay_ms).contains(&due), "{outcome:?}");
+            pilot.finish(outcome).unwrap();
+        }
+        let mut restored = node_pilot(&fx, fx.node);
+        let outcome = restored.agent_failed(&fx.fleet, error.into()).unwrap();
+        assert!(matches!(outcome, Outcome::NeedsHuman { reason: NeedsHuman::AgentFailed { .. } }), "{outcome:?}");
+    }
+    let mut restored = node_pilot(&fx, fx.node);
+    let failure = restored.agent_failed(&fx.fleet, BARE_FIVE_HOUR_QUOTA.into()).unwrap();
+    assert!(matches!(failure, Outcome::NeedsHuman { reason: NeedsHuman::AgentFailed { .. } }));
+    restored.finish(failure).unwrap();
+    restored.user_go_on().unwrap();
+    assert!(restored.agent_failed(&fx.fleet, BARE_FIVE_HOUR_QUOTA.into()).unwrap().acp_quota_due_at().is_some());
 }
 
 #[test]
