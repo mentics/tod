@@ -25,9 +25,11 @@ use gpui::{
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::checkbox::Checkbox;
 use gpui_component::input::{Input, InputState, Textarea, TextareaState};
+use gpui_component::select::{Select, SelectState};
 use gpui_component::{ActiveTheme, Disableable, StyledExt, h_flex, v_flex};
 use std::collections::HashMap;
 use std::sync::Arc;
+use tod_agent::{AgentPlatform, agent_launch::parse_platform};
 use tod_store::fleet::FleetStore;
 use tod_store::lifecycle_config::{
     self, Agents, Check, Checks, DeleteSandbox, PHASES, PhaseAgent, PrDraftReview, Resolved, ResolvedAgent,
@@ -68,6 +70,7 @@ pub struct LifecycleConfigEditor {
 struct Form {
     phase: &'static str,
     skills: Entity<InputState>,
+    platform: Entity<SelectState<Vec<String>>>,
     model: Entity<InputState>,
     effort: Entity<InputState>,
     /// One row per command the phase's gate runs: a label and the command.
@@ -239,6 +242,9 @@ impl LifecycleConfigEditor {
                         for source in [&agent.model, &agent.effort].into_iter().flatten().map(|(_, s)| *s) {
                             title_of(source);
                         }
+                        if let Some((_, source)) = agent.platform {
+                            title_of(source);
+                        }
                         if let Some(checks) =
                             fleet.read(|conn| lifecycle_config::resolve_checks(conn, node, phase)).ok().flatten()
                         {
@@ -295,6 +301,15 @@ impl LifecycleConfigEditor {
             state
         });
         let agent = self.own_agents.get(phase).cloned().unwrap_or_default();
+        let platform = cx.new(|cx| {
+            let mut choices = vec!["Inherit provider".to_string()];
+            choices.extend([AgentPlatform::Claude, AgentPlatform::OpenAi, AgentPlatform::Cursor, AgentPlatform::Google]
+                .map(|provider| provider.label().to_string()));
+            let selected = agent.platform.map_or("Inherit provider", AgentPlatform::label).to_string();
+            let mut state = SelectState::new(choices, None, window, cx);
+            state.set_selected_value(&selected, window, cx);
+            state
+        });
         let model = cx.new(|cx| {
             let mut state = InputState::new(window, cx).placeholder("model (empty: inherited)");
             state.set_value(agent.model.unwrap_or_default(), window, cx);
@@ -310,7 +325,7 @@ impl LifecycleConfigEditor {
             .get(phase)
             .map(|list| list.iter().map(|c| Self::check_row(c, window, cx)).collect())
             .unwrap_or_default();
-        self.form = Some(Form { phase, skills, model, effort, checks, saving: false });
+        self.form = Some(Form { phase, skills, platform, model, effort, checks, saving: false });
         self.error = None;
         cx.notify();
     }
@@ -589,7 +604,11 @@ impl LifecycleConfigEditor {
         let field = |input: &Entity<InputState>| {
             Some(input.read(cx).text().to_string().trim().to_string()).filter(|v| !v.is_empty())
         };
-        let agent = PhaseAgent { model: field(&form.model), effort: field(&form.effort) };
+        let agent = PhaseAgent {
+            platform: form.platform.read(cx).selected_value().and_then(|value| parse_platform(value)),
+            model: field(&form.model),
+            effort: field(&form.effort),
+        };
         let mut checks = Vec::new();
         for row in &form.checks {
             let (label, command) = (field(&row.label), field(&row.command));
@@ -671,6 +690,9 @@ impl LifecycleConfigEditor {
             "{skills}{}",
             resolved.as_ref().map(|r| from(r.source_node)).unwrap_or_default()
         );
+        if let Some((platform, source)) = agent.platform {
+            summary.push_str(&format!("\nprovider {}{}", platform.label(), from(source)));
+        }
         if let Some((model, source)) = &agent.model {
             summary.push_str(&format!("\nmodel {model}{}", from(*source)));
         }
@@ -840,7 +862,8 @@ impl LifecycleConfigEditor {
                         .child("Used in this order. Leave empty to give this node and what is below it no skills for the phase."),
                 )
             })
-            .child(div().text_xs().font_semibold().child("Model and effort"))
+            .child(div().text_xs().font_semibold().child("Agent for this phase"))
+            .child(Select::new(&form.platform))
             .child(
                 h_flex()
                     .gap_2()
@@ -852,7 +875,7 @@ impl LifecycleConfigEditor {
                 div()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child("What the agent for this phase runs with, over the node's Agent capability and the settings. Leave one empty to inherit it."),
+                    .child("Overrides the node's agent settings for this phase. Empty model and effort fields inherit their values."),
             )
             .when(lifecycle_config::takes_checks(form.phase), |el| {
                 el.child(div().text_xs().font_semibold().child("Checks"))

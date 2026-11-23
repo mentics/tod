@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum AgentPlatform {
     Cursor,
+    #[serde(alias = "openai", alias = "codex")]
+    OpenAi,
+    Google,
     #[serde(alias = "anthropic")]
     Claude,
 }
@@ -21,6 +24,8 @@ impl AgentPlatform {
     pub fn label(self) -> &'static str {
         match self {
             Self::Cursor => "Cursor",
+            Self::OpenAi => "OpenAI",
+            Self::Google => "Google",
             Self::Claude => "Claude",
         }
     }

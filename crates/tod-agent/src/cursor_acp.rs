@@ -102,7 +102,7 @@ enum ConversationCommand {
 #[derive(Clone)]
 struct ConversationSpec {
     host: AcpHost,
-    agent_bin: PathBuf,
+    agent_bin: Option<PathBuf>,
     cwd: PathBuf,
     model: String,
     effort: String,
@@ -139,6 +139,7 @@ struct LiveConversation {
     /// What the agent reported spending (see
     /// [`AgentProvider::session_token_usage`]).
     usage: SharedAcpUsage,
+    catalog: Arc<Mutex<Option<AcpSessionCatalog>>>,
 }
 
 impl LiveConversation {
@@ -155,6 +156,7 @@ impl LiveConversation {
             context_chars: Arc::new(AtomicU64::new(0)),
             reply_parts: SharedReplyParts::default(),
             usage: SharedAcpUsage::default(),
+            catalog: Arc::new(Mutex::new(None)),
         };
         let conversation = Self {
             cmd_tx,
@@ -167,6 +169,7 @@ impl LiveConversation {
             context_chars: worker.context_chars.clone(),
             reply_parts: worker.reply_parts.clone(),
             usage: worker.usage.clone(),
+            catalog: worker.catalog.clone(),
         };
         thread::spawn(move || worker.run(cmd_rx));
         conversation
@@ -203,6 +206,7 @@ struct ConversationWorker {
     context_chars: Arc<AtomicU64>,
     reply_parts: SharedReplyParts,
     usage: SharedAcpUsage,
+    catalog: Arc<Mutex<Option<AcpSessionCatalog>>>,
 }
 
 impl ConversationWorker {
@@ -311,7 +315,7 @@ impl ConversationWorker {
             let spec = &self.spec;
             let session = PersistentAcpSession::connect(
                 spec.host,
-                &spec.agent_bin,
+                spec.agent_bin.as_deref(),
                 &spec.cwd,
                 &spec.model,
                 &spec.effort,
@@ -330,6 +334,7 @@ impl ConversationWorker {
                 Some(self.reply_parts.clone()),
                 Some(self.usage.clone()),
             )?;
+            *self.catalog.lock().unwrap_or_else(|e| e.into_inner()) = session.catalog.clone();
             *self.session_id.lock().unwrap_or_else(|e| e.into_inner()) =
                 Some(session.session_id.clone());
             report_session(
@@ -418,11 +423,11 @@ impl CursorAcpProvider {
     }
 
     /// The agent to run, found now when the provider was not given one.
-    fn agent_bin(&self) -> Result<PathBuf> {
-        match &self.agent_bin {
-            Some(bin) => Ok(bin.clone()),
-            None => self.host.resolve_bin(),
+    fn agent_bin(&self, environment: &AgentEnvironment) -> Result<Option<PathBuf>> {
+        if !matches!(environment, AgentEnvironment::Host) {
+            return Ok(None);
         }
+        self.agent_bin.clone().map_or_else(|| self.host.resolve_bin().map(Some), |bin| Ok(Some(bin)))
     }
 
     pub fn with_agent_bin(host: AcpHost, agent_bin: PathBuf) -> Self {
@@ -451,7 +456,7 @@ impl CursorAcpProvider {
     ) -> Result<AgentRunHandle> {
         let id = RunId::new();
         let (tx, rx) = mpsc::channel();
-        let agent_bin = self.agent_bin()?;
+        let agent_bin = self.agent_bin(&environment)?;
         let host = self.host;
         let child_slot: Arc<Mutex<Option<AgentProcess>>> = Arc::new(Mutex::new(None));
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -468,7 +473,7 @@ impl CursorAcpProvider {
             run_id = ?id,
             ?kind,
             host = host.label(),
-            agent_bin = %agent_bin.display(),
+            agent_bin = ?agent_bin,
             cwd = %cwd.display(),
             model = %model,
             effort = %effort,
@@ -488,7 +493,7 @@ impl CursorAcpProvider {
         let worker = thread::spawn(move || {
             let result = run_acp_session(
                 host,
-                &agent_bin,
+                agent_bin.as_deref(),
                 &cwd,
                 &model,
                 &effort,
@@ -580,6 +585,7 @@ impl AgentProvider for CursorAcpProvider {
         session_title: String,
         environment: AgentEnvironment,
     ) -> Result<AgentRunHandle> {
+        validate_environment(self.host, &environment)?;
         self.spawn_run(
             AgentRunKind::FleetAgent,
             owner_id,
@@ -593,6 +599,7 @@ impl AgentProvider for CursorAcpProvider {
     }
 
     fn send_session_turn(&mut self, turn: SessionTurn) -> Result<AgentRunHandle> {
+        validate_environment(self.host, &turn.environment)?;
         let blocks = turn.prompt_blocks();
         let SessionTurn {
             key,
@@ -610,7 +617,7 @@ impl AgentProvider for CursorAcpProvider {
         let tag = TrafficTag::new(key.clone(), &title, purpose.run_kind().traffic_label());
         let spec = ConversationSpec {
             host: self.host,
-            agent_bin: self.agent_bin()?,
+            agent_bin: self.agent_bin(&environment)?,
             cwd,
             model: options.model,
             effort: options.effort,
@@ -709,6 +716,11 @@ impl AgentProvider for CursorAcpProvider {
         self.conversations
             .get(key)
             .map(|conversation| conversation.context_chars.load(Ordering::Relaxed))
+    }
+
+    fn session_catalog(&self, key: &str) -> Option<AcpSessionCatalog> {
+        self.conversations.get(key).and_then(|conversation|
+            conversation.catalog.lock().unwrap_or_else(|e| e.into_inner()).clone())
     }
 
     fn session_token_usage(&self, key: &str) -> Option<crate::TokenUsage> {
@@ -825,7 +837,7 @@ impl AgentProvider for CursorAcpProvider {
 
 fn auth_method_from_initialize(init_result: &Value, host: AcpHost) -> Option<String> {
     // Claude's adapter relies on the `claude` CLI's own login.
-    if host == AcpHost::Claude {
+    if matches!(host, AcpHost::Claude | AcpHost::OpenAi | AcpHost::Google) {
         return None;
     }
     let methods = init_result.get("authMethods")?.as_array()?;
@@ -924,7 +936,7 @@ fn name_session(host: AcpHost, session_id: &str, title: &str) {
                 ),
             }
         }
-        AcpHost::Cursor => tracing::debug!(
+        AcpHost::Cursor | AcpHost::OpenAi | AcpHost::Google => tracing::debug!(
             event = "agent",
             action = "acp_session_name_skipped",
             session_id,
@@ -1062,7 +1074,7 @@ fn spawn_stderr_logger(
 
 fn run_acp_session(
     host: AcpHost,
-    agent_bin: &Path,
+    agent_bin: Option<&Path>,
     cwd: &Path,
     model: &str,
     effort: &str,
@@ -1112,6 +1124,7 @@ fn run_acp_session(
         run_id,
         kind,
         write_roots,
+        host,
         activity,
         pending_permission,
         context_chars: None,
@@ -1252,6 +1265,7 @@ struct AcpClient {
     run_id: RunId,
     kind: AgentRunKind,
     write_roots: Vec<PathBuf>,
+    host: AcpHost,
     /// Short human-readable description of what the agent is doing right now,
     /// shared with the run's `poll_run` caller so a UI can show live status.
     activity: Arc<Mutex<Option<String>>>,
@@ -1553,7 +1567,7 @@ impl AcpClient {
                 } else {
                     format!("Requesting permission: {tool_title}")
                 }));
-                let allowed = tool_path_allowed(tool_title, &self.write_roots);
+                let allowed = !matches!(self.host, AcpHost::OpenAi | AcpHost::Google) && tool_path_allowed(tool_title, &self.write_roots);
                 if allowed {
                     tracing::info!(
                         event = "agent",
@@ -1718,17 +1732,25 @@ struct SpawnedAgent {
 /// Start the ACP agent where `environment` says. In a dev container the
 /// working directory and write roots are the container's paths, and the host's
 /// `extra_write_roots` (the data root) mean nothing there.
+fn validate_environment(host: AcpHost, environment: &AgentEnvironment) -> Result<()> {
+    if host == AcpHost::Google && !matches!(environment, AgentEnvironment::Host) {
+        anyhow::bail!("{} ACP is supported only on this machine; remote environments are not supported", host.label());
+    }
+    Ok(())
+}
+
 fn spawn_agent(
     host: AcpHost,
-    agent_bin: &Path,
+    agent_bin: Option<&Path>,
     cwd: &Path,
     environment: &AgentEnvironment,
     env: &[(String, String)],
     extra_write_roots: &[PathBuf],
 ) -> Result<SpawnedAgent> {
+    validate_environment(host, environment)?;
     match environment {
         AgentEnvironment::Host => Ok(SpawnedAgent {
-            child: spawn_acp_process(host, agent_bin, env)?,
+            child: spawn_acp_process(host, agent_bin.context("local ACP binary was not resolved")?, env)?,
             cwd: cwd.to_path_buf(),
             write_roots: acp_write_roots(cwd, extra_write_roots),
             in_container: false,
@@ -1799,6 +1821,8 @@ fn sign_in_hint(host: AcpHost, environment: &AgentEnvironment) -> String {
     let (who, sign_in) = match host {
         AcpHost::Claude => ("Claude Code", "run `claude` and sign in with `/login`"),
         AcpHost::Cursor => ("Cursor Agent", "run `cursor-agent login`"),
+        AcpHost::OpenAi => ("Codex", "run `codex login`"),
+        AcpHost::Google => ("Gemini CLI", "run `gemini` and sign in"),
     };
     match environment {
         AgentEnvironment::Host => format!(
@@ -1895,6 +1919,36 @@ fn pick_allow_option_id(options: &[Value]) -> Option<&str> {
                 .copied()
                 .find(|id| id.to_ascii_lowercase().contains("allow"))
         })
+}
+
+/// Choices and capabilities advertised when an ACP session connects.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AcpSessionCatalog {
+    pub models: Vec<String>,
+    pub efforts: Vec<String>,
+    pub accepts_images: bool,
+    pub can_resume: bool,
+}
+
+/// Extract capabilities from initialize and choices from session/new or session/load.
+pub fn acp_session_catalog(init: &Value, result: &Value) -> AcpSessionCatalog {
+    let choices = |option: Option<Value>| -> Vec<String> {
+        option.and_then(|v| v.get("options").and_then(Value::as_array).cloned())
+            .unwrap_or_default().iter().filter_map(|v| v.get("value").and_then(Value::as_str))
+            .map(str::to_string).collect()
+    };
+    let config = result.get("configOptions");
+    let mut models = choices(pick_model_option(config));
+    if models.is_empty() {
+        models = result.pointer("/models/availableModels").and_then(Value::as_array).cloned()
+            .unwrap_or_default().iter().filter_map(|m| m.get("modelId").and_then(Value::as_str))
+            .map(str::to_string).collect();
+    }
+    AcpSessionCatalog {
+        models, efforts: choices(pick_effort_option(config)),
+        accepts_images: init.pointer("/agentCapabilities/promptCapabilities/image").and_then(Value::as_bool).unwrap_or(false),
+        can_resume: resume_method(init).is_some(),
+    }
 }
 
 fn pick_model_option(config_options: Option<&Value>) -> Option<Value> {
@@ -2057,7 +2111,15 @@ fn apply_session_config_options(
 ) -> Result<()> {
     let mut config_options = session_result.get("configOptions").cloned();
 
-    if let Some(model_option) = pick_model_option(config_options.as_ref()) {
+    if matches!(session.host, AcpHost::OpenAi | AcpHost::Google) {
+        let catalog = acp_session_catalog(&Value::Null, session_result);
+        if model != "auto" { anyhow::ensure!(catalog.models.iter().any(|m| m == model), "{} does not offer model `{model}` for this session", session.host.label()); }
+        if let Some(value) = effort_for_acp(effort) { anyhow::ensure!(catalog.efforts.iter().any(|e| e == value), "{} does not offer effort `{value}` for this session", session.host.label()); }
+    }
+
+    if matches!(session.host, AcpHost::OpenAi | AcpHost::Google) && model == "auto" {
+        // Keep the adapter default.
+    } else if let Some(model_option) = pick_model_option(config_options.as_ref()) {
         match set_config_option(session, session_id, &model_option, model, "model")? {
             Some(updated) => config_options = Some(updated),
             // Set without the options coming back: the agent runs it now.
@@ -2269,13 +2331,14 @@ struct PersistentAcpSession {
     in_container: bool,
     /// Whether the agent said it takes image content in a prompt.
     accepts_images: bool,
+    catalog: Option<AcpSessionCatalog>,
     _reader_handle: JoinHandle<()>,
 }
 
 impl PersistentAcpSession {
     fn connect(
         host: AcpHost,
-        agent_bin: &Path,
+        agent_bin: Option<&Path>,
         cwd: &Path,
         model: &str,
         effort: &str,
@@ -2324,6 +2387,7 @@ impl PersistentAcpSession {
             run_id: RunId::new(),
             kind,
             write_roots,
+            host,
             activity,
             pending_permission,
             context_chars,
@@ -2400,6 +2464,7 @@ impl PersistentAcpSession {
             }
         };
 
+        let catalog = acp_session_catalog(&init_result, &session_result);
         apply_session_config_options(&mut client, &session_id, &session_result, model, effort)?;
         apply_permission_mode(&mut client, host, &session_id, &session_result)?;
 
@@ -2409,6 +2474,7 @@ impl PersistentAcpSession {
             cwd,
             in_container,
             accepts_images,
+            catalog: Some(catalog),
             _reader_handle: reader_handle,
         })
     }
@@ -2723,6 +2789,99 @@ while True:
             }
         }
         panic!("timed out waiting for run {id:?}");
+    }
+
+    #[test]
+    fn new_hosts_exchange_turns_with_fake_acp() {
+        if !python_available() { return; }
+        for (host, platform) in [(AcpHost::OpenAi, crate::AgentPlatform::OpenAi), (AcpHost::Google, crate::AgentPlatform::Google)] {
+            let dir = scratch_dir("fake-new-acp");
+            let bin = dir.join("fake.py");
+            std::fs::write(&bin, FAKE_ACP_AGENT).unwrap();
+            let mut provider = CursorAcpProvider::with_agent_bin(host, bin);
+            let run = provider.send_session_turn(SessionTurn { key: "chat".into(), owner_id: "test".into(), title: String::new(), cwd: dir, options: crate::AgentLaunchOptions::for_platform(platform), resume_session_id: None, opening: None, message: "hello".into(), images: vec![], purpose: crate::provider::SessionPurpose::Chat, env: vec![], environment: AgentEnvironment::Host }).unwrap();
+            assert_eq!(wait_for_reply(&mut provider, run.id), "reply to: hello");
+            assert_eq!(provider.session_id("chat").as_deref(), Some("fake-session-1"));
+        }
+    }
+
+    #[test]
+    fn session_catalog_reports_actual_adapter_choices() {
+        if !python_available() { return; }
+        let dir = scratch_dir("fake-session-catalog");
+        let bin = dir.join("fake.py");
+        let script = FAKE_ACP_AGENT.replace(
+            "result = {\"sessionId\": \"fake-session-1\"}",
+            "result = {\"sessionId\": \"fake-session-1\", \"configOptions\": [{\"id\": \"model\", \"category\": \"model\", \"options\": [{\"value\": \"adapter-model\"}]}, {\"id\": \"effort\", \"category\": \"effort\", \"options\": [{\"value\": \"high\"}]}]}"
+        );
+        std::fs::write(&bin, script).unwrap();
+        let mut provider = CursorAcpProvider::with_agent_bin(AcpHost::OpenAi, bin);
+        assert_eq!(provider.session_catalog("chat"), None);
+        let run = provider.send_session_turn(SessionTurn { key: "chat".into(), owner_id: "test".into(), title: String::new(), cwd: dir, options: crate::AgentLaunchOptions::for_platform(crate::AgentPlatform::OpenAi), resume_session_id: None, opening: None, message: "hello".into(), images: vec![], purpose: crate::provider::SessionPurpose::Chat, env: vec![], environment: AgentEnvironment::Host }).unwrap();
+        assert_eq!(wait_for_reply(&mut provider, run.id), "reply to: hello");
+        assert_eq!(provider.session_catalog("chat"), Some(AcpSessionCatalog { models: vec!["adapter-model".into()], efforts: vec!["high".into()], accepts_images: false, can_resume: true }));
+        provider.close_session("chat");
+        assert_eq!(provider.session_catalog("chat"), None);
+    }
+
+    #[test]
+    fn new_hosts_ask_user_before_approving_tool_calls() {
+        if !python_available() { return; }
+        for (host, platform) in [(AcpHost::OpenAi, crate::AgentPlatform::OpenAi), (AcpHost::Google, crate::AgentPlatform::Google)] {
+            let dir = scratch_dir("fake-new-permission");
+            let bin = dir.join("fake.py");
+            let script = FAKE_ACP_AGENT.replace("    elif method == \"session/prompt\":", "    elif method == \"session/prompt\":\n        send({\"jsonrpc\": \"2.0\", \"id\": 999, \"method\": \"session/request_permission\", \"params\": {\"toolCall\": {\"title\": \"Run shell\"}, \"options\": [{\"optionId\": \"allow-once\", \"name\": \"Allow\", \"kind\": \"allow_once\"}]}})\n        answer = json.loads(sys.stdin.readline())\n        assert answer[\"result\"][\"outcome\"][\"optionId\"] == \"allow-once\"");
+            std::fs::write(&bin, script).unwrap();
+            let mut provider = CursorAcpProvider::with_agent_bin(host, bin);
+            let run = provider.send_session_turn(SessionTurn { key: "permission".into(), owner_id: "test".into(), title: String::new(), cwd: dir, options: crate::AgentLaunchOptions::for_platform(platform), resume_session_id: None, opening: None, message: "hello".into(), images: vec![], purpose: crate::provider::SessionPurpose::Chat, env: vec![], environment: AgentEnvironment::Host }).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                match provider.poll_run(run.id) {
+                    Some(AgentRunState::NeedsPermission(_)) => break,
+                    Some(AgentRunState::Failure(e)) => panic!("{e}"),
+                    Some(AgentRunState::Success(_)) => panic!("tool was approved without asking"),
+                    _ => { assert!(std::time::Instant::now() < deadline); thread::sleep(Duration::from_millis(20)); }
+                }
+            }
+            provider.respond_to_permission(run.id, "allow-once").unwrap();
+            assert_eq!(wait_for_reply(&mut provider, run.id), "reply to: hello");
+        }
+    }
+
+    #[test]
+    fn new_hosts_reject_unadvertised_model() {
+        if !python_available() { return; }
+        let dir = scratch_dir("fake-unsupported-model");
+        let bin = dir.join("fake.py");
+        std::fs::write(&bin, FAKE_ACP_AGENT).unwrap();
+        let mut provider = CursorAcpProvider::with_agent_bin(AcpHost::OpenAi, bin);
+        let run = provider.send_session_turn(SessionTurn { key: "model".into(), owner_id: "test".into(), title: String::new(), cwd: dir, options: crate::AgentLaunchOptions::from_settings(crate::AgentPlatform::OpenAi, "missing-model", "auto"), resume_session_id: None, opening: None, message: "hello".into(), images: vec![], purpose: crate::provider::SessionPurpose::Chat, env: vec![], environment: AgentEnvironment::Host }).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match provider.poll_run(run.id) {
+                Some(AgentRunState::Failure(e)) => { assert!(e.contains("does not offer model `missing-model`"), "{e}"); break; }
+                Some(AgentRunState::Success(_)) => panic!("unsupported model was accepted"),
+                _ => { assert!(std::time::Instant::now() < deadline); thread::sleep(Duration::from_millis(20)); }
+            }
+        }
+    }
+
+    #[test]
+    fn codex_uses_remote_binaries_and_gemini_requires_the_host() {
+        let environment = AgentEnvironment::DevContainer(crate::devcontainer::DevContainerLaunch { container: "test".into(), host_dir: PathBuf::from("/tmp"), directory: None, env: vec![], path_prepend: vec![], files: vec![] });
+        let codex = CursorAcpProvider::for_host(AcpHost::OpenAi);
+        assert!(validate_environment(AcpHost::OpenAi, &environment).is_ok());
+        assert_eq!(codex.agent_bin(&environment).unwrap(), None);
+        assert!(validate_environment(AcpHost::Google, &environment).is_err());
+    }
+
+    #[test]
+    fn advertised_catalog_reads_config_and_legacy_models() {
+        let catalog = acp_session_catalog(&Value::Null, &json!({"configOptions": [{"id":"model", "category":"model", "options":[{"value":"m1"}]}, {"id":"reasoning_effort", "options":[{"value":"high"}]}]}));
+        assert_eq!(catalog.models, ["m1"]);
+        assert_eq!(catalog.efforts, ["high"]);
+        let legacy = acp_session_catalog(&Value::Null, &json!({"models":{"availableModels":[{"modelId":"m2"}]}}));
+        assert_eq!(legacy.models, ["m2"]);
     }
 
     /// The first launch dies on its first request (as an agent does when its

@@ -476,16 +476,7 @@ pub fn perform(
 ) -> Result<Done> {
     let g = gather(ctx, node)?;
     let action = verb.action();
-    if g.actions.default != Some(action) && !g.actions.menu.contains(&action) {
-        let offered: Vec<&str> = g.actions.default.iter().chain(&g.actions.menu).map(|a| Verb::of(*a).name()).collect();
-        bail!(
-            "`{}` ({}) is not offered for this node now (it is {}). The menu offers: {}",
-            verb.name(),
-            action.label(),
-            run_state_text(g.inputs.run),
-            if offered.is_empty() { "nothing".to_string() } else { offered.join(", ") }
-        );
-    }
+    ensure_offered(&g.actions, g.inputs.run, action)?;
     let result = run_verb(ctx, node, verb, opts, &g, progress);
     let (title, failed, detail) = match &result {
         Ok(done) => (format!("{} ran \"{}\"", who.label(), action.label()), done.failed, done.message.clone()),
@@ -498,6 +489,19 @@ pub fn perform(
         (Err(err), Ok(())) => Err(err),
         (Err(err), Err(note_err)) => Err(err.context(format!("also, who tried it was not recorded: {note_err:#}"))),
     }
+}
+
+/// Refuse an action that is no longer offered by the runner menu.
+pub fn ensure_offered(actions: &RunnerActions, run: RunState, action: RunnerAction) -> Result<()> {
+    if actions.default == Some(action) || actions.menu.contains(&action) {
+        return Ok(());
+    }
+    let offered: Vec<&str> = actions.default.iter().chain(&actions.menu).map(|a| Verb::of(*a).name()).collect();
+    bail!(
+        "`{}` ({}) is not offered for this node now (it is {}). The menu offers: {}",
+        Verb::of(action).name(), action.label(), run_state_text(run),
+        if offered.is_empty() { "nothing".to_string() } else { offered.join(", ") }
+    )
 }
 
 /// A note on the node's activity, by the operator or a shepherd.
@@ -527,6 +531,34 @@ fn start_local(ctx: &Ctx, node: Uuid, renew_budget: bool) -> Result<Done> {
     Ok(Done::ok("Started: the daemon runs it on this machine."))
 }
 
+/// Prepare a fresh session or phase before the surface starts the runner.
+/// The app can host a runner in-process, whereas the CLI uses the daemon;
+/// both must make the same durable changes before asking their host to run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreshRun {
+    Session,
+    Phase,
+}
+
+pub fn prepare_fresh_run(
+    fleet: &FleetStore,
+    root: &Path,
+    node: Uuid,
+    supervised: bool,
+    fresh: FreshRun,
+) -> Result<()> {
+    if fresh == FreshRun::Phase {
+        crate::lifecycle::restart_stay(fleet, node)?;
+    }
+    if !supervised {
+        match fresh {
+            FreshRun::Session => crate::autopilot::AutopilotState::request_fresh_session(root, node)?,
+            FreshRun::Phase => crate::autopilot::AutopilotState::request_rerun_phase(root, node)?,
+        }
+    }
+    Ok(())
+}
+
 fn run_verb(
     ctx: &Ctx,
     node: Uuid,
@@ -547,7 +579,7 @@ fn run_verb(
         Verb::RunFresh if supervised => supervised_go(ctx, node, g, Some(REQUEST_FRESH_SESSION), progress),
         Verb::RunFresh => {
             let daemon = ctx.daemon("starting a run on this machine goes through the daemon")?;
-            crate::autopilot::AutopilotState::request_fresh_session(ctx.root, node)?;
+            prepare_fresh_run(ctx.fleet, ctx.root, node, false, FreshRun::Session)?;
             daemon.start(node, false)?;
             Ok(Done::ok("Started in a new session: the daemon runs it on this machine."))
         }
@@ -576,12 +608,11 @@ fn run_verb(
             Ok(Done { message, failed })
         }
         Verb::RerunPhase => {
-            crate::lifecycle::restart_stay(ctx.fleet, node)?;
+            prepare_fresh_run(ctx.fleet, ctx.root, node, supervised, FreshRun::Phase)?;
             if supervised {
                 return supervised_go(ctx, node, g, Some(REQUEST_FRESH_SESSION), progress);
             }
             let daemon = ctx.daemon("starting a run on this machine goes through the daemon")?;
-            crate::autopilot::AutopilotState::request_rerun_phase(ctx.root, node)?;
             daemon.start(node, false)?;
             Ok(Done::ok("The phase starts again in a new session: the daemon runs it on this machine."))
         }
@@ -628,13 +659,34 @@ pub fn find_place<'a>(places: &'a [FilesPlace], wanted: &str) -> Result<&'a File
     })
 }
 
+/// Gather the files that migration affects and preserve the node's sessions
+/// before either surface asks the user how to handle those files.
+pub fn prepare_migration(
+    fleet: &FleetStore,
+    node: &str,
+    place: &str,
+) -> Result<Vec<tod_store::fleet::provision::AffectedLocation>> {
+    let affected = tod_store::fleet::places::migrate_impact(fleet, node, place)?;
+    tod_store::fleet::session_log::keep_node_state(fleet, node).context("keep the node's sessions")?;
+    Ok(affected)
+}
+
+/// Finish a migration after its affected files have been removed.
+pub fn finish_migration(fleet: &FleetStore, node: &str, place: &str, left_sandbox: bool) -> Result<()> {
+    tod_store::fleet::places::migrate(fleet, node, place)?;
+    if left_sandbox {
+        cloud_sync::lost::announce_left_cloud(fleet, node)?;
+    }
+    Ok(())
+}
+
 /// Migrate `node` to a location: what `ui::files_impact::confirm_migrate`
 /// does, with the dialog's questions answered by the options. Nothing is
 /// started. The node's sessions are kept, its current files are removed (each
 /// branch pushed first), the location is chosen, and a sandbox it leaves is
 /// announced to the orchestrator.
 fn migrate(ctx: &Ctx, node: Uuid, g: &Gathered, opts: &Options, progress: &mut dyn FnMut(&str)) -> Result<Done> {
-    use tod_store::fleet::{LocationState, places, provision, session_log};
+    use tod_store::fleet::{LocationState, provision};
     if matches!(g.inputs.run, RunState::Active { .. } | RunState::HandTurn) {
         bail!("the node's run is active: pause it (`runner pause`) or stop it, wait for it to end, then migrate");
     }
@@ -657,8 +709,7 @@ fn migrate(ctx: &Ctx, node: Uuid, g: &Gathered, opts: &Options, progress: &mut d
     g.facts.check_migration_target(place)?;
     let paths = tod_store::TodPaths::at(ctx.root);
     let settings = tod_store::TodSettings::load(&paths).context("read the settings")?;
-    let affected = places::migrate_impact(ctx.fleet, &id, &place.id).context("Could not migrate")?;
-    session_log::keep_node_state(ctx.fleet, &id).context("keep the node's sessions")?;
+    let affected = prepare_migration(ctx.fleet, &id, &place.id).context("Could not migrate")?;
     let left_sandbox = affected.iter().any(|a| a.location.sandbox().is_some());
     for a in &affected {
         let mut state = provision::location_state(ctx.fleet, &paths, &a.node_id)?;
@@ -696,10 +747,7 @@ fn migrate(ctx: &Ctx, node: Uuid, g: &Gathered, opts: &Options, progress: &mut d
         })
         .with_context(|| format!("Could not remove {title}'s files"))?;
     }
-    places::migrate(ctx.fleet, &id, &place.id).context("Could not migrate")?;
-    if left_sandbox {
-        cloud_sync::lost::announce_left_cloud(ctx.fleet, &id)?;
-    }
+    finish_migration(ctx.fleet, &id, &place.id, left_sandbox)?;
     Ok(Done::ok(format!(
         "Migrated to {}. Nothing was started. The node now has a Files override of its own (location {}), which \
          every node below it inherits; `tod-cli capabilities disable {id} files` hands it back to the nearest \
@@ -773,7 +821,7 @@ pub fn answer(
     let detail = format!("{}: {answered}", after.decision.question.lines().next().unwrap_or(""));
     record_note(ctx.fleet, node, &phase, title, false, detail)
         .map_err(|err| err.context("the answer was recorded, but who gave it was not"))?;
-    let wake_problem = cloud_sync::wake_after_answer(ctx.fleet, ctx.root, &node.to_string()).err().map(|e| format!("{e:#}"));
+    let wake_problem = crate::lifecycle::answer::wake_after_decision(ctx.fleet, decision_id).err().map(|e| format!("{e:#}"));
     Ok(Answer { decision: decision_id, node, answered, moved_to, changed_from, wake_problem })
 }
 

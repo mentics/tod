@@ -48,7 +48,7 @@ const MAX_TAGS: usize = 10;
 const DETAILS_ROWS: f32 = 6.;
 /// Max visible height of the notes list, in equivalent text lines, before it scrolls.
 const NOTES_MAX_LINES: f32 = 16.;
-const PLATFORM_ORDER: [AgentPlatform; 2] = [AgentPlatform::Claude, AgentPlatform::Cursor];
+const PLATFORM_ORDER: [AgentPlatform; 4] = [AgentPlatform::Claude, AgentPlatform::Cursor, AgentPlatform::OpenAi, AgentPlatform::Google];
 
 /// Next value when cycling an optional catalog field: unset → first → … → last → unset.
 fn cycle_option(current: Option<&str>, options: &[&str]) -> Option<String> {

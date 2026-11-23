@@ -1,3 +1,4 @@
+use super::commands::DragStep;
 use std::path::Path;
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -155,18 +156,6 @@ pub fn send_click(
         SendMessageW(hwnd, up, WPARAM(0), lp);
     }
     Ok(())
-}
-
-/// One step of a drag held open: press, move, or release.
-///
-/// `drag` does the whole gesture in one message and is what a test wants. This
-/// is for looking at the UI *during* a drag — the landing line a list draws
-/// under the pointer only exists while the button is down.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DragStep {
-    Press,
-    Move,
-    Release,
 }
 
 pub fn send_drag_step(

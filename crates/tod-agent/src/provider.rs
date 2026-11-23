@@ -242,6 +242,11 @@ pub trait AgentProvider {
         None
     }
 
+    /// Choices and capabilities from the latest session handshake, if connected.
+    fn session_catalog(&self, _key: &str) -> Option<crate::AcpSessionCatalog> {
+        None
+    }
+
     /// Stop the live process behind conversation `key`. The agent-side session
     /// is left intact, so a later turn can resume it.
     fn close_session(&mut self, key: &str);

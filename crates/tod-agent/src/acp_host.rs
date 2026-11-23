@@ -8,6 +8,8 @@ pub use crate::platform::AgentPlatform;
 pub fn agent_platform_acp_host(platform: AgentPlatform) -> AcpHost {
     match platform {
         AgentPlatform::Cursor => AcpHost::Cursor,
+        AgentPlatform::OpenAi => AcpHost::OpenAi,
+        AgentPlatform::Google => AcpHost::Google,
         AgentPlatform::Claude => AcpHost::Claude,
     }
 }
@@ -17,12 +19,16 @@ pub fn agent_platform_acp_host(platform: AgentPlatform) -> AcpHost {
 pub enum AcpHost {
     Cursor,
     Claude,
+    OpenAi,
+    Google,
 }
 
 impl AcpHost {
     pub fn platform(self) -> AgentPlatform {
         match self {
             Self::Cursor => AgentPlatform::Cursor,
+            Self::OpenAi => AgentPlatform::OpenAi,
+            Self::Google => AgentPlatform::Google,
             Self::Claude => AgentPlatform::Claude,
         }
     }
@@ -30,13 +36,15 @@ impl AcpHost {
     pub fn label(self) -> &'static str {
         match self {
             Self::Cursor => "Cursor",
+            Self::OpenAi => "OpenAI",
+            Self::Google => "Google",
             Self::Claude => "Claude",
         }
     }
 
     pub fn client_name(self) -> &'static str {
         match self {
-            Self::Cursor => "tod-interview-ui",
+            Self::Cursor | Self::OpenAi | Self::Google => "tod-interview-ui",
             Self::Claude => "tod-interview-ui",
         }
     }
@@ -44,6 +52,8 @@ impl AcpHost {
     pub fn auth_method_id(self) -> &'static str {
         match self {
             Self::Cursor => "cursor_login",
+            Self::OpenAi => "openai",
+            Self::Google => "google",
             Self::Claude => "claude_login",
         }
     }
@@ -51,6 +61,11 @@ impl AcpHost {
     pub fn resolve_bin(self) -> Result<PathBuf> {
         match self {
             Self::Cursor => resolve_cursor_bin(),
+            Self::OpenAi => match std::env::var_os("TOD_CODEX_ACP_BIN").filter(|path| !path.is_empty()) {
+                Some(path) => Ok(path.into()),
+                None => resolve_new_bin("codex-acp", "Install @agentclientprotocol/codex-acp"),
+            },
+            Self::Google => resolve_new_bin("gemini", "Install Gemini CLI"),
             Self::Claude => resolve_claude_acp_bin(),
         }
     }
@@ -61,7 +76,7 @@ impl AcpHost {
     pub fn uses_acp_subcommand(self, _agent_bin: &Path) -> bool {
         match self {
             Self::Cursor => true,
-            Self::Claude => false,
+            Self::Claude | Self::OpenAi | Self::Google => false,
         }
     }
 }
@@ -95,6 +110,22 @@ fn resolve_via_login_shell(_name: &str) -> Option<PathBuf> {
 
 fn first_existing(candidates: &[PathBuf]) -> Option<PathBuf> {
     candidates.iter().find(|p| p.is_file()).cloned()
+}
+
+fn resolve_new_bin(name: &str, install: &str) -> Result<PathBuf> {
+    resolve_via_login_shell(name)
+        .or_else(|| {
+            std::env::split_paths(&std::env::var_os("PATH")?)
+                .map(|dir| {
+                    dir.join(if cfg!(windows) {
+                        format!("{name}.cmd")
+                    } else {
+                        name.to_string()
+                    })
+                })
+                .find(|p| p.is_file())
+        })
+        .ok_or_else(|| anyhow::anyhow!("{name} not found on PATH. {install}."))
 }
 
 fn resolve_cursor_bin() -> Result<PathBuf> {
@@ -158,7 +189,12 @@ fn resolve_git_bash_path() -> Option<PathBuf> {
     let mut candidates = Vec::new();
     for base_var in ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"] {
         if let Ok(base) = std::env::var(base_var) {
-            candidates.push(PathBuf::from(&base).join("Git").join("bin").join("bash.exe"));
+            candidates.push(
+                PathBuf::from(&base)
+                    .join("Git")
+                    .join("bin")
+                    .join("bash.exe"),
+            );
         }
     }
     candidates.push(PathBuf::from(r"C:\Git\bin\bash.exe"));
@@ -262,6 +298,10 @@ pub fn spawn_acp_process(
     // received". The agent is tod's child, not a nested session.
     command.env_remove("CLAUDECODE");
 
+    if host == AcpHost::Google {
+        command.arg("--acp");
+    }
+
     // Git Bash's login profile rebuilds PATH from ORIGINAL_PATH when that is
     // already set, and every Git Bash terminal exports it. tod launched from
     // one would hand it down, and the agent's shell would drop whatever the
@@ -298,6 +338,14 @@ pub fn container_agent_bin(
             &[crate::claude_adapter::BIN],
             "npm install -g @agentclientprotocol/claude-agent-acp (and sign in to `claude` there)",
         ),
+        AcpHost::OpenAi => (
+            &["codex-acp"],
+            "npm install -g @agentclientprotocol/codex-acp (and sign in to Codex there)",
+        ),
+        AcpHost::Google => anyhow::bail!(
+            "{} ACP is not supported in remote environments",
+            host.label()
+        ),
         AcpHost::Cursor => (
             &["cursor-agent", "agent"],
             "curl https://cursor.com/install -fsS | bash (and sign in there)",
@@ -319,6 +367,14 @@ pub fn sandbox_agent_bin(host: AcpHost, launch: &crate::sandbox::SandboxLaunch) 
         AcpHost::Claude => (
             &[crate::claude_adapter::BIN],
             "create the sandbox with `tod-sandbox create <name> --agents`, then sign in to `claude` there",
+        ),
+        AcpHost::OpenAi => (
+            &["codex-acp"],
+            "npm install -g @agentclientprotocol/codex-acp (and sign in to Codex there)",
+        ),
+        AcpHost::Google => anyhow::bail!(
+            "{} ACP is not supported in remote environments",
+            host.label()
         ),
         AcpHost::Cursor => (
             &["cursor-agent", "agent"],

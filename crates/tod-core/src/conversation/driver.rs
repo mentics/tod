@@ -15,15 +15,17 @@ use crate::conversation::context::{ReportedStale, focus_selection, last_action_a
 use crate::conversation::protocol::{
     Next, Protocol, ProtocolEnv, RunNotice, TurnContext, protocol_for,
 };
+use crate::conversation::quota;
 use crate::interview::context::estimate_tokens;
 use crate::media::MediaPaths;
 use crate::session_name::session_name;
 use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
 use tod_agent::{
-    AgentLaunchOptions, AgentProvider, AgentRunState, PermissionRequest, PromptImage, RunId,
+    AgentLaunchOptions, AgentPlatform, AgentProvider, AgentRunState, PermissionRequest, PromptImage, RunId,
     SessionOpening, SessionTurn, SharedAgent, TokenUsage,
 };
+use tod_agent::agent_launch::{parse_platform, platform_storage};
 use tod_journey::{Actor, Decision, Event, JourneyKey, TurnPhase};
 use tod_store::conversation::{
     Conversation, ConversationRepo, Focus, ProtocolKind, ReplyPart, TurnAttachment, TurnRole,
@@ -32,6 +34,7 @@ use tod_store::conversation::{
 use tod_store::fleet::FleetStore;
 use tod_store::fleet::Workdir;
 use tod_store::interview::{ACTOR_USER, InterviewCommand};
+use tod_store::outline::uuid_blob::now_ms;
 use tod_store::settings::InterviewContextSettings;
 use uuid::Uuid;
 
@@ -75,6 +78,14 @@ impl AgentAccess for SharedAgentAccess<'_> {
 
 /// The body of the transcript entry that marks a fresh agent session.
 pub const ROTATION_NOTE: &str = "Started a fresh agent session";
+
+fn can_resume_platform(saved: Option<AgentPlatform>, requested: AgentPlatform) -> bool {
+    match saved {
+        Some(saved) => saved == requested,
+        // Untagged sessions predate the new ACP providers.
+        None => matches!(requested, AgentPlatform::Claude | AgentPlatform::Cursor),
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ConversationConfig {
@@ -446,11 +457,12 @@ impl ConversationDriver {
         fleet: &FleetStore,
         agent: &mut A,
     ) -> Result<()> {
-        let Some(run) = self.run.take() else {
+        let Some(run) = self.run.as_ref() else {
             return Ok(());
         };
+        agent.with(|a| a.cancel_run(run.id)).context("canceling the agent run")?;
+        self.run.take();
         self.end_lease(fleet);
-        let _ = agent.with(|a| a.cancel_run(run.id));
         self.activity = None;
         self.parts.clear();
         self.permission = None;
@@ -552,10 +564,28 @@ impl ConversationDriver {
         self.continuations = 0;
         self.quiet_streak = 0;
 
+        let launch = match self.try_launch_options(fleet)
+            .and_then(|desired| quota::route(fleet.paths().root(), desired, now_ms()))
+        {
+            Ok(launch) => launch,
+            Err(err) => {
+                self.start_failed(fleet, id, &err)?;
+                return Err(err);
+            }
+        };
         let live = agent.with(|a| a.session_id(&key).is_some());
         let resumable = live || conversation.agent_session_id.is_some();
+        let saved_platform = conversation.platform.as_deref().and_then(parse_platform);
+        let session_platform = if live {
+            self.launched.as_ref().map(|launch| launch.platform).or(saved_platform)
+        } else {
+            saved_platform
+        };
+        let switch_note = session_platform.filter(|previous| *previous != launch.platform)
+            .map(|previous| format!("Switched from {} to {}", previous.label(), launch.platform.label()));
+        let switch_session = resumable && !can_resume_platform(session_platform, launch.platform);
         let budget = self.config.context.context_budget_tokens as i64;
-        if resumable && self.session_tokens.is_none() {
+        if resumable && !switch_session && self.session_tokens.is_none() {
             self.session_tokens = Some(self.estimate_from_transcript(fleet, id)?);
         }
         let over_budget = self.session_tokens.is_some_and(|t| t > budget);
@@ -567,7 +597,7 @@ impl ConversationDriver {
         let started = loop {
             let text_now = format!("{text}{note}");
             let text = text_now.as_str();
-            let attempt = if resumable && !over_budget {
+            let attempt = if resumable && !over_budget && !switch_session {
                 let message = join(&join_sections(&changes, &answers), text);
                 self.start(
                     fleet,
@@ -578,14 +608,17 @@ impl ConversationDriver {
                     message,
                     images.clone(),
                     conversation.agent_session_id.clone().filter(|_| !live),
+                    launch.clone(),
                 )
-            } else if has_history {
-                let reason = if !resumable {
+            } else if has_history || switch_session {
+                let reason = if switch_session {
+                    "provider changed"
+                } else if !resumable {
                     "not resumable"
                 } else {
                     "over budget"
                 };
-                let announce = !rotated;
+                let marker = (!rotated).then(|| switch_note.as_deref().unwrap_or(ROTATION_NOTE));
                 rotated = true;
                 self.rotate_and_start(
                     fleet,
@@ -596,7 +629,8 @@ impl ConversationDriver {
                     text,
                     images.clone(),
                     reason,
-                    announce,
+                    marker,
+                    launch.clone(),
                 )
             } else {
                 // The first turn: the opening context, then the message.
@@ -628,6 +662,7 @@ impl ConversationDriver {
                     join(&changes, text),
                     images.clone(),
                     None,
+                    launch.clone(),
                 )
             };
             // An agent that takes no images still gets the message: the same
@@ -751,7 +786,7 @@ impl ConversationDriver {
         let Some(run) = &self.run else {
             return Ok(());
         };
-        let outcome = match agent.with(|a| a.poll_run(run.id)) {
+        let mut outcome = match agent.with(|a| a.poll_run(run.id)) {
             Some(AgentRunState::InFlight(activity)) => {
                 self.parts = agent
                     .with(|a| a.session_reply_parts(&run.key))
@@ -777,10 +812,18 @@ impl ConversationDriver {
             Some(AgentRunState::Failure(message)) => Err(message),
             None => Err("agent run was lost".to_string()),
         };
+        let now = now_ms();
+        let quota_limit = match &outcome {
+            Ok(reply) => quota::banner(reply, now),
+            Err(message) => quota::detect(message, now),
+        };
+        if quota_limit.is_some() && let Ok(reply) = outcome {
+            outcome = Err(reply);
+        }
         let run = self.run.take().expect("checked above");
         self.end_lease(fleet);
         self.activity = None;
-        self.parts.clear();
+        let partial = std::mem::take(&mut self.parts);
         self.permission = None;
         let id = self
             .conversation_id
@@ -790,6 +833,36 @@ impl ConversationDriver {
             events.push(ConversationEvent::Notice(RunNotice::Error(format!(
                 "could not record the turn's token usage: {err:#}"
             ))));
+        }
+        if let Some(limit) = &quota_limit
+            && let Some(launch) = self.launched.clone()
+            && quota::equivalent(&launch).is_some()
+        {
+            let root = fleet.paths().root();
+            quota::remember(root, launch.platform, limit, now)?;
+            match quota::route(root, launch.clone(), now) {
+                Ok(next) => {
+                    let (conversation, text, images) = Self::read_retry(fleet, id, run.user_seq)?;
+                    let mut handoff = String::from(
+                        "The previous agent stopped at its usage limit. Check the task, recorded changes, and current working files before continuing. Preserve completed work and avoid repeating actions that already took effect.",
+                    );
+                    let parts = agent.with(|a| a.session_reply_parts(&run.key)).unwrap_or(partial);
+                    let answer = reply_answer(&parts);
+                    if !answer.is_empty() && quota::banner(&answer, now).is_none() {
+                        let excerpt: String = answer.chars().take(2_000).collect();
+                        handoff.push_str("\n\nPartial reply from the previous agent:\n");
+                        handoff.push_str(&excerpt);
+                    }
+                    let marker = quota_switch_note(launch.platform, next.platform);
+                    let progress_before = self.progress_before.clone();
+                    self.rotate_and_start(fleet, agent, &conversation, run.user_seq, &handoff,
+                        &text, images, "provider quota exhausted", Some(&marker), next)?;
+                    self.progress_before = progress_before;
+                    events.push(ConversationEvent::Rotated);
+                    return Ok(());
+                }
+                Err(blocked) => outcome = Err(blocked.to_string()),
+            }
         }
         let chars = agent
             .with(|a| a.session_context_chars(&run.key))
@@ -816,20 +889,22 @@ impl ConversationDriver {
                         conversation_id: id,
                         agent_session_id: agent.with(|a| a.session_id(&run.key)),
                         session_name: name,
+                        launch: self.launched.clone(),
                     },
                 )?;
                 // With parts, the turn's body is the answer alone: the
                 // narration around the work stays in the parts.
                 // The agent's session log leaves the sandbox with each turn,
                 // so a recreated sandbox can resume this session.
-                if let (Some(sandbox), Some(node)) = (run.sandbox.clone(), self.focus.node_id()) {
+                let claude = self.launched.as_ref().is_some_and(|launch| launch.platform == AgentPlatform::Claude);
+                if let (true, Some(sandbox), Some(node)) = (claude, run.sandbox.clone(), self.focus.node_id()) {
                     tod_store::fleet::session_log::pull_node_in_background(
                         fleet.paths().root().to_path_buf(),
                         node.to_string(),
                         sandbox,
                     );
-                } else if let (Some(node), Some(session)) =
-                    (self.focus.node_id(), agent.with(|a| a.session_id(&run.key)))
+                } else if let (true, Some(node), Some(session)) =
+                    (claude, self.focus.node_id(), agent.with(|a| a.session_id(&run.key)))
                 {
                     // On this machine or in a dev container the log is kept
                     // too, so a move to another environment has it to copy.
@@ -872,26 +947,7 @@ impl ConversationDriver {
                         }
                 }) =>
             {
-                let (conversation, text, attachments) = fleet.read(|conn| {
-                    let repo = ConversationRepo::new(conn);
-                    let conversation = repo.get(id)?.context("conversation vanished")?;
-                    let (text, attachments) = repo
-                        .turns(id)?
-                        .into_iter()
-                        .find(|t| t.seq == run.user_seq)
-                        .map(|t| (t.body, t.attachments))
-                        .unwrap_or_default();
-                    Ok((conversation, text, attachments))
-                })?;
-                let images = attachments
-                    .iter()
-                    .map(|attachment| {
-                        Ok(PromptImage {
-                            mime_type: attachment.mime_type.clone(),
-                            data: attachment.read(fleet.paths().root())?,
-                        })
-                    })
-                    .collect::<Result<Vec<_>>>()?;
+                let (conversation, text, images) = Self::read_retry(fleet, id, run.user_seq)?;
                 tracing::warn!(conversation = %id, "sandbox gone, making a new one: {message}");
                 self.rotate_and_start(
                     fleet,
@@ -902,33 +958,15 @@ impl ConversationDriver {
                     &text,
                     images,
                     "sandbox lost",
-                    true,
+                    Some(ROTATION_NOTE),
+                    self.launched.clone().context("no launch for the turn being retried")?,
                 )?;
                 events.push(ConversationEvent::Rotated);
             }
-            Err(message) if run.cold_resume => {
+            Err(message) if run.cold_resume && quota_limit.is_none() => {
                 // The recorded session could not be resumed: start fresh and
                 // send the same message again, with its images.
-                let (conversation, text, attachments) = fleet.read(|conn| {
-                    let repo = ConversationRepo::new(conn);
-                    let conversation = repo.get(id)?.context("conversation vanished")?;
-                    let (text, attachments) = repo
-                        .turns(id)?
-                        .into_iter()
-                        .find(|t| t.seq == run.user_seq)
-                        .map(|t| (t.body, t.attachments))
-                        .unwrap_or_default();
-                    Ok((conversation, text, attachments))
-                })?;
-                let images = attachments
-                    .iter()
-                    .map(|attachment| {
-                        Ok(PromptImage {
-                            mime_type: attachment.mime_type.clone(),
-                            data: attachment.read(fleet.paths().root())?,
-                        })
-                    })
-                    .collect::<Result<Vec<_>>>()?;
+                let (conversation, text, images) = Self::read_retry(fleet, id, run.user_seq)?;
                 tracing::warn!(conversation = %id, "resume failed, rotating: {message}");
                 // The corrections were already in the failed prompt; a fresh
                 // session gets the current state in its snapshot.
@@ -941,7 +979,8 @@ impl ConversationDriver {
                     &text,
                     images,
                     "cold resume failed",
-                    true,
+                    Some(ROTATION_NOTE),
+                    self.launched.clone().context("no launch for the turn being retried")?,
                 )?;
                 events.push(ConversationEvent::Rotated);
             }
@@ -965,6 +1004,21 @@ impl ConversationDriver {
             }
         }
         Ok(())
+    }
+
+    fn read_retry(fleet: &FleetStore, id: Uuid, seq: i64) -> Result<(Conversation, String, Vec<PromptImage>)> {
+        let (conversation, text, attachments) = fleet.read(|conn| {
+            let repo = ConversationRepo::new(conn);
+            let conversation = repo.get(id)?.context("conversation vanished")?;
+            let (text, attachments) = repo.turns(id)?.into_iter().find(|turn| turn.seq == seq)
+                .map(|turn| (turn.body, turn.attachments)).unwrap_or_default();
+            Ok((conversation, text, attachments))
+        })?;
+        let images = attachments.into_iter().map(|attachment| {
+            let data = attachment.read(fleet.paths().root())?;
+            Ok(PromptImage { mime_type: attachment.mime_type, data })
+        }).collect::<Result<Vec<_>>>()?;
+        Ok((conversation, text, images))
     }
 
     /// Record a finished reply, and decide from what the agent recorded
@@ -1128,6 +1182,19 @@ impl ConversationDriver {
             let last_seq = repo.turns(id)?.last().map_or(0, |t| t.seq);
             Ok((conversation, last_seq))
         })?;
+        let previous = self.launched.clone().context("no launch for the conversation being continued")?;
+        let launch = match quota::route(fleet.paths().root(), previous.clone(), now_ms()) {
+            Ok(launch) => launch,
+            Err(err) => {
+                self.start_failed(fleet, id, &err)?;
+                return Err(err);
+            }
+        };
+        if launch.platform != previous.platform {
+            let marker = quota_switch_note(previous.platform, launch.platform);
+            return self.rotate_and_start(fleet, agent, &conversation, last_seq, "", &message,
+                Vec::new(), "provider quota exhausted", Some(&marker), launch);
+        }
         let live = agent.with(|a| a.session_id(&Self::session_key(id)).is_some());
         let resume = conversation.agent_session_id.clone().filter(|_| !live);
         self.start(
@@ -1139,6 +1206,7 @@ impl ConversationDriver {
             message,
             Vec::new(),
             resume,
+            launch,
         )
     }
 
@@ -1154,7 +1222,7 @@ impl ConversationDriver {
                 id,
                 focus: self.focus,
                 protocol: self.protocol.kind(),
-                platform: Some(launch.platform.label().to_lowercase()),
+                platform: Some(platform_storage(launch.platform).to_owned()),
                 model: Some(launch.model.clone()).filter(|m| !m.is_empty()),
                 effort: Some(launch.effort.clone()).filter(|e| !e.is_empty()),
             },
@@ -1267,7 +1335,7 @@ impl ConversationDriver {
 
     /// Mark the rotation, forget the old session, and send `text` to a fresh
     /// one that gets the conversation's snapshot. `reason` is recorded to the
-    /// journey ("over budget" | "not resumable" | "cold resume failed").
+    /// journey along with a marker in the transcript.
     #[allow(clippy::too_many_arguments)]
     fn rotate_and_start<A: AgentAccess + ?Sized>(
         &mut self,
@@ -1279,12 +1347,13 @@ impl ConversationDriver {
         text: &str,
         images: Vec<PromptImage>,
         reason: &str,
-        announce: bool,
+        marker: Option<&str>,
+        launch: AgentLaunchOptions,
     ) -> Result<()> {
         let id = conversation.id;
         agent.with(|a| a.close_session(&Self::session_key(id)));
-        if announce {
-            self.append(fleet, id, TurnRole::Rotation, ROTATION_NOTE)?;
+        if let Some(marker) = marker {
+            self.append(fleet, id, TurnRole::Rotation, marker)?;
             crate::journey::record(
                 self.journey_key(),
                 Actor::App,
@@ -1294,14 +1363,20 @@ impl ConversationDriver {
                 },
             );
         }
-        fleet.interview(
-            ACTOR_USER,
-            InterviewCommand::SetConversationSession {
-                conversation_id: id,
-                agent_session_id: None,
-                session_name: None,
-            },
-        )?;
+        let saved_platform = conversation.platform.as_deref().and_then(parse_platform);
+        // Keep the old provider's resume ID until the replacement starts.
+        // A failed switch can then return to the previous provider.
+        if can_resume_platform(saved_platform, launch.platform) {
+            fleet.interview(
+                ACTOR_USER,
+                InterviewCommand::SetConversationSession {
+                    conversation_id: id,
+                    agent_session_id: None,
+                    session_name: None,
+                    launch: None,
+                },
+            )?;
+        }
         let budget = self.config.context.context_budget_tokens as i64;
         let context = self.with_recent_answers(
             fleet,
@@ -1319,6 +1394,7 @@ impl ConversationDriver {
             join(changes, text),
             images,
             None,
+            launch,
         )
     }
 
@@ -1347,6 +1423,7 @@ impl ConversationDriver {
         message: String,
         images: Vec<PromptImage>,
         resume: Option<String>,
+        options: AgentLaunchOptions,
     ) -> Result<()> {
         let id = conversation.id;
         let key = Self::session_key(id);
@@ -1413,7 +1490,7 @@ impl ConversationDriver {
             });
         }
         self.session_place = Some(cwd.clone());
-        if let Some(session) = &resume {
+        if let Some(session) = &resume && options.platform == AgentPlatform::Claude {
             self.bring_session(fleet, id, &cwd, session, moved);
         }
         self.progress_before = progress;
@@ -1484,15 +1561,6 @@ impl ConversationDriver {
             + images.len() as i64 * IMAGE_TOKENS;
         self.session_tokens = Some(self.session_tokens.unwrap_or(0) + sent);
         let cold_resume = resume.is_some();
-        let options = match self.try_launch_options(fleet) {
-            Ok(options) => options,
-            Err(err) => {
-                let message = format!("{err:#}");
-                self.append(fleet, id, TurnRole::Error, &message)?;
-                self.last_error = Some(message);
-                return Err(err);
-            }
-        };
         self.launched = Some(options.clone());
         let turn_had_images = !images.is_empty();
         let turn = SessionTurn {
@@ -1572,15 +1640,16 @@ impl ConversationDriver {
         let Some(session) = agent.with(|a| a.session_id(&run.key)) else {
             return Ok(());
         };
-        run.session_saved = true;
         fleet.interview(
             ACTOR_USER,
             InterviewCommand::SetConversationSession {
                 conversation_id: id,
                 agent_session_id: Some(session),
                 session_name: Some(run.title.clone()),
+                launch: self.launched.clone(),
             },
         )?;
+        run.session_saved = true;
         Ok(())
     }
 
@@ -1650,6 +1719,10 @@ const IMAGE_TOKENS: i64 = 1_600;
 const IMAGES_REFUSED: &str = "does not accept images";
 
 /// `first`, then `second`, as paragraphs; whichever is empty is left out.
+fn quota_switch_note(from: AgentPlatform, to: AgentPlatform) -> String {
+    format!("{} reached its usage limit. Continuing with {}.", from.label(), to.label())
+}
+
 fn join_sections(first: &str, second: &str) -> String {
     match (first.trim_end(), second.trim_end()) {
         ("", second) => second.to_string(),

@@ -82,7 +82,7 @@ pub const CURSOR_EFFORTS: &[&str] = &["auto", "minimal", "low", "medium", "high"
 pub fn default_model_for(platform: AgentPlatform) -> &'static str {
     match platform {
         AgentPlatform::Claude => "default",
-        AgentPlatform::Cursor => "auto",
+        AgentPlatform::Cursor | AgentPlatform::OpenAi | AgentPlatform::Google => "auto",
     }
 }
 
@@ -90,6 +90,7 @@ pub fn models_for(platform: AgentPlatform) -> &'static [&'static str] {
     match platform {
         AgentPlatform::Claude => CLAUDE_MODELS,
         AgentPlatform::Cursor => CURSOR_MODELS,
+        AgentPlatform::OpenAi | AgentPlatform::Google => &["auto"],
     }
 }
 
@@ -97,6 +98,7 @@ pub fn efforts_for(platform: AgentPlatform) -> &'static [&'static str] {
     match platform {
         AgentPlatform::Claude => CLAUDE_EFFORTS,
         AgentPlatform::Cursor => CURSOR_EFFORTS,
+        AgentPlatform::OpenAi | AgentPlatform::Google => &["auto"],
     }
 }
 
@@ -112,6 +114,8 @@ pub fn effort_for_acp(effort: &str) -> Option<&str> {
 pub fn parse_platform(raw: &str) -> Option<AgentPlatform> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "cursor" => Some(AgentPlatform::Cursor),
+        "openai" | "open_ai" | "codex" => Some(AgentPlatform::OpenAi),
+        "google" | "gemini" => Some(AgentPlatform::Google),
         "claude" | "anthropic" => Some(AgentPlatform::Claude),
         _ => None,
     }
@@ -120,12 +124,18 @@ pub fn parse_platform(raw: &str) -> Option<AgentPlatform> {
 pub fn platform_storage(platform: AgentPlatform) -> &'static str {
     match platform {
         AgentPlatform::Cursor => "cursor",
+        AgentPlatform::OpenAi => "open_ai",
+        AgentPlatform::Google => "google",
         AgentPlatform::Claude => "claude",
     }
 }
 
-/// If `model` is not in the platform catalog, return the platform default.
+/// Preserve dynamic adapter model IDs; static catalogs fall back to the default.
 pub fn coerce_model(platform: AgentPlatform, model: &str) -> String {
+    if matches!(platform, AgentPlatform::OpenAi | AgentPlatform::Google) {
+        let model = model.trim();
+        return if model.is_empty() { default_model_for(platform) } else { model }.to_string();
+    }
     let models = models_for(platform);
     if models.iter().any(|m| *m == model) {
         model.to_string()
@@ -134,8 +144,12 @@ pub fn coerce_model(platform: AgentPlatform, model: &str) -> String {
     }
 }
 
-/// If `effort` is not in the platform catalog, return `auto`.
+/// Preserve dynamic adapter effort IDs; static catalogs fall back to `auto`.
 pub fn coerce_effort(platform: AgentPlatform, effort: &str) -> String {
+    if matches!(platform, AgentPlatform::OpenAi | AgentPlatform::Google) {
+        let effort = effort.trim();
+        return if effort.is_empty() { DEFAULT_EFFORT } else { effort }.to_string();
+    }
     let efforts = efforts_for(platform);
     if efforts.iter().any(|e| *e == effort) {
         effort.to_string()

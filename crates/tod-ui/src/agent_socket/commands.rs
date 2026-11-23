@@ -1,5 +1,6 @@
-use crate::agent_socket::a11y_tree::{self, ActAction, TreeQuery};
-use crate::agent_socket::capture::DragStep;
+//! Desktop automation commands and their wire syntax.
+
+use super::selector::{self, Selector};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,7 +23,7 @@ pub enum Command {
     Key {
         keystroke: String,
     },
-    /// Insert text into the focused GPUI input handler (after a prior focus click + sync).
+    /// Insert text into the focused input handler (after a prior focus click + sync).
     Text {
         text: String,
     },
@@ -56,7 +57,7 @@ pub enum Command {
         path: PathBuf,
         crop: Option<(f32, f32, f32, f32)>,
     },
-    /// Like `Shot`, but forces a fresh draw and renders offscreen through gpui,
+    /// Like `Shot`, but forces a fresh draw and renders the window offscreen,
     /// so it is current even while the window is covered or minimized.
     Shot2 {
         path: PathBuf,
@@ -324,7 +325,7 @@ pub fn parse_line(line: &str) -> Result<Command, String> {
                 "set" => {
                     let value = parts
                         .next()
-                        .ok_or_else(|| "agent-platform set requires cursor|claude".to_string())?;
+                        .ok_or_else(|| "agent-platform set requires cursor|claude|openai|google".to_string())?;
                     if parts.next().is_some() {
                         return Err("agent-platform set takes exactly one value".into());
                     }
@@ -372,18 +373,201 @@ pub fn parse_line(line: &str) -> Result<Command, String> {
             };
             Ok(Command::Coverage { frames })
         }
-        "tree" => Ok(Command::Tree(a11y_tree::parse_tree(line["tree".len()..].trim())?)),
+        "tree" => Ok(Command::Tree(parse_tree(line["tree".len()..].trim())?)),
         "act" => {
-            let (selector, action) = a11y_tree::parse_act(line["act".len()..].trim())?;
+            let (selector, action) = parse_act(line["act".len()..].trim())?;
             Ok(Command::Act { selector, action })
         }
         "wait-for" => {
             let (selector, gone, timeout_ms) =
-                a11y_tree::parse_wait_for(line["wait-for".len()..].trim())?;
+                parse_wait_for(line["wait-for".len()..].trim())?;
             Ok(Command::WaitFor { selector, gone, timeout_ms })
         }
         other => Err(format!("unknown command `{other}`")),
     }
+}
+
+/// One step of a drag held open: press, move, or release.
+///
+/// `drag` does the whole gesture in one message and is what a test wants. This
+/// is for looking at the UI *during* a drag — the landing line a list draws
+/// under the pointer only exists while the button is down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DragStep {
+    Press,
+    Move,
+    Release,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TreeQuery {
+    pub role: Option<String>,
+    pub label: Option<String>,
+    pub within: Option<String>,
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ActAction {
+    Click,
+    Focus,
+    SetValue(String),
+    ScrollIntoView,
+}
+
+/// Whitespace-separated tokens of `text` with their byte ranges; a double-quoted
+/// run (`"a b"`, with `\"` inside) is part of one token, quotes kept.
+fn tokens(text: &str) -> Vec<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let (mut i, mut quoted, mut start) = (0, false, None);
+    while i < bytes.len() {
+        let b = bytes[i];
+        if quoted && b == b'\\' {
+            i += 2;
+            continue;
+        }
+        if b == b'"' {
+            quoted = !quoted;
+            start.get_or_insert(i);
+        } else if b.is_ascii_whitespace() && !quoted {
+            if let Some(s) = start.take() {
+                out.push((s, i));
+            }
+        } else {
+            start.get_or_insert(i);
+        }
+        i += 1;
+    }
+    if let Some(s) = start {
+        out.push((s, text.len()));
+    }
+    out
+}
+
+/// A flag value or action argument: the text, unquoted when it is one quoted string.
+fn unquoted(text: &str) -> String {
+    selector::unquote_whole(text.trim()).unwrap_or_else(|| text.trim().to_string())
+}
+
+/// `tree [--role R] [--label S] [--within SEL] [--json]`. A flag's value runs to
+/// the next `--flag`, so none of them needs quoting (quote one to hold a `--`).
+pub fn parse_tree(rest: &str) -> Result<TreeQuery, String> {
+    let mut query = TreeQuery::default();
+    let ranges = tokens(rest);
+    let mut tokens = ranges.iter().map(|&(a, b)| &rest[a..b]).peekable();
+    while let Some(token) = tokens.next() {
+        let mut value = || {
+            let mut words = Vec::new();
+            while let Some(next) = tokens.peek() {
+                if next.starts_with("--") {
+                    break;
+                }
+                words.push(tokens.next().unwrap_or_default());
+            }
+            if words.is_empty() {
+                Err(format!("{token} needs a value"))
+            } else {
+                Ok(words.join(" "))
+            }
+        };
+        match token {
+            "--json" => query.json = true,
+            "--role" => query.role = Some(unquoted(&value()?)),
+            "--label" => query.label = Some(unquoted(&value()?)),
+            // A selector keeps its quotes: `Selector::parse` reads them.
+            "--within" => query.within = Some(value()?),
+            other => return Err(format!("unknown tree option `{other}`")),
+        }
+    }
+    if let Some(within) = &query.within {
+        Selector::parse(within)?;
+    }
+    Ok(query)
+}
+
+const ACTION_WORDS: [&str; 4] = ["click", "focus", "set-value", "scroll-into-view"];
+
+/// `act <selector> [click|focus|set-value <text>|scroll-into-view]`; the action
+/// is the end of the line, the selector everything before it. When the line has
+/// a double quote anywhere (`act "textinput:Item title" set-value Cov node`,
+/// `act button:"Run now" click`) the selector ends at the first unquoted action
+/// word instead, so a quoted label may contain one.
+pub fn parse_act(rest: &str) -> Result<(String, ActAction), String> {
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return Err("act requires a selector".into());
+    }
+    if rest.contains('"') {
+        let split = tokens(rest)
+            .into_iter()
+            .skip(1)
+            .find(|&(a, b)| ACTION_WORDS.contains(&&rest[a..b]));
+        let (selector, action) = match split {
+            None => (rest, ActAction::Click),
+            Some((a, b)) => {
+                let after = rest[b..].trim();
+                let action = match &rest[a..b] {
+                    "set-value" => ActAction::SetValue(unquoted(after)),
+                    word => {
+                        if !after.is_empty() {
+                            return Err(format!("unexpected text after `{word}`: {after}"));
+                        }
+                        match word {
+                            "click" => ActAction::Click,
+                            "focus" => ActAction::Focus,
+                            _ => ActAction::ScrollIntoView,
+                        }
+                    }
+                };
+                (rest[..a].trim(), action)
+            }
+        };
+        Selector::parse(selector)?;
+        return Ok((selector.to_string(), action));
+    }
+    let (selector, action) = if let Some((sel, text)) = rest.split_once(" set-value ") {
+        (sel, ActAction::SetValue(text.trim().to_string()))
+    } else if let Some(sel) = rest.strip_suffix(" set-value") {
+        (sel, ActAction::SetValue(String::new()))
+    } else if let Some(sel) = rest.strip_suffix(" scroll-into-view") {
+        (sel, ActAction::ScrollIntoView)
+    } else if let Some(sel) = rest.strip_suffix(" focus") {
+        (sel, ActAction::Focus)
+    } else if let Some(sel) = rest.strip_suffix(" click") {
+        (sel, ActAction::Click)
+    } else {
+        (rest, ActAction::Click)
+    };
+    Selector::parse(selector)?;
+    Ok((selector.trim().to_string(), action))
+}
+
+/// `wait-for <selector> [--gone] [--timeout-ms N]`; the selector may be quoted.
+pub fn parse_wait_for(rest: &str) -> Result<(String, bool, u64), String> {
+    let mut gone = false;
+    let mut timeout_ms = 5000u64;
+    let mut selector = Vec::new();
+    let ranges = tokens(rest);
+    let mut words = ranges.iter().map(|&(a, b)| &rest[a..b]);
+    while let Some(token) = words.next() {
+        match token {
+            "--gone" => gone = true,
+            "--timeout-ms" => {
+                let value = words.next().ok_or("--timeout-ms needs a number")?;
+                timeout_ms = value
+                    .parse()
+                    .map_err(|_| format!("invalid --timeout-ms `{value}`"))?;
+            }
+            other => selector.push(other),
+        }
+    }
+    if selector.is_empty() {
+        return Err("wait-for requires a selector".into());
+    }
+    let selector = selector.join(" ");
+    Selector::parse(&selector)?;
+    Ok((selector, gone, timeout_ms))
 }
 
 fn parse_coord(raw: &str, name: &str) -> Result<f32, String> {
@@ -394,6 +578,107 @@ fn parse_coord(raw: &str, name: &str) -> Result<f32, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_tree_options() {
+        let q = parse_tree("").unwrap();
+        assert_eq!(q, TreeQuery::default());
+        let q = parse_tree("--role button --label Run now --within #task-panel >> group: --json").unwrap();
+        assert_eq!(q.role.as_deref(), Some("button"));
+        assert_eq!(q.label.as_deref(), Some("Run now"));
+        assert_eq!(q.within.as_deref(), Some("#task-panel >> group:"));
+        assert!(q.json);
+        assert!(parse_tree("--role").is_err());
+        assert!(parse_tree("--bogus x").is_err());
+        assert!(parse_tree("--within nonsense").is_err());
+    }
+
+    #[test]
+    fn parses_act_actions_off_the_end() {
+        assert_eq!(
+            parse_act("button:Resume").unwrap(),
+            ("button:Resume".into(), ActAction::Click)
+        );
+        assert_eq!(
+            parse_act("button:Resume now click").unwrap(),
+            ("button:Resume now".into(), ActAction::Click)
+        );
+        assert_eq!(
+            parse_act("#chat/input focus").unwrap(),
+            ("#chat/input".into(), ActAction::Focus)
+        );
+        assert_eq!(
+            parse_act("textinput:Message set-value hello  big world").unwrap(),
+            (
+                "textinput:Message".into(),
+                ActAction::SetValue("hello  big world".into())
+            )
+        );
+        assert_eq!(
+            parse_act("#row-9 scroll-into-view").unwrap(),
+            ("#row-9".into(), ActAction::ScrollIntoView)
+        );
+        assert_eq!(
+            parse_act("#a >> button:Go").unwrap(),
+            ("#a >> button:Go".into(), ActAction::Click)
+        );
+        assert!(parse_act("").is_err());
+        assert!(parse_act("nonsense").is_err());
+    }
+
+    #[test]
+    fn parses_wait_for() {
+        assert_eq!(
+            parse_wait_for("button:Resume now").unwrap(),
+            ("button:Resume now".into(), false, 5000)
+        );
+        assert_eq!(
+            parse_wait_for("#runner-menu --gone --timeout-ms 250").unwrap(),
+            ("#runner-menu".into(), true, 250)
+        );
+        assert!(parse_wait_for("--gone").is_err());
+        assert!(parse_wait_for("#a --timeout-ms x").is_err());
+    }
+
+    #[test]
+    fn quoted_selectors_in_act_tree_and_wait_for() {
+        assert_eq!(
+            parse_act(r#""textinput:Item title" set-value Cov node"#).unwrap(),
+            (
+                r#""textinput:Item title""#.into(),
+                ActAction::SetValue("Cov node".into())
+            )
+        );
+        assert_eq!(
+            parse_act(r#"textinput:"Item title" set-value "quoted value""#).unwrap(),
+            (
+                r#"textinput:"Item title""#.into(),
+                ActAction::SetValue("quoted value".into())
+            )
+        );
+        // A quoted label may hold an action word.
+        assert_eq!(
+            parse_act(r#"button:"Click here to focus" focus"#).unwrap(),
+            (r#"button:"Click here to focus""#.into(), ActAction::Focus)
+        );
+        assert_eq!(
+            parse_act(r##""#a >> button:Go now""##).unwrap(),
+            (r##""#a >> button:Go now""##.into(), ActAction::Click)
+        );
+        assert_eq!(
+            parse_act(r#"button:"Run now" click"#).unwrap(),
+            (r#"button:"Run now""#.into(), ActAction::Click)
+        );
+        assert!(parse_act(r#"button:"Run now" click extra"#).is_err());
+        let q = parse_tree(r##"--label "two  words" --within "#a >> button:Go now" --role button"##).unwrap();
+        assert_eq!(q.label.as_deref(), Some("two  words"));
+        assert_eq!(q.within.as_deref(), Some(r##""#a >> button:Go now""##));
+        assert_eq!(q.role.as_deref(), Some("button"));
+        assert_eq!(
+            parse_wait_for(r#"textinput:"Item  title" --gone --timeout-ms 9"#).unwrap(),
+            (r#"textinput:"Item  title""#.into(), true, 9)
+        );
+    }
 
     #[test]
     fn parses_test_user_events() {

@@ -97,8 +97,9 @@ fn open_permission_dialog(
                             OPEN.with(|open| {
                                 open.borrow_mut().remove(&run);
                             });
-                            if let Ok(mut agent) = agent.lock() {
-                                let _ = agent.respond_to_permission(run, &option_id);
+                            let mut access = tod_core::conversation::SharedAgentAccess(&agent);
+                            if let Err(err) = tod_core::conversation::ConversationService::respond_to_permission(&mut access, run, &option_id) {
+                                tracing::error!("responding to agent permission failed: {err:#}");
                             }
                             window.close_dialog(cx);
                         })

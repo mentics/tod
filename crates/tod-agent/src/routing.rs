@@ -13,13 +13,17 @@ use std::path::PathBuf;
 pub struct RoutingAgentProvider {
     cursor: CursorAcpProvider,
     claude: CursorAcpProvider,
+    openai: CursorAcpProvider,
+    google: CursorAcpProvider,
 }
 
 impl RoutingAgentProvider {
     pub fn new(traffic_log: SharedAgentTrafficLog) -> Self {
         Self {
             cursor: build_host_provider(AcpHost::Cursor, traffic_log.clone()),
-            claude: build_host_provider(AcpHost::Claude, traffic_log),
+            claude: build_host_provider(AcpHost::Claude, traffic_log.clone()),
+            openai: build_host_provider(AcpHost::OpenAi, traffic_log.clone()),
+            google: build_host_provider(AcpHost::Google, traffic_log),
         }
     }
 
@@ -27,6 +31,8 @@ impl RoutingAgentProvider {
         match platform {
             AgentPlatform::Cursor => &mut self.cursor,
             AgentPlatform::Claude => &mut self.claude,
+            AgentPlatform::OpenAi => &mut self.openai,
+            AgentPlatform::Google => &mut self.google,
         }
     }
 }
@@ -45,8 +51,14 @@ impl AgentProvider for RoutingAgentProvider {
         session_title: String,
         environment: crate::AgentEnvironment,
     ) -> Result<AgentRunHandle> {
-        self.for_platform(options.platform)
-            .start_fleet_agent(owner_id, cwd, prompt, options, session_title, environment)
+        self.for_platform(options.platform).start_fleet_agent(
+            owner_id,
+            cwd,
+            prompt,
+            options,
+            session_title,
+            environment,
+        )
     }
 
     fn send_session_turn(&mut self, turn: SessionTurn) -> Result<AgentRunHandle> {
@@ -58,56 +70,89 @@ impl AgentProvider for RoutingAgentProvider {
         self.cursor
             .session_id(key)
             .or_else(|| self.claude.session_id(key))
+            .or_else(|| self.openai.session_id(key))
+            .or_else(|| self.google.session_id(key))
     }
 
     fn fleet_run_session_id(&self, id: RunId) -> Option<String> {
         self.cursor
             .fleet_run_session_id(id)
             .or_else(|| self.claude.fleet_run_session_id(id))
+            .or_else(|| self.openai.fleet_run_session_id(id))
+            .or_else(|| self.google.fleet_run_session_id(id))
     }
 
 
     fn session_context_chars(&self, key: &str) -> Option<u64> {
         self.cursor
             .session_context_chars(key)
+            .or_else(|| self.openai.session_context_chars(key))
+            .or_else(|| self.google.session_context_chars(key))
             .or_else(|| self.claude.session_context_chars(key))
     }
 
     fn session_reply_parts(&self, key: &str) -> Option<Vec<crate::ReplyPart>> {
         self.cursor
             .session_reply_parts(key)
+            .or_else(|| self.openai.session_reply_parts(key))
+            .or_else(|| self.google.session_reply_parts(key))
             .or_else(|| self.claude.session_reply_parts(key))
+    }
+
+    fn session_catalog(&self, key: &str) -> Option<crate::AcpSessionCatalog> {
+        self.cursor.session_catalog(key)
+            .or_else(|| self.claude.session_catalog(key))
+            .or_else(|| self.openai.session_catalog(key))
+            .or_else(|| self.google.session_catalog(key))
     }
 
     fn session_token_usage(&self, key: &str) -> Option<crate::TokenUsage> {
         self.cursor
             .session_token_usage(key)
+            .or_else(|| self.openai.session_token_usage(key))
+            .or_else(|| self.google.session_token_usage(key))
             .or_else(|| self.claude.session_token_usage(key))
     }
 
     fn close_session(&mut self, key: &str) {
         self.cursor.close_session(key);
+        self.openai.close_session(key);
+        self.google.close_session(key);
         self.claude.close_session(key);
     }
 
     fn set_session_observer(&mut self, observer: super::provider::SessionObserver) {
         self.cursor.set_session_observer(observer.clone());
-        self.claude.set_session_observer(observer);
+        self.claude.set_session_observer(observer.clone());
+        self.openai.set_session_observer(observer.clone());
+        self.google.set_session_observer(observer);
     }
 
     fn poll_run(&mut self, id: RunId) -> Option<super::provider::AgentRunState> {
-        self.cursor.poll_run(id).or_else(|| self.claude.poll_run(id))
+        self.cursor
+            .poll_run(id)
+            .or_else(|| self.claude.poll_run(id))
+            .or_else(|| self.openai.poll_run(id))
+            .or_else(|| self.google.poll_run(id))
     }
 
     fn respond_to_permission(&mut self, id: RunId, option_id: &str) -> Result<()> {
         if self.cursor.respond_to_permission(id, option_id).is_ok() {
             return Ok(());
         }
-        self.claude.respond_to_permission(id, option_id)
+        if self.claude.respond_to_permission(id, option_id).is_ok() {
+            return Ok(());
+        }
+        if self.openai.respond_to_permission(id, option_id).is_ok() {
+            return Ok(());
+        }
+        self.google.respond_to_permission(id, option_id)
     }
 
     fn cancel_run(&mut self, id: RunId) -> Result<()> {
         let _ = self.cursor.cancel_run(id);
+        let _ = self.openai.cancel_run(id);
+        let _ = self.google.cancel_run(id);
         let _ = self.claude.cancel_run(id);
         Ok(())
     }

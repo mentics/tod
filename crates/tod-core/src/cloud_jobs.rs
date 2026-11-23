@@ -136,9 +136,25 @@ pub fn submit_work(
     kind: Option<&'static str>,
     progress: &mut dyn FnMut(&str),
 ) -> JobResult {
+    submit_work_tracked(fleet, root, node_id, kind, progress).result
+}
+
+/// Submit work with the accepted cloud row when starting a new sandbox. The
+/// task panel uses that row for its immediate display; callers that only need
+/// the outcome can use [`submit_work`].
+pub fn submit_work_tracked(
+    fleet: &FleetStore,
+    root: &std::path::Path,
+    node_id: &str,
+    kind: Option<&'static str>,
+    progress: &mut dyn FnMut(&str),
+) -> Started {
     match kind {
-        Some(kind) if cloud_sync::cloud_node(fleet, node_id).is_some() => request(fleet, root, node_id, kind, progress),
-        _ => run_in_cloud(fleet, root, node_id, progress).result,
+        Some(kind) if cloud_sync::cloud_node(fleet, node_id).is_some() => Started {
+            accepted: None,
+            result: request(fleet, root, node_id, kind, progress),
+        },
+        _ => run_in_cloud(fleet, root, node_id, progress),
     }
 }
 

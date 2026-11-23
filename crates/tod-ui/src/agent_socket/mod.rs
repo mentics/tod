@@ -12,9 +12,9 @@
 //! - `transcripts close` — close the transcript window if open
 //! - `transcripts focus` — focus the transcript window if open
 //! - `transcripts status` — reply `ok open` or `ok closed`
-//! - `agent-platform get` — reply `ok claude` or `ok cursor`
+//! - `agent-platform get` — reply with the configured platform ID
 //! - `agent-platform cycle` — cycle platform and reply with new value
-//! - `agent-platform set cursor|claude` — set platform and reply with new value
+//! - `agent-platform set cursor|claude|openai|google` — set platform and reply with new value
 //! - `mode` — reply `ok driven|user|idle` (see below)
 //! - `size` — reply `ok W H`, the window's content size in logical pixels
 //! - `resize W H` — set the content size (the app owns it while driven)
@@ -79,17 +79,18 @@ pub mod commands;
 mod driver;
 pub mod mode;
 mod snapshot;
+mod transport;
 
 pub use driver::{driving, input_watch};
+pub use transport::bind;
 pub mod selector;
 
 use crate::app::transcript_window::{TranscriptWindowControl, TranscriptWindowStatus};
-use commands::{AgentPlatformSocketCommand, Command, TranscriptsCommand, parse_line};
+use commands::{ActAction, AgentPlatformSocketCommand, Command, TranscriptsCommand, TreeQuery, parse_line};
 use mode::{Kind, Mode, Shared};
 use gpui::{AnyWindowHandle, AsyncApp, Keystroke};
 use gpui_component::WindowExt;
-use std::io::{BufRead, BufReader, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender};
@@ -102,13 +103,6 @@ pub fn shutdown() {
     if let Some(flag) = SHUTDOWN.get() {
         flag.store(true, Ordering::Relaxed);
     }
-}
-
-/// Bind the control socket. Call before opening the main window so port conflicts fail fast.
-pub fn bind(addr: SocketAddr) -> anyhow::Result<TcpListener> {
-    TcpListener::bind(addr).map_err(|err| {
-        anyhow::anyhow!("agent-socket: bind {addr} failed: {err} (choose another port)")
-    })
 }
 
 enum UiRequest {
@@ -140,11 +134,11 @@ enum UiRequest {
     EnsureSize,
     /// The dev-only `test-user` seam.
     TestUser(commands::TestUser),
-    A11yTree(a11y_tree::TreeQuery),
+    A11yTree(TreeQuery),
     A11yCoverage { frames: usize },
     A11yAct {
         selector: String,
-        action: a11y_tree::ActAction,
+        action: ActAction,
     },
     /// How many nodes a selector matches now (what `wait-for` polls).
     A11yCount(String),
@@ -180,7 +174,9 @@ pub fn start(
     let for_threads = shared.clone();
     std::thread::Builder::new()
         .name("tod-agent-socket".into())
-        .spawn(move || listen_loop(listener, tx, shutdown, for_threads))
+        .spawn(move || {
+            transport::listen(listener, shutdown, move |line| handle_line(&tx, &for_threads, line));
+        })
         .expect("spawn agent socket thread");
 
     // Real vs synthetic input, the mode, snapshots, the title bar.
@@ -206,140 +202,78 @@ pub fn start(
     .detach();
 }
 
-fn listen_loop(
-    listener: TcpListener,
-    tx: async_channel::Sender<Pending>,
-    shutdown: Arc<AtomicBool>,
-    shared: Arc<Shared>,
-) {
-    let _ = listener.set_nonblocking(true);
-    while !shutdown.load(Ordering::Relaxed) {
-        match listener.accept() {
-            Ok((stream, _)) => {
-                let tx = tx.clone();
-                let shared = shared.clone();
-                let _ = std::thread::Builder::new()
-                    .name("tod-agent-client".into())
-                    .spawn(move || handle_client(stream, tx, shared));
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            Err(e) => {
-                eprintln!("agent-socket: accept error: {e}");
-                break;
-            }
+fn handle_line(tx: &async_channel::Sender<Pending>, shared: &Shared, line: &str) -> transport::Reply {
+    // Input commands wait here while the user has the app (`mode.rs`).
+    let parsed = parse_line(line)
+        .and_then(|cmd| gate(&cmd, shared).map(|()| cmd));
+    // The agent's command runs on the window at the size the app owns.
+    let mut note: Option<String> = None;
+    let parsed = match parsed {
+        Ok(cmd)
+            if matches!(mode::classify(&cmd), Kind::Input | Kind::Observe)
+                && !matches!(cmd, Command::Resize { .. }) =>
+        {
+            ensure_size(tx).map(|n| {
+                note = n;
+                cmd
+            })
         }
-    }
-}
-
-fn handle_client(stream: TcpStream, tx: async_channel::Sender<Pending>, shared: Arc<Shared>) {
-    // Accepted sockets can inherit the listener's non-blocking mode (notably on
-    // Windows). Force blocking so read_line waits for the next command instead
-    // of treating WouldBlock as a disconnect.
-    let _ = stream.set_nonblocking(false);
-    let _ = stream.set_nodelay(true);
-    let mut reader = BufReader::new(stream.try_clone().expect("clone tcp stream"));
-    let mut writer = stream;
-    let mut line = String::new();
-
-    loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => break,
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!("agent-socket: read error: {e}");
-                break;
-            }
+        other => other,
+    };
+    let reply = match parsed {
+        Ok(Command::TestUser(event)) => dispatch_ui(tx, UiRequest::TestUser(event)),
+        Ok(Command::Shot { path, crop }) => window_size(tx).and_then(|(w, h)| {
+            capture::capture_window_png(&path, w, h, crop).map(|()| "ok".to_string())
+        }),
+        Ok(Command::Mode) => Ok(format!("ok {}", shared.mode().word())),
+        Ok(Command::Size) => dispatch_ui(tx, UiRequest::Size),
+        Ok(Command::Resize { w, h }) => dispatch_ui(tx, UiRequest::Resize { w, h }),
+        Ok(Command::Shot2 { path, crop }) => {
+            dispatch_ui(tx, UiRequest::Shot2 { path, crop })
         }
-
-        // Input commands wait here while the user has the app (`mode.rs`).
-        let parsed = parse_line(line.trim_end_matches(['\r', '\n']))
-            .and_then(|cmd| gate(&cmd, &shared).map(|()| cmd));
-        // The agent's command runs on the window at the size the app owns.
-        let mut note: Option<String> = None;
-        let parsed = match parsed {
-            Ok(cmd)
-                if matches!(mode::classify(&cmd), Kind::Input | Kind::Observe)
-                    && !matches!(cmd, Command::Resize { .. }) =>
-            {
-                ensure_size(&tx).map(|n| {
-                    note = n;
-                    cmd
-                })
-            }
-            other => other,
-        };
-        let reply = match parsed {
-            Ok(Command::TestUser(event)) => dispatch_ui(&tx, UiRequest::TestUser(event)),
-            Ok(Command::Shot { path, crop }) => window_size(&tx).and_then(|(w, h)| {
-                capture::capture_window_png(&path, w, h, crop).map(|()| "ok".to_string())
-            }),
-            Ok(Command::Mode) => Ok(format!("ok {}", shared.mode().word())),
-            Ok(Command::Size) => dispatch_ui(&tx, UiRequest::Size),
-            Ok(Command::Resize { w, h }) => dispatch_ui(&tx, UiRequest::Resize { w, h }),
-            Ok(Command::Shot2 { path, crop }) => {
-                dispatch_ui(&tx, UiRequest::Shot2 { path, crop })
-            }
-            Ok(Command::Key { keystroke }) => dispatch_ui(&tx, UiRequest::Key(keystroke)),
-            Ok(Command::Text { text }) => dispatch_ui(&tx, UiRequest::Text(text)),
-            #[cfg(windows)]
-            Ok(Command::Click { x, y, right }) => {
-                let _synthetic = driver::synthetic();
-                window_size(&tx).and_then(|(w, h)| {
-                    capture::send_click(x, y, w, h, right).map(|()| "ok".to_string())
-                })
-            }
-            #[cfg(not(windows))]
-            Ok(Command::Click { x, y, right }) => dispatch_ui(&tx, UiRequest::Click { x, y, right }),
-            Ok(Command::Scroll { x, y, dx, dy }) => dispatch_ui(&tx, UiRequest::Scroll { x, y, dx, dy }),
-            Ok(Command::Close) => dispatch_ui(&tx, UiRequest::Close),
-            Ok(Command::Drag { from, to }) => {
-                let _synthetic = driver::synthetic();
-                window_size(&tx).and_then(|(w, h)| {
-                    capture::send_drag(from, to, w, h).map(|()| "ok".to_string())
-                })
-            }
-            Ok(Command::DragStep { step, x, y }) => {
-                let _synthetic = driver::synthetic();
-                window_size(&tx).and_then(|(w, h)| {
-                    capture::send_drag_step(step, x, y, w, h).map(|()| "ok".to_string())
-                })
-            }
-            Ok(Command::Sync) => dispatch_ui(&tx, UiRequest::Sync),
-            Ok(Command::Quit) => dispatch_ui(&tx, UiRequest::Quit),
-            Ok(Command::Transcripts(action)) => dispatch_ui(&tx, UiRequest::Transcripts(action)),
-            Ok(Command::AgentPlatform(action)) => {
-                dispatch_ui(&tx, UiRequest::AgentPlatform(action))
-            }
-            Ok(Command::Coverage { frames }) => dispatch_ui(&tx, UiRequest::A11yCoverage { frames }),
-            Ok(Command::Tree(query)) => dispatch_ui(&tx, UiRequest::A11yTree(query)),
-            Ok(Command::Act { selector, action }) => {
-                dispatch_ui(&tx, UiRequest::A11yAct { selector, action })
-            }
-            Ok(Command::WaitFor { selector, gone, timeout_ms }) => {
-                wait_for(&tx, &selector, gone, timeout_ms)
-            }
-            Err(e) => Err(e),
-        };
-
-        let msg = match reply {
-            Ok(line) => match note {
-                // On the first line, so a multi-line reply (`tree`) keeps its
-                // announced line count.
-                Some(note) => match line.split_once('\n') {
-                    Some((first, rest)) => format!("{first} # note: {note}\n{rest}\n"),
-                    None => format!("{line} # note: {note}\n"),
-                },
-                None => format!("{line}\n"),
-            },
-            Err(e) => format!("err {e}\n"),
-        };
-        if writer.write_all(msg.as_bytes()).is_err() || writer.flush().is_err() {
-            break;
+        Ok(Command::Key { keystroke }) => dispatch_ui(tx, UiRequest::Key(keystroke)),
+        Ok(Command::Text { text }) => dispatch_ui(tx, UiRequest::Text(text)),
+        #[cfg(windows)]
+        Ok(Command::Click { x, y, right }) => {
+            let _synthetic = driver::synthetic();
+            window_size(tx).and_then(|(w, h)| {
+                capture::send_click(x, y, w, h, right).map(|()| "ok".to_string())
+            })
         }
-    }
+        #[cfg(not(windows))]
+        Ok(Command::Click { x, y, right }) => dispatch_ui(tx, UiRequest::Click { x, y, right }),
+        Ok(Command::Scroll { x, y, dx, dy }) => dispatch_ui(tx, UiRequest::Scroll { x, y, dx, dy }),
+        Ok(Command::Close) => dispatch_ui(tx, UiRequest::Close),
+        Ok(Command::Drag { from, to }) => {
+            let _synthetic = driver::synthetic();
+            window_size(tx).and_then(|(w, h)| {
+                capture::send_drag(from, to, w, h).map(|()| "ok".to_string())
+            })
+        }
+        Ok(Command::DragStep { step, x, y }) => {
+            let _synthetic = driver::synthetic();
+            window_size(tx).and_then(|(w, h)| {
+                capture::send_drag_step(step, x, y, w, h).map(|()| "ok".to_string())
+            })
+        }
+        Ok(Command::Sync) => dispatch_ui(tx, UiRequest::Sync),
+        Ok(Command::Quit) => dispatch_ui(tx, UiRequest::Quit),
+        Ok(Command::Transcripts(action)) => dispatch_ui(tx, UiRequest::Transcripts(action)),
+        Ok(Command::AgentPlatform(action)) => {
+            dispatch_ui(tx, UiRequest::AgentPlatform(action))
+        }
+        Ok(Command::Coverage { frames }) => dispatch_ui(tx, UiRequest::A11yCoverage { frames }),
+        Ok(Command::Tree(query)) => dispatch_ui(tx, UiRequest::A11yTree(query)),
+        Ok(Command::Act { selector, action }) => {
+            dispatch_ui(tx, UiRequest::A11yAct { selector, action })
+        }
+        Ok(Command::WaitFor { selector, gone, timeout_ms }) => {
+            wait_for(tx, &selector, gone, timeout_ms)
+        }
+        Err(e) => Err(e),
+    };
+
+    transport::Reply { result: reply, note }
 }
 
 /// Ask the UI thread to put the window at the size the app owns before an
@@ -796,15 +730,5 @@ mod tests {
         assert!(shared.with(|m, now| m.tick(now)).is_some());
         shared.with(|m, _| m.restored(vec![]));
         assert_eq!(waiter.join().unwrap(), Ok(()));
-    }
-
-    #[test]
-    fn bind_fails_when_port_in_use() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let addr = SocketAddr::from(([127, 0, 0, 1], port));
-        let err = bind(addr).unwrap_err();
-        assert!(err.to_string().contains("bind"));
-        assert!(err.to_string().contains("choose another port"));
     }
 }

@@ -38,6 +38,7 @@ struct FakeAgent {
     /// Refuse to resume a recorded session (as after it expired).
     fail_resume: bool,
     refuse_images: bool,
+    fail_cancel: bool,
 }
 
 impl FakeAgent {
@@ -51,6 +52,7 @@ impl FakeAgent {
             parts: HashMap::new(),
             fail_resume: false,
             refuse_images: false,
+            fail_cancel: false,
         }
     }
 
@@ -162,6 +164,7 @@ impl AgentProvider for FakeAgent {
     }
 
     fn cancel_run(&mut self, _: RunId) -> anyhow::Result<()> {
+        if self.fail_cancel { anyhow::bail!("cancel failed"); }
         Ok(())
     }
 
@@ -2266,4 +2269,175 @@ fn a_rotation_that_finds_the_files_lock_busy_is_a_wait_not_an_error() {
     assert_eq!(*role, TurnRole::Error, "{all:?}");
     assert!(body.contains("tod-x on branch task/x") && body.contains("Send it again"), "{body}");
     assert!(driver.status().last_error.is_some());
+}
+
+#[test]
+fn service_sends_polls_reopens_and_preserves_transcript_order() {
+    use super::ConversationService;
+    let fx = fixture();
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let focus = Focus::Node(fx.node);
+    let mut service = ConversationService::default();
+    let id = service.open(config(&fx, 100_000), &fx.fleet, focus, ProtocolKind::Outline, None).unwrap();
+    assert!(service.snapshot(id, &fx.fleet).unwrap().0.is_empty());
+    service.send(id, &fx.fleet, &mut agent, "Hello", vec![]).unwrap();
+    let (turns, status) = service.snapshot(id, &fx.fleet).unwrap();
+    assert!(status.running);
+    assert_eq!(turns.last().unwrap().role, TurnRole::User);
+    assert!(service.send(id, &fx.fleet, &mut agent, "again", vec![]).is_err());
+    let events = service.poll(&fx.fleet, &mut agent);
+    assert!(events[0].1.contains(&DONE));
+    let (turns, status) = service.snapshot(id, &fx.fleet).unwrap();
+    assert!(!status.running);
+    assert_eq!(turns.iter().map(|t| t.role).collect::<Vec<_>>(), vec![TurnRole::User, TurnRole::Agent]);
+    let id = service.slot_by_id(id).unwrap().conversation_id.unwrap();
+    let mut reopened = ConversationService::default();
+    let slot = reopened.open(config(&fx, 100_000), &fx.fleet, focus, ProtocolKind::Outline, Some(id)).unwrap();
+    assert_eq!(reopened.snapshot(slot, &fx.fleet).unwrap().0.len(), 2);
+    reopened.send(slot, &fx.fleet, &mut agent, "Follow up", vec![]).unwrap();
+    reopened.cancel(slot, &fx.fleet, &mut agent).unwrap();
+    let (turns, status) = reopened.snapshot(slot, &fx.fleet).unwrap();
+    assert!(!status.running);
+    assert_eq!(turns.last().unwrap().body, "Stopped");
+}
+
+#[test]
+fn service_preserves_exclusive_ownership_while_a_driver_is_away() {
+    use super::ConversationService;
+    let fx = fixture();
+    let focus = Focus::Node(fx.node);
+    let mut service = ConversationService::default();
+    let other = service.host_elsewhere(Focus::Project, ProtocolKind::Chat, Uuid::new_v4(), ConversationStatus::default()).unwrap();
+    let slot = service.open(config(&fx, 100_000), &fx.fleet, focus, ProtocolKind::Outline, None).unwrap();
+    let ix = service.find_index(focus, ProtocolKind::Outline, None).unwrap();
+    let (id, driver) = service.take_to_send(ix).unwrap();
+    assert!(service.take_to_send(ix).is_none());
+    assert_eq!(service.open(config(&fx, 100_000), &fx.fleet, focus, ProtocolKind::Outline, None).unwrap(), slot);
+    service.set_cancel(id);
+    assert!(service.take_cancel(id));
+    assert!(!service.take_cancel(id));
+    service.put_back(id, driver);
+    assert!(!service.status_at(ix).unwrap().running);
+
+    service.release_elsewhere(other);
+    assert!(service.snapshot(slot, &fx.fleet).is_ok());
+}
+
+#[test]
+fn service_keeps_a_run_when_provider_cancellation_fails() {
+    use super::ConversationService;
+    let fx = fixture();
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut service = ConversationService::default();
+    let slot = service.open(config(&fx, 100_000), &fx.fleet, Focus::Node(fx.node), ProtocolKind::Outline, None).unwrap();
+    service.send(slot, &fx.fleet, &mut agent, "Hello", vec![]).unwrap();
+    agent.fail_cancel = true;
+    assert!(service.cancel(slot, &fx.fleet, &mut agent).is_err());
+    assert!(service.snapshot(slot, &fx.fleet).unwrap().1.running);
+    assert!(service.poll(&fx.fleet, &mut agent)[0].1.contains(&DONE));
+}
+
+#[test]
+fn switching_provider_carries_history_and_resumes_the_new_session_after_reopen() {
+    use tod_store::{AgentRole, TodPaths, TodSettings};
+
+    let fx = fixture();
+    let paths = TodPaths::at(&fx.root);
+    let mut settings = TodSettings::default();
+    settings.set_platform_for(AgentRole::Chat, AgentPlatform::Claude);
+    settings.save(&paths).unwrap();
+    let mut config = config(&fx, 100_000);
+    config.settings_path = Some(paths.settings_path());
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut driver = ConversationDriver::new(config.clone(), Focus::Project, ProtocolKind::Chat);
+    say(&mut driver, &fx, &mut agent, "Remember the copper notebook");
+    let id = driver.conversation_id().unwrap();
+    let key = agent.last().key.clone();
+    let claude_session = agent.session_id(&key).unwrap();
+
+    settings.set_platform_for(AgentRole::Chat, AgentPlatform::OpenAi);
+    settings.save(&paths).unwrap();
+    say(&mut driver, &fx, &mut agent, "What should you remember?");
+    let turn = agent.last();
+    assert_eq!(turn.key, key);
+    assert_eq!(turn.options.platform, AgentPlatform::OpenAi);
+    assert_eq!(turn.resume_session_id, None);
+    let context = turn.opening.as_ref().unwrap().context.as_ref().unwrap();
+    assert!(context.contains("Remember the copper notebook"));
+    assert!(turns(&fx, id).contains(&(TurnRole::Rotation, "Switched from Claude to OpenAI".into())));
+    let openai_session = agent.session_id(&key).unwrap();
+    assert_ne!(openai_session, claude_session);
+
+    let saved = fx.fleet.read(|db| ConversationRepo::new(db).get(id)).unwrap().unwrap();
+    assert_eq!(saved.platform.as_deref(), Some("open_ai"));
+    assert_eq!(saved.agent_session_id.as_deref(), Some(openai_session.as_str()));
+    let handoff = super::handoff::terminal_handoff(
+        &fx.fleet, &config.media, AgentPlatform::Claude, ProtocolKind::Chat, Focus::Project, Some(id),
+    ).unwrap();
+    assert_eq!(handoff.command, format!("codex resume {openai_session}"));
+
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut reopened = ConversationDriver::open(config, &fx.fleet, id).unwrap();
+    say(&mut reopened, &fx, &mut agent, "Continue with OpenAI");
+    assert_eq!(agent.last().resume_session_id.as_deref(), Some(openai_session.as_str()));
+    assert!(agent.last().opening.is_none());
+}
+
+#[test]
+fn a_failed_provider_switch_leaves_the_previous_session_resumable() {
+    let fx = fixture();
+    let mut config = config(&fx, 100_000);
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut driver = ConversationDriver::new(config.clone(), Focus::Project, ProtocolKind::Chat);
+    say(&mut driver, &fx, &mut agent, "My first turn");
+    let id = driver.conversation_id().unwrap();
+    let previous = agent.session_id(&agent.last().key).unwrap();
+
+    config.launch = AgentLaunchOptions::for_platform(AgentPlatform::Google);
+    let mut switched = ConversationDriver::open(config.clone(), &fx.fleet, id).unwrap();
+    super::driver::set_cwd_error(anyhow::anyhow!("working directory unavailable"));
+    let error = switched.send(&fx.fleet, &mut agent, "My next turn").unwrap_err();
+    assert!(error.to_string().contains("working directory unavailable"));
+
+    config.launch = AgentLaunchOptions::for_platform(AgentPlatform::Claude);
+    let mut restored = ConversationDriver::open(config, &fx.fleet, id).unwrap();
+    say(&mut restored, &fx, &mut agent, "Back on Claude");
+    assert_eq!(agent.last().resume_session_id.as_deref(), Some(previous.as_str()));
+}
+
+#[test]
+fn quota_failure_switches_the_in_flight_turn_and_future_conversations() {
+    let fx = fixture();
+    let mut config = config(&fx, 100_000);
+    config.launch = AgentLaunchOptions::from_settings(AgentPlatform::Claude, "sonnet", "high");
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut driver = ConversationDriver::new(config.clone(), Focus::Project, ProtocolKind::Chat);
+    say(&mut driver, &fx, &mut agent, "Keep the earlier context");
+    agent.runs.clear();
+    driver.send(&fx.fleet, &mut agent, "Finish the report").unwrap();
+    let id = driver.conversation_id().unwrap();
+    let run = *agent.runs.keys().next().unwrap();
+    let now = tod_store::outline::uuid_blob::now_ms();
+    agent.runs.insert(run, AgentRunState::Failure(format!("Weekly limit reached|{}", now + 60_000)));
+    assert_eq!(driver.tick(&fx.fleet, &mut agent), vec![ConversationEvent::Rotated]);
+    let fallback = agent.last();
+    assert_eq!(fallback.options, AgentLaunchOptions::from_settings(AgentPlatform::OpenAi, "gpt-5.6-sol", "medium"));
+    assert!(fallback.resume_session_id.is_none());
+    assert!(fallback.opening.as_ref().unwrap().context.as_ref().unwrap().contains("Keep the earlier context"));
+    assert!(fallback.message.contains("Preserve completed work"));
+    assert!(fallback.message.contains("Finish the report"));
+    assert!(driver.tick(&fx.fleet, &mut agent).contains(&DONE));
+    assert_eq!(turns(&fx, id).iter().filter(|(role, _)| *role == TurnRole::User).count(), 2);
+
+    let mut another = ConversationDriver::new(config, Focus::Project, ProtocolKind::Chat);
+    agent.runs.clear();
+    another.send(&fx.fleet, &mut agent, "Start another conversation").unwrap();
+    assert_eq!(agent.last().options.platform, AgentPlatform::OpenAi);
+    let run = *agent.runs.keys().next().unwrap();
+    agent.runs.insert(run, AgentRunState::Success(Some(format!("You've hit your usage limit|{}", now + 120_000))));
+    let events = another.tick(&fx.fleet, &mut agent);
+    assert!(events.iter().any(|event| matches!(event, ConversationEvent::TurnFinished { error: Some(message) }
+        if message.contains("usage limit reached") && message.ends_with(&(now + 60_000).to_string()))));
+    assert!(!another.status().running);
+    assert_eq!(agent.turns.len(), 4);
 }

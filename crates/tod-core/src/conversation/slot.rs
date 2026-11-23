@@ -1,20 +1,20 @@
-//! A conversation's driver as the view holds it: sometimes away.
+//! A conversation's driver while it is held by a service or lent to a worker.
 //!
 //! Starting a turn and collecting a finished one run git, Docker, and
 //! `tod-cli` (the worktree's submodules and status, a commit, the container's
 //! environment), which can take seconds. So the driver goes to the background
 //! executor for each [`ConversationDriver::send`] and
-//! [`ConversationDriver::tick`], and the view reads what it last knew of it
+//! [`ConversationDriver::tick`], and the host reads what it last knew of it
 //! here in the meantime.
 
-use tod_core::conversation::{ConversationDriver, ConversationStatus};
+use super::{ConversationDriver, ConversationStatus};
 use tod_store::conversation::{Focus, ProtocolKind};
 use uuid::Uuid;
 
 /// What the view shows while a turn is being started.
 const STARTING: &str = "Starting the agent…";
 
-pub(crate) struct DriverSlot {
+pub struct DriverSlot {
     /// Finds the slot again when its driver comes back.
     pub id: u64,
     /// `None` while the driver is away on the background executor.
@@ -48,8 +48,7 @@ impl DriverSlot {
         slot
     }
 
-    /// A slot for a conversation another owner drives (a node's runner,
-    /// `crate::unified::runners`): it has no driver here, so nothing takes it
+    /// A slot for a conversation another owner drives (a node's runner): it has no driver here, so nothing takes it
     /// to send or tick, and it shows `status` until the owner releases it.
     pub fn hosted_elsewhere(
         id: u64,

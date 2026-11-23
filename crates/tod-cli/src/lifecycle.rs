@@ -176,11 +176,10 @@ fn set(inv: &Invocation, args: &Args, env: impl Fn(&str) -> Option<String>) -> a
     let client = InterviewClient::new(&inv.data_root, ACTOR_USER);
     let current = current_state(&client, node)?;
     operator::check_operator_target(&current, state)?;
-    client.outline(operator::user_move(node, state, Some(&format!("tod-cli: {reason}"))))?;
-    let now = current_state(&client, node)?;
-    if now != *state {
-        anyhow::bail!("asked to move the node to `{state}`, but it is in `{now}`");
-    }
+    let now = operator::perform_user_move(
+        node, state, Some(&format!("tod-cli: {reason}")),
+        |mutation| client.outline(mutation), || current_state(&client, node),
+    )?;
     if inv.json {
         return Ok(serde_json::to_string(&serde_json::json!({ "node": node, "from": current, "to": now }))?);
     }

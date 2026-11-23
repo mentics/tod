@@ -10,6 +10,8 @@
 
 pub mod context;
 pub mod driver;
+pub mod service;
+pub mod slot;
 pub mod fix;
 pub mod guidance;
 pub mod incident;
@@ -22,6 +24,7 @@ pub mod phase;
 pub mod pr;
 pub mod problems;
 pub mod protocol;
+pub mod quota;
 pub mod quick_fix;
 pub mod process_review;
 pub mod triage;
@@ -37,3 +40,6 @@ pub use driver::{
     ROTATION_NOTE, SharedAgentAccess,
 };
 pub use protocol::{CONTINUATION_CAP, Next, Protocol, ProtocolEnv, RunNotice, protocol_for};
+
+pub use service::ConversationService;
+pub use slot::DriverSlot;

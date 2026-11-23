@@ -119,9 +119,7 @@ pub fn confirm_migrate(
             let (fleet, node, place_id) = (fleet.clone(), node.clone(), place.id.clone());
             cx.background_executor()
                 .spawn(async move {
-                    let affected = tod_store::fleet::places::migrate_impact(&fleet, &node, &place_id)?;
-                    tod_store::fleet::session_log::keep_node_state(&fleet, &node)?;
-                    anyhow::Ok(affected)
+                    tod_core::runner_operator::prepare_migration(&fleet, &node, &place_id)
                 })
                 .await
         };
@@ -152,17 +150,9 @@ pub fn confirm_migrate(
                             let result = cx
                                 .background_executor()
                                 .spawn(async move {
-                                    tod_store::fleet::places::migrate(&fleet_for_run, &node_for_run, &place_id)?;
-                                    if left_sandbox {
-                                        // The impact dialog removed the location's
-                                        // sandbox and the row's copy of it; the
-                                        // orchestrator is told.
-                                        tod_core::cloud_sync::lost::announce_left_cloud(
-                                            &fleet_for_run,
-                                            &node_for_run,
-                                        )?;
-                                    }
-                                    anyhow::Ok(())
+                                    tod_core::runner_operator::finish_migration(
+                                        &fleet_for_run, &node_for_run, &place_id, left_sandbox,
+                                    )
                                 })
                                 .await;
                             let _ = cx.update(|window, cx| on_done(result.map_err(migrate_error), window, cx));

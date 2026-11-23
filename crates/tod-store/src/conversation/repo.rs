@@ -419,13 +419,29 @@ impl<'a> ConversationRepo<'a> {
         agent_session_id: Option<&str>,
         session_name: Option<&str>,
     ) -> Result<()> {
+        self.set_agent_session_with_launch(conversation_id, agent_session_id, session_name, None)
+    }
+
+    /// Keep the native session ID and the launch options that own it in the same write.
+    pub fn set_agent_session_with_launch(
+        &self,
+        conversation_id: Uuid,
+        agent_session_id: Option<&str>,
+        session_name: Option<&str>,
+        launch: Option<&tod_agent::AgentLaunchOptions>,
+    ) -> Result<()> {
         let n = self.conn.execute(
             "UPDATE conversations SET agent_session_id = ?1,
-                    session_name = COALESCE(?2, session_name), updated_at = ?3
-             WHERE id = ?4",
+                    session_name = COALESCE(?2, session_name),
+                    platform = COALESCE(?3, platform), model = COALESCE(?4, model),
+                    effort = COALESCE(?5, effort), updated_at = ?6
+             WHERE id = ?7",
             params![
                 agent_session_id,
                 session_name,
+                launch.map(|launch| tod_agent::agent_launch::platform_storage(launch.platform)),
+                launch.map(|launch| launch.model.as_str()),
+                launch.map(|launch| launch.effort.as_str()),
                 now_ms(),
                 uuid_to_blob(conversation_id)
             ],

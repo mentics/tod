@@ -10,20 +10,21 @@
 //!
 //! Starting a turn and collecting a finished one run git, Docker, and
 //! `tod-cli`, which can take seconds — see
-//! `crate::ui::driver_slot::DriverSlot`. Callers take a slot's
+//! `tod_core::conversation::DriverSlot`. Callers take a slot's
 //! driver to the background executor and put it back; [`AgentRuns`] only
 //! ever holds the slots, never blocks the UI thread itself.
 
-use crate::ui::driver_slot::DriverSlot;
+use tod_core::conversation::{ConversationService, DriverSlot};
 use crate::interview::agent::SharedAgent;
 use crate::interview::{TodPaths, TodSettings};
 use anyhow::Context as _;
 use gpui::Context;
 use std::sync::Arc;
 use tod_core::conversation::implement::HandoffAnswer;
-use tod_core::conversation::{ConversationConfig, ConversationDriver, ConversationStatus, SharedAgentAccess};
+use tod_core::conversation::{ConversationConfig, ConversationDriver, SharedAgentAccess};
+#[cfg(test)]
+use tod_core::conversation::ConversationStatus;
 use tod_store::conversation::{Conversation, ConversationRepo, Focus, ProtocolKind};
-use tod_store::decisions::DecisionRepo;
 use tod_store::fleet::FleetStore;
 use tod_store::interview::{ACTOR_USER, InterviewCommand};
 use tod_store::outline::OutlineMutation;
@@ -92,9 +93,7 @@ pub struct AgentRuns {
     /// looked at. Idle drivers for a conversation nobody is showing are
     /// dropped by [`AgentRuns::retain`]: everything they know is already in
     /// the database.
-    slots: Vec<DriverSlot>,
-    /// The next [`DriverSlot::id`].
-    next_slot: u64,
+    service: ConversationService,
     /// Collects finished turns; see [`AgentRuns::start_polling`].
     _poll: Option<gpui::Task<()>>,
 }
@@ -118,13 +117,21 @@ pub fn close_sessions(agent: &SharedAgent, keys: &[String]) {
     }
 }
 
+impl std::ops::Deref for AgentRuns {
+    type Target = ConversationService;
+    fn deref(&self) -> &Self::Target { &self.service }
+}
+
+impl std::ops::DerefMut for AgentRuns {
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.service }
+}
+
 impl AgentRuns {
     pub fn new(fleet: Arc<FleetStore>, agent: SharedAgent) -> Self {
         Self {
             fleet,
             agent,
-            slots: Vec::new(),
-            next_slot: 0,
+            service: ConversationService::default(),
             _poll: None,
         }
     }
@@ -154,14 +161,14 @@ impl AgentRuns {
                     .spawn(async move {
                         away.into_iter()
                             .map(|(id, mut driver)| {
-                                let events = driver.tick(&fleet, &mut SharedAgentAccess(&agent));
+                                let events = ConversationService::poll_driver(&mut driver, &fleet, &mut SharedAgentAccess(&agent));
                                 (id, driver, events)
                             })
                             .collect::<Vec<_>>()
                     })
                     .await;
                 let Ok(()) = this.update(cx, |this, cx| {
-                    for (id, mut driver, events) in ticked {
+                    for (id, driver, events) in ticked {
                         // Every run collected here can block on a permission,
                         // not only one a view shows.
                         if let Some(request) = driver.status().permission {
@@ -174,15 +181,6 @@ impl AgentRuns {
                             match event {
                                 tod_core::conversation::ConversationEvent::Notice(notice) => {
                                     tracing::warn!("conversation notice: {notice:?}");
-                                }
-                                // A person's turn that could not start (another
-                                // node holds the files lock): nothing here
-                                // waits and retries, so it is shown as failed,
-                                // with the holder named, for the drawer's Retry.
-                                tod_core::conversation::ConversationEvent::FilesBusy { message } => {
-                                    if let Err(err) = driver.record_files_busy(&this.fleet, &message) {
-                                        tracing::error!("could not record the busy files lock: {err:#}");
-                                    }
                                 }
                                 _ => {}
                             }
@@ -205,92 +203,12 @@ impl AgentRuns {
         &self.agent
     }
 
-    fn is_match(d: &DriverSlot, focus: Focus, protocol: ProtocolKind, conversation_id: Option<Uuid>) -> bool {
-        match conversation_id {
-            Some(id) => d.conversation_id == Some(id),
-            None => d.conversation_id.is_none() && d.focus == focus && d.protocol == protocol,
-        }
-    }
-
-    /// The slot showing `focus`/`protocol`/`conversation_id`, when there is
-    /// one here already.
-    pub fn find_index(
-        &self,
-        focus: Focus,
-        protocol: ProtocolKind,
-        conversation_id: Option<Uuid>,
-    ) -> Option<usize> {
-        self.slots
-            .iter()
-            .position(|d| Self::is_match(d, focus, protocol, conversation_id))
-    }
-
-    pub fn slot_by_index(&self, ix: usize) -> Option<&DriverSlot> {
-        self.slots.get(ix)
-    }
-
-    pub fn slot_by_id(&self, id: u64) -> Option<&DriverSlot> {
-        self.slots.iter().find(|s| s.id == id)
-    }
-
-    pub fn status_at(&self, ix: usize) -> Option<ConversationStatus> {
-        self.slots.get(ix).map(|s| s.status.clone())
-    }
-
-    #[cfg(test)]
-    /// Whether a conversation running `protocol` on `focus` is working now,
-    /// whichever conversation a caller has open.
-    pub fn protocol_running(&self, focus: Focus, protocol: ProtocolKind) -> bool {
-        self.slots
-            .iter()
-            .any(|d| d.focus == focus && d.protocol == protocol && d.status.running)
-    }
-
-    /// The slot for `focus`/`protocol`/`conversation_id`, starting a fresh
-    /// [`DriverSlot`] from `make` when there is none yet. Returns its index.
-    pub fn ensure(
-        &mut self,
-        focus: Focus,
-        protocol: ProtocolKind,
-        conversation_id: Option<Uuid>,
-        make: impl FnOnce() -> Result<ConversationDriver, String>,
-    ) -> Result<usize, String> {
-        if let Some(ix) = self.find_index(focus, protocol, conversation_id) {
-            return Ok(ix);
-        }
-        let driver = make()?;
-        self.next_slot += 1;
-        self.slots.push(DriverSlot::new(self.next_slot, driver));
-        Ok(self.slots.len() - 1)
-    }
-
-    /// Take the driver at `ix` to send a message: `None` when it is working
-    /// already (or away).
-    pub fn take_to_send(&mut self, ix: usize) -> Option<(u64, ConversationDriver)> {
-        let slot = self.slots.get_mut(ix)?;
-        let driver = slot.take_to_send()?;
-        Some((slot.id, driver))
-    }
-
-    /// Every slot with a turn in flight, taken to be ticked off the main
-    /// thread; [`AgentRuns::put_back`] returns each one.
-    pub fn take_running(&mut self) -> Vec<(u64, ConversationDriver)> {
-        self.slots
-            .iter_mut()
-            .filter_map(|slot| slot.take_to_tick().map(|driver| (slot.id, driver)))
-            .collect()
-    }
-
     /// Stop the turn of slot `id` without blocking the caller: stopping takes
     /// the agent lock, ends the activity lease and writes the transcript, all
     /// of which can wait on the agent's worker or the database. A driver that
     /// is away on the background executor is marked to stop when it is back.
     pub fn stop(&mut self, id: u64, cx: &mut Context<Self>) {
-        let driver = self
-            .slots
-            .iter_mut()
-            .find(|s| s.id == id)
-            .and_then(|s| s.take_to_cancel(STOPPING));
+        let driver = self.service.take_to_cancel(id, STOPPING);
         match driver {
             Some(driver) => self.cancel_in_background(id, driver, cx),
             None => self.set_cancel(id),
@@ -300,16 +218,14 @@ impl AgentRuns {
 
     /// Cancel `driver`'s turn on the background executor, then put it back.
     fn cancel_in_background(&mut self, id: u64, mut driver: ConversationDriver, cx: &mut Context<Self>) {
-        if let Some(slot) = self.slots.iter_mut().find(|s| s.id == id) {
-            slot.status.activity = Some(STOPPING.to_string());
-        }
+        self.service.set_stopping(id, STOPPING);
         let fleet = self.fleet.clone();
         let agent = self.agent.clone();
         cx.spawn(async move |this, cx| {
             let driver = cx
                 .background_executor()
                 .spawn(async move {
-                    if let Err(err) = driver.cancel(&fleet, &mut SharedAgentAccess(&agent)) {
+                    if let Err(err) = ConversationService::cancel_driver(&mut driver, &fleet, &mut SharedAgentAccess(&agent)) {
                         tracing::warn!("stopping a conversation failed: {err:#}");
                     }
                     driver
@@ -323,82 +239,12 @@ impl AgentRuns {
         .detach();
     }
 
-    /// Mark the slot `id` to stop as soon as its driver is back.
-    pub fn set_cancel(&mut self, id: u64) {
-        if let Some(slot) = self.slots.iter_mut().find(|s| s.id == id) {
-            slot.cancel = true;
-        }
-    }
-
-    /// Take, and clear, the slot `id`'s cancel flag.
-    pub fn take_cancel(&mut self, id: u64) -> bool {
-        self.slots
-            .iter_mut()
-            .find(|s| s.id == id)
-            .is_some_and(|s| std::mem::take(&mut s.cancel))
-    }
-
-    /// The driver is back: put it back in its slot.
-    pub fn put_back(&mut self, id: u64, driver: ConversationDriver) {
-        if let Some(slot) = self.slots.iter_mut().find(|s| s.id == id) {
-            slot.put_back(driver);
-        }
-    }
-
-    /// Show `conversation_id`, which another owner drives (a node's runner),
-    /// as running here: every view that asks what runs on its node sees it,
-    /// and nothing here sends to it or ticks it until
-    /// [`Self::release_elsewhere`]. An idle slot this registry held for the
-    /// conversation is dropped (the database has everything it knew); a
-    /// working one is left alone and `None` returned.
-    pub fn host_elsewhere(
-        &mut self,
-        focus: Focus,
-        protocol: ProtocolKind,
-        conversation_id: Uuid,
-        status: ConversationStatus,
-    ) -> Option<u64> {
-        if let Some(ix) = self.slots.iter().position(|s| s.conversation_id == Some(conversation_id)) {
-            if self.slots[ix].status.running {
-                return None;
-            }
-            self.slots.remove(ix);
-        }
-        self.next_slot += 1;
-        self.slots.push(DriverSlot::hosted_elsewhere(
-            self.next_slot,
-            focus,
-            protocol,
-            conversation_id,
-            status,
-        ));
-        Some(self.next_slot)
-    }
-
-    /// The status a slot [`Self::host_elsewhere`] made shows; `false` when it
-    /// is gone (dropped by a view's [`Self::retain`]), so the owner hosts it
-    /// again.
-    pub fn update_elsewhere(&mut self, id: u64, status: ConversationStatus) -> bool {
-        match self.slots.iter_mut().find(|s| s.id == id && s.is_hosted_elsewhere()) {
-            Some(slot) => {
-                slot.status = status;
-                true
-            }
-            None => false,
-        }
-    }
-
-    /// Drop a slot [`Self::host_elsewhere`] made.
-    pub fn release_elsewhere(&mut self, id: u64) {
-        self.slots.retain(|s| s.id != id);
-    }
-
     /// Whether a lifecycle conversation this registry drives is working on
     /// `node` (not counting ones hosted for another owner). Chat-panel
     /// conversations are separate from the lifecycle processor and never
     /// count.
     pub fn driving_on_node(&self, node: Uuid) -> bool {
-        self.slots.iter().any(|s| {
+        self.service.slots().iter().any(|s| {
             s.focus == Focus::Node(node)
                 && s.status.running
                 && !s.is_hosted_elsewhere()
@@ -436,7 +282,7 @@ impl AgentRuns {
     pub fn running_work_split(&self) -> (Vec<String>, Vec<String>) {
         let daemon = self.fleet.is_client();
         let (mut affected, mut continuing) = (Vec::new(), Vec::new());
-        for d in self.slots.iter().filter(|d| d.status.running) {
+        for d in self.service.slots().iter().filter(|d| d.status.running) {
             let what = self.describe_slot(d);
             if daemon && d.is_hosted_elsewhere() {
                 continuing.push(what);
@@ -451,7 +297,7 @@ impl AgentRuns {
     /// `→ state`, W11) reads. Reads each matching slot's conversation row for
     /// the transition a gate check or on-entry turn is about.
     pub fn runs_for_node(&self, node: Uuid) -> Vec<NodeRun> {
-        self.slots
+        self.service.slots()
             .iter()
             .filter(|s| s.focus == Focus::Node(node))
             .map(|s| {
@@ -480,7 +326,7 @@ impl AgentRuns {
     /// `node`, for [`close_sessions`]: their live agent processes ran in a
     /// sandbox that was deleted and made again.
     pub fn node_session_keys(&self, node: Uuid) -> Vec<String> {
-        self.slots
+        self.service.slots()
             .iter()
             .filter(|s| s.focus == Focus::Node(node))
             .filter_map(|s| s.conversation_id)
@@ -492,7 +338,7 @@ impl AgentRuns {
     /// the outline) running right now.
     pub fn running_lifecycle_nodes(&self) -> std::collections::HashSet<Uuid> {
         use tod_store::conversation::ProtocolKind;
-        self.slots
+        self.service.slots()
             .iter()
             .filter(|s| {
                 s.status.running
@@ -511,7 +357,7 @@ impl AgentRuns {
     /// Nodes a chat (the chat drawer, the freeform conversation) is working
     /// on right now: the complement of [`Self::running_lifecycle_nodes`].
     pub fn running_chat_nodes(&self) -> std::collections::HashSet<Uuid> {
-        self.slots
+        self.service.slots()
             .iter()
             .filter(|s| {
                 s.status.running && matches!(s.protocol, ProtocolKind::Chat | ProtocolKind::Outline)
@@ -530,8 +376,8 @@ impl AgentRuns {
     /// when this registry notifies, never per row per frame) since it reads
     /// each running slot's conversation row.
     pub fn running_status_labels(&self, lifecycle_of: impl Fn(Uuid) -> Option<String>) -> std::collections::HashMap<Uuid, String> {
-        let mut nodes: Vec<Uuid> = self
-            .slots
+        let mut nodes: Vec<Uuid> = self.service
+            .slots()
             .iter()
             .filter(|s| s.status.running && s.protocol.has_transition())
             .filter_map(|s| match s.focus {
@@ -568,8 +414,8 @@ impl AgentRuns {
         if text.is_empty() {
             return false;
         }
-        let Some(ix) = self
-            .slots
+        let Some(ix) = self.service
+            .slots()
             .iter()
             .position(|s| s.conversation_id == Some(conversation_id))
         else {
@@ -585,14 +431,14 @@ impl AgentRuns {
             let (driver, result) = cx
                 .background_executor()
                 .spawn(async move {
-                    let result = driver
-                        .send(&fleet, &mut SharedAgentAccess(&agent), &text)
+                    let result = ConversationService::send_driver(&mut driver, &fleet, &mut SharedAgentAccess(&agent), &text, Vec::new())
                         .map_err(|e| format!("{e:#}"));
                     (driver, result)
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.put_back(id, driver);
+                if this.take_cancel(id) { this.stop(id, cx); }
                 cx.notify();
             });
             if let Err(err) = result {
@@ -678,14 +524,7 @@ impl AgentRuns {
         let fleet = self.fleet.clone();
         cx.background_executor()
             .spawn(async move {
-                let result = fleet
-                    .read(|conn| DecisionRepo::new(conn).get(decision_id))
-                    .map_err(anyhow::Error::from)
-                    .and_then(|decision| {
-                        let Some(decision) = decision else { return Ok(None) };
-                        let root = fleet.paths().root().to_path_buf();
-                        tod_core::cloud_sync::wake_after_answer(&fleet, &root, &decision.node_id.to_string())
-                    });
+                let result = tod_core::lifecycle::answer::wake_after_decision(&fleet, decision_id);
                 if let Err(err) = result {
                     tracing::warn!("waking the node after answering {decision_id}: {err:#}");
                 }
@@ -761,7 +600,7 @@ impl AgentRuns {
     /// Whether `conversation_id`'s turn is in flight here, driven by the app
     /// or by a runner hosted elsewhere.
     pub fn conversation_running(&self, conversation_id: Uuid) -> bool {
-        self.slots
+        self.service.slots()
             .iter()
             .any(|d| d.conversation_id == Some(conversation_id) && d.status.running)
     }

@@ -691,6 +691,26 @@ fn takes_a_node_from_proposed_to_done() {
 }
 
 #[test]
+fn codex_default_covers_a_whole_lifecycle_with_the_configured_provider() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    let path = fx.root.join(tod_store::paths::SETTINGS_FILE);
+    std::fs::write(&path, "default_agent:\n  platform: codex\n").unwrap();
+    let mut config = config(&fx);
+    config.settings_path = Some(path);
+    let mut pilot = Autopilot::new(config, fx.node, Budget::default()).unwrap()
+        .with_poll_interval(Duration::ZERO)
+        .with_housekeeping_gap(Duration::ZERO);
+    let mut agent = FakeAgent::new(&fx.fleet);
+    assert_eq!(pilot.run(&fx.fleet, &mut agent).unwrap(), Outcome::Done);
+    let platforms = fx.fleet.read(|conn| {
+        let mut statement = conn.prepare("SELECT DISTINCT platform FROM conversations")?;
+        Ok(statement.query_map([], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?)
+    }).unwrap();
+    assert_eq!(platforms, ["open_ai"]);
+}
+
+#[test]
 fn review_not_converging_is_never_raised_with_nothing_standing() {
     assert_eq!(NeedsHuman::review_not_converging(5, vec![]), None);
     assert!(matches!(

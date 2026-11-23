@@ -409,21 +409,22 @@ impl Shell {
         match action {
             AgentPlatformSocketCommand::Get => {
                 let platform = self.settings.read(cx).agent_platform();
-                Ok(format!("ok {}", platform_label(platform)))
+                Ok(format!("ok {}", tod_agent::agent_launch::platform_storage(platform)))
             }
             AgentPlatformSocketCommand::Cycle => {
                 self.settings.update(cx, |settings, cx| {
                     settings.cycle_agent_platform(1, cx);
                 });
                 let platform = self.settings.read(cx).agent_platform();
-                Ok(format!("ok {}", platform_label(platform)))
+                Ok(format!("ok {}", tod_agent::agent_launch::platform_storage(platform)))
             }
             AgentPlatformSocketCommand::Set(raw) => {
-                let platform = parse_agent_platform(&raw)?;
+                let platform = tod_agent::agent_launch::parse_platform(&raw)
+                    .ok_or_else(|| format!("unknown agent platform `{raw}` (expected cursor|claude|openai|google)"))?;
                 self.settings.update(cx, |settings, cx| {
                     settings.set_agent_platform(platform, cx);
                 });
-                Ok(format!("ok {}", platform_label(platform)))
+                Ok(format!("ok {}", tod_agent::agent_launch::platform_storage(platform)))
             }
         }
     }
@@ -1297,25 +1298,6 @@ fn queue_report(
         },
     );
     Ok(listening)
-}
-
-#[cfg(feature = "agent-socket")]
-fn platform_label(platform: AgentPlatform) -> &'static str {
-    match platform {
-        AgentPlatform::Cursor => "cursor",
-        AgentPlatform::Claude => "claude",
-    }
-}
-
-#[cfg(feature = "agent-socket")]
-fn parse_agent_platform(raw: &str) -> Result<AgentPlatform, String> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "cursor" => Ok(AgentPlatform::Cursor),
-        "claude" | "anthropic" => Ok(AgentPlatform::Claude),
-        other => Err(format!(
-            "unknown agent platform `{other}` (expected cursor|claude)"
-        )),
-    }
 }
 
 fn resolve_fleet_root() -> Result<PathBuf, anyhow::Error> {

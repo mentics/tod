@@ -6,14 +6,15 @@
 //! where anything is stored or when — it is told what to say and reports back.
 
 mod acp_host;
-pub mod claude_adapter;
 pub mod agent_launch;
 pub mod agent_traffic;
+pub mod claude_adapter;
 mod cursor_acp;
 pub mod devcontainer;
 pub mod exit_diagnosis;
 mod mock;
 pub mod platform;
+mod pricing;
 mod process_tree;
 mod provider;
 mod reply;
@@ -21,7 +22,6 @@ mod routing;
 pub mod run_state;
 pub mod sandbox;
 mod transcript;
-mod pricing;
 mod usage;
 pub mod util;
 
@@ -37,14 +37,15 @@ pub use run_state::{
 pub use acp_host::AcpHost;
 use agent_traffic::SharedAgentTrafficLog;
 #[allow(unused_imports)]
-pub use cursor_acp::CursorAcpProvider;
+pub use cursor_acp::{AcpSessionCatalog, CursorAcpProvider, acp_session_catalog};
 pub use mock::{
     MockAgentProvider, MockInterviewHandler, MockInterviewTurn, MockReply,
     set_mock_interview_handler,
 };
+pub use pricing::{Rates, format_usd, price, rates_for};
 pub use provider::{
-    AgentProvider, AgentRunHandle, AgentRunState, PermissionOption, PermissionRequest, RunId,
-    PromptImage, SessionObserver, SessionOpening, SessionPurpose, SessionStarted, SessionTurn,
+    AgentProvider, AgentRunHandle, AgentRunState, PermissionOption, PermissionRequest, PromptImage,
+    RunId, SessionObserver, SessionOpening, SessionPurpose, SessionStarted, SessionTurn,
 };
 pub use reply::ReplyPart;
 pub use routing::RoutingAgentProvider;
@@ -52,7 +53,6 @@ pub use transcript::{
     FormatProblem, Transcript, TranscriptRead, TranscriptTurn, read_transcript,
     transcript_fingerprint,
 };
-pub use pricing::{Rates, format_usd, price, rates_for};
 pub use usage::{Cost, TokenCounts, TokenUsage};
 
 use std::sync::{Arc, Mutex};
@@ -87,6 +87,7 @@ impl AgentBackend {
         match platform {
             AgentPlatform::Cursor => Self::Cursor,
             AgentPlatform::Claude => Self::Claude,
+            AgentPlatform::OpenAi | AgentPlatform::Google => Self::Cursor,
         }
     }
 

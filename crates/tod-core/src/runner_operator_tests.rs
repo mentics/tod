@@ -217,6 +217,25 @@ fn run_fresh_asks_for_a_new_session_then_starts() {
 }
 
 #[test]
+fn preparing_a_phase_rerun_clears_local_run_state_but_not_for_a_supervisor() {
+    let fx = fixture();
+    active(&fx);
+    let mut state = crate::autopilot::AutopilotState::fresh();
+    state.outcome = Some(Outcome::BudgetExhausted { limit: BudgetLimit::Sessions { used: 3, elapsed_secs: 10 } });
+    state.save(&fx.root, fx.node).unwrap();
+
+    prepare_fresh_run(&fx.fleet, &fx.root, fx.node, true, FreshRun::Phase).unwrap();
+    let state = crate::autopilot::AutopilotState::load(&fx.root, fx.node).unwrap();
+    assert!(!state.fresh_session);
+    assert!(state.outcome.is_some());
+
+    prepare_fresh_run(&fx.fleet, &fx.root, fx.node, false, FreshRun::Phase).unwrap();
+    let state = crate::autopilot::AutopilotState::load(&fx.root, fx.node).unwrap();
+    assert!(state.fresh_session);
+    assert!(state.outcome.is_none());
+}
+
+#[test]
 fn a_verb_the_menu_does_not_offer_is_refused_naming_what_it_does() {
     let fx = fixture();
     active(&fx);

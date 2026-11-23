@@ -572,6 +572,14 @@ mod tests {
                 .menu
                 .contains(&MigrateTo)
         );
+        // A hand-started conversation may also be stopped before migration;
+        // the shared availability check must leave that prompt reachable.
+        for run in [RunState::Active { pausing: false }, RunState::HandTurn] {
+            let actions = menu(&inputs(run));
+            crate::runner_operator::ensure_offered(&actions, run, MigrateTo).unwrap();
+        }
+        let actions = menu(&inputs(RunState::HandTurn));
+        crate::runner_operator::ensure_offered(&actions, RunState::HandTurn, StopNow).unwrap();
         let with_children = RunnerInputs {
             has_children: true,
             ..inputs(RunState::NeverRun)

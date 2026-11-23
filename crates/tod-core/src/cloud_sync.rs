@@ -1566,6 +1566,19 @@ fn claude_token_for_node(root: &Path) -> Result<Option<String>> {
     )
 }
 
+fn supervisor_uses_codex(fleet: &FleetStore, root: &Path, node_id: &str) -> Result<bool> {
+    if cloud_agent().as_deref() == Some("mock") {
+        return Ok(false);
+    }
+    let node = uuid::Uuid::parse_str(node_id).context("read the node's agent settings")?;
+    let path = tod_store::TodPaths::at(root).settings_path();
+    let options = crate::conversation::launch::try_resolve_from(
+        fleet, &path, tod_store::conversation::Focus::Node(node),
+        tod_store::conversation::ProtocolKind::Implementation, None,
+    )?;
+    Ok(options.platform == tod_agent::AgentPlatform::OpenAi)
+}
+
 /// Why Blaxel's record of a sandbox says it can no longer run, if it does:
 /// its deployment `status` or its running `state` is a terminal one. A
 /// sandbox that expired can stay `DEPLOYED` for an hour while its `state`
@@ -1703,8 +1716,12 @@ pub fn ensure_supervisor(
     // Reset environment can set one up again whatever state its relay is in.
     let _own = tod_store::fleet::sandbox::NodeProvisioningScope::enter();
     let (task, repo_url, branch) = node_source(fleet, node_id)?;
-    // Before any network call: without it the sandbox could not run Claude.
-    let claude_oauth_token = claude_token_for_node(root)?;
+    let uses_codex = supervisor_uses_codex(fleet, root, node_id)?;
+    let claude_oauth_token = if uses_codex {
+        CredentialStore::from_data_root(root).get(CredentialKind::ClaudeOauthToken)
+    } else {
+        claude_token_for_node(root)?
+    };
     let user = resolve_user(root)?;
 
     let retired = tod_store::fleet::provision::retire_unusable_sandbox(fleet, node_id, progress)?;
@@ -1789,6 +1806,13 @@ pub fn ensure_supervisor(
         }
     }
 
+    if uses_codex {
+        node::ensure_codex_adapter(&bx, &url, progress)?;
+    } else if cloud_agent().as_deref() != Some("mock")
+        && let Err(err) = node::ensure_codex_adapter(&bx, &url, progress)
+    {
+        progress(&format!("Codex fallback is unavailable in {name}: {err:#}"));
+    }
     push_supervisor_settings(&bx, &url, root, node_id)?;
     if wake {
         progress("waking the node…");
@@ -1929,7 +1953,9 @@ fn run_in_cloud_reporting(
     // Fails early, before any network call, on a node with no repository or
     // no Claude token to run it with.
     node_source(fleet, node_id)?;
-    claude_token_for_node(root)?;
+    if !supervisor_uses_codex(fleet, root, node_id)? {
+        claude_token_for_node(root)?;
+    }
     lost::forget_failure(root, node_id);
     // "Run": a row the supervisor consumes when it starts, which also
     // supersedes an older answer to leave the node stopped.
@@ -2136,7 +2162,7 @@ fn older_orchestrator_hint(err: anyhow::Error) -> anyhow::Error {
 
 /// The settings a node's supervisor reads in its sandbox, as `tod.yml`: only
 /// what it acts on there (`lifecycle`: which repositories release, and
-/// `pr_readiness`: the review schedule), so nothing else of this machine's
+/// `pr_readiness`: the review schedule, and the default coding agent), so nothing else of this machine's
 /// settings leaves it. Without them the supervisor judges a merged pull
 /// request by the defaults, and waits for a release a `merge` repository
 /// never makes.
@@ -2145,6 +2171,7 @@ pub fn supervisor_settings(root: &Path) -> Result<String> {
     let mut shared = tod_store::TodSettings::default();
     shared.lifecycle = all.lifecycle;
     shared.pr_readiness = all.pr_readiness;
+    shared.default_agent = all.default_agent;
     serde_yaml::to_string(&shared).context("serialize the supervisor's settings")
 }
 
@@ -2349,6 +2376,9 @@ fn wake_node_requesting_inner(fleet: &FleetStore, root: &Path, node_id: &str, ki
         &mut wake_progress,
     )
     .with_context(|| format!("not waking {node_id}'s supervisor"))?;
+    if supervisor_uses_codex(fleet, root, node_id)? {
+        tod_sandbox::node::ensure_codex_adapter(&bx, &url, &mut wake_progress)?;
+    }
     push_supervisor_settings(&bx, &url, root, node_id)?;
     if fresh_session {
         let request = format!(

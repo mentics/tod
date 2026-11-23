@@ -146,6 +146,42 @@ Reversal never uses Ctrl+Z; it applies inverses from the conversation's own log,
 and asks for confirmation when an item changed since or other changes depend on
 it.
 
+### Run TOD with Codex
+
+Install `@agentclientprotocol/codex-acp` and sign in with `codex login` in the
+environment that will run the agent. The desktop app and daemon find
+`codex-acp` on PATH or use `TOD_CODEX_ACP_BIN` when set. Choose **OpenAI**
+under **Settings → Default Agent** for lifecycle work or under **Chat Agent**
+for chat. The `auto` model uses the adapter's default.
+
+Set a task's preference under its **Agent** capability, or choose a provider
+for a specific step under **Lifecycle Config**. When Claude or Codex reports
+that its usage limit has been reached, TOD continues the turn in a fresh
+session on the other provider. The conversation and working files carry over.
+TOD stores quota reset times in `provider-quota.json` under its data root and
+skips an exhausted provider until its reset. If it cannot read a reset time,
+it checks eligibility again after one hour. If both providers are exhausted,
+the cloud supervisor waits until the earlier reset.
+
+Claude-to-Codex fallback looks up a model and effort by capability tier. For
+example, Haiku at low effort maps to GPT-5.6 Luna at low effort, Sonnet at
+high effort maps to GPT-5.6 Sol at medium effort, and Opus at high effort maps
+to GPT-6 Astra at high effort. The destination's adapter must support the
+selected model and effort. Both providers must be signed in to switch.
+
+A node already parked on a quota wait from an older build can be resumed by
+finding the wait with `tod-cli wait list --node <NODE>` and cancelling it with
+`tod-cli wait cancel <WAIT_ID>` on the same data root.
+
+Dev containers need the adapter and a Codex sign-in inside the container.
+Cloud node setup installs the adapter and sends the coding-agent settings to
+the supervisor. Sign in from the node's sandbox (for example `codex login
+--device-auth`), then resume. The sandbox has its own login and quota file.
+Build the updated Linux supervisor with
+`scripts/build-sandbox-binaries.sh` for cloud use.
+
+Gemini remains available for local chat through Gemini CLI.
+
 ## Agent control socket (dev / CI only)
 
 Requires a build **with** the default features (`agent-socket`). Not present in `--no-default-features` release builds.
@@ -212,6 +248,7 @@ If the chosen port is already in use, startup fails immediately with a bind erro
 | `act <selector> [click\|focus\|set-value <text>\|scroll-into-view]` | Do something to the one element a selector matches (default `click`). Goes through the accessibility action path; if the element has no handler for it, falls back to a synthetic click at its centre and says so. `set-value` also focuses the field, so a following `key enter` or `text` goes to it (the reply says `(focused)`). `err no-match <selector>` or `err ambiguous <n> matches: …` otherwise. Counts as input, like `click`. |
 | `wait-for <selector> [--gone] [--timeout-ms N]` | Wait until the selector matches (or, with `--gone`, stops matching); `ok N matches` or `err timeout …`. Default timeout 5000 ms. |
 | `coverage [frames N]` | Clickable elements this frame versus how many the tree exposes (`ok C clickable E exposed X explicit M missing`, then M lines naming each missing one). With `frames N`, first times N forced draws with the tree off and on. |
+| `agent-platform get` / `cycle` / `set <platform>` | Read or change the default platform in Settings. Accepts `claude`, `cursor`, `openai`, or `google`. OpenAI's saved ID is `open_ai`. |
 
 Selectors: `#<id-path-suffix>` (the tail of an element's id path, on a `/` boundary), `<role>:<label>` (case-insensitive substring of the label or value, e.g. `button:Start`; `textinput` also matches a multi-line input), and `<sel> >> <sel>` to scope the right one to what is inside the left one (`#unified-task-panel >> button:Start`). An element with no id of its own gets `#~file.rs:LINE` (where it was built; `#1`, `#2` for repeats). Double quotes protect spaces, `>>` and action words, in `act`, `tree --within`/`--label`/`--role` and `wait-for`: `act "textinput:Item title" set-value Cov node`, `act button:"Run now" click`, `"#a >> button:Go now"` (inside quotes `\"` is a quote); unquoted forms work as before. `tree` lists a node whose id path is a number or has a long run of digits (`#input-4294967389`) by `role:label` instead. A request's free-text answer field is a text input named `Answer: <question>`: `act "textinput:Answer: What retention" set-value 30 days`, then `key ctrl-enter` submits it. Run `tree` to see what is there. The tree is switched on by the first of these commands and off again after 30 s without one; with the socket idle it costs nothing.
 

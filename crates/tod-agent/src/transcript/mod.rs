@@ -77,6 +77,7 @@ pub fn read_transcript(
     agent_session_id: &str,
 ) -> anyhow::Result<Option<TranscriptRead>> {
     match platform {
+        AgentPlatform::OpenAi | AgentPlatform::Google => Ok(None),
         AgentPlatform::Claude => match crate::run_state::claude_config_dir() {
             Some(dir) => claude::read(&dir, agent_session_id),
             None => Ok(None),
@@ -94,6 +95,7 @@ pub fn read_transcript(
 /// then reads as new. `None` when there is no record to check.
 pub fn transcript_fingerprint(platform: AgentPlatform, agent_session_id: &str) -> Option<String> {
     match platform {
+        AgentPlatform::OpenAi | AgentPlatform::Google => None,
         AgentPlatform::Claude => crate::run_state::claude_transcript_fingerprint(agent_session_id),
         AgentPlatform::Cursor => cursor::fingerprint(&cursor::config_dir()?, agent_session_id),
     }

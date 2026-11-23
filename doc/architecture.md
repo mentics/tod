@@ -112,7 +112,7 @@ the ones below it.
   └─ tod-ui          GPUI views, app shell, conversation view, unified  │
       │              workbench, dev-only agent control socket          │
       ├─ tod-agentd  the daemon (runs, scheduler, server)              │
-      └─ tod-core    policy: conversation driver and protocols, phase  │
+      └─ tod-core    policy: conversation service and protocols, phase │
           │          and gate rules, context assembly, autopilot,      │
           │          next-actor, cloud sync, settings and paths        │
           ├─ tod-store         SQLite persistence: outline, fleet,     │
@@ -142,8 +142,9 @@ What each layer may know:
   an agent. It is shared by the app, `tod-cli`, the daemon, and the
   supervisor, which is what lets one node run in four places with one code
   path.
-- **`tod-ui`** renders and routes input. Nothing that runs git, Docker, or
-  `tod-cli` runs on its main thread.
+- **`tod-ui`** renders, routes input, and schedules background work. It
+  uses core operations for application behavior. Nothing that runs git,
+  Docker, or `tod-cli` runs on its main thread.
 
 New code goes in the lowest layer that can hold it. The crate-by-crate
 detail, with the module names, is in `.claude/CLAUDE.md`.
@@ -190,7 +191,9 @@ message sends the opening context and the message as one turn; every later
 message sends only the delta (the user's own edits and reversals, and items
 changed elsewhere) plus the message. When the session outgrows its budget
 or cannot be resumed, the driver rotates to a fresh one seeded with a
-snapshot. Replies are never parsed: anything the app needs, the agent
+snapshot. Changing the provider between messages also starts a fresh session
+with recent transcript context and records the switch. The TOD conversation
+keeps its ID and history. Replies are never parsed: anything the app needs, the agent
 records through `tod-cli` as it works.
 
 **Recording and reversal.** An agent writes as an actor
@@ -308,12 +311,17 @@ so a crash never leaves one awake. `doc/files-locations.md`,
 `tod-ui` is GPUI with `gpui-component`. The **unified view**
 (`unified/`) is the workbench: column one is always the node tree, and
 panels (task, details, obligations, plan, findings, settings, transcript)
-open in columns by one placement rule. The **conversation view**
-(`conversation/`) is where every agent chat runs, with the transcript, the
-change set, and a side pane chosen by the protocol; Ctrl+J opens it on the
-current selection. The **lifecycle panel** and the conversation view share
-one `LifecycleController`, so a gate check started in either shows in both.
+open in columns by one placement rule. Ctrl+J opens the **chat drawer** on
+the current selection. The drawer works with the framework-independent
+`tod_core::conversation::ConversationService` for interactive driver
+ownership and saved and live turns. The app schedules that service for the
+life of the app. The daemon and cloud supervisor host unattended runners.
 `views/` holds the rest: transcripts, locations, log panel, editors.
+
+The dev-only desktop control socket has its own command parser and TCP
+framing under `tod-ui/src/agent_socket`. GPUI handlers provide the window,
+input, screenshots, and accessibility tree. The `tod-agentd` socket carries
+application commands and state changes for the app and CLI.
 
 Conventions that every view follows: styles come from
 `doc/ui-style-guide.yaml` and are implemented once each; dynamic text is
@@ -322,6 +330,14 @@ selectable; list-shaped views converge on one item-list component
 (navigation mode and edit mode); multi-column surfaces move focus with
 Left/Right or Ctrl+Left/Right. Every user-facing lifecycle action records a
 journey event with a snapshot of the buttons that were on screen.
+
+For the next desktop UI, menus, keyboard shortcuts, and command search should
+dispatch the same UI action for a given intent. Give navigation, text editing,
+and dialogs their own focus rules and restore focus to the originating control
+after dismissal. The keyboard acceptance path is finding a task, invoking a
+task action, opening chat, answering a permission prompt, and returning to the
+task. The shell and chat should share typography, spacing, color, and focus
+tokens.
 
 ## Rules that hold everywhere
 

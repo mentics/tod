@@ -95,7 +95,7 @@ pub fn take<A: AgentAccess + ?Sized>(
         agent.with(|a| a.close_session(&ConversationDriver::session_key(id)));
         store.interview(
             ACTOR_USER,
-            InterviewCommand::SetConversationSession { conversation_id: id, agent_session_id: None, session_name: None },
+            InterviewCommand::SetConversationSession { conversation_id: id, agent_session_id: None, session_name: None, launch: None },
         )?;
         store.interview(
             ACTOR_USER,

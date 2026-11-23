@@ -9,6 +9,16 @@ use tod_store::fleet::FleetStore;
 use tod_store::interview::ACTOR_USER;
 use uuid::Uuid;
 
+/// Wake the cloud supervisor after an answer has been recorded. Keeping this
+/// separate from recording lets a surface deliver to an in-process session and
+/// report a wake failure without suggesting the already-saved answer failed.
+pub fn wake_after_decision(fleet: &FleetStore, decision_id: Uuid) -> anyhow::Result<Option<String>> {
+    let decision = fleet
+        .read(|conn| DecisionRepo::new(conn).get(decision_id))?
+        .with_context(|| format!("decision {decision_id} not found after answering"))?;
+    crate::cloud_sync::wake_after_answer(fleet, fleet.paths().root(), &decision.node_id.to_string())
+}
+
 /// "option 2 (\"per invoice\")", "\"do it Tuesday\"", or "option 1" when
 /// there is no free text and the option's own label is empty.
 pub fn describe_answer(decision: &Decision, option: Option<i64>, text: Option<&str>) -> String {

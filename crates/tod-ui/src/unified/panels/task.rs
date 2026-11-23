@@ -1022,6 +1022,10 @@ impl TaskPanel {
         let run = self.run_state(live.as_ref(), cx);
         self.record(format!("{action:?}"), cx);
         let node = self.node_id;
+        if let Err(err) = tod_core::runner_operator::ensure_offered(&self.runner_actions(live.as_ref(), cx), run, action) {
+            self.runners.update(cx, |r, cx| r.fail(node, format!("{err:#}"), cx));
+            return;
+        }
         let supervised = self.runner.supervised;
         match action {
             A::Start if supervised => self.supervised_go(None, cx),
@@ -1038,7 +1042,9 @@ impl TaskPanel {
             A::RunFresh if supervised => self.supervised_go(Some(tod_core::cloud_sync::REQUEST_FRESH_SESSION), cx),
             A::RunFresh => {
                 let root = self.fleet.paths().root().to_path_buf();
-                match tod_core::autopilot::AutopilotState::request_fresh_session(&root, node) {
+                match tod_core::runner_operator::prepare_fresh_run(
+                    &self.fleet, &root, node, false, tod_core::runner_operator::FreshRun::Session,
+                ) {
                     Ok(()) => {
                         let _ = self.runners.update(cx, |r, cx| r.start(node, false, cx));
                     }
@@ -1100,29 +1106,24 @@ impl TaskPanel {
     }
 
     /// Start, or go on with, a supervised node. `None` starts it (making its
-    /// sandbox when it has none); a request goes to its supervisor, except
-    /// that a node with no sandbox now (never made, deleted, or lost) can
-    /// only be started: its new sandbox starts the step in a new session.
+    /// sandbox when it has none); a request resumes its supervisor, restoring
+    /// a missing sandbox when needed.
     fn supervised_go(&mut self, kind: Option<&'static str>, cx: &mut Context<Self>) {
         let node = self.node_id;
-        let has_sandbox = matches!(self.runner.place, Some(Place::Sandbox { exists: true }))
-            && self.runner.cloud.as_ref().is_some_and(|cloud| cloud.lost_at.is_none());
-        match kind {
-            Some(kind) if has_sandbox => self.cloud_request(kind, cx),
-            _ => {
-                self.cloud_started("Starting…", cx);
-                crate::views::cloud_node::run_in_cloud(self.fleet.clone(), node.to_string(), cx, move |this, update, cx| {
-                    this.on_cloud_update(node, update, cx)
-                });
-            }
-        }
+        self.cloud_started("Starting…", cx);
+        crate::views::cloud_node::submit_work(self.fleet.clone(), node.to_string(), kind, cx, move |this, update, cx| {
+            this.on_cloud_update(node, update, cx)
+        });
     }
 
     /// Rerun this phase: a new stay in the node's current state (so it
     /// behaves as if just entered), then the runner starts in a new session.
     fn rerun_phase(&mut self, cx: &mut Context<Self>) {
         let node = self.node_id;
-        if let Err(err) = tod_core::lifecycle::restart_stay(&self.fleet, node) {
+        let root = self.fleet.paths().root().to_path_buf();
+        if let Err(err) = tod_core::runner_operator::prepare_fresh_run(
+            &self.fleet, &root, node, self.runner.supervised, tod_core::runner_operator::FreshRun::Phase,
+        ) {
             self.runners.update(cx, |r, cx| r.fail(node, format!("{err:#}"), cx));
             return;
         }
@@ -1130,13 +1131,7 @@ impl TaskPanel {
             self.supervised_go(Some(tod_core::cloud_sync::REQUEST_FRESH_SESSION), cx);
             return;
         }
-        let root = self.fleet.paths().root().to_path_buf();
-        match tod_core::autopilot::AutopilotState::request_rerun_phase(&root, node) {
-            Ok(()) => {
-                let _ = self.runners.update(cx, |r, cx| r.start(node, false, cx));
-            }
-            Err(err) => self.runners.update(cx, |r, cx| r.fail(node, format!("{err:#}"), cx)),
-        }
+        let _ = self.runners.update(cx, |r, cx| r.start(node, false, cx));
     }
 
     /// Pause: the local runner stops once its turn ends; a supervised one is
@@ -1177,7 +1172,15 @@ impl TaskPanel {
     fn choose_migration(&mut self, place: tod_store::fleet::FilesPlace, cx: &mut Context<Self>) {
         self.record(format!("MigrateTo({})", place.name), cx);
         let (_, live) = self.runner_status(cx);
-        match self.run_state(live.as_ref(), cx) {
+        let run = self.run_state(live.as_ref(), cx);
+        if let Err(err) = tod_core::runner_operator::ensure_offered(
+            &self.runner_actions(live.as_ref(), cx), run, RunnerAction::MigrateTo,
+        ) {
+            let node = self.node_id;
+            self.runners.update(cx, |r, cx| r.fail(node, format!("{err:#}"), cx));
+            return;
+        }
+        match run {
             RunState::Active { .. } => self.runner.prompt = Some(Prompt::MigrateRunning { place, can_pause: true }),
             RunState::HandTurn => self.runner.prompt = Some(Prompt::MigrateRunning { place, can_pause: false }),
             _ => self.runner.migration_wait = Some(place),
@@ -1503,17 +1506,6 @@ impl TaskPanel {
                 popup
             });
         recorded(chip, recorded_current).into_any_element()
-    }
-
-    /// Records the user's request of `kind` (a new session, or going on) for
-    /// the node's supervisor, answering a "leave it stopped" stop question to
-    /// continue first, and wakes it, off the UI thread.
-    fn cloud_request(&mut self, kind: &'static str, cx: &mut Context<Self>) {
-        let node = self.node_id;
-        self.cloud_started("Asking the supervisor…", cx);
-        crate::views::cloud_node::request(self.fleet.clone(), node.to_string(), kind, cx, move |this, update, cx| {
-            this.on_cloud_update(node, update, cx)
-        });
     }
 
     /// A job of the panel's own begins: the button shows `what` until it ends.
@@ -2899,6 +2891,7 @@ mod request_tests {
                     conversation_id,
                     agent_session_id: Some("session-1".into()),
                     session_name: None,
+                    launch: None,
                 },
             )
             .unwrap();

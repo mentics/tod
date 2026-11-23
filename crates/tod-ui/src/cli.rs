@@ -103,7 +103,6 @@ impl LaunchOptions {
                     );
                 }
                 #[cfg(feature = "agent-socket")]
-                #[cfg(feature = "agent-socket")]
                 "--driven-idle-ms" => {
                     i += 1;
                     let v = rest.get(i).ok_or_else(|| {
@@ -117,6 +116,7 @@ impl LaunchOptions {
                             anyhow::anyhow!("invalid --driven-idle-ms `{v}` (must be a positive number)")
                         })?;
                 }
+                #[cfg(feature = "agent-socket")]
                 "--agent-socket-port" => {
                     i += 1;
                     let v = rest.get(i).ok_or_else(|| {
@@ -136,14 +136,7 @@ impl LaunchOptions {
                     agent_socket_port = Some(port);
                 }
                 #[cfg(not(feature = "agent-socket"))]
-                "--agent-socket" => {
-                    anyhow::bail!(
-                        "this build was compiled without the agent-socket feature; \
-                         rebuild with --features agent-socket for UI automation"
-                    );
-                }
-                #[cfg(not(feature = "agent-socket"))]
-                "--agent-socket-port" => {
+                "--agent-socket" | "--agent-socket-port" => {
                     anyhow::bail!(
                         "this build was compiled without the agent-socket feature; \
                          rebuild with --features agent-socket for UI automation"
@@ -280,7 +273,6 @@ mod tests {
 
     #[cfg(feature = "agent-socket")]
     #[test]
-    #[cfg(feature = "agent-socket")]
     fn parses_driven_idle_ms() {
         let opts = LaunchOptions::from_args(["tod".to_string()]).unwrap();
         assert_eq!(opts.driven_idle_ms, 5_000);
@@ -293,6 +285,7 @@ mod tests {
         assert!(LaunchOptions::from_args(["tod", "--driven-idle-ms"].map(String::from)).is_err());
     }
 
+    #[cfg(feature = "agent-socket")]
     #[test]
     fn parses_agent_socket_port_flag() {
         let opts =
@@ -319,13 +312,10 @@ mod tests {
     #[cfg(not(feature = "agent-socket"))]
     #[test]
     fn rejects_agent_socket_without_feature() {
-        let err = LaunchOptions::from_args([
-            "tod".into(),
-            "--agent-socket".into(),
-            "127.0.0.1:9876".into(),
-        ])
-        .unwrap_err();
-        assert!(err.to_string().contains("agent-socket"));
+        for (flag, value) in [("--agent-socket", "127.0.0.1:9876"), ("--agent-socket-port", "9876")] {
+            let err = LaunchOptions::from_args(["tod", flag, value].map(String::from)).unwrap_err();
+            assert!(err.to_string().contains("without the agent-socket feature"));
+        }
     }
 
     #[test]
