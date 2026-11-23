@@ -773,6 +773,7 @@ impl Autopilot {
         // Called again after it stopped: the user has presumably dealt with
         // what it stopped for.
         self.state.outcome = None;
+        self.state.quota_after_push = None;
         // The user's explicit requests on the node (`tod_store::node_requests`)
         // are consumed as the run starts: the first boundary of a local runner.
         // One for a new session starts in one, as the saved flag does.

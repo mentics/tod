@@ -52,6 +52,10 @@ pub struct AutopilotState {
     pub steps: Vec<StepRecord>,
     /// How the last run stopped; `None` while one runs.
     pub outcome: Option<Outcome>,
+    /// The quota wait to restore after a local branch retry takes over the
+    /// next wake. The branch and the agent can be ready at different times.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_after_push: Option<Outcome>,
     /// Retries already scheduled for each renewable ACP usage window.
     /// Retained across wakes, cleared when a turn succeeds.
     #[serde(default)]
@@ -324,6 +328,7 @@ impl AutopilotState {
             current: None,
             steps: Vec::new(),
             outcome: None,
+            quota_after_push: None,
             acp_quota_retries: AcpQuotaRetries::default(),
             fresh_session: false,
             loops: LoopCounters::default(),
@@ -364,6 +369,7 @@ impl AutopilotState {
         state.loops.clear();
         state.loops.review_floor_ms = now_ms();
         state.outcome = None;
+        state.quota_after_push = None;
         state.acp_quota_retries = AcpQuotaRetries::default();
         state.save(data_root, node)
     }
