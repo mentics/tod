@@ -3,76 +3,75 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs, io,
     path::Path,
+    sync::Arc,
 };
 
 const COLLECTION_SPEC: &str = include_str!("../../../../doc/redesign/collection-panel.md");
 const PRODUCT_SPEC: &str = include_str!("../../../../doc/redesign/product-definitions.md");
 const COMPONENT: &str = "collection-panel";
-const DESIGN: &[&str] = &["Design"];
-const SPECIFICATION: &[&str] = &["Design", "Specification"];
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Item {
-    pub id: &'static str,
-    pub name: &'static str,
+    pub id: Arc<str>,
+    pub name: Arc<str>,
     pub kind: &'static str,
     pub status: &'static str,
-    pub phase: &'static str,
-    pub tags: &'static [&'static str],
+    pub phase: Arc<str>,
+    pub tags: Arc<[String]>,
     pub cost: Option<u32>,
-    pub parent: Option<&'static str>,
-    pub spec: Option<&'static str>,
+    pub parent: Option<Arc<str>>,
+    pub detail: Option<Arc<str>>,
 }
 
 pub fn items() -> Vec<Item> {
+    let design: Arc<[String]> = Arc::from(["Design".into()]);
     let task = Item {
-        id: "verify-keyboard",
-        name: "Verify native keyboard navigation",
+        id: "verify-keyboard".into(),
+        name: "Verify native keyboard navigation".into(),
         kind: "Task",
         status: "Active",
-        phase: "Build",
-        tags: DESIGN,
+        phase: "Build".into(),
+        tags: design.clone(),
         cost: Some(19),
-        parent: Some(COMPONENT),
-        spec: None,
+        parent: Some(COMPONENT.into()),
+        detail: None,
     };
     let mut items = vec![
         Item {
-            id: COMPONENT,
-            name: "Collection panel",
+            id: COMPONENT.into(),
+            name: "Collection panel".into(),
             kind: "Product component",
             status: "Draft",
-            phase: "",
-            tags: DESIGN,
+            phase: "".into(),
+            tags: design,
             cost: None,
             parent: None,
-            spec: None,
+            detail: None,
         },
-        task,
+        task.clone(),
         Item {
-            id: "check-focus",
-            name: "Check focus after cancelling a chip edit",
+            id: "check-focus".into(),
+            name: "Check focus after cancelling a chip edit".into(),
             status: "Blocked",
-            phase: "Review",
+            phase: "Review".into(),
             cost: Some(28),
-            parent: Some("verify-keyboard"),
-            ..task
+            parent: Some("verify-keyboard".into()),
+            ..task.clone()
         },
         Item {
-            id: "test-pages",
-            name: "Test paging through a collection",
+            id: "test-pages".into(),
+            name: "Test paging through a collection".into(),
             cost: Some(11),
-            ..task
+            ..task.clone()
         },
         Item {
-            id: "compare-arrangements",
-            name: "Compare grouped and nested collections",
+            id: "compare-arrangements".into(),
+            name: "Compare grouped and nested collections".into(),
             cost: Some(8),
             ..task
         },
     ];
     items.extend(requirements(COLLECTION_SPEC, Some(COMPONENT)));
-    items.extend(requirements(PRODUCT_SPEC, None).filter(|item| item.id == "REQ-SPEC-01"));
+    items.extend(requirements(PRODUCT_SPEC, None).filter(|item| item.id.as_ref() == "REQ-SPEC-01"));
     items
 }
 
@@ -84,15 +83,15 @@ fn requirements(source: &'static str, parent: Option<&'static str>) -> impl Iter
             return None;
         }
         Some(Item {
-            id,
-            name,
+            id: id.into(),
+            name: name.into(),
             kind: "Requirement",
             status: "Draft",
-            phase: "",
-            tags: SPECIFICATION,
+            phase: "".into(),
+            tags: Arc::from(["Design".into(), "Specification".into()]),
             cost: None,
-            parent,
-            spec: Some(body.trim()),
+            parent: parent.map(Into::into),
+            detail: Some(body.trim().into()),
         })
     })
 }
@@ -167,11 +166,11 @@ impl Column {
         }
     }
 
-    pub fn value(self, item: Item) -> String {
+    pub fn value(self, item: &Item) -> String {
         match self {
             Self::Kind => item.kind.into(),
             Self::Status => item.status.into(),
-            Self::Phase => item.phase.into(),
+            Self::Phase => item.phase.to_string(),
             Self::Cost => item
                 .cost
                 .map_or_else(String::new, |cost| format!("${cost}")),
@@ -528,7 +527,13 @@ pub(crate) fn save_json(path: &Path, value: &impl Serialize) -> io::Result<()> {
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum RowKey {
     Group(String),
-    Item(&'static str),
+    Item(Arc<str>),
+}
+
+impl RowKey {
+    pub fn item(id: impl Into<Arc<str>>) -> Self {
+        Self::Item(id.into())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -567,20 +572,20 @@ pub fn rows(items: &[Item], config: &Config, collapsed: &BTreeSet<RowKey>) -> Ve
         })
         .unwrap_or((SortField::Name, false));
     let nest = config.chips.contains(&Chip::Nest);
-    let mut buckets = BTreeMap::<&str, Vec<Item>>::new();
+    let mut buckets = BTreeMap::<&str, Vec<&Item>>::new();
     for item in items.iter().filter(matches) {
         let group = match group_field {
             Some(GroupField::Kind) => item.kind,
             Some(GroupField::Status) => item.status,
             None => "",
         };
-        buckets.entry(group).or_default().push(*item);
+        buckets.entry(group).or_default().push(item);
     }
 
     let mut output = Vec::new();
     for (group, mut members) in buckets {
         members.sort_by(|a, b| {
-            let by_name = a.name.cmp(b.name);
+            let by_name = a.name.cmp(&b.name);
             let order = match sort_field {
                 SortField::Name => by_name,
                 SortField::Cost => match (a.cost, b.cost) {
@@ -609,7 +614,12 @@ pub fn rows(items: &[Item], config: &Config, collapsed: &BTreeSet<RowKey>) -> Ve
         let mut visited = BTreeSet::new();
         for item in members
             .iter()
-            .filter(|item| !nest || !members.iter().any(|parent| item.parent == Some(parent.id)))
+            .filter(|item| {
+                !nest
+                    || !members
+                        .iter()
+                        .any(|parent| item.parent.as_ref() == Some(&parent.id))
+            })
             .chain(&members)
         {
             append_row(
@@ -627,28 +637,28 @@ pub fn rows(items: &[Item], config: &Config, collapsed: &BTreeSet<RowKey>) -> Ve
 }
 
 fn append_row(
-    item: Item,
-    members: &[Item],
+    item: &Item,
+    members: &[&Item],
     depth: usize,
     visible: bool,
     collapsed: &BTreeSet<RowKey>,
-    visited: &mut BTreeSet<&'static str>,
+    visited: &mut BTreeSet<Arc<str>>,
     output: &mut Vec<Row>,
 ) {
-    if !visited.insert(item.id) {
+    if !visited.insert(item.id.clone()) {
         return;
     }
-    let key = RowKey::Item(item.id);
+    let key = RowKey::item(item.id.clone());
     let descendants: Vec<_> = members
         .iter()
-        .filter(|child| child.parent == Some(item.id))
+        .filter(|child| child.parent.as_ref() == Some(&item.id))
         .collect();
     let expanded = visible && !collapsed.contains(&key);
     if visible {
         output.push(Row {
             key,
-            name: item.name.to_owned(),
-            item: Some(item),
+            name: item.name.to_string(),
+            item: Some(item.clone()),
             depth,
             expandable: !descendants.is_empty(),
         });
@@ -664,6 +674,20 @@ fn append_row(
             output,
         );
     }
+}
+
+pub(super) fn visible_outline(rows: &[Row], collapsed: &BTreeSet<RowKey>) -> Vec<Row> {
+    let mut hidden_below = None;
+    rows.iter()
+        .filter(|row| {
+            if hidden_below.is_some_and(|depth| row.depth > depth) {
+                return false;
+            }
+            hidden_below = collapsed.contains(&row.key).then_some(row.depth);
+            true
+        })
+        .cloned()
+        .collect()
 }
 
 #[cfg(test)]
@@ -696,7 +720,7 @@ mod tests {
         assert!(
             items
                 .iter()
-                .any(|item| item.id == "REQ-SPEC-01" && item.spec.is_some())
+                .any(|item| item.id.as_ref() == "REQ-SPEC-01" && item.detail.is_some())
         );
         let config = Config {
             name: "Nested".into(),
@@ -706,13 +730,13 @@ mod tests {
         assert!(
             expanded
                 .iter()
-                .any(|row| row.key == RowKey::Item("REQ-COLLECTION-01") && row.depth == 1)
+                .any(|row| row.key == RowKey::item("REQ-COLLECTION-01") && row.depth == 1)
         );
-        let collapsed = rows(&items, &config, &BTreeSet::from([RowKey::Item(COMPONENT)]));
+        let collapsed = rows(&items, &config, &BTreeSet::from([RowKey::item(COMPONENT)]));
         assert!(
             !collapsed
                 .iter()
-                .any(|row| row.key == RowKey::Item("REQ-COLLECTION-01"))
+                .any(|row| row.key == RowKey::item("REQ-COLLECTION-01"))
         );
     }
 }

@@ -438,7 +438,7 @@ fn values(field: Field, items: &[Item]) -> Vec<&str> {
     match field {
         Field::Tag => items
             .iter()
-            .flat_map(|item| item.tags.iter().copied())
+            .flat_map(|item| item.tags.iter().map(String::as_str))
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect(),
@@ -447,7 +447,7 @@ fn values(field: Field, items: &[Item]) -> Vec<&str> {
             .map(|item| match field {
                 Field::Kind => item.kind,
                 Field::Status => item.status,
-                _ => item.phase,
+                _ => item.phase.as_ref(),
             })
             .filter(|value| !value.is_empty())
             .collect::<BTreeSet<_>>()

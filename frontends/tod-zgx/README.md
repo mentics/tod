@@ -47,13 +47,19 @@ specification history.
 cargo run --release --locked --manifest-path frontends/tod-zgx/Cargo.toml --features live -- --data-root /path/to/tod/data
 ```
 
-The live adapter takes a startup snapshot of saved nodes and outlines through
-TOD's existing store APIs. Enter opens the item in the ZGX list or detail
-pane. Live **Pause runner** and **Resume runner** call TOD's runner operator
-off the UI thread and use the daemon for local runners. Named dynamic
-collections, pinning, and multi-task chat are exercised in the demo.
-The live adapter uses the existing outline model and currently has no chat
-host or collection editor.
+The palette's live catalog comes from TOD's existing store. Search for a saved
+outline and press **Enter** to open it in the collection pane. The pane loads
+the tree when you open the outline and shows its saved hierarchy, sibling
+order, and initial collapsed branches. Use the arrow keys to browse and
+expand or collapse branches, and **Enter** to inspect a row. The pane shows
+item type, lifecycle phase, and tags from the store. Browse state stays in
+the pane during the session. Reopen the outline from the palette to load
+the current saved tree.
+
+Live **Pause runner** and **Resume runner** call TOD's runner operator off
+the UI thread and use the daemon for local runners. The live outline pane
+is read-only for outline data. The demo exercises editable collection
+configs, pinning, and multi-task chat.
 
 ## Boundaries
 

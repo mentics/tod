@@ -10,7 +10,7 @@ use std::{
     rc::Rc,
     time::Duration,
 };
-use tod_palette::{Effect, Palette, ResultRow};
+use tod_palette::{Context, Effect, Palette, ResultRow};
 use workspace::Workspace;
 use zgx::{
     compose::{NodeHandle, ViewHandle, prelude::*},
@@ -39,6 +39,8 @@ enum Surface {
 struct App {
     workspace: Signal<Workspace>,
     collections: Option<collection::Panels>,
+    #[cfg(feature = "live")]
+    outline: Option<collection::OutlinePanel>,
     surface: Signal<Surface>,
     palette: Signal<Option<Palette>>,
     open: Signal<bool>,
@@ -63,10 +65,25 @@ impl App {
             .collections
             .as_ref()
             .map_or_else(Vec::new, |panels| panels.search_items().collect());
-        let collection = (self.surface.get() == Surface::Collections).then_some(collection::ID);
-        self.palette.set(Some(self.workspace.with(|workspace| {
-            workspace.palette(invoked, actions, extra, collection)
-        })));
+        let context = if self.surface.get() == Surface::Collections {
+            self.collections.as_ref().map(|_| Context {
+                focused: Some(collection::ID.into()),
+                ..Default::default()
+            })
+        } else {
+            None
+        };
+        #[cfg(feature = "live")]
+        let context = context.or_else(|| {
+            if self.surface.get() != Surface::Collections {
+                return None;
+            }
+            self.outline.as_ref()?.palette_context()
+        });
+        self.palette
+            .set(Some(self.workspace.with(|workspace| {
+                workspace.palette(invoked, actions, extra, context)
+            })));
         self.open.set(true);
     }
 
@@ -92,6 +109,58 @@ impl App {
             self.surface.set(Surface::Collections);
             panels.focus();
         }
+        #[cfg(feature = "live")]
+        if let Some(outline) = &self.outline {
+            if outline.ready() {
+                self.surface.set(Surface::Collections);
+                outline.focus();
+            } else if self.surface.get() != Surface::Collections {
+                let id = self
+                    .workspace
+                    .with(|workspace| workspace.collection.clone());
+                self.open_saved_outline(&id);
+            }
+        }
+    }
+
+    #[cfg(feature = "live")]
+    fn open_saved_outline(&self, id: &str) -> bool {
+        let (Some(outline), Some(backend)) = (&self.outline, &self.backend) else {
+            return false;
+        };
+        let title = self.workspace.with(|workspace| {
+            workspace
+                .record(id)
+                .filter(|record| record.item.kind == tod_palette::Kind::Collection)
+                .map(|record| record.item.title.clone())
+        });
+        let Some(title) = title else {
+            return false;
+        };
+        let mut workspace = self.workspace.get();
+        if let Err(error) = workspace.apply(Effect::Open(id.into())) {
+            self.error.set(error);
+            return true;
+        }
+        self.workspace.set(workspace);
+        self.open.set(false);
+        let request = outline.begin(title);
+        self.surface.set(Surface::Collections);
+        let task = backend.load_outline(id.into());
+        let app = self.clone();
+        let outline = outline.clone();
+        self.tasks.spawn(async move {
+            let result = task
+                .await
+                .unwrap_or_else(|error| Err(format!("Outline worker failed. {error}")));
+            if outline.finish(request, result)
+                && app.surface.get() == Surface::Collections
+                && !app.open.get()
+            {
+                outline.focus();
+            }
+        });
+        true
     }
 
     fn show_workspace(&self) {
@@ -166,6 +235,12 @@ impl App {
                 }
                 _ => {}
             }
+        }
+        #[cfg(feature = "live")]
+        if let Effect::Open(id) = &effect
+            && self.open_saved_outline(id)
+        {
+            return;
         }
         #[cfg(feature = "live")]
         if let Some((command, task)) = self
@@ -316,6 +391,10 @@ impl App {
     }
 
     fn open_item(&self, id: String) {
+        #[cfg(feature = "live")]
+        if self.open_saved_outline(&id) {
+            return;
+        }
         let mut workspace = self.workspace.get();
         if let Err(error) = workspace.apply(Effect::Open(id)) {
             workspace.message = error;
@@ -640,7 +719,6 @@ fn workspace_view(app: &App) -> View {
     let chips = app.workspace.clone();
     let chip_app = app.clone();
     let detail = app.workspace.clone();
-    let message = app.workspace.clone();
     column().id("task-workspace").w_full().h_full().gap(14.)
         .child(switch(move || chips.get(), move |workspace, _| {
             row().gap(6.).children(workspace.collections().map(|record| {
@@ -666,7 +744,6 @@ fn workspace_view(app: &App) -> View {
                     .child(text(title).text_size(20.).text_wrap(true))
                     .child(text(body).text_wrap(true).text_color(rgb(MUTED)))
             })))
-        .child(text_signal(move || message.with(|workspace| workspace.message.clone())).text_color(rgb(MUTED)))
 }
 
 fn surface_style(active: &Signal<Surface>, surface: Surface) -> Styles {
@@ -717,9 +794,14 @@ fn mount(
     collection_data: Option<&collection::Data>,
     #[cfg(feature = "live")] backend: Option<live::Backend>,
 ) -> (App, ViewHandle) {
+    #[cfg(feature = "live")]
+    let outline = (backend.is_some() && workspace.collections().next().is_some())
+        .then(|| collection::OutlinePanel::new(cx));
     let app = App {
         workspace: cx.ui.signal(workspace),
         collections: collection_data.map(|data| collection::Panels::new(cx, data)),
+        #[cfg(feature = "live")]
+        outline,
         surface: cx.ui.signal(Surface::Workspace),
         palette: cx.ui.signal(None),
         open: cx.ui.signal(false),
@@ -737,6 +819,7 @@ fn mount(
     let shortcut = app.clone();
     let search = app.clone();
     let context = app.clone();
+    let message = app.workspace.clone();
     let tasks_screen = app.surface.clone();
     let mut screens = overlay().grow().min_h(0.).child(
         workspace_view(&app)
@@ -746,11 +829,19 @@ fn mount(
         .items_center()
         .gap(10.)
         .child(text("tod").text_size(23.));
-    if let Some(panels) = &app.collections {
+    #[cfg(feature = "live")]
+    let live_screen = app.outline.as_ref().map(|outline| outline.view(cx));
+    #[cfg(not(feature = "live"))]
+    let live_screen: Option<View> = None;
+    let collection_screen = app
+        .collections
+        .as_ref()
+        .map(|panels| panels.view(cx))
+        .or(live_screen);
+    if let Some(collection_screen) = collection_screen {
         let collections_screen = app.surface.clone();
         screens = screens.child(
-            panels
-                .view(cx)
+            collection_screen
                 .reactive_style(move || surface_style(&collections_screen, Surface::Collections)),
         );
         header = header.child(surface_tabs(&app));
@@ -798,6 +889,13 @@ fn mount(
                     ),
             )
             .child(screens)
+            .child(switch_or_none(
+                move || message.with(|workspace| workspace.message.clone()),
+                |message, _| {
+                    (!message.is_empty())
+                        .then(|| text(message).text_wrap(true).text_color(rgb(MUTED)))
+                },
+            ))
             .child(palette_view(&app)),
     );
     (app, view)

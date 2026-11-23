@@ -8,11 +8,14 @@ use std::{
 use tod_core::runner_operator::{self, Options, Session, Verb, Who};
 use tod_palette::{Effect, Item, Kind};
 use tod_store::outline::{
-    repos::{ListRepo, NodeRepo, OutlineRepo},
+    repos::{ListRepo, NodeRepo, OutlineRepo, TreeLoader},
     types::Capability,
 };
 
-use crate::workspace::{Record, Workspace};
+use crate::{
+    collection::OutlineData,
+    workspace::{Record, Workspace},
+};
 
 #[derive(Clone)]
 pub struct Backend {
@@ -71,6 +74,31 @@ impl Backend {
         });
         Some((command, task))
     }
+
+    pub fn load_outline(&self, id: String) -> tokio::task::JoinHandle<Result<OutlineData, String>> {
+        let root = self.root.clone();
+        self.runtime.spawn_blocking(move || {
+            let load = || -> Result<OutlineData, Box<dyn std::error::Error>> {
+                let id = id.parse()?;
+                let fleet = tod_core::direct_store::open(&root, false)?;
+                let outline = fleet.read(|conn| {
+                    let Some(list) = ListRepo::new(conn).get(id)? else {
+                        return Ok(None);
+                    };
+                    let mut outline = OutlineData::new(list.title);
+                    for row in TreeLoader::new(conn).flatten_all(id)? {
+                        let task = row.capabilities.contains(&Capability::Lifecycle)
+                            && tod_store::fleet::node_actions::is_task_node(conn, row.node.id)?;
+                        let kind = row_kind(task, row.capabilities.contains(&Capability::Spec));
+                        outline.push(row, kind);
+                    }
+                    Ok(Some(outline))
+                })?;
+                outline.ok_or_else(|| "This saved outline is no longer in the workspace.".into())
+            };
+            load().map_err(|error| format!("Could not open saved outline. {error}"))
+        })
+    }
 }
 
 fn run_runner(root: &Path, node: &str, verb: Verb) -> Result<String, Box<dyn std::error::Error>> {
@@ -116,16 +144,14 @@ fn load_records(
             });
         }
         for node in nodes.list_all()? {
-            let kind = if tod_store::fleet::node_actions::is_task_node(conn, node.id)? {
-                Kind::Task
-            } else if nodes
-                .list_capabilities(node.id)?
-                .contains(&Capability::Spec)
-            {
-                Kind::ProductDefinition
-            } else {
-                Kind::Node
-            };
+            let task = tod_store::fleet::node_actions::is_task_node(conn, node.id)?;
+            let kind = row_kind(
+                task,
+                !task
+                    && nodes
+                        .list_capabilities(node.id)?
+                        .contains(&Capability::Spec),
+            );
             let (outline, scope) = locations.remove(&node.id).unzip();
             records.push(Record {
                 item: Item {
@@ -142,4 +168,14 @@ fn load_records(
         Ok(records)
     })?;
     Ok(records)
+}
+
+fn row_kind(task: bool, specification: bool) -> Kind {
+    if task {
+        Kind::Task
+    } else if specification {
+        Kind::ProductDefinition
+    } else {
+        Kind::Node
+    }
 }

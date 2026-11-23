@@ -4,6 +4,7 @@ use std::{
     fs::{self, OpenOptions},
     io,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 use zgx::{compose::prelude::*, reactive::Signal, semantics::Live, widgets::Ui};
 
@@ -51,11 +52,11 @@ impl Specification {
 pub struct SpecStore {
     value: Signal<Specification>,
     path: PathBuf,
-    initial_body: &'static str,
+    initial_body: Arc<str>,
 }
 
 impl SpecStore {
-    pub fn new(ui: &Ui, spec: Specification, path: PathBuf, initial_body: &'static str) -> Self {
+    pub fn new(ui: &Ui, spec: Specification, path: PathBuf, initial_body: Arc<str>) -> Self {
         Self {
             value: ui.signal(spec),
             path,
@@ -85,7 +86,7 @@ impl SpecStore {
             .truncate(false)
             .open(self.path.with_extension("lock"))?;
         lock.try_lock().map_err(io::Error::other)?;
-        let mut latest = Specification::load(&self.path, self.initial_body)?;
+        let mut latest = Specification::load(&self.path, &self.initial_body)?;
         if latest.revisions.len() != base {
             return Ok((latest, false));
         }
@@ -110,7 +111,7 @@ pub fn inspect(
     item: model::Item,
     store: SpecStore,
     open_work: impl Fn(&str) + Clone + 'static,
-    implementation_label: &'static str,
+    implementation_label: Arc<str>,
 ) -> View {
     component(move |cx| {
         let mode = cx.state(Mode::Current);
@@ -158,7 +159,7 @@ pub fn inspect(
                                 offset,
                                 revision,
                                 open_work,
-                                implementation_label,
+                                implementation_label.to_string(),
                             )
                         }
                     }
@@ -271,7 +272,7 @@ fn document(
     offset: Signal<f32>,
     revision: Option<usize>,
     open_work: impl Fn(&str) + 'static,
-    implementation_label: &'static str,
+    implementation_label: String,
 ) -> View {
     let history = mode.clone();
     let revision_number = store.value.clone();

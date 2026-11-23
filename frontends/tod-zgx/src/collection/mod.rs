@@ -1,9 +1,13 @@
 mod completion;
 mod model;
+#[cfg(feature = "live")]
+mod outline;
 mod specification;
 
 use completion::{Choice, Completion, Draft, Edit, Stage};
 use model::{Chip, Column, Config, Item, Row, RowKey};
+#[cfg(feature = "live")]
+pub(super) use outline::{OutlineData, OutlinePanel};
 use specification::{SpecStore, Specification};
 use std::{
     cell::{Cell, RefCell},
@@ -11,6 +15,7 @@ use std::{
     io,
     path::PathBuf,
     rc::Rc,
+    sync::Arc,
 };
 use zgx::{
     compose::{NodeHandle, ViewHandle, prelude::*},
@@ -39,6 +44,22 @@ struct Panel {
     collapsed: BTreeSet<RowKey>,
     inspected: Option<Item>,
     error: String,
+}
+
+impl Panel {
+    fn new(cursor: Option<RowKey>) -> Self {
+        Self {
+            cursor,
+            open: false,
+            chip: 0,
+            edit: None,
+            range: None,
+            marked: BTreeSet::new(),
+            collapsed: BTreeSet::new(),
+            inspected: None,
+            error: String::new(),
+        }
+    }
 }
 
 #[derive(Clone, PartialEq)]
@@ -73,8 +94,8 @@ const CONFIG_CHANGED: &str =
 
 struct SavedCollection {
     config: Signal<Config>,
-    path: PathBuf,
-    panels: [Signal<Panel>; 2],
+    path: Option<PathBuf>,
+    panels: Vec<Signal<Panel>>,
     runtime: Runtime,
 }
 
@@ -97,15 +118,34 @@ struct Collection {
     list_focused: Signal<bool>,
     focus: Rc<RefCell<Focus>>,
     items: Rc<[Item]>,
-    specs: SpecStore,
+    specs: Option<SpecStore>,
+    outline: Option<Signal<Arc<[Row]>>>,
 }
 
 impl Collection {
     fn rows(&self) -> Vec<Row> {
+        if let Some(outline) = &self.outline {
+            return outline.with(|rows| {
+                self.panel
+                    .with(|panel| model::visible_outline(rows, &panel.collapsed))
+            });
+        }
         self.saved.config.with(|config| {
             self.panel
                 .with(|panel| model::rows(&self.items, config, &panel.collapsed))
         })
+    }
+
+    fn total(&self) -> usize {
+        match &self.outline {
+            Some(outline) => outline.with(|rows| rows.len()),
+            None => self.saved.config.with(|config| {
+                model::rows(&self.items, config, &BTreeSet::new())
+                    .iter()
+                    .filter(|row| row.item.is_some())
+                    .count()
+            }),
+        }
     }
 
     fn focus(&self, target: impl FnOnce(&Focus) -> Option<&NodeHandle>) {
@@ -179,7 +219,10 @@ impl Collection {
     }
 
     fn save(&self, config: Config, chip: usize) -> bool {
-        if let Err(error) = config.save(&self.saved.path) {
+        let Some(path) = &self.saved.path else {
+            return false;
+        };
+        if let Err(error) = config.save(path) {
             self.panel
                 .update(|panel| panel.error = format!("Could not save config. {error}"));
             return false;
@@ -314,11 +357,11 @@ impl Collection {
     }
 
     fn activate(&self, row: &Row) {
-        if let Some(item) = row.item {
+        if let Some(item) = &row.item {
             self.panel.update(|panel| {
                 panel.cursor = Some(row.key.clone());
                 panel.range = None;
-                panel.inspected = Some(item);
+                panel.inspected = Some(item.clone());
             });
         } else {
             self.toggle_branch(row);
@@ -327,6 +370,9 @@ impl Collection {
 
     fn list_key(&self, key: &Key, shift: bool) -> bool {
         if matches!(key, Key::Character(value) if value == "/") {
+            if self.saved.path.is_none() {
+                return false;
+            }
             if !self.panel.with(|panel| panel.open) {
                 self.toggle_config();
             }
@@ -995,6 +1041,7 @@ fn list_row(collection: &Collection, item: Row, columns: &[Column]) -> View {
             column_cell(
                 column,
                 item.item
+                    .as_ref()
                     .map_or_else(String::new, |item| column.value(item)),
             )
         }))
@@ -1086,6 +1133,42 @@ fn panel_view(
     let detail_scroll = cx.ui.signal(0.);
     let cursor = collection.panel.clone();
     let display = collection.saved.config.clone();
+    let editable = collection.saved.path.is_some();
+    let heading = if editable {
+        row()
+            .gap(8.)
+            .child(
+                button()
+                    .id(slot.id("config-name"))
+                    .h(32.)
+                    .px(9.)
+                    .rounded(5.)
+                    .bg(rgb(CONTROL))
+                    .accessible_description(format!(
+                        "Configure {} collection panel",
+                        slot.label().to_lowercase()
+                    ))
+                    .child(text_signal(move || {
+                        headers.with(|panel| {
+                            config.with(|config| {
+                                format!("{}  {}", config.name, if panel.open { "⌃" } else { "⌄" })
+                            })
+                        })
+                    }))
+                    .on_mount(move |node| {
+                        header_focus.borrow_mut().header = Some(node);
+                    })
+                    .on_click(move || toggle.toggle_config()),
+            )
+            .child(div().grow())
+            .child(text(slot.label()).text_size(12.).text_color(rgb(MUTED)))
+    } else {
+        text_signal(move || config.with(|config| config.name.clone()))
+            .id("saved-outline-name")
+            .font_bold()
+            .text_size(18.)
+            .h(32.)
+    };
     column()
         .grow()
         .flex_basis(0.)
@@ -1102,39 +1185,7 @@ fn panel_view(
                 active.set(Some(slot));
             }
         })
-        .child(
-            row()
-                .gap(8.)
-                .child(
-                    button()
-                        .id(slot.id("config-name"))
-                        .h(32.)
-                        .px(9.)
-                        .rounded(5.)
-                        .bg(rgb(CONTROL))
-                        .accessible_description(format!(
-                            "Configure {} collection panel",
-                            slot.label().to_lowercase()
-                        ))
-                        .child(text_signal(move || {
-                            headers.with(|panel| {
-                                config.with(|config| {
-                                    format!(
-                                        "{}  {}",
-                                        config.name,
-                                        if panel.open { "⌃" } else { "⌄" }
-                                    )
-                                })
-                            })
-                        }))
-                        .on_mount(move |node| {
-                            header_focus.borrow_mut().header = Some(node);
-                        })
-                        .on_click(move || toggle.toggle_config()),
-                )
-                .child(div().grow())
-                .child(text(slot.label()).text_size(12.).text_color(rgb(MUTED))),
-        )
+        .child(heading)
         .child(switch_or_none(
             move || show_config.with(|panel| panel.open),
             move |open, _| open.then(|| config_view(config_builder.clone())),
@@ -1142,12 +1193,7 @@ fn panel_view(
         .child(
             text_signal(move || {
                 count.panel.with(|panel| {
-                    let total = count.saved.config.with(|config| {
-                        model::rows(&count.items, config, &BTreeSet::new())
-                            .iter()
-                            .filter(|row| row.item.is_some())
-                            .count()
-                    });
+                    let total = count.total();
                     format!("{total} items  ·  {} marked", panel.marked.len())
                 })
             })
@@ -1202,7 +1248,12 @@ fn panel_view(
                     },
                     move |(rows, columns), _| {
                         if rows.is_empty() {
-                            return text("No matches").p(12.);
+                            return text(if editable {
+                                "No matches"
+                            } else {
+                                "This outline has no items."
+                            })
+                            .p(12.);
                         }
                         column().w_full().children(
                             rows.into_iter()
@@ -1212,26 +1263,31 @@ fn panel_view(
                 )),
         )
         .child(switch_or_none(
-            move || details.with(|panel| panel.inspected),
+            move || details.with(|panel| panel.inspected.clone()),
             move |item, _| {
                 let item = item?;
-                if item.id == specification::REQUIREMENT {
+                if item.id.as_ref() == specification::REQUIREMENT
+                    && let Some(specs) = &requirement.specs
+                {
                     let open_task = requirement.clone();
                     let implementation_label = requirement
                         .items
                         .iter()
-                        .find(|work| work.id == specification::IMPLEMENTATION)
+                        .find(|work| work.id.as_ref() == specification::IMPLEMENTATION)
                         .expect("implementation work fixture")
-                        .name;
+                        .name
+                        .clone();
                     return Some(specification::inspect(
                         slot,
                         item,
-                        requirement.specs.clone(),
+                        specs.clone(),
                         move |id| {
-                            if let Some(item) = open_task.items.iter().find(|item| item.id == id) {
+                            if let Some(item) =
+                                open_task.items.iter().find(|item| item.id.as_ref() == id)
+                            {
                                 open_task
                                     .panel
-                                    .update(|panel| panel.inspected = Some(*item));
+                                    .update(|panel| panel.inspected = Some(item.clone()));
                             }
                         },
                         implementation_label,
@@ -1258,7 +1314,7 @@ fn panel_view(
                                 .grow()
                                 .min_h(0.)
                                 .child(
-                                    text(item.spec.unwrap_or(
+                                    text(item.detail.as_deref().unwrap_or(
                                         "Mock item in the native collection experiment.",
                                     ))
                                     .w_full()
@@ -1277,7 +1333,7 @@ pub(super) struct Data {
     path: PathBuf,
     items: Rc<[Item]>,
     spec: Specification,
-    initial_body: &'static str,
+    initial_body: Arc<str>,
 }
 
 impl Data {
@@ -1297,10 +1353,10 @@ impl Data {
         let items: Rc<[Item]> = model::items().into();
         let initial_body = items
             .iter()
-            .find(|item| item.id == specification::REQUIREMENT)
-            .and_then(|item| item.spec)
+            .find(|item| item.id.as_ref() == specification::REQUIREMENT)
+            .and_then(|item| item.detail.clone())
             .expect("collection requirement fixture");
-        let spec = Specification::load(&Specification::path(&path), initial_body)?;
+        let spec = Specification::load(&Specification::path(&path), &initial_body)?;
         Ok(Self {
             config,
             path,
@@ -1324,27 +1380,18 @@ impl Panels {
             &cx.ui,
             data.spec.clone(),
             Specification::path(&data.path),
-            data.initial_body,
+            data.initial_body.clone(),
         );
         let cursor = model::rows(&data.items, &data.config, &BTreeSet::new())
             .first()
             .map(|row| row.key.clone());
-        let panels = Slot::ALL.map(|_| {
-            cx.ui.signal(Panel {
-                cursor: cursor.clone(),
-                open: false,
-                chip: 0,
-                edit: None,
-                range: None,
-                marked: BTreeSet::new(),
-                collapsed: BTreeSet::new(),
-                inspected: None,
-                error: String::new(),
-            })
-        });
+        let panels = Slot::ALL
+            .into_iter()
+            .map(|_| cx.ui.signal(Panel::new(cursor.clone())))
+            .collect();
         let saved = Rc::new(SavedCollection {
             config: cx.ui.signal(data.config.clone()),
-            path: data.path.clone(),
+            path: Some(data.path.clone()),
             panels,
             runtime: cx.ui.runtime.clone(),
         });
@@ -1359,7 +1406,8 @@ impl Panels {
             list_focused: cx.ui.signal(false),
             focus: Default::default(),
             items: data.items.clone(),
-            specs: specs.clone(),
+            specs: Some(specs.clone()),
+            outline: None,
         });
         Self {
             collections,
@@ -1389,8 +1437,8 @@ impl Panels {
                 .iter()
                 .filter(|item| item.kind != "Task")
                 .map(|item| Item {
-                    id: item.id.into(),
-                    title: item.name.into(),
+                    id: item.id.to_string(),
+                    title: item.name.to_string(),
                     kind: Kind::ProductDefinition,
                     scope: Some(self.name()),
                 }),
@@ -1402,7 +1450,7 @@ impl Panels {
             || self.collections[0]
                 .items
                 .iter()
-                .any(|item| item.id == id && item.kind != "Task")
+                .any(|item| item.id.as_ref() == id && item.kind != "Task")
     }
 
     fn active(&self) -> &Collection {
@@ -1415,9 +1463,17 @@ impl Panels {
 
     pub fn open_item(&self, id: &str) {
         let collection = self.active();
-        if let Some(item) = collection.items.iter().find(|item| item.id == id).copied() {
+        if let Some(item) = collection
+            .items
+            .iter()
+            .find(|item| item.id.as_ref() == id)
+            .cloned()
+        {
             let rows = collection.rows();
-            if let Some(index) = rows.iter().position(|row| row.key == RowKey::Item(item.id)) {
+            if let Some(index) = rows
+                .iter()
+                .position(|row| matches!(&row.key, RowKey::Item(id) if id == &item.id))
+            {
                 collection.move_row(&rows, index, index, false);
             }
             collection
@@ -1466,7 +1522,8 @@ impl Panels {
 
     pub fn smoke_test(&self, ui: &mut zgx::widgets::Ui, view: &ViewHandle) {
         smoke_test(ui, &self.collections, &self.help, view);
-        std::fs::remove_file(&self.collections[0].saved.path).expect("remove smoke config");
+        std::fs::remove_file(self.collections[0].saved.path.as_ref().unwrap())
+            .expect("remove smoke config");
     }
 }
 
@@ -1539,7 +1596,7 @@ fn smoke_test(
     let cursor = || collection.panel.with(|panel| panel.cursor.clone());
     let visible = |key: &RowKey| collection.rows().iter().any(|row| &row.key == key);
     let group = RowKey::Group("Product component".into());
-    let component = RowKey::Item("collection-panel");
+    let component = RowKey::item("collection-panel");
     press(ui, Key::ArrowDown, false);
     assert_eq!(cursor().as_ref(), Some(&component));
     press(ui, Key::ArrowLeft, false);
@@ -1650,13 +1707,13 @@ fn smoke_test(
     assert!(collection.panel.with(|panel| panel.edit.is_none()));
 
     collection.focus(|focus| focus.list.as_ref());
-    navigate_to(ui, collection, &RowKey::Item("REQ-COLLECTION-01"));
+    navigate_to(ui, collection, &RowKey::item("REQ-COLLECTION-01"));
     press(ui, Key::Enter, false);
     assert_eq!(
         collection
             .panel
-            .with(|panel| panel.inspected.map(|item| item.id)),
-        Some("REQ-COLLECTION-01")
+            .with(|panel| panel.inspected.as_ref().map(|item| item.id.to_string())),
+        Some("REQ-COLLECTION-01".into())
     );
 
     press(ui, Key::Character("/".into()), false);
@@ -1667,8 +1724,8 @@ fn smoke_test(
     press(ui, Key::Tab, false); // Add chip control
     press(ui, Key::Tab, false);
     assert_eq!(ui.input.focused(), Some(list));
-    let nested_child = RowKey::Item("check-focus");
-    let nested_parent = RowKey::Item("verify-keyboard");
+    let nested_child = RowKey::item("check-focus");
+    let nested_parent = RowKey::item("verify-keyboard");
     navigate_to(ui, collection, &nested_child);
     press(ui, Key::Space, false);
     press(ui, Key::ArrowLeft, false);
@@ -1771,7 +1828,9 @@ fn smoke_test(
     assert!(scene.transformed_bounds(phase).x < scene.transformed_bounds(cost).x);
     drop(scene);
     assert_eq!(
-        Config::load(&collection.saved.path).unwrap().columns(),
+        Config::load(collection.saved.path.as_ref().unwrap())
+            .unwrap()
+            .columns(),
         [Column::Kind, Column::Phase, Column::Cost]
     );
 
