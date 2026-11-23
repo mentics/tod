@@ -52,6 +52,10 @@ pub struct AutopilotState {
     pub steps: Vec<StepRecord>,
     /// How the last run stopped; `None` while one runs.
     pub outcome: Option<Outcome>,
+    /// Retries already scheduled for each renewable ACP usage window.
+    /// Retained across wakes, cleared when a turn succeeds.
+    #[serde(default)]
+    pub acp_quota_retries: AcpQuotaRetries,
     /// The user asked for the next run's agent to start a new session
     /// instead of continuing or reopening one; the run clears it as it
     /// starts ([`super::Autopilot::new`]).
@@ -89,6 +93,12 @@ pub struct AutopilotState {
     /// (`super::Autopilot::run_ci_fixers`), per (pull request, check).
     #[serde(default)]
     pub ci_fix_attempts: Vec<CiFixAttempt>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcpQuotaRetries {
+    pub five_hour: u8,
+    pub weekly: u8,
 }
 
 /// How many entries of [`AutopilotState::infra_reruns`] and
@@ -314,6 +324,7 @@ impl AutopilotState {
             current: None,
             steps: Vec::new(),
             outcome: None,
+            acp_quota_retries: AcpQuotaRetries::default(),
             fresh_session: false,
             loops: LoopCounters::default(),
             pending_groups: None,
@@ -353,6 +364,7 @@ impl AutopilotState {
         state.loops.clear();
         state.loops.review_floor_ms = now_ms();
         state.outcome = None;
+        state.acp_quota_retries = AcpQuotaRetries::default();
         state.save(data_root, node)
     }
 

@@ -99,9 +99,43 @@ fn acp_rate_limit_data(error: &str) -> Option<serde_json::Value> {
     })
 }
 
+fn acp_reset_ms(data: &serde_json::Value) -> Option<i64> {
+    data.get("rateLimit")?.get("resetsAt")?.as_i64()?.checked_mul(1000).filter(|at| *at > 0)
+}
+
 /// The rate-limit reset Claude ACP reported, in Unix milliseconds.
 pub fn acp_rate_limit_reset_ms(error: &str) -> Option<i64> {
-    acp_rate_limit_data(error)?.get("rateLimit")?.get("resetsAt")?.as_i64()?.checked_mul(1000)
+    acp_reset_ms(&acp_rate_limit_data(error)?)
+}
+
+/// A renewable subscription window Claude ACP reports even when it omits
+/// the absolute reset. A request-rate error need not be a usage window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcpUsageWindow {
+    FiveHour,
+    Weekly,
+}
+
+pub fn acp_usage_window_without_reset(error: &str) -> Option<AcpUsageWindow> {
+    let data = acp_rate_limit_data(error)?;
+    if acp_reset_ms(&data).is_some() {
+        return None;
+    }
+    let kind = data.get("rateLimit").and_then(|limit| limit.get("rateLimitType")).or_else(|| data.get("rateLimitType"));
+    match kind.and_then(serde_json::Value::as_str) {
+        Some("five_hour") => return Some(AcpUsageWindow::FiveHour),
+        Some("seven_day") => return Some(AcpUsageWindow::Weekly),
+        Some(_) => return None,
+        None => {}
+    }
+    let message = error.split_once("ACP error")?.1.split(" ({").next()?.to_ascii_lowercase();
+    if has(&message, &["you've hit your 5-hour limit", "5-hour limit reached"]) {
+        Some(AcpUsageWindow::FiveHour)
+    } else if has(&message, &["you've hit your weekly limit", "weekly limit reached"]) {
+        Some(AcpUsageWindow::Weekly)
+    } else {
+        None
+    }
 }
 
 /// The first host-like word of `text` (`api.github.com`), when it has one.
@@ -289,6 +323,25 @@ mod tests {
         let unrelated = r#"ACP error -32603: Internal error ({"errorKind":"other","rateLimit":{"resetsAt":1795205400}})"#;
         assert_eq!(acp_rate_limit_reset_ms(unrelated), None);
         assert_eq!(classify(Source::Agent, unrelated).kind, Kind::Work);
+        assert_eq!(acp_usage_window_without_reset(bare), Some(AcpUsageWindow::FiveHour));
+        assert_eq!(acp_usage_window_without_reset(timed), None);
+    }
+
+    #[test]
+    fn only_identified_acp_usage_windows_have_slow_retries() {
+        let weekly = r#"opening session: ACP error -32603: Internal error: You've hit your weekly limit · resets 10am (UTC) ({"errorKind":"rate_limit"})"#;
+        let typed = r#"ACP error -32603: Usage exhausted ({"errorKind":"rate_limit","rateLimit":{"rateLimitType":"seven_day"}})"#;
+        for error in [weekly, typed] {
+            assert_eq!(acp_usage_window_without_reset(error), Some(AcpUsageWindow::Weekly), "{error}");
+        }
+        for error in [
+            r#"ACP error -32603: Too many requests ({"errorKind":"rate_limit"})"#,
+            r#"ACP error -32603: You've hit your weekly limit ({"errorKind":"auth"})"#,
+            r#"ACP error -32603: You've hit your weekly limit ({"errorKind":"rate_limit","rateLimitType":"monthly"})"#,
+            "You've hit your weekly limit · resets 10am (UTC)",
+        ] {
+            assert_eq!(acp_usage_window_without_reset(error), None, "{error}");
+        }
     }
 
     #[test]
