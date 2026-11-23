@@ -1166,16 +1166,13 @@ fn ensure_claude_adapter(bx: &Blaxel, url: &str, progress: &mut dyn FnMut(&str))
     Ok(())
 }
 
-/// Install the ACP adapter on demand when TOD selects Codex for a cloud node.
+/// Install or refresh the managed adapter for Codex in a cloud node.
 pub fn ensure_codex_adapter(bx: &Blaxel, url: &str, progress: &mut dyn FnMut(&str)) -> Result<()> {
-    let check = bx.run(url, "command -v codex-acp >/dev/null 2>&1 && command -v codex >/dev/null 2>&1", 30)?;
-    if check.exit_code == 0 {
-        return Ok(());
-    }
-    progress("installing the Codex ACP adapter…");
-    let result = bx.run(url, "npm install -g --silent --prefix /usr/local @agentclientprotocol/codex-acp @openai/codex", 600)?;
+    let script = include_str!("../../../assets/agent/codex-adapter.sh");
+    progress("checking the Codex ACP adapter…");
+    let result = bx.run(url, &format!("sh -lc {}", shell_quote(script)), 240)?;
     if result.exit_code != 0 {
-        bail!("could not install codex-acp (exit {}): {}", result.exit_code, result.output().trim());
+        bail!("could not install or update Codex ACP (exit {}): {}", result.exit_code, result.output().trim());
     }
     Ok(())
 }

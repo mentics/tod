@@ -424,7 +424,9 @@ impl CursorAcpProvider {
 
     /// The agent to run, found now when the provider was not given one.
     fn agent_bin(&self, environment: &AgentEnvironment) -> Result<Option<PathBuf>> {
-        if !matches!(environment, AgentEnvironment::Host) {
+        if !matches!(environment, AgentEnvironment::Host)
+            || (self.host == AcpHost::OpenAi && self.agent_bin.is_none())
+        {
             return Ok(None);
         }
         self.agent_bin.clone().map_or_else(|| self.host.resolve_bin().map(Some), |bin| Ok(Some(bin)))
@@ -1749,12 +1751,25 @@ fn spawn_agent(
 ) -> Result<SpawnedAgent> {
     validate_environment(host, environment)?;
     match environment {
-        AgentEnvironment::Host => Ok(SpawnedAgent {
-            child: spawn_acp_process(host, agent_bin.context("local ACP binary was not resolved")?, env)?,
-            cwd: cwd.to_path_buf(),
-            write_roots: acp_write_roots(cwd, extra_write_roots),
-            in_container: false,
-        }),
+        AgentEnvironment::Host => {
+            // The first Codex run can install npm packages. Resolve it on
+            // the worker, outside the shared agent's lock.
+            let managed;
+            let bin = match agent_bin {
+                Some(bin) => bin,
+                None if host == AcpHost::OpenAi => {
+                    managed = host.resolve_bin()?;
+                    &managed
+                }
+                None => bail!("local ACP binary was not resolved"),
+            };
+            Ok(SpawnedAgent {
+                child: spawn_acp_process(host, bin, env)?,
+                cwd: cwd.to_path_buf(),
+                write_roots: acp_write_roots(cwd, extra_write_roots),
+                in_container: false,
+            })
+        }
         AgentEnvironment::DevContainer(launch) => {
             let container = crate::devcontainer::prepare(launch)?;
             let bin = container_agent_bin(host, &container)?;
@@ -1819,10 +1834,19 @@ fn is_auth_required(code: Option<i64>, message: &str) -> bool {
 /// sign in to its CLI there, which the adapter then uses.
 fn sign_in_hint(host: AcpHost, environment: &AgentEnvironment) -> String {
     let (who, sign_in) = match host {
-        AcpHost::Claude => ("Claude Code", "run `claude` and sign in with `/login`"),
-        AcpHost::Cursor => ("Cursor Agent", "run `cursor-agent login`"),
-        AcpHost::OpenAi => ("Codex", "run `codex login`"),
-        AcpHost::Google => ("Gemini CLI", "run `gemini` and sign in"),
+        AcpHost::Claude => ("Claude Code", "run `claude` and sign in with `/login`".into()),
+        AcpHost::Cursor => ("Cursor Agent", "run `cursor-agent login`".into()),
+        AcpHost::OpenAi if matches!(environment, AgentEnvironment::Host) => {
+            ("Codex", format!("run `{}`", crate::codex_adapter::login_command(false)))
+        }
+        AcpHost::OpenAi => (
+            "Codex",
+            format!(
+                "run `codex login --device-auth` (or `{}` if `codex` is outside PATH)",
+                crate::codex_adapter::login_command(true)
+            ),
+        ),
+        AcpHost::Google => ("Gemini CLI", "run `gemini` and sign in".into()),
     };
     match environment {
         AgentEnvironment::Host => format!(
@@ -2594,23 +2618,37 @@ mod tests {
 
         let host = sign_in_hint(AcpHost::Claude, &AgentEnvironment::Host);
         assert!(host.contains("on this machine") && host.contains("/login"), "{host}");
-        let sandbox = sign_in_hint(
-            AcpHost::Claude,
-            &AgentEnvironment::Sandbox(crate::sandbox::SandboxLaunch {
-                launcher: "tod-sandbox".into(),
-                data_root: "root".into(),
-                sandbox: "vm1".into(),
-                directory: "/work".into(),
-                env: Vec::new(),
-                cli_relay: Vec::new(),
-            }),
-        );
+        let sandbox_env = AgentEnvironment::Sandbox(crate::sandbox::SandboxLaunch {
+            launcher: "tod-sandbox".into(),
+            data_root: "root".into(),
+            sandbox: "vm1".into(),
+            directory: "/work".into(),
+            env: Vec::new(),
+            cli_relay: Vec::new(),
+        });
+        let sandbox = sign_in_hint(AcpHost::Claude, &sandbox_env);
         assert!(
             sandbox.contains("cloud sandbox `vm1`") && sandbox.contains("tod-sandbox shell vm1"),
             "{sandbox}"
         );
         let cursor = sign_in_hint(AcpHost::Cursor, &AgentEnvironment::Host);
         assert!(cursor.contains("cursor-agent login"), "{cursor}");
+
+        let desktop = sign_in_hint(AcpHost::OpenAi, &AgentEnvironment::Host);
+        assert!(desktop.contains(" login`") && !desktop.contains("--device-auth"), "{desktop}");
+        let container_env = AgentEnvironment::DevContainer(crate::devcontainer::DevContainerLaunch {
+            container: "workspace-dev-app-1".into(),
+            host_dir: "/work".into(),
+            directory: None,
+            env: Vec::new(),
+            path_prepend: Vec::new(),
+            files: Vec::new(),
+        });
+        for env in [&container_env, &sandbox_env] {
+            let hint = sign_in_hint(AcpHost::OpenAi, env);
+            assert!(hint.contains("`codex login --device-auth`"), "{hint}");
+            assert!(hint.contains("/.bin/codex\" login --device-auth`"), "{hint}");
+        }
     }
 
     use super::*;

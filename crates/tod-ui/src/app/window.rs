@@ -1397,6 +1397,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
         AgentBackend::from_platform(app_settings.platform_for(tod_store::AgentRole::Default))
     };
     tod_agent::claude_adapter::set_local_dir(tod_store::install::claude_adapter_dir());
+    tod_agent::codex_adapter::set_local_dir(tod_store::install::codex_adapter_dir());
     // Whether a missing or outdated Claude adapter is worth saying at start.
     let uses_claude = !matches!(agent_backend, AgentBackend::Mock)
         && tod_store::AgentRole::ALL
