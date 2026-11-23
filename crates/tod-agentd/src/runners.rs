@@ -27,7 +27,7 @@ use std::time::Duration;
 use tod_agent::SharedAgent;
 use tod_agentd_client::Event;
 use tod_core::attention;
-use tod_core::autopilot::local::{FAILED_PREFIX, Live, LocalEvent, LocalRun, Request, RunnerState};
+use tod_core::autopilot::local::{FAILED_PREFIX, Live, LocalEvent, LocalRun, PAUSED, Request, RunnerState, STOPPED};
 use tod_core::autopilot::{AutopilotState, Budget, Outcome};
 use tod_core::conversation::ConversationConfig;
 use tod_core::next_actor::{self, NextActor, NodeStanding, YouReason};
@@ -61,6 +61,16 @@ enum Desired {
     Run,
     Pause,
     Stop,
+}
+
+impl Desired {
+    fn stop_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Pause => Some(PAUSED),
+            Self::Stop => Some(STOPPED),
+            Self::Unset | Self::Run => None,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -265,6 +275,17 @@ impl Runners {
     /// only read, for what the runner line says and for their wake. Then keep
     /// the clock.
     pub fn resume_saved(&self) {
+        self.load_saved_slots();
+        let this = self.clone();
+        let _ = std::thread::Builder::new().name("tod-agentd-runners".into()).spawn(move || {
+            loop {
+                std::thread::sleep(TICK);
+                this.tick();
+            }
+        });
+    }
+
+    fn load_saved_slots(&self) {
         let root = self.inner.store.paths().root().to_path_buf();
         for (node, state) in load_saved(&root) {
             // A node deleted from the store holds no slot: its saved run file
@@ -339,13 +360,6 @@ impl Runners {
                 }
             }
         }
-        let this = self.clone();
-        let _ = std::thread::Builder::new().name("tod-agentd-runners".into()).spawn(move || {
-            loop {
-                std::thread::sleep(TICK);
-                this.tick();
-            }
-        });
     }
 
     /// Start a run that is due: one that ended to wait and whose time has
@@ -638,16 +652,13 @@ impl Runners {
             let mut requests = Vec::new();
             let mut parked = Vec::new();
             for (node, slot) in slots.iter() {
-                if slot.run.is_some() {
+                if slot.run.is_some() || slot.starting || slot.desired.stop_reason().is_some() {
                     continue;
                 }
                 match &slot.outcome {
                     Some(Outcome::Waiting { due_at_ms, .. }) if *due_at_ms <= now => due.push(*node),
                     Some(Outcome::Waiting { .. }) => parked.push((*node, slot.since)),
-                    // A run the user paused or stopped by hand is theirs to resume.
-                    Some(Outcome::NeedsHuman { reason })
-                        if reason.is_request() && !matches!(slot.desired, Desired::Pause | Desired::Stop) =>
-                    {
+                    Some(Outcome::NeedsHuman { reason }) if reason.is_request() => {
                         requests.push((*node, matches!(reason, tod_core::autopilot::NeedsHuman::Decision { .. })))
                     }
                     _ => {}
@@ -959,7 +970,8 @@ impl Runners {
                 if let Some(run) = &slot.run {
                     match slot.desired {
                         Desired::Stop => run.stop_now(),
-                        _ => run.pause(),
+                        Desired::Pause => run.pause(),
+                        Desired::Unset | Desired::Run => {}
                     }
                 }
                 Ok(())
@@ -979,6 +991,21 @@ impl Runners {
     /// reason and a restarted daemon does not start it again at once. The
     /// same way `LocalRun` saves a run that failed.
     fn record_start_failure(&self, node: Uuid, error: &anyhow::Error) {
+        let mut slots = self.inner.slots.lock().expect("runner slots");
+        let slot = slots.entry(node).or_default();
+        if slot.run.as_ref().is_some_and(|run| !run.is_finished()) {
+            return;
+        }
+        if let Some(reason) = slot.desired.stop_reason() {
+            if slot.starting {
+                tracing::error!(%node, "the start failed before the user stop could take effect: {error:#}");
+                slot.starting = false;
+                self.inner.finish_user_stop(node, slot, reason);
+                drop(slots);
+                self.inner.publish(node);
+            }
+            return;
+        }
         let mut reason = format!("{FAILED_PREFIX}{error:#}");
         let root = self.inner.store.paths().root().to_path_buf();
         // The run's row says the same, so an older "waiting on a request"
@@ -1005,14 +1032,11 @@ impl Runners {
             // The slot still says it; only a restart would lose it.
             tracing::error!(%node, "could not save the failure of the run's start ({reason}): {err:#}");
         }
-        {
-            let mut slots = self.inner.slots.lock().expect("runner slots");
-            let slot = slots.entry(node).or_default();
-            slot.starting = false;
-            slot.run = None;
-            slot.live = Live::default();
-            slot.outcome = Some(outcome);
-        }
+        slot.starting = false;
+        slot.run = None;
+        slot.live = Live::default();
+        slot.outcome = Some(outcome);
+        drop(slots);
         self.inner.publish(node);
     }
 
@@ -1036,39 +1060,41 @@ impl Runners {
             RunnerPlace::Local => {}
             RunnerPlace::Supervisor => return Err(anyhow!(SUPERVISED)),
         }
-        // Nothing automatic resumes what the user paused or stopped: only
-        // their Start or Resume (`user_go_on`) does. Read from the saved
-        // state, so it holds across a restart and for a node with no slot.
-        if !user_go_on {
-            let root = self.inner.store.paths().root().to_path_buf();
-            let saved = AutopilotState::load(&root, node)
-                .with_context(|| format!("read the saved run of {node} to see whether the user paused it"))?;
-            if saved.outcome.as_ref().is_some_and(tod_core::autopilot::local::stopped_by_user) {
-                tracing::info!(%node, "not starting the run on its own: the user paused or stopped it");
-                return Ok(());
-            }
-        }
-        {
+        let started = {
             let mut slots = self.inner.slots.lock().expect("runner slots");
             let slot = slots.entry(node).or_default();
+            // A timer or reconciler may have picked this node before the
+            // user stopped it. Recheck under the lock where the start is
+            // reserved. The saved outcome also protects an unloaded slot.
+            if !user_go_on {
+                let root = self.inner.store.paths().root();
+                let saved = AutopilotState::load(root, node)
+                    .with_context(|| format!("read the saved run of {node} to see whether the user paused it"))?;
+                if slot.desired.stop_reason().is_some()
+                    || saved.outcome.as_ref().is_some_and(tod_core::autopilot::local::stopped_by_user)
+                {
+                    tracing::info!(%node, "not starting the run on its own: the user paused or stopped it");
+                    return Ok(());
+                }
+            }
             slot.desired = Desired::Run;
             if slot.run.is_some() || slot.starting {
                 return Ok(());
             }
             slot.starting = true;
-        }
-        match self.spawn(node, renew_budget, user_go_on) {
-            Ok(run) => {
-                {
-                    let mut slots = self.inner.slots.lock().expect("runner slots");
-                    let slot = slots.entry(node).or_default();
-                    slot.starting = false;
-                    slot.run = Some(run);
-                    slot.live = Live::default();
-                    slot.since = now_ms();
-                    slot.outcome = None;
-                    slot.seen_waiting = false;
-                }
+            // The callback takes the same lock, so even a run that ends
+            // immediately cannot finish before its handle is installed.
+            self.spawn(node, renew_budget, user_go_on).map(|run| {
+                slot.starting = false;
+                slot.run = Some(run);
+                slot.live = Live::default();
+                slot.since = now_ms();
+                slot.outcome = None;
+                slot.seen_waiting = false;
+            })
+        };
+        match started {
+            Ok(()) => {
                 self.inner.publish(node);
                 Ok(())
             }
@@ -1110,53 +1136,31 @@ impl Runners {
     /// (in process or through the daemon API) and `tod-cli runner pause` /
     /// `stop` all come here.
     fn user_stop(&self, node: Uuid, desired: Desired) -> Result<()> {
-        let reason = match desired {
-            Desired::Stop => tod_core::autopilot::local::STOPPED,
-            _ => tod_core::autopilot::local::PAUSED,
-        };
-        let idle = {
+        let reason = desired.stop_reason().expect("user stop or pause");
+        let saved = {
             let mut slots = self.inner.slots.lock().expect("runner slots");
             let slot = slots.entry(node).or_default();
             slot.desired = desired;
-            match &slot.run {
-                Some(run) => {
-                    match desired {
-                        Desired::Stop => run.stop_now(),
-                        _ => run.pause(),
-                    }
-                    false
+            if let Some(run) = &slot.run {
+                match desired {
+                    Desired::Stop => run.stop_now(),
+                    Desired::Pause => run.pause(),
+                    Desired::Unset | Desired::Run => unreachable!("user stop or pause"),
                 }
-                None => !slot.starting,
+                Ok(())
+            } else if slot.starting {
+                // A start failure is being handed back. Its completion
+                // records this stop before publishing an idle slot.
+                Ok(())
+            } else {
+                let outcome = Outcome::Stopped { reason: reason.to_string() };
+                self.inner.save_user_stop(node, &outcome).map(|()| {
+                    slot.outcome = Some(outcome);
+                })
             }
         };
-        let saved = if idle { self.save_user_stop(node, reason) } else { Ok(()) };
         self.inner.publish(node);
         saved
-    }
-
-    /// Write a user's pause or stop of a node with no live run: its saved
-    /// state's outcome (read by `resume_saved` and `start_as`) and its run
-    /// state (what the runner line shows and the stale-wait sweep reads).
-    fn save_user_stop(&self, node: Uuid, reason: &str) -> Result<()> {
-        let root = self.inner.store.paths().root().to_path_buf();
-        let outcome = Outcome::Stopped { reason: reason.to_string() };
-        let mut state = AutopilotState::load(&root, node).context("read the run's saved state")?;
-        state.outcome = Some(outcome.clone());
-        state.save(&root, node).context("save the pause or stop in the run's saved state")?;
-        tod_core::run_state::record(
-            &self.inner.store,
-            node,
-            tod_core::run_state::for_outcome(&outcome, tod_core::run_state::Words::local()),
-            "local",
-        )
-        .context("record the pause or stop in the run's state")?;
-        let mut slots = self.inner.slots.lock().expect("runner slots");
-        let slot = slots.entry(node).or_default();
-        // Only an idle slot: a run started meanwhile writes its own outcome.
-        if slot.run.is_none() && !slot.starting {
-            slot.outcome = Some(outcome);
-        }
-        Ok(())
     }
 
     /// Read GitHub now, for a run that is waiting on it.
@@ -1242,6 +1246,30 @@ impl Runners {
 }
 
 impl Inner {
+    /// Called with the slot locked so a new start cannot race the final save.
+    fn save_user_stop(&self, node: Uuid, outcome: &Outcome) -> Result<()> {
+        let root = self.store.paths().root();
+        let mut state = AutopilotState::load(root, node).context("read the run's saved state")?;
+        state.outcome = Some(outcome.clone());
+        state.save(root, node).context("save the pause or stop in the run's saved state")?;
+        tod_core::run_state::record(
+            &self.store,
+            node,
+            tod_core::run_state::for_outcome(outcome, tod_core::run_state::Words::local()),
+            "local",
+        )
+        .context("record the pause or stop in the run's state")?;
+        Ok(())
+    }
+
+    fn finish_user_stop(&self, node: Uuid, slot: &mut Slot, reason: &str) {
+        let outcome = Outcome::Stopped { reason: reason.to_string() };
+        if let Err(err) = self.save_user_stop(node, &outcome) {
+            tracing::error!(%node, "could not make the accepted pause or stop durable: {err:#}");
+        }
+        slot.outcome = Some(outcome);
+    }
+
     fn state(node: Uuid, slot: &Slot) -> RunnerState {
         RunnerState {
             node,
@@ -1281,12 +1309,16 @@ impl Inner {
                     tod_core::sandbox_retire::poke();
                     slot.run = None;
                     slot.live = Live::default();
-                    slot.outcome = Some(match result {
-                        Ok(outcome) => outcome,
-                        Err(error) => Outcome::Stopped {
-                            reason: format!("{}{error}", tod_core::autopilot::local::FAILED_PREFIX),
-                        },
-                    });
+                    if let Some(reason) = slot.desired.stop_reason() {
+                        // A stop accepted after the worker's last boundary
+                        // still wins over its saved wait or handover.
+                        this.finish_user_stop(node, slot, reason);
+                    } else {
+                        slot.outcome = Some(match result {
+                            Ok(outcome) => outcome,
+                            Err(error) => Outcome::Stopped { reason: format!("{FAILED_PREFIX}{error}") },
+                        });
+                    }
                 }
             }
         }
@@ -2173,6 +2205,62 @@ mod tests {
             assert!(format!("{err:#}").contains("Media bundle"), "{err:#}");
             assert!(!held(&fx));
             assert_eq!(next.inner.slots.lock().unwrap()[&fx.node].desired, Desired::Run);
+        }
+    }
+
+    #[test]
+    fn a_late_user_pause_or_stop_overrides_a_due_wait_even_after_reloading() {
+        for (desired, reason) in [(Desired::Pause, PAUSED), (Desired::Stop, STOPPED)] {
+            let fx = fixture();
+            let store = &fx.runners.inner.store;
+            let waiting = Outcome::Waiting { what: "the agent's usage limit".into(), due_at_ms: now_ms() - 1 };
+            // The autopilot already saved the wait, but its worker has not
+            // finished the final push. The user's command has been accepted.
+            AutopilotState { outcome: Some(waiting.clone()), sessions: 4, ..AutopilotState::fresh() }
+                .save(&fx.root, fx.node)
+                .unwrap();
+            tod_core::run_state::record(
+                store,
+                fx.node,
+                tod_core::run_state::for_outcome(&waiting, tod_core::run_state::Words::local()),
+                "local",
+            )
+            .unwrap();
+            {
+                let mut slots = fx.runners.inner.slots.lock().unwrap();
+                let slot = slots.entry(fx.node).or_default();
+                slot.desired = desired;
+                slot.outcome = Some(waiting.clone());
+            }
+            fx.runners.start_due();
+            // A wake picked before the stop may already be on its way here.
+            fx.runners.start_auto(fx.node).unwrap();
+            assert_eq!(AutopilotState::load(&fx.root, fx.node).unwrap().outcome, Some(waiting.clone()));
+
+            Inner::on_event(&fx.runners.inner, fx.node, LocalEvent::Finished(Ok(waiting)));
+            let stopped = Outcome::Stopped { reason: reason.into() };
+            let saved = AutopilotState::load(&fx.root, fx.node).unwrap();
+            assert_eq!(saved.outcome.as_ref(), Some(&stopped));
+            assert_eq!(saved.sessions, 4, "the final save keeps the worker's progress");
+            let row = store.read(|conn| tod_store::run_state::get(conn, fx.node)).unwrap().unwrap();
+            let expected = tod_core::run_state::for_outcome(&stopped, tod_core::run_state::Words::local());
+            assert_eq!(row.reason_kind, expected.reason_kind);
+            assert_eq!(row.reason_text, expected.reason_text);
+
+            let next = Runners::new(store.clone(), fx.runners.inner.agent.clone());
+            next.load_saved_slots();
+            for runners in [&fx.runners, &next] {
+                runners.start_due();
+                let slots = runners.inner.slots.lock().unwrap();
+                let slot = &slots[&fx.node];
+                assert_eq!(slot.desired, desired);
+                assert_eq!(slot.outcome.as_ref(), Some(&stopped));
+                assert!(slot.run.is_none());
+            }
+            // The fixture has no media, so this error proves an explicit
+            // Resume actually tried to start the held run.
+            let err = next.start(fx.node, false).unwrap_err();
+            assert!(format!("{err:#}").contains("Media bundle"), "{err:#}");
         }
     }
 
