@@ -530,11 +530,16 @@ fn review_front(
         };
         super::note_draft_skipped(fleet, node, &live, state)?;
         // tod's own review of a head is an agent session: owed in `pr_draft`.
-        let own_review_owed = before_review
-            && !matches!(
-                fleet.read(|conn| crate::pr_draft_review::owed(conn, node, &live, feed))?,
-                crate::pr_draft_review::Owed::Clear
-            );
+        let own_review_owed = if before_review {
+            use crate::pr_draft_review::{self, Owed};
+            match fleet.read_detached(|conn| pr_draft_review::owed(conn, node, &live, feed))? {
+                Owed::Clear => false,
+                Owed::Unreadable(why) => return Ok(Front::Done(GithubCheck::Unreadable(why))),
+                Owed::Post(_) | Owed::Answer(_) | Owed::Review => true,
+            }
+        } else {
+            false
+        };
         let ledger = api_work::Ledger::load(data_root, node)?;
         let plan = api_work::classify(
             &live,

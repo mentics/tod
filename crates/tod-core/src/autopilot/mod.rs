@@ -1670,10 +1670,7 @@ impl Autopilot {
             let settings = pr_readiness::settings_for_node(fleet, self.node, &self.config.data_root)?;
             let answered_at = pr_readiness::agent_answered_at(fleet, self.node)?;
             let mut live = match pr_readiness::live_answered(feed.as_ref(), &links.prs, &settings, answered_at) {
-                Ok(live) => {
-                    github_wait::clear_read_failures(fleet, self.node)?;
-                    live
-                }
+                Ok(live) => live,
                 Err(err) => {
                     hook.waiting(None, None);
                     return Ok(Some(github_wait::github_look_failed(fleet, self.node, false, &err)?));
@@ -1813,9 +1810,14 @@ impl Autopilot {
                 }
                 overall = pr_readiness::overall(&current);
             }
+            // The PR snapshot alone does not settle a read failure. A look
+            // that needs to compare reviewed heads must finish that read too.
+            // The review path clears the failure only after that comparison.
+            //
             // Nothing for the agent is left but a check the user is asked
             // about: only now does the run wait on that answer.
             if held_unrelated > 0 && !matches!(overall, PrNext::Work(_) | PrNext::Merged) {
+                github_wait::clear_read_failures(fleet, node)?;
                 hook.waiting(None, None);
                 return Ok(Some(Outcome::NeedsHuman {
                     reason: NeedsHuman::Decision { pending: held_unrelated + pending },
@@ -1823,6 +1825,7 @@ impl Autopilot {
             }
             match overall {
                 PrNext::Merged => {
+                    github_wait::clear_read_failures(fleet, node)?;
                     self.clear_poll_waits(fleet)?;
                     hook.waiting(None, None);
                     return Ok(None);
@@ -1844,11 +1847,14 @@ impl Autopilot {
                             OwnReview::Stop(outcome) => return Ok(Some(outcome)),
                             OwnReview::Clear => {}
                         }
+                    } else {
+                        github_wait::clear_read_failures(fleet, node)?;
                     }
                     self.reset_housekeeping()?;
                     return Ok(None);
                 }
                 PrNext::Work(works) => {
+                    github_wait::clear_read_failures(fleet, node)?;
                     waited_since = None;
                     self.clear_poll_waits(fleet)?;
                     hook.waiting(None, None);
@@ -2072,11 +2078,13 @@ impl Autopilot {
                                 }
                             }
                         }
+                        github_wait::clear_read_failures(fleet, node)?;
                         self.reset_housekeeping()?;
                         // Hours or days: the run ends, and is woken at the
                         // time recorded (or by the review's webhook).
                         return Ok(Some(self.wait_for_review(fleet, &live, &settings)?));
                     }
+                    github_wait::clear_read_failures(fleet, node)?;
                     // A bot that has not come: tod asks it, a bounded number of
                     // times, and when it stays silent asks the user once.
                     match self.bot_waiting(fleet, feed.as_ref(), &live, &mut asked)? {
@@ -3079,10 +3087,19 @@ impl Autopilot {
         use crate::pr_draft_review::{self, Owed};
         let node = self.node;
         if !fleet.read(|conn| pr_draft_review::enabled(conn, node))? {
+            github_wait::clear_read_failures(fleet, node)?;
             return Ok(OwnReview::Clear);
         }
         pr_draft_review::sync_resolved(fleet, node, live)?;
-        match fleet.read(|conn| pr_draft_review::owed(conn, node, live, feed))? {
+        let owed = fleet.read_detached(|conn| pr_draft_review::owed(conn, node, live, feed))?;
+        if !matches!(owed, Owed::Unreadable(_)) {
+            github_wait::clear_read_failures(fleet, node)?;
+        }
+        match owed {
+            Owed::Unreadable(why) => {
+                hook.waiting(None, None);
+                Ok(OwnReview::Stop(github_wait::github_look_failed(fleet, node, false, &why)?))
+            }
             Owed::Clear => {
                 pr_draft_review::carry_heads(fleet, node, live)?;
                 Ok(OwnReview::Clear)
