@@ -26,6 +26,20 @@ pub struct UsageLimit {
 
 /// Whether `text` says a usage limit was reached, and when it resets.
 pub fn detect(text: &str, now_ms: i64) -> Option<UsageLimit> {
+    use tod_store::incident_class::{acp_rate_limit_reset_ms, acp_usage_window_without_reset};
+
+    if let Some(reset_at_ms) = acp_rate_limit_reset_ms(text).filter(|at| *at > now_ms) {
+        return Some(UsageLimit {
+            reset_at_ms,
+            parsed: true,
+        });
+    }
+    if let Some(window) = acp_usage_window_without_reset(text) {
+        return Some(UsageLimit {
+            reset_at_ms: check_after(window, now_ms),
+            parsed: false,
+        });
+    }
     let lower = text.to_lowercase();
     let is_limit = lower.contains("usage limit reached")
         || lower.contains("usage_limit_reached")
@@ -33,6 +47,8 @@ pub fn detect(text: &str, now_ms: i64) -> Option<UsageLimit> {
         || lower.contains("reached your usage limit")
         || lower.contains("hour limit reached")
         || lower.contains("weekly limit reached")
+        || lower.contains("hit your 5-hour limit")
+        || lower.contains("hit your weekly limit")
         || lower.contains("hit your limit");
     if !is_limit {
         return None;
@@ -59,6 +75,15 @@ pub fn detect(text: &str, now_ms: i64) -> Option<UsageLimit> {
             parsed: false,
         },
     })
+}
+
+pub(crate) fn check_after(window: tod_store::incident_class::AcpUsageWindow, now_ms: i64) -> i64 {
+    use tod_store::incident_class::AcpUsageWindow::{FiveHour, Weekly};
+    let hours = match window {
+        FiveHour => 1,
+        Weekly => 24,
+    };
+    now_ms.saturating_add(hours * 60 * 60 * 1000)
 }
 
 /// Some adapters return the quota banner as an otherwise successful reply.
@@ -164,16 +189,39 @@ pub fn route(root: &Path, desired: AgentLaunchOptions, now_ms: i64) -> Result<Ag
     };
     if let Some(equivalent) = equivalent(&desired) {
         if let Some(other_reset) = until(equivalent.platform) {
-            bail!(
-                "{} and {} usage limit reached|{}",
-                desired.platform.label(),
-                equivalent.platform.label(),
-                reset.min(other_reset)
-            );
+            bail!("{BOTH_EXHAUSTED}|{}", reset.min(other_reset));
         }
         return Ok(equivalent);
     }
     bail!("{} usage limit reached|{reset}", desired.platform.label());
+}
+
+const BOTH_EXHAUSTED: &str = "Claude and OpenAI usage limit reached";
+
+/// The registry's retry deadline carried in a conversation failure.
+pub(crate) fn scheduled_reset(message: &str) -> Option<i64> {
+    let (reason, _) = message.rsplit_once('|')?;
+    if [
+        BOTH_EXHAUSTED,
+        "Claude usage limit reached",
+        "OpenAI usage limit reached",
+    ]
+    .iter()
+    .any(|suffix| reason.trim().ends_with(suffix))
+    {
+        return epoch_suffix(message);
+    }
+    None
+}
+
+pub(crate) fn retry_error(message: &str, platform: AgentPlatform, reset_at_ms: i64) -> String {
+    use tod_store::incident_class::{acp_rate_limit_reset_ms, acp_usage_window_without_reset};
+    if acp_rate_limit_reset_ms(message).is_some_and(|at| at == reset_at_ms)
+        || acp_usage_window_without_reset(message).is_some()
+    {
+        return message.to_string();
+    }
+    format!("{} usage limit reached|{reset_at_ms}", platform.label())
 }
 
 /// Approximate capability tiers shared by Claude Code and Codex. ACP still
@@ -528,6 +576,36 @@ mod tests {
                 NOON
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn recognizes_claude_windows_from_acp_even_without_a_quota_banner() {
+        let reset = (NOON / 1000) + 2 * 3600;
+        let exact = format!(
+            r#"ACP error -32603: Internal error ({{"errorKind":"rate_limit","rateLimit":{{"resetsAt":{reset}}}}})"#
+        );
+        assert_eq!(
+            detect(&exact, NOON),
+            Some(UsageLimit {
+                reset_at_ms: reset * 1000,
+                parsed: true
+            })
+        );
+        let weekly = r#"ACP error -32603: Internal error ({"errorKind":"rate_limit","rateLimitType":"seven_day"})"#;
+        assert_eq!(
+            detect(weekly, NOON),
+            Some(UsageLimit {
+                reset_at_ms: NOON + 86_400_000,
+                parsed: false
+            })
+        );
+        assert_eq!(
+            detect(
+                r#"ACP error -32603: Too many requests ({"errorKind":"rate_limit"})"#,
+                NOON
+            ),
+            None
         );
     }
 

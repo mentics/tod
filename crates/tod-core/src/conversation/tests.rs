@@ -38,6 +38,7 @@ struct FakeAgent {
     /// Refuse to resume a recorded session (as after it expired).
     fail_resume: bool,
     refuse_images: bool,
+    refuse_codex: bool,
     fail_cancel: bool,
 }
 
@@ -52,6 +53,7 @@ impl FakeAgent {
             parts: HashMap::new(),
             fail_resume: false,
             refuse_images: false,
+            refuse_codex: false,
             fail_cancel: false,
         }
     }
@@ -75,6 +77,9 @@ impl AgentProvider for FakeAgent {
     }
 
     fn send_session_turn(&mut self, turn: SessionTurn) -> anyhow::Result<AgentRunHandle> {
+        if self.refuse_codex && turn.options.platform == AgentPlatform::OpenAi {
+            anyhow::bail!("codex-acp not found on PATH");
+        }
         if self.refuse_images && !turn.images.is_empty() {
             anyhow::bail!("this agent does not accept images; send the message without them");
         }
@@ -2440,4 +2445,30 @@ fn quota_failure_switches_the_in_flight_turn_and_future_conversations() {
         if message.contains("usage limit reached") && message.ends_with(&(now + 60_000).to_string()))));
     assert!(!another.status().running);
     assert_eq!(agent.turns.len(), 4);
+}
+
+#[test]
+fn unavailable_codex_leaves_the_original_quota_retry_in_place() {
+    for sync_failure in [true, false] {
+        let fx = fixture();
+        let mut agent = FakeAgent::new(&fx.fleet);
+        let mut driver = ConversationDriver::new(config(&fx, 100_000), Focus::Project, ProtocolKind::Chat);
+        driver.send(&fx.fleet, &mut agent, "Finish the report").unwrap();
+        let first = *agent.runs.keys().next().unwrap();
+        let reset = tod_store::outline::uuid_blob::now_ms() + 60_000;
+        agent.runs.insert(first, AgentRunState::Failure(format!("Weekly limit reached|{reset}")));
+        agent.refuse_codex = sync_failure;
+        let mut events = driver.tick(&fx.fleet, &mut agent);
+        if !sync_failure {
+            assert!(events.contains(&ConversationEvent::Rotated));
+            let fallback = *agent.runs.keys().find(|run| **run != first).unwrap();
+            agent.runs.insert(fallback, AgentRunState::Failure("Codex is not signed in".into()));
+            events = driver.tick(&fx.fleet, &mut agent);
+        }
+        assert!(events.iter().any(|event| matches!(event, ConversationEvent::TurnFinished { error: Some(message) }
+            if crate::autopilot::Outcome::acp_quota_wait(message).and_then(|outcome| outcome.acp_quota_due_at()) == Some(reset))));
+        let expected = if sync_failure { "codex-acp not found" } else { "Codex is not signed in" };
+        assert!(turns(&fx, driver.conversation_id().unwrap()).iter()
+            .any(|(role, text)| *role == TurnRole::Error && text.contains(expected)));
+    }
 }

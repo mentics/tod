@@ -159,9 +159,9 @@ for a specific step under **Lifecycle Config**. When Claude or Codex reports
 that its usage limit has been reached, TOD continues the turn in a fresh
 session on the other provider. The conversation and working files carry over.
 TOD stores quota reset times in `provider-quota.json` under its data root and
-skips an exhausted provider until its reset. If it cannot read a reset time,
-it checks eligibility again after one hour. If both providers are exhausted,
-the cloud supervisor waits until the earlier reset.
+skips an exhausted provider until its reset. Without an exact reset, TOD
+checks hourly, or daily for Claude's weekly ACP usage window. If both
+providers are exhausted, the runner waits until the earlier retry time.
 
 Claude-to-Codex fallback looks up a model and effort by capability tier. For
 example, Haiku at low effort maps to GPT-5.6 Luna at low effort, Sonnet at

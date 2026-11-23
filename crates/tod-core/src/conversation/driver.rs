@@ -172,6 +172,8 @@ struct Run {
     /// What the session had reported spending before this turn, so the
     /// turn's own spending is the difference (`ConversationDriver::record_usage`).
     usage_before: tod_agent::TokenCounts,
+    /// The original provider's wait, if the replacement cannot authenticate.
+    quota_retry: Option<String>,
 }
 
 pub struct ConversationDriver {
@@ -834,6 +836,14 @@ impl ConversationDriver {
                 "could not record the turn's token usage: {err:#}"
             ))));
         }
+        if let Some(original) = run.quota_retry.as_ref()
+            && let Err(message) = &outcome
+            && tod_store::incident_class::classify(tod_store::incident_class::Source::Agent, message).kind
+                == tod_store::incident_class::Kind::Auth
+        {
+            self.append(fleet, id, TurnRole::Error, message)?;
+            outcome = Err(original.clone());
+        }
         if let Some(limit) = &quota_limit
             && let Some(launch) = self.launched.clone()
             && quota::equivalent(&launch).is_some()
@@ -855,13 +865,41 @@ impl ConversationDriver {
                     }
                     let marker = quota_switch_note(launch.platform, next.platform);
                     let progress_before = self.progress_before.clone();
-                    self.rotate_and_start(fleet, agent, &conversation, run.user_seq, &handoff,
-                        &text, images, "provider quota exhausted", Some(&marker), next)?;
-                    self.progress_before = progress_before;
-                    events.push(ConversationEvent::Rotated);
-                    return Ok(());
+                    let retry = quota::retry_error(outcome.as_ref().err().map_or("", String::as_str),
+                        launch.platform, limit.reset_at_ms);
+                    let destination = next.platform.label();
+                    match self.rotate_and_start(fleet, agent, &conversation, run.user_seq, &handoff,
+                        &text, images, "provider quota exhausted", Some(&marker), next)
+                    {
+                        Ok(()) => {
+                            if let Some(run) = &mut self.run {
+                                run.quota_retry = Some(retry);
+                            }
+                            self.progress_before = progress_before;
+                            events.push(ConversationEvent::Rotated);
+                            return Ok(());
+                        }
+                        Err(err) if tod_store::fleet::worktree::is_lock_busy(&err) => return Err(err),
+                        Err(err) => {
+                            events.push(ConversationEvent::Notice(RunNotice::Error(format!(
+                                "Could not continue with {destination}: {err:#}"
+                            ))));
+                            outcome = Err(retry);
+                        }
+                    }
                 }
-                Err(blocked) => outcome = Err(blocked.to_string()),
+                Err(blocked) => {
+                    let blocked = blocked.to_string();
+                    // Keep the bounded Claude retry for an unknown reset when
+                    // its next check is the earliest route back to a provider.
+                    let use_window = quota::scheduled_reset(&blocked) == Some(limit.reset_at_ms)
+                        && outcome.as_ref().err().is_some_and(|message| {
+                            tod_store::incident_class::acp_usage_window_without_reset(message).is_some()
+                        });
+                    if !use_window {
+                        outcome = Err(blocked);
+                    }
+                }
             }
         }
         let chars = agent
@@ -1608,6 +1646,7 @@ impl ConversationDriver {
             sandbox,
             workdir,
             usage_before,
+            quota_retry: None,
         });
         self.start_lease(fleet);
         crate::journey::record(
