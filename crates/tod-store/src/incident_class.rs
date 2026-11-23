@@ -88,6 +88,22 @@ fn has(lower: &str, needles: &[&str]) -> bool {
     needles.iter().any(|n| lower.contains(n))
 }
 
+/// The JSON data Claude's ACP bridge includes after the human error message,
+/// possibly following a parenthesized time zone or an error-chain prefix.
+fn acp_rate_limit_data(error: &str) -> Option<serde_json::Value> {
+    let (_, response) = error.split_once("ACP error")?;
+    let response = response.trim_end().strip_suffix(')')?;
+    response.match_indices(" ({").find_map(|(at, _)| {
+        let data = serde_json::from_str::<serde_json::Value>(&response[at + 2..]).ok()?;
+        (data.get("errorKind")?.as_str()? == "rate_limit").then_some(data)
+    })
+}
+
+/// The rate-limit reset Claude ACP reported, in Unix milliseconds.
+pub fn acp_rate_limit_reset_ms(error: &str) -> Option<i64> {
+    acp_rate_limit_data(error)?.get("rateLimit")?.get("resetsAt")?.as_i64()?.checked_mul(1000)
+}
+
 /// The first host-like word of `text` (`api.github.com`), when it has one.
 fn host_of(text: &str) -> Option<String> {
     let lower = text.to_lowercase();
@@ -158,6 +174,9 @@ pub fn classify(source: Source, error: &str) -> Classification {
     }
 
     if source == Source::Agent {
+        if acp_rate_limit_data(error).is_some() {
+            return named(Kind::Provider, "rate_limit", "The model API is rate limiting");
+        }
         if has(&lower, &["overloaded_error", "overloaded", "529"]) {
             return named(Kind::Provider, "overloaded", "The model API is overloaded");
         }
@@ -256,6 +275,20 @@ mod tests {
         let b = classify(Source::Tool, "tod-cli: no such table foo (pid 98)");
         assert_eq!(a.kind, Kind::ToolBroken);
         assert_eq!(a.signature, b.signature);
+    }
+
+    #[test]
+    fn claude_acp_rate_limit_data_is_classified_even_without_a_reset() {
+        let bare = r#"ACP error -32603: Internal error: You've hit your 5-hour limit · resets 8:10pm (UTC) ({"errorKind":"rate_limit"})"#;
+        let timed = r#"opening session: ACP error -32603: Internal error: You've hit your weekly limit · resets 2am (America/Los_Angeles) ({"errorKind":"rate_limit","rateLimit":{"status":"rejected","resetsAt":1795514400,"rateLimitType":"seven_day","unifiedWindows":{"five_hour":{"status":"allowed","resetsAt":1795436400},"seven_day":{"status":"rejected","resetsAt":1795514400}}}})"#;
+        for error in [bare, timed] {
+            assert_eq!(classify(Source::Agent, error).signature, "provider:rate_limit");
+        }
+        assert_eq!(acp_rate_limit_reset_ms(timed), Some(1_795_514_400_000));
+        assert_eq!(acp_rate_limit_reset_ms(bare), None);
+        let unrelated = r#"ACP error -32603: Internal error ({"errorKind":"other","rateLimit":{"resetsAt":1795205400}})"#;
+        assert_eq!(acp_rate_limit_reset_ms(unrelated), None);
+        assert_eq!(classify(Source::Agent, unrelated).kind, Kind::Work);
     }
 
     #[test]

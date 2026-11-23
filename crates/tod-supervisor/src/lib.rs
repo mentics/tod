@@ -822,7 +822,7 @@ pub fn wake(config: Config) -> Result<Woke> {
         .collect();
     consume_requests(&store, &taken, &consumer)?;
     let run = Autopilot::new(conversation, config.node, budget)
-        .map(|pilot| pilot.with_poll_interval(config.poll))
+        .map(|pilot| pilot.with_poll_interval(config.poll).with_external_wait_scheduler())
         .and_then(|mut pilot| {
             // The user asked (Resume, a new session, a fresh budget): a stop at
             // a round limit starts a fresh set of rounds. A wake nobody asked

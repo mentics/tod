@@ -46,13 +46,15 @@ fn pilot_node(fx: &Fixture, title: &str) -> Uuid {
     node
 }
 
-fn run_node(fx: &Fixture, node: Uuid, agent: &mut FakeAgent) -> Outcome {
+fn node_pilot(fx: &Fixture, node: Uuid) -> Autopilot {
     Autopilot::new(config(fx), node, Budget::default())
         .unwrap()
         .with_poll_interval(Duration::ZERO)
         .with_housekeeping_gap(Duration::ZERO)
-        .run(&fx.fleet, agent)
-        .unwrap()
+}
+
+fn run_node(fx: &Fixture, node: Uuid, agent: &mut FakeAgent) -> Outcome {
+    node_pilot(fx, node).run(&fx.fleet, agent).unwrap()
 }
 
 fn open_incidents(fx: &Fixture) -> Vec<incidents::Incident> {
@@ -72,6 +74,52 @@ fn waiting_what(outcome: &Outcome) -> String {
         Outcome::Waiting { what, .. } => what.clone(),
         other => panic!("expected a wait, got {other:?}"),
     }
+}
+
+#[test]
+fn claude_quota_waits_until_the_structured_reset_on_start_and_on_turn_failure() {
+    let reset_secs = chrono::Utc::now().timestamp() + 3600;
+    let error = format!(
+        r#"ACP error -32603: Internal error: You've hit your 5-hour limit ({{"errorKind":"rate_limit","rateLimit":{{"resetsAt":{reset_secs}}}}})"#
+    );
+    for (supervised, start_failure) in [(false, true), (true, false)] {
+        let fx = setup();
+        retire_outside_criteria(&fx);
+        let mut agent = FakeAgent::new(&fx.fleet);
+        if start_failure {
+            agent.send_error = Some(error.clone());
+        } else {
+            agent.fail_turns = Some(error.clone());
+        }
+        let mut pilot = node_pilot(&fx, fx.node);
+        if supervised {
+            pilot = pilot.with_external_wait_scheduler();
+        }
+        let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
+        assert!(matches!(&outcome, Outcome::Waiting { due_at_ms, .. } if *due_at_ms == reset_secs * 1000), "{outcome:?}");
+        let waits = fx
+            .fleet
+            .read(|conn| tod_store::waits::WaitRepo::new(conn).list_pending_for_node(fx.node))
+            .unwrap();
+        assert_eq!(
+            waits.iter().find(|wait| wait.kind == tod_store::waits::KIND_UNTIL).map(|wait| wait.due_at),
+            supervised.then_some(reset_secs * 1000),
+        );
+        assert_eq!(pending_for(&fx, fx.node), 0);
+    }
+}
+
+#[test]
+fn claude_quota_without_a_future_reset_uses_the_incident_retry() {
+    incident::set_enabled(true);
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    let mut agent = FakeAgent::new(&fx.fleet);
+    agent.fail_turns = Some(r#"ACP error -32603: Internal error ({"errorKind":"rate_limit"})"#.into());
+    let outcome = run_node(&fx, fx.node, &mut agent);
+    assert!(waiting_what(&outcome).contains("1 of 3 retries"), "{outcome:?}");
+    assert_eq!(pending_for(&fx, fx.node), 0);
+    incident::set_enabled(false);
 }
 
 #[test]

@@ -454,6 +454,9 @@ pub struct Autopilot {
     /// The least time between two rounds whose only work is merging a moved
     /// base branch in ([`PR_HOUSEKEEPING_GAP`]).
     housekeeping_gap: Duration,
+    /// The supervisor wakes from wait rows, and the local daemon wakes from
+    /// the due time in the saved outcome.
+    external_wait_scheduler: bool,
     state: AutopilotState,
     /// Set by the user's request for a new session ([`AutopilotState::fresh_session`]):
     /// the next conversation is a new one, never a reopened one. Taken by
@@ -527,6 +530,7 @@ impl Autopilot {
             poll: Duration::from_millis(500),
             pr_poll: PR_POLL,
             housekeeping_gap: PR_HOUSEKEEPING_GAP,
+            external_wait_scheduler: false,
             state,
             fresh_session,
             lost_checked: None,
@@ -537,6 +541,12 @@ impl Autopilot {
             pilot.start_fresh_session()?;
         }
         Ok(pilot)
+    }
+
+    /// Record provider reset timers for the supervisor's wait scheduler.
+    pub fn with_external_wait_scheduler(mut self) -> Self {
+        self.external_wait_scheduler = true;
+        self
     }
 
     /// How often a pull request being waited on is read again.
@@ -1200,6 +1210,16 @@ impl Autopilot {
         use tod_store::incidents::Verdict;
         /// Retries of a first sighting before it is the user's after all.
         const RETRIES: u32 = 3;
+        let now = state::now_ms();
+        if let Some(due_at_ms) = tod_store::incident_class::acp_rate_limit_reset_ms(&error).filter(|at| *at > now) {
+            // Probing this account before its reset would only spend a retry.
+            let what = "the agent's usage limit; trying again when it resets".to_string();
+            return if self.external_wait_scheduler {
+                self.wait_until(fleet, due_at_ms, what)
+            } else {
+                Ok(Outcome::Waiting { what, due_at_ms })
+            };
+        }
         let observed = crate::incident::observe(
             fleet,
             self.node,
@@ -1214,7 +1234,6 @@ impl Autopilot {
                 }
             }
             Verdict::Retry if observed.attempt <= RETRIES => {
-                let now = chrono::Utc::now().timestamp_millis();
                 let due_at_ms = now + 60_000i64 * (1i64 << observed.attempt.min(5));
                 return Ok(Outcome::Waiting {
                     what: format!("the agent turn failed ({} of {RETRIES} retries): {error}", observed.attempt),
@@ -1268,17 +1287,20 @@ impl Autopilot {
 
     fn wait_for_files(&self, fleet: &FleetStore, what: String) -> Result<Outcome> {
         const RETRY_MS: i64 = 60_000;
-        let now = chrono::Utc::now().timestamp_millis();
+        self.wait_until(fleet, state::now_ms() + RETRY_MS, what)
+    }
+
+    fn wait_until(&self, fleet: &FleetStore, due_at_ms: i64, what: String) -> Result<Outcome> {
         fleet
             .interview(
                 "autopilot",
                 tod_store::interview::InterviewCommand::RecordWait {
                     node_id: self.node,
-                    wait: tod_store::waits::NewWait::until(now + RETRY_MS).with_detail(&what),
+                    wait: tod_store::waits::NewWait::until(due_at_ms).with_detail(&what),
                 },
             )
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        Ok(Outcome::Waiting { what, due_at_ms: now + RETRY_MS })
+        Ok(Outcome::Waiting { what, due_at_ms })
     }
 
     /// Settle the gate and advance through it: the `GateCheck` step.
