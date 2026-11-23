@@ -45,6 +45,11 @@ pub fn stopped_by_user(outcome: &Outcome) -> bool {
     matches!(outcome, Outcome::Stopped { reason } if reason == PAUSED || reason == STOPPED)
 }
 
+/// Whether the daemon handed this run over for its replacement to continue.
+pub fn handed_over(outcome: &Outcome) -> bool {
+    matches!(outcome, Outcome::Stopped { reason } if reason == HANDOVER)
+}
+
 /// What the user asked of a run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Request {
@@ -210,13 +215,9 @@ impl LocalRun {
                     // run only to hand it back to the runner: it ends as a
                     // wait that the daemon resumes when it is due.
                     let outcome = push_retry_as_wait(&data_root, node, outcome, hook.push_retry.take())?;
-                    if matches!(&outcome, Outcome::Stopped { reason } if reason == HANDOVER) {
-                        // Not an ending: the saved run has no outcome, like a
-                        // cut-off one, so the next daemon continues it, and the
-                        // node says so rather than "you stopped it".
-                        let mut state = AutopilotState::load(&data_root, node)?;
-                        state.outcome = None;
-                        state.save(&data_root, node)?;
+                    if handed_over(&outcome) {
+                        // The checkpoint already lets the next daemon
+                        // continue. Say so on a handover that finished here.
                         crate::run_state::record(
                             &fleet,
                             node,

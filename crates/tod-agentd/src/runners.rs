@@ -319,7 +319,10 @@ impl Runners {
                     continue;
                 }
             }
-            match state.outcome {
+            // Older builds saved a handover as stopped until their final
+            // branch push returned. A quiet check may still say it is
+            // waiting even though its GitHub wait has expired.
+            match state.outcome.filter(|outcome| !tod_core::autopilot::local::handed_over(outcome)) {
                 None => {
                     tracing::info!(%node, "resuming the run the daemon was stopped on");
                     // A failure is recorded on the node by `start`.
@@ -1070,9 +1073,23 @@ impl Runners {
                 let root = self.inner.store.paths().root();
                 let saved = AutopilotState::load(root, node)
                     .with_context(|| format!("read the saved run of {node} to see whether the user paused it"))?;
-                if slot.desired.stop_reason().is_some()
-                    || saved.outcome.as_ref().is_some_and(tod_core::autopilot::local::stopped_by_user)
-                {
+                let saved_stop = saved.outcome.as_ref().is_some_and(tod_core::autopilot::local::stopped_by_user);
+                if slot.desired.stop_reason().is_none() && !saved_stop {
+                    // A checkpoint interrupted by handover may be missing
+                    // the user stop that is already durable in the run row.
+                    let stop = self.inner.store.read(|conn| {
+                        use tod_core::run_state::kind;
+                        Ok(tod_store::run_state::get(conn, node)?.and_then(|row| match row.reason_kind.as_str() {
+                            kind::PAUSED => Some(Desired::Pause),
+                            kind::STOPPED_NOW | kind::LEFT_STOPPED => Some(Desired::Stop),
+                            _ => None,
+                        }))
+                    })?;
+                    if let Some(stop) = stop {
+                        slot.desired = stop;
+                    }
+                }
+                if slot.desired.stop_reason().is_some() || saved_stop {
                     tracing::info!(%node, "not starting the run on its own: the user paused or stopped it");
                     return Ok(());
                 }
@@ -2107,6 +2124,65 @@ mod tests {
             let slots = next.inner.slots.lock().unwrap();
             assert!(slots.contains_key(&fx.node), "the next daemon holds the run");
             assert_eq!(slots[&fx.node].desired, Desired::Run);
+        }
+    }
+
+    #[test]
+    fn a_legacy_handover_during_a_quiet_check_with_an_expired_wait_is_resumed() {
+        use tod_store::interview::InterviewCommand;
+        use tod_store::waits::{NewWait, WaitRepo};
+        let fx = fixture();
+        let store = &fx.runners.inner.store;
+        let waiting = tod_core::run_state::waiting_outside("pull request #42 to be marked ready for review");
+        tod_core::run_state::record(store, fx.node, waiting, "local").unwrap();
+        store
+            .interview(
+                "test",
+                InterviewCommand::RecordWait {
+                    node_id: fx.node,
+                    wait: NewWait::event("github:pr:42:ready_for_review", now_ms() - 1),
+                },
+            )
+            .unwrap();
+        let old_wait = store
+            .read(|conn| Ok(WaitRepo::new(conn).list_pending_for_node(fx.node)?.remove(0)))
+            .unwrap();
+        store
+            .interview("test", InterviewCommand::SetWaitState { wait_id: old_wait.id, state: "expired".into() })
+            .unwrap();
+        AutopilotState {
+            outcome: Some(Outcome::Stopped { reason: tod_core::autopilot::local::HANDOVER.into() }),
+            sessions: 4,
+            active_ms: 20_000,
+            ..AutopilotState::fresh()
+        }
+        .save(&fx.root, fx.node)
+        .unwrap();
+
+        // Starting reaches the fixture's deliberate media error. Before
+        // recovery, the marker was loaded unchanged and it never tried.
+        fx.runners.load_saved_slots();
+        let saved = AutopilotState::load(&fx.root, fx.node).unwrap();
+        assert!(matches!(saved.outcome, Some(Outcome::Stopped { reason }) if reason.contains("Media bundle")));
+        assert_eq!(saved.sessions, 4);
+        assert_eq!(saved.active_ms, 20_000);
+    }
+
+    #[test]
+    fn a_durable_manual_stop_row_holds_if_the_handover_checkpoint_survived() {
+        use tod_core::run_state::{Words, for_outcome, record};
+        for (reason, desired) in [(PAUSED, Desired::Pause), (STOPPED, Desired::Stop)] {
+            for outcome in [None, Some(Outcome::Stopped { reason: tod_core::autopilot::local::HANDOVER.into() })] {
+                let fx = fixture();
+                let draft = for_outcome(&Outcome::Stopped { reason: reason.into() }, Words::local());
+                record(&fx.runners.inner.store, fx.node, draft, "local").unwrap();
+                AutopilotState { outcome: outcome.clone(), ..AutopilotState::fresh() }.save(&fx.root, fx.node).unwrap();
+                fx.runners.load_saved_slots();
+                let slots = fx.runners.inner.slots.lock().unwrap();
+                assert_eq!(slots[&fx.node].desired, desired);
+                assert_eq!(AutopilotState::load(&fx.root, fx.node).unwrap().outcome, outcome);
+                assert!(matches!(standing_of(&fx).actor, NextActor::You { why: YouReason::Paused, .. }));
+            }
         }
     }
 

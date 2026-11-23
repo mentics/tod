@@ -1191,6 +1191,22 @@ fn local_run_asked(request: impl FnOnce(&super::local::LocalRun)) -> (Fixture, V
     (fx, events)
 }
 
+/// Gap 85: the daemon can exit during the final branch push, before
+/// LocalRun reports completion or updates the quiet check's waiting row.
+#[test]
+fn a_handover_checkpoint_is_restartable_before_the_final_branch_push() {
+    let fx = bare();
+    let mut pilot = autopilot(&fx, Budget::default());
+    pilot.state.sessions = 3;
+    pilot.state.begin_active();
+    let outcome = Outcome::Stopped { reason: super::local::HANDOVER.into() };
+    assert_eq!(pilot.finish(outcome.clone()).unwrap(), outcome);
+    let saved = AutopilotState::load(&fx.root, fx.node).unwrap();
+    assert_eq!(saved.outcome, None);
+    assert_eq!(saved.sessions, 3);
+    assert_eq!(saved.active_since_ms, None);
+}
+
 /// Gap 61: a daemon handover stopped three live runs as if the user had, and
 /// each said "you stopped it".
 #[test]

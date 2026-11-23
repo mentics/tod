@@ -676,7 +676,9 @@ impl Autopilot {
     /// Stop with `outcome`, saved.
     fn finish(&mut self, outcome: Outcome) -> Result<Outcome> {
         tracing::info!(node = %self.node, ?outcome, "autopilot stopped");
-        self.state.outcome = Some(outcome.clone());
+        // The daemon can exit while the runner saves its branch after
+        // this checkpoint. A handover must already be restartable here.
+        self.state.outcome = (!local::handed_over(&outcome)).then(|| outcome.clone());
         self.state.end_active();
         self.save()?;
         Ok(outcome)
