@@ -347,6 +347,9 @@ pub enum Owed {
     Answer(Vec<ReviewFinding>),
     /// A review of the current head.
     Review,
+    /// GitHub could not compare the reviewed head with the current one.
+    /// The caller handles this like any other failed read of GitHub.
+    Unreadable(String),
 }
 
 /// [`Owed`] for `node`, whose linked pull requests stand at `live`.
@@ -399,10 +402,18 @@ pub fn owed(conn: &Connection, node: Uuid, live: &[LivePr], feed: &dyn PrFeed) -
                 // A head that moved only by tod's own fixer commits (a formatter,
                 // a lint autofix: `tod_store::pr_pushes::VERDICT_MECHANICAL`) is
                 // exempt from review.
-                let same = tod_store::pr_pushes::PrPushRepo::new(conn).only_mechanical_since(node, &label, was)?
-                    || feed
-                        .same_change(&p.pr, base, was, now)
-                        .map_err(|err| anyhow::anyhow!("{}: comparing tod's review of {was} with head {now}: {err}", p.pr.url))?;
+                if tod_store::pr_pushes::PrPushRepo::new(conn).only_mechanical_since(node, &label, was)? {
+                    continue;
+                }
+                let same = match feed.same_change(&p.pr, base, was, now) {
+                    Ok(same) => same,
+                    Err(err) => {
+                        return Ok(Owed::Unreadable(format!(
+                            "{}: comparing tod's review of {was} with head {now}: {err}",
+                            p.pr.url
+                        )));
+                    }
+                };
                 if !same {
                     return Ok(Owed::Review);
                 }

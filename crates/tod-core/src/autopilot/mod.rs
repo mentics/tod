@@ -103,6 +103,24 @@ pub enum Outcome {
     Waiting { what: String, due_at_ms: i64 },
 }
 
+impl Outcome {
+    const ACP_QUOTA_WAIT: &str = "the agent's usage limit; trying again when it resets";
+
+    /// A Claude ACP quota failure with a concrete reset can use a timed wait.
+    pub fn acp_quota_wait(error: &str) -> Option<Self> {
+        let due_at_ms = tod_store::incident_class::acp_rate_limit_reset_ms(error).filter(|at| *at > 0)?;
+        Some(Self::Waiting { what: Self::ACP_QUOTA_WAIT.into(), due_at_ms })
+    }
+
+    /// Unlike a review wait, this timer cannot be woken early by a bot answer.
+    pub fn acp_quota_due_at(&self) -> Option<i64> {
+        match self {
+            Self::Waiting { what, due_at_ms } if what == Self::ACP_QUOTA_WAIT => Some(*due_at_ms),
+            _ => None,
+        }
+    }
+}
+
 /// Where a run is when it calls its [`StepHook`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Boundary {
@@ -676,7 +694,9 @@ impl Autopilot {
     /// Stop with `outcome`, saved.
     fn finish(&mut self, outcome: Outcome) -> Result<Outcome> {
         tracing::info!(node = %self.node, ?outcome, "autopilot stopped");
-        self.state.outcome = Some(outcome.clone());
+        // The daemon can exit while the runner saves its branch after
+        // this checkpoint. A handover must already be restartable here.
+        self.state.outcome = (!local::handed_over(&outcome)).then(|| outcome.clone());
         self.state.end_active();
         self.save()?;
         Ok(outcome)
@@ -1212,13 +1232,14 @@ impl Autopilot {
         /// Retries of a first sighting before it is the user's after all.
         const RETRIES: u32 = 3;
         let now = state::now_ms();
-        if let Some(due_at_ms) = tod_store::incident_class::acp_rate_limit_reset_ms(&error).filter(|at| *at > now) {
+        if let Some(wait @ Outcome::Waiting { due_at_ms, .. }) = Outcome::acp_quota_wait(&error)
+            && due_at_ms > now
+        {
             // Probing this account before its reset would only spend a retry.
-            let what = "the agent's usage limit; trying again when it resets".to_string();
             return if self.external_wait_scheduler {
-                self.wait_until(fleet, due_at_ms, what)
+                self.wait_until(fleet, due_at_ms, Outcome::ACP_QUOTA_WAIT.into())
             } else {
-                Ok(Outcome::Waiting { what, due_at_ms })
+                Ok(wait)
             };
         }
         let observed = crate::incident::observe(
@@ -1670,10 +1691,7 @@ impl Autopilot {
             let settings = pr_readiness::settings_for_node(fleet, self.node, &self.config.data_root)?;
             let answered_at = pr_readiness::agent_answered_at(fleet, self.node)?;
             let mut live = match pr_readiness::live_answered(feed.as_ref(), &links.prs, &settings, answered_at) {
-                Ok(live) => {
-                    github_wait::clear_read_failures(fleet, self.node)?;
-                    live
-                }
+                Ok(live) => live,
                 Err(err) => {
                     hook.waiting(None, None);
                     return Ok(Some(github_wait::github_look_failed(fleet, self.node, false, &err)?));
@@ -1813,9 +1831,14 @@ impl Autopilot {
                 }
                 overall = pr_readiness::overall(&current);
             }
+            // The PR snapshot alone does not settle a read failure. A look
+            // that needs to compare reviewed heads must finish that read too.
+            // The review path clears the failure only after that comparison.
+            //
             // Nothing for the agent is left but a check the user is asked
             // about: only now does the run wait on that answer.
             if held_unrelated > 0 && !matches!(overall, PrNext::Work(_) | PrNext::Merged) {
+                github_wait::clear_read_failures(fleet, node)?;
                 hook.waiting(None, None);
                 return Ok(Some(Outcome::NeedsHuman {
                     reason: NeedsHuman::Decision { pending: held_unrelated + pending },
@@ -1823,6 +1846,7 @@ impl Autopilot {
             }
             match overall {
                 PrNext::Merged => {
+                    github_wait::clear_read_failures(fleet, node)?;
                     self.clear_poll_waits(fleet)?;
                     hook.waiting(None, None);
                     return Ok(None);
@@ -1844,11 +1868,14 @@ impl Autopilot {
                             OwnReview::Stop(outcome) => return Ok(Some(outcome)),
                             OwnReview::Clear => {}
                         }
+                    } else {
+                        github_wait::clear_read_failures(fleet, node)?;
                     }
                     self.reset_housekeeping()?;
                     return Ok(None);
                 }
                 PrNext::Work(works) => {
+                    github_wait::clear_read_failures(fleet, node)?;
                     waited_since = None;
                     self.clear_poll_waits(fleet)?;
                     hook.waiting(None, None);
@@ -2072,11 +2099,13 @@ impl Autopilot {
                                 }
                             }
                         }
+                        github_wait::clear_read_failures(fleet, node)?;
                         self.reset_housekeeping()?;
                         // Hours or days: the run ends, and is woken at the
                         // time recorded (or by the review's webhook).
                         return Ok(Some(self.wait_for_review(fleet, &live, &settings)?));
                     }
+                    github_wait::clear_read_failures(fleet, node)?;
                     // A bot that has not come: tod asks it, a bounded number of
                     // times, and when it stays silent asks the user once.
                     match self.bot_waiting(fleet, feed.as_ref(), &live, &mut asked)? {
@@ -3079,10 +3108,19 @@ impl Autopilot {
         use crate::pr_draft_review::{self, Owed};
         let node = self.node;
         if !fleet.read(|conn| pr_draft_review::enabled(conn, node))? {
+            github_wait::clear_read_failures(fleet, node)?;
             return Ok(OwnReview::Clear);
         }
         pr_draft_review::sync_resolved(fleet, node, live)?;
-        match fleet.read(|conn| pr_draft_review::owed(conn, node, live, feed))? {
+        let owed = fleet.read_detached(|conn| pr_draft_review::owed(conn, node, live, feed))?;
+        if !matches!(owed, Owed::Unreadable(_)) {
+            github_wait::clear_read_failures(fleet, node)?;
+        }
+        match owed {
+            Owed::Unreadable(why) => {
+                hook.waiting(None, None);
+                Ok(OwnReview::Stop(github_wait::github_look_failed(fleet, node, false, &why)?))
+            }
             Owed::Clear => {
                 pr_draft_review::carry_heads(fleet, node, live)?;
                 Ok(OwnReview::Clear)

@@ -195,6 +195,13 @@ The app no longer holds a `LocalRun`. The runner line (start, pause, resume;
 `doc/ui/task-panel.md`) writes **desired state** for the node: `run`, `pause`,
 or `stop`. The daemon makes it so.
 
+A local Pause or Stop is saved before the daemon signals the worker. It is
+kept separately from the worker's checkpoint so later progress, a final
+push, or an interrupted handover cannot write it away. On startup the daemon
+restores the stop while keeping that checkpoint's progress and budget. The
+temporary request goes away once the checkpoint holds the stop. The node
+stays stopped until an explicit Start or Resume.
+
 **One runner per node.** The daemon holds a lease per node (a row, with the
 supervisor's pid and a heartbeat on the daemon's own timer). The app's own
 conversation on a node and the supervisor must not both drive its agent: the

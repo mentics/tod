@@ -1191,6 +1191,22 @@ fn local_run_asked(request: impl FnOnce(&super::local::LocalRun)) -> (Fixture, V
     (fx, events)
 }
 
+/// Gap 85: the daemon can exit during the final branch push, before
+/// LocalRun reports completion or updates the quiet check's waiting row.
+#[test]
+fn a_handover_checkpoint_is_restartable_before_the_final_branch_push() {
+    let fx = bare();
+    let mut pilot = autopilot(&fx, Budget::default());
+    pilot.state.sessions = 3;
+    pilot.state.begin_active();
+    let outcome = Outcome::Stopped { reason: super::local::HANDOVER.into() };
+    assert_eq!(pilot.finish(outcome.clone()).unwrap(), outcome);
+    let saved = AutopilotState::load(&fx.root, fx.node).unwrap();
+    assert_eq!(saved.outcome, None);
+    assert_eq!(saved.sessions, 3);
+    assert_eq!(saved.active_since_ms, None);
+}
+
 /// Gap 61: a daemon handover stopped three live runs as if the user had, and
 /// each said "you stopped it".
 #[test]
@@ -3335,6 +3351,121 @@ fn seed_review_phase_round(fx: &Fixture, repo_heads: serde_json::Value, finding:
     });
     std::thread::sleep(Duration::from_millis(3));
     id
+}
+
+const REVIEW_COMPARE_UNAVAILABLE: &str = "resolving main: HTTP request failed: io: Connection refused";
+const REVIEW_COMPARE_INCOMPLETE: &str = "GitHub API error: GitHub did not supply a patch for binary.dat";
+
+struct OwnReviewComparisonFeed {
+    draft: Arc<OwnReviewFeed>,
+    error: std::sync::Mutex<Option<&'static str>>,
+}
+
+impl crate::pr_readiness::PrFeed for OwnReviewComparisonFeed {
+    fn snapshot(&self, pr: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
+        self.draft.snapshot(pr)
+    }
+
+    fn same_change(&self, _: &tod_store::github::NodePr, base: &str, reviewed: &str, head: &str) -> Result<bool, String> {
+        assert_eq!((base, reviewed, head), ("main", "old-head", "abcdef1"));
+        match *self.error.lock().unwrap() {
+            Some(error) => Err(error.to_string()),
+            None => Ok(true),
+        }
+    }
+}
+
+fn own_review_comparison_fixture(error: &'static str) -> (Fixture, Arc<OwnReviewComparisonFeed>) {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    with_pr_draft_review(&fx);
+    seed_review_phase_round(&fx, serde_json::json!({ "acme/app": "old-head" }), false);
+    linked_to_pr(&fx, "pr_draft");
+    // Reproduce an existing draft after its phase-entry turn.
+    fx.fleet
+        .interview(
+            ACTOR_USER,
+            InterviewCommand::CreateConversation {
+                id: Uuid::new_v4(),
+                focus: Focus::Node(fx.node),
+                protocol: ProtocolKind::Pr,
+                platform: None,
+                model: None,
+                effort: None,
+            },
+        )
+        .unwrap();
+    let feed = Arc::new(OwnReviewComparisonFeed {
+        draft: OwnReviewFeed::new(false),
+        error: std::sync::Mutex::new(Some(error)),
+    });
+    crate::pr_readiness::set_feed_override(Some(feed.clone()));
+    (fx, feed)
+}
+
+#[test]
+fn local_review_comparison_retries_without_resetting_attempts_on_snapshot_success() {
+    let (fx, feed) = own_review_comparison_fixture(REVIEW_COMPARE_UNAVAILABLE);
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut pilot = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO);
+    let mut retry_wait_id = None;
+    let max = tod_store::waits::DEFAULT_MAX_ATTEMPTS;
+    for attempt in 1..max {
+        let outcome = pilot.babysit(&fx.fleet, &mut agent, &mut (), true).unwrap();
+        let Some(Outcome::Waiting { what, due_at_ms }) = outcome else { panic!("{outcome:?}") };
+        assert!(what.contains("comparing tod's review of old-head"), "{what}");
+        let wait = read_wait(&fx).expect("comparison failure is recorded");
+        assert_eq!(wait.attempt, attempt);
+        assert_eq!(wait.due_at, due_at_ms);
+        assert_eq!(*retry_wait_id.get_or_insert(wait.id), wait.id);
+    }
+
+    let outcome = pilot.babysit(&fx.fleet, &mut agent, &mut (), true).unwrap();
+    let Some(Outcome::Stopped { reason }) = outcome else { panic!("{outcome:?}") };
+    assert!(reason.contains(REVIEW_COMPARE_UNAVAILABLE), "{reason}");
+    assert!(read_wait(&fx).expect("spent retry budget stays recorded").exhausted());
+
+    *feed.error.lock().unwrap() = None;
+    let outcome = pilot.babysit(&fx.fleet, &mut agent, &mut (), true).unwrap();
+    assert_eq!(outcome, None);
+    assert!(read_wait(&fx).is_none());
+    assert_eq!(agent.turns, 0);
+    assert_eq!(openings(&fx, ProtocolKind::Review).len(), 1, "only the seeded review");
+}
+
+#[test]
+fn a_permanently_uncomparable_review_still_stops_without_an_agent_turn() {
+    let (fx, _) = own_review_comparison_fixture(REVIEW_COMPARE_INCOMPLETE);
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let outcome = autopilot(&fx, Budget::default())
+        .babysit(&fx.fleet, &mut agent, &mut (), true)
+        .unwrap();
+    let Some(Outcome::Stopped { reason }) = outcome else { panic!("{outcome:?}") };
+    assert!(reason.starts_with(local::FAILED_PREFIX), "{reason}");
+    assert!(reason.contains(REVIEW_COMPARE_INCOMPLETE), "{reason}");
+    assert!(read_wait(&fx).expect("permanent failure stays recorded").exhausted());
+    assert_eq!(agent.turns, 0);
+}
+
+#[test]
+fn api_wake_review_comparison_records_read_retries_without_waking_an_agent() {
+    let (fx, feed) = own_review_comparison_fixture(REVIEW_COMPARE_UNAVAILABLE);
+    let root = &config(&fx).data_root;
+    for attempt in 1..=2 {
+        let found = check_github_as(&fx.fleet, fx.node, root, "pr_draft", GithubLook::Act).unwrap();
+        let GithubCheck::Unreadable(why) = found else { panic!("{found:?}") };
+        assert!(why.contains("comparing tod's review of old-head"), "{why}");
+        let next = look_failed_next_look(&fx.fleet, fx.node, false, &why, state::now_ms()).unwrap();
+        let wait = read_wait(&fx).expect("comparison failure is recorded");
+        assert_eq!(wait.attempt, attempt);
+        assert_eq!(wait.due_at, next);
+    }
+
+    *feed.error.lock().unwrap() = None;
+    let found = check_github_as(&fx.fleet, fx.node, root, "pr_draft", GithubLook::Act).unwrap();
+    assert!(matches!(found, GithubCheck::Waiting { .. }), "{found:?}");
+    assert!(read_wait(&fx).is_none());
+    assert_eq!(openings(&fx, ProtocolKind::Review).len(), 1, "only the seeded review");
 }
 
 /// ENG-3558: the clean round in `review` reviewed exactly the change the pull
