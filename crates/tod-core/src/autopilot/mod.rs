@@ -1286,8 +1286,19 @@ impl Autopilot {
         let failed: Vec<&tod_store::check_runs::CheckRun> = round.failed().collect();
         let failing: Vec<String> = failed.iter().map(|r| crate::checks::run_name(r).to_string()).collect();
         if self.state.loops.checks_sent.as_deref() == Some(round.fingerprint.as_str()) {
-            let said = self.last_fix_words(fleet)?;
-            return Ok(ChecksStep::Stop(Outcome::NeedsHuman { reason: NeedsHuman::ChecksUnfixed { failing, said } }));
+            if self.fix_ran_to_end(fleet)? {
+                let said = self.last_fix_words(fleet)?;
+                return Ok(ChecksStep::Stop(Outcome::NeedsHuman { reason: NeedsHuman::ChecksUnfixed { failing, said } }));
+            }
+            // Saved by a build that counted the checks as sent before any agent
+            // ran (before gap 109), or left by a round whose agent never
+            // finished: no fix agent has worked on these files, so "it changed
+            // nothing" is false, and what an older conversation said is not
+            // this round's. Send them again (gap 111).
+            tracing::info!(node = %self.node, "failing checks were marked sent but no fix agent ran to its end; sending them again");
+            self.state.loops.checks_sent = None;
+            self.state.loops.check_rounds = self.state.loops.check_rounds.saturating_sub(1);
+            self.save()?;
         }
         let limit = tod_store::TodSettings::load(&tod_store::TodPaths::at(&self.config.data_root))?
             .lifecycle
@@ -1339,6 +1350,27 @@ impl Autopilot {
         self.owe_groups(fleet, ProtocolKind::Fix, "fix", lifecycle)?;
         self.record(fleet, "fix_checks", lifecycle, None)?;
         Ok(ChecksStep::Fixed)
+    }
+
+    /// Whether the node's newest fix or quick fix conversation ended with an
+    /// agent reply, so that failing checks it was sent were really worked on.
+    /// False when there is none, or its last turn is an error (the agent could
+    /// not start or was cut off), or it has no turns at all.
+    fn fix_ran_to_end(&self, fleet: &FleetStore) -> Result<bool> {
+        use tod_store::conversation::TurnRole;
+        let node = self.node;
+        fleet.read(|conn| {
+            let repo = ConversationRepo::new(conn);
+            let mut newest: Option<(i64, bool)> = None;
+            for kind in [ProtocolKind::Fix, ProtocolKind::QuickFix] {
+                let Some(conversation) = repo.latest_for_focus_with_protocol(Focus::Node(node), kind)? else { continue };
+                let replied = repo.turns(conversation.id)?.last().is_some_and(|t| matches!(t.role, TurnRole::Agent));
+                if newest.is_none_or(|(at, _)| conversation.updated_at > at) {
+                    newest = Some((conversation.updated_at, replied));
+                }
+            }
+            Ok(newest.is_some_and(|(_, replied)| replied))
+        })
     }
 
     /// The last thing the node's fix or quick fix agent said (its reply, or
