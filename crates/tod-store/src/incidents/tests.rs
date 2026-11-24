@@ -348,6 +348,24 @@ fn an_auth_failure_with_no_environment_is_counted_as_unknown() {
     let (_dir, conn, n) = setup(1);
     observe(&conn, n[0], Source::Agent, "an agent turn", AGENT_AUTH, 5).unwrap();
     let by = auth_by_environment(&conn, None).unwrap();
-    assert_eq!(by.values().map(|a| a.failures).sum::<u64>(), 1);
-    assert!(by.keys().all(|k| k.starts_with("unknown:")));
+    // The node has no Files location, so the store reads it as this machine.
+    assert_eq!(by["host:this machine"].failures, 1);
+}
+
+#[test]
+fn an_auth_failure_in_an_agent_filed_request_is_measured_too() {
+    let (_dir, conn, n) = setup(2);
+    let start = 1_000 * MIN;
+    let env = container("workspace-dev-app-1", Some(start));
+    // The request path, with the environment given: no incident yet.
+    let seen = observe_request_in(&conn, n[0], None, "asking the user", AUTH, start + 3 * MIN, Some(&env)).unwrap();
+    assert_eq!(seen.verdict, Verdict::Retry);
+    // A second node's request opens the incident; its environment is read from
+    // the store (no location: this machine).
+    let seen = observe_request(&conn, n[1], None, "asking the user", AUTH, start + 4 * MIN).unwrap();
+    assert!(seen.opened);
+    let by = auth_by_environment(&conn, None).unwrap();
+    let a = &by["container:workspace-dev-app-1"];
+    assert_eq!((a.failures, a.in_incident, a.within_restart_window, a.latest_age_secs), (1, 0, 1, Some(180)));
+    assert_eq!((by["host:this machine"].failures, by["host:this machine"].in_incident), (1, 1));
 }

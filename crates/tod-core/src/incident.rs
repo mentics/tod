@@ -126,21 +126,9 @@ fn environment_of(fleet: &FleetStore, node: Uuid) -> EnvironmentSeen {
         .and_then(|f| f.ready_directory())
         .unwrap_or_else(|| tod_store::fleet::Workdir::host(fleet.paths().root()));
     let (kind, name) = tod_store::fleet::dev_container::environment_label(files.as_ref(), &cwd);
-    environment_seen(kind, name, tod_agent::devcontainer::started_at_ms)
+    incidents::environment_seen(kind, name, tod_agent::devcontainer::started_at_ms)
 }
 
-/// The environment with its start time read by `start` (for a container only).
-fn environment_seen(kind: &str, name: String, start: impl Fn(&str) -> Result<i64>) -> EnvironmentSeen {
-    let (started_at_ms, start_unknown) = match kind {
-        "container" => match start(&name) {
-            Ok(ms) => (Some(ms), None),
-            Err(e) => (None, Some(format!("{e:#}"))),
-        },
-        "sandbox" => (None, Some("a sandbox's start time is not recorded".to_string())),
-        _ => (None, Some("this machine has no start time to compare".to_string())),
-    };
-    EnvironmentSeen { kind: kind.to_string(), name, started_at_ms, start_unknown }
-}
 
 /// A look at GitHub failed with `error`: logged by class and operation
 /// (`tod-cli lessons stats`). Always on this machine's store, whatever the
@@ -363,17 +351,17 @@ mod environment_tests {
 
     #[test]
     fn a_containers_start_is_read_and_a_failed_read_is_recorded_as_unknown() {
-        let seen = environment_seen("container", "workspace-dev-app-1".into(), |c| {
+        let seen = incidents::environment_seen("container", "workspace-dev-app-1".into(), |c| {
             assert_eq!(c, "workspace-dev-app-1");
             Ok(42)
         });
         assert_eq!((seen.kind.as_str(), seen.started_at_ms, seen.start_unknown), ("container", Some(42), None));
 
-        let seen = environment_seen("container", "gone".into(), |_| anyhow::bail!("No container named `gone`"));
+        let seen = incidents::environment_seen("container", "gone".into(), |_| anyhow::bail!("No container named `gone`"));
         assert_eq!(seen.started_at_ms, None);
         assert!(seen.start_unknown.unwrap().contains("No container named"));
 
-        let seen = environment_seen("host", "this machine".into(), |_| panic!("the host is not inspected"));
+        let seen = incidents::environment_seen("host", "this machine".into(), |_| panic!("the host is not inspected"));
         assert_eq!((seen.started_at_ms, seen.key()), (None, "host:this machine".to_string()));
     }
 }

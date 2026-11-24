@@ -308,7 +308,17 @@ pub enum Op {
     },
     /// An agent-filed request's error: attach the node to the open incident
     /// its signature matches, or note the sighting.
-    ObserveRequest { node: Uuid, conversation: Option<Uuid>, operation: String, error: String, now: i64 },
+    ObserveRequest {
+        node: Uuid,
+        conversation: Option<Uuid>,
+        operation: String,
+        error: String,
+        now: i64,
+        /// Where the node's agent runs; read from the node's location when
+        /// absent.
+        #[serde(default)]
+        environment: Option<EnvironmentSeen>,
+    },
     /// A cause that parks nothing (a bot silent) was seen on `node`.
     Notice { node: Uuid, signature: String, summary: String, detail: String, now: i64 },
     /// The node's operation went through: it is no longer parked, and if it
@@ -340,8 +350,10 @@ pub fn run_op(conn: &Connection, op: &Op) -> Result<serde_json::Value> {
         Op::Observe { node, source, operation, error, now, environment } => {
             serde_json::to_value(observe_in(conn, *node, *source, operation, error, *now, environment.as_ref())?)?
         }
-        Op::ObserveRequest { node, conversation, operation, error, now } => {
-            serde_json::to_value(observe_request(conn, *node, *conversation, operation, error, *now)?)?
+        Op::ObserveRequest { node, conversation, operation, error, now, environment } => {
+            serde_json::to_value(observe_request_in(
+                conn, *node, *conversation, operation, error, *now, environment.as_ref(),
+            )?)?
         }
         Op::Notice { node, signature, summary, detail, now } => {
             serde_json::to_value(notice(conn, *node, signature, summary, detail, *now)?)?
@@ -611,33 +623,7 @@ pub fn observe_in(
     if !c.kind.parks() {
         return Ok(Observed::none());
     }
-    let observed = observe_classified(conn, node, &c, operation, error, now, None)?;
-    if c.kind == Kind::Auth {
-        let unknown = EnvironmentSeen {
-            kind: "unknown".into(),
-            name: "no environment was given".into(),
-            started_at_ms: None,
-            start_unknown: Some("no environment was given".into()),
-        };
-        let env = environment.unwrap_or(&unknown);
-        conn.execute(
-            "INSERT INTO incident_auth_failures
-                 (seen_at, node_id, signature, operation, env_kind, env_name, env_started_at, env_start_unknown, incident_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                now,
-                uuid_to_blob(node),
-                c.signature,
-                operation,
-                env.kind,
-                env.name,
-                env.started_at_ms,
-                env.start_unknown,
-                observed.incident.as_ref().map(|i| uuid_to_blob(i.id)),
-            ],
-        )?;
-    }
-    Ok(observed)
+    observe_classified(conn, node, &c, operation, error, now, None, environment)
 }
 
 /// Logs a failed look at GitHub, classified by its text
@@ -742,7 +728,86 @@ pub fn auth_by_environment(
     Ok(out)
 }
 
+/// The one place every source of a failure ends (a turn, GitHub, a tool, an
+/// agent-filed request): an `auth` one is logged in `incident_auth_failures`
+/// with `environment`, or with the node's own as the store reads it
+/// ([`environment_for_node`]) when the caller gave none, so no path skips the
+/// measure.
+#[allow(clippy::too_many_arguments)]
 fn observe_classified(
+    conn: &Connection,
+    node: Uuid,
+    c: &Classification,
+    operation: &str,
+    error: &str,
+    now: i64,
+    decision: Option<Uuid>,
+    environment: Option<&EnvironmentSeen>,
+) -> Result<Observed> {
+    let observed = observe_classified_inner(conn, node, c, operation, error, now, decision)?;
+    if c.kind == Kind::Auth {
+        let resolved;
+        let env = match environment {
+            Some(env) => env,
+            None => {
+                resolved = environment_for_node(conn, node);
+                &resolved
+            }
+        };
+        conn.execute(
+            "INSERT INTO incident_auth_failures
+                 (seen_at, node_id, signature, operation, env_kind, env_name, env_started_at, env_start_unknown, incident_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                now,
+                uuid_to_blob(node),
+                c.signature,
+                operation,
+                env.kind,
+                env.name,
+                env.started_at_ms,
+                env.start_unknown,
+                observed.incident.as_ref().map(|i| uuid_to_blob(i.id)),
+            ],
+        )?;
+    }
+    Ok(observed)
+}
+
+/// The environment `node`'s agent runs in and when it last started, read from
+/// the node's Files location (a container's start from `docker inspect`).
+/// Anything that cannot be read is recorded as unknown with the reason, never
+/// guessed.
+pub fn environment_for_node(conn: &Connection, node: Uuid) -> EnvironmentSeen {
+    use crate::fleet::dev_container::environment_label;
+    let files = match crate::fleet::node_actions::resolve_files_for_node(conn, &node.to_string()) {
+        Ok(files) => files,
+        Err(e) => {
+            let why = format!("could not resolve the node's files: {e:#}");
+            return EnvironmentSeen { kind: "unknown".into(), name: why.clone(), started_at_ms: None, start_unknown: Some(why) };
+        }
+    };
+    let (kind, name) = match files.as_ref().and_then(|f| f.ready_directory()) {
+        Some(cwd) => environment_label(files.as_ref(), &cwd),
+        None => ("host", "this machine".to_string()),
+    };
+    environment_seen(kind, name, tod_agent::devcontainer::started_at_ms)
+}
+
+/// The environment with its start time read by `start` (a container only).
+pub fn environment_seen(kind: &str, name: String, start: impl Fn(&str) -> Result<i64>) -> EnvironmentSeen {
+    let (started_at_ms, start_unknown) = match kind {
+        "container" => match start(&name) {
+            Ok(ms) => (Some(ms), None),
+            Err(e) => (None, Some(format!("{e:#}"))),
+        },
+        "sandbox" => (None, Some("a sandbox's start time is not recorded".to_string())),
+        _ => (None, Some("this machine has no start time to compare".to_string())),
+    };
+    EnvironmentSeen { kind: kind.to_string(), name, started_at_ms, start_unknown }
+}
+
+fn observe_classified_inner(
     conn: &Connection,
     node: Uuid,
     c: &Classification,
@@ -857,6 +922,20 @@ pub fn observe_request(
     error: &str,
     now: i64,
 ) -> Result<Observed> {
+    observe_request_in(conn, node, conversation, operation, error, now, None)
+}
+
+/// [`observe_request`] with the environment of an `auth` failure given (else
+/// read from the node's location).
+pub fn observe_request_in(
+    conn: &Connection,
+    node: Uuid,
+    conversation: Option<Uuid>,
+    operation: &str,
+    error: &str,
+    now: i64,
+    environment: Option<&EnvironmentSeen>,
+) -> Result<Observed> {
     if error.trim().is_empty() {
         return Ok(Observed::none());
     }
@@ -881,13 +960,13 @@ pub fn observe_request(
             if conversation.is_some() && incident.investigation_conversation == conversation {
                 return Ok(Observed::none());
             }
-            return observe_classified(conn, node, candidate, operation, error, now, None);
+            return observe_classified(conn, node, candidate, operation, error, now, None, environment);
         }
     }
     // No incident yet: note the sighting under the first candidate; a second
     // node asking the same opens the incident (and adopts this request).
     match candidates.first() {
-        Some(first) => observe_classified(conn, node, first, operation, error, now, None),
+        Some(first) => observe_classified(conn, node, first, operation, error, now, None, environment),
         None => Ok(Observed::none()),
     }
 }
