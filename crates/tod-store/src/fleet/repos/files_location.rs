@@ -389,6 +389,7 @@ pub fn migrate_from_node_files(conn: &Connection) -> Result<()> {
                 None => Default::default(),
             },
             clone_url: None,
+            treehouse: None,
         });
         if let Some(name) = &sandbox {
             conn.execute(

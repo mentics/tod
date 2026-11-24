@@ -688,8 +688,12 @@ Nothing starts or builds a container; tod only uses a running one.
 - **Repository in the container** (the default): the workspace directory is a
   container path, and git runs there too. Git worktrees go to
   `<repo>/.worktrees/<branch>`, which is added to the repository's
-  `info/exclude`. Treehouse runs there too: the `treehouse` on the
-  container's `PATH` (else a login shell's), with its own configuration and
+  `info/exclude`. Treehouse runs there too: the location's **Treehouse**
+  path (`files_places.container_treehouse`, `DevContainerSetting::treehouse`,
+  an absolute path in the container; one that is not there is an error, never
+  the `PATH`'s or git), else the `treehouse` on the container's `PATH` (else
+  a login shell's; never an interactive shell's, so a `treehouse` only
+  `.zshrc` puts on the `PATH` needs the path), with its own configuration and
   `TREEHOUSE_NO_UPDATE_CHECK=1`; none of tod's Treehouse settings apply.
   A lease is not held while a node is parked: the daemon's minute pass
   (`tod_core::worktree_release`) gives back the lease of a node at `pr_draft`

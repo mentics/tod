@@ -23,7 +23,7 @@ use gpui::{
     StatefulInteractiveElement, Styled, Window, div, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::input::{Input, InputState, Textarea, TextareaState};
+use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_component::{ActiveTheme, Disableable, WindowExt, h_flex, v_flex};
 use std::sync::Arc;
 use tod_agent::devcontainer::{self, ContainerSummary};
@@ -95,6 +95,11 @@ struct LocationsDialog {
     image: Entity<InputState>,
     /// An image location's repository: the GitHub HTTPS URL tod clones.
     clone_url: Entity<InputState>,
+    /// A dev container's `treehouse`, as an absolute path inside it; empty
+    /// finds it on the container's `PATH`.
+    treehouse: Entity<InputState>,
+    /// Re-probes the Worktrees note when the Treehouse path is left or entered.
+    _treehouse_subscription: gpui::Subscription,
     use_worktree: bool,
     runs_in: RunsIn,
     repo_on_host: bool,
@@ -170,6 +175,13 @@ impl LocationsDialog {
         let input = |placeholder: &'static str, window: &mut Window, cx: &mut Context<Self>| {
             cx.new(|cx| InputState::new(window, cx).placeholder(placeholder))
         };
+        let treehouse = input("Empty: the one on the container's PATH", window, cx);
+        let _treehouse_subscription = cx.subscribe(&treehouse, |this: &mut Self, _, event, cx| {
+            if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
+                this.check = None;
+                this.probe_worktree(cx);
+            }
+        });
         let mut this = Self {
             focus_handle: cx.focus_handle(),
             fleet,
@@ -183,6 +195,8 @@ impl LocationsDialog {
             container: input("Container name", window, cx),
             image: input("Image (empty uses the default)", window, cx),
             clone_url: input("https://github.com/owner/name", window, cx),
+            treehouse,
+            _treehouse_subscription,
             use_worktree: true,
             runs_in: RunsIn::Machine,
             repo_on_host: false,
@@ -273,6 +287,7 @@ impl LocationsDialog {
         set(&self.container, dev.container().unwrap_or_default().to_string(), window, cx);
         set(&self.image, image, window, cx);
         set(&self.clone_url, dev.repo_url().unwrap_or_default().to_string(), window, cx);
+        set(&self.treehouse, dev.treehouse().unwrap_or_default().to_string(), window, cx);
         self.editing = place;
         self.error = None;
         self.build_open = false;
@@ -299,6 +314,7 @@ impl LocationsDialog {
             RunsIn::DevContainer => Some(DevContainerSetting {
                 container: Some(text(&self.container)).filter(|c| !c.is_empty()),
                 repo_on_host: self.repo_on_host,
+                treehouse: Some(text(&self.treehouse)).filter(|t| !t.is_empty()),
                 ..Default::default()
             }),
             RunsIn::Sandbox => Some(DevContainerSetting {
@@ -405,6 +421,7 @@ impl LocationsDialog {
     /// Check where launches would run, off the UI thread (this talks to
     /// Docker or wakes a sandbox).
     fn run_check(&mut self, cx: &mut Context<Self>) {
+        self.probe_worktree(cx);
         let draft = self.draft(cx);
         let root = self.fleet.paths().root().to_path_buf();
         self.generation += 1;
@@ -1004,15 +1021,23 @@ impl LocationsDialog {
                         .child(self.choice("loc-repo-inside", "Inside the container", !self.repo_on_host, cx, |this, _, cx| {
                             this.repo_on_host = false;
                             this.check = None;
-                            cx.notify();
+                            this.probe_worktree(cx);
                         }))
                         .child(self.choice("loc-repo-mounted", "On this machine, mounted", self.repo_on_host, cx, |this, _, cx| {
                             this.repo_on_host = true;
                             this.check = None;
-                            cx.notify();
+                            this.probe_worktree(cx);
                         })),
                 )
                 .child(field("Container", &self.container, cx))
+                .when(!self.repo_on_host && self.use_worktree, |el| {
+                    el.child(field("Treehouse (absolute path inside the container)", &self.treehouse, cx)).child(
+                        div().text_xs().text_color(muted).child(
+                            "Give it when `treehouse` is only on an interactive shell's PATH (set up by .zshrc): \
+                             tod never starts one. A path that is not there is an error, never a fallback.",
+                        ),
+                    )
+                })
             })
             .when(runs_in == RunsIn::Sandbox, |el| {
                 el.child(
@@ -1302,8 +1327,8 @@ fn check_place(place: &FilesPlace, root: &std::path::Path) -> Result<String, Str
     }
 }
 
-/// Treehouse required by Settings but missing where `place`'s nodes would run
-/// (see [`tod_store::fleet::treehouse_required_problem`]). Runs programs and
+/// Treehouse required by Settings, or named by the location, but missing where
+/// `place`'s nodes would run (see [`tod_store::fleet::treehouse_problem`]). Runs programs and
 /// may talk to Docker: off the UI thread only.
 fn worktree_problem(place: &FilesPlace, root: &std::path::Path) -> Option<String> {
     use tod_store::fleet::Workdir;
@@ -1312,13 +1337,14 @@ fn worktree_problem(place: &FilesPlace, root: &std::path::Path) -> Option<String
         Err(err) => return Some(format!("Could not read the settings to check Treehouse: {err:#}")),
     };
     let repo = place.repo().unwrap_or_default().to_string();
+    let configured = place.dev_container.as_ref().and_then(|dev| dev.treehouse());
     let workdir = match &place.dev_container {
         Some(dev) if !dev.sandbox && !dev.repo_on_host => {
             Workdir::Container { container: dev.container()?.to_string(), path: repo }
         }
         _ => Workdir::Host(std::path::PathBuf::from(repo)),
     };
-    tod_store::fleet::treehouse_required_problem(&workdir, &settings)
+    tod_store::fleet::treehouse_problem(&workdir, &settings, configured)
 }
 
 fn check_repo_in_sandbox(sandbox: &str, repo: Option<&str>) -> Result<String, String> {

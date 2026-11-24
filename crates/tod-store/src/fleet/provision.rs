@@ -475,6 +475,7 @@ fn make_worktree(
         paths,
         &data_root,
         &repo_path,
+        files.dev_container.as_ref().and_then(|dev| dev.treehouse()),
         branch,
         &lease_holder,
     )
@@ -605,7 +606,8 @@ pub fn release_parked_worktree(
     if !unpushed.is_empty() {
         return Ok(Release::Kept(unpushed.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ")));
     }
-    worktree::treehouse_return(&dir, &lease_id, settings, paths)
+    let treehouse = configured_treehouse(fleet, &location)?;
+    worktree::treehouse_return(&dir, treehouse.as_deref(), &lease_id, settings, paths)
         .with_context(|| format!("give back the lease of {}", location.describe()))?;
     forget_removed_location(fleet, node_id, &location)?;
     Ok(Release::Released)
@@ -2033,6 +2035,29 @@ pub fn node_location(fleet: &FleetStore, node_id: &str) -> Result<Option<FilesLo
     fleet.read(|conn| FilesLocationRepo::new(conn).get(node_id))
 }
 
+/// The Treehouse path `location`'s container is configured with
+/// ([`crate::fleet::repos::node_files::DevContainerSetting::treehouse`]): the
+/// one the location (`files_places`) picked by the node it was made from names,
+/// while that is still for the same container. `None` finds it on the
+/// container's `PATH`, as when no path is configured.
+fn configured_treehouse(fleet: &FleetStore, location: &FilesLocation) -> Result<Option<String>> {
+    use crate::fleet::repos::files_place::FilesPlaceRepo;
+    use crate::fleet::repos::node_files::NodeFilesRepo;
+    let Some(container) = location.container.as_deref().map(str::trim).filter(|c| !c.is_empty()) else {
+        return Ok(None);
+    };
+    fleet.read(|conn| {
+        let Some(place_id) = NodeFilesRepo::new(conn).get(&location.source_node_id)?.and_then(|f| f.place_id) else {
+            return Ok(None);
+        };
+        Ok(FilesPlaceRepo::new(conn)
+            .get(&place_id)?
+            .and_then(|place| place.dev_container)
+            .filter(|dev| dev.repo_container() == Some(container))
+            .and_then(|dev| dev.treehouse().map(str::to_string)))
+    })
+}
+
 pub(super) fn location_dir(location: &FilesLocation) -> Result<Workdir> {
     location
         .directory()
@@ -2755,7 +2780,8 @@ pub fn remove_location(
                 let cleared = cleared.as_ref().context("the commit guard did not run; nothing was deleted")?;
                 sandboxes.delete(&bx, cleared).with_context(|| format!("delete sandbox {name}"))?;
             } else if let Some(lease_id) = location.lease_id() {
-                worktree::treehouse_return(&dir, lease_id, settings, paths)?;
+                let treehouse = configured_treehouse(fleet, &location)?;
+                worktree::treehouse_return(&dir, treehouse.as_deref(), lease_id, settings, paths)?;
             } else {
                 let shared = fleet.read(|conn| {
                     FilesLocationRepo::new(conn).others_using_worktree(node_id, &dir.storage())

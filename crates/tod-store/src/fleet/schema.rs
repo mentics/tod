@@ -971,6 +971,8 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     ensure_skill_group(conn)?;
     // `files_places.clone_url`: machine-local, no schema version.
     crate::fleet::repos::files_place::ensure_clone_url(conn)?;
+    // `files_places.container_treehouse`: machine-local, no schema version.
+    crate::fleet::repos::files_place::ensure_container_treehouse(conn)?;
     // `node_files_locations.used_at`: machine-local, no schema version.
     crate::fleet::repos::files_location::ensure_used_at(conn)?;
     // The git identity cloud sandboxes author commits as: seeded from this
