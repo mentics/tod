@@ -77,6 +77,7 @@ for arg in "$@"; do
     batch) batch=1 ;;
     run) [ -n "$batch" ] && run=1 ;;
     --file) if [ -n "$run" ]; then take_file=1; continue; fi ;;
+    --file=*) if [ -n "$run" ]; then file="${arg#--file=}"; continue; fi ;;
   esac
   bargs+=("$arg")
 done
@@ -266,6 +267,7 @@ for arg in "$@"; do
     batch) batch=1 ;;
     run) [ -n "$batch" ] && run=1 ;;
     --file) if [ -n "$run" ]; then take_file=1; continue; fi ;;
+    --file=*) if [ -n "$run" ]; then file="${arg#--file=}"; continue; fi ;;
   esac
   bargs+=("$arg")
 done
@@ -1036,6 +1038,75 @@ mod tests {
         let out = run(&["batch", "run", "--file", script.to_str().unwrap()], "");
         assert!(out.contains("from the file"), "{out}");
         assert!(!out.contains("--file"), "the host cli must not see the path: {out}");
+        let eq = format!("--file={}", script.display());
+        let out = run(&["batch", "run", &eq], "");
+        assert!(out.contains("from the file"), "{out}");
+        assert!(!out.contains("--file"), "the host cli must not see the path: {out}");
+    }
+
+    /// The same for the HTTP shim (a node's sandbox): the request it posts
+    /// carries the script from stdin or from `--file PATH` / `--file=PATH`,
+    /// and never the path.
+    #[cfg(unix)]
+    #[test]
+    fn the_http_shim_sends_a_batch_script_from_stdin_or_a_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tod_test_util::scratch_dir(format!("tod-http-shim-batch-{}", uuid::Uuid::new_v4()));
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let write_exe = |path: &Path, body: &str| {
+            std::fs::write(path, body).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let shim = dir.join("tod-cli");
+        write_exe(&shim, HTTP_SHIM_SCRIPT);
+        let captured = dir.join("posted");
+        // A fake curl: keeps the request body it was given and answers 200.
+        write_exe(
+            &bin.join("curl"),
+            &format!(
+                "#!/usr/bin/env bash\nwhile [ $# -gt 0 ]; do case \"$1\" in -o) out=\"$2\"; shift;; --data-binary) cp \"${{2#@}}\" '{}'; shift;; esac; shift; done\nprintf '0 0 0\\n' > \"$out\"\nprintf 200\n",
+                captured.display()
+            ),
+        );
+        let script = dir.join("script.txt");
+        std::fs::write(&script, "from the file\n").unwrap();
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+        let run = |args: &[&str], stdin: &str| {
+            let _ = std::fs::remove_file(&captured);
+            let mut child = Command::new("bash")
+                .arg(&shim)
+                .args(args)
+                .env("PATH", &path)
+                .env(ORCHESTRATOR_CLI_URL_ENV, "http://127.0.0.1:9/cli")
+                .env(USER_ENV, "u")
+                .env(NODE_ENV, "n")
+                .env("TOD_LOCAL_CLI", dir.join("missing"))
+                .env_remove(PORT_ENV)
+                .env_remove(TOKEN_ENV)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
+            let out = child.wait_with_output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&std::fs::read(&captured).unwrap()).into_owned()
+        };
+        let posted = run(&["batch", "run"], "from stdin\n");
+        assert!(posted.contains("from stdin"), "{posted}");
+        let eq = format!("--file={}", script.display());
+        for args in [
+            vec!["batch".to_string(), "run".into(), "--file".into(), script.display().to_string()],
+            vec!["batch".to_string(), "run".into(), eq],
+        ] {
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let posted = run(&args, "");
+            assert!(posted.contains("from the file"), "{posted}");
+            assert!(!posted.contains("--file"), "the path must not be posted: {posted}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -95,6 +95,9 @@ pub(crate) fn run(inv: Invocation) -> anyhow::Result<String> {
                         .clone(),
                 );
             }
+            other if other.starts_with("--file=") => {
+                file = Some(other["--file=".len()..].to_string());
+            }
             "--script" => {
                 i += 1;
                 script = Some(

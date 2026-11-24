@@ -657,6 +657,8 @@ Second."), "{listed}");
         )
         .unwrap();
         let err = cli(&root, &["batch", "run", "--file", script.to_str().unwrap()]).unwrap_err();
+        let eq = cli(&root, &["batch", "run", &format!("--file={}", script.to_str().unwrap())]).unwrap_err();
+        assert!(format!("{eq:#}").starts_with("batch: 3 applied") || format!("{eq:#}").contains("FAILED"), "{eq:#}");
         let report = format!("{err:#}");
         assert!(report.starts_with("batch: 3 applied, 1 failed"), "{report}");
         assert!(report.contains("[3] FAILED node rename no-such-node"), "{report}");
