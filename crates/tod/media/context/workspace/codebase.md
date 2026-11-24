@@ -39,6 +39,16 @@ work. Leave out the app's internal vocabulary (node, slug, obligation,
 lifecycle state, change set, plan step) and its name, unless the project's own
 code or docs use the word, or the change is to the app itself.
 
+## The project's helper scripts may be missing
+
+A project's skills and docs sometimes name a helper on `PATH` (a `git-info`
+script, a wrapper). It may not be installed where you run, and a missing one can
+hang with no output. Do not wait on it, retry it, or ask the user to supply it:
+use plain git. The change's scope and base need no helper: `git merge-base
+<base> HEAD`, `git diff <base>...HEAD --stat`, `git diff <base>...HEAD -- <path>`,
+`git log <base>..HEAD` (`origin/<base>` when the local ref is absent). Say in
+your notes which helper was unavailable and what you used.
+
 ## Sites behind Cloudflare Access
 
 Some of the user's internal sites (a job scheduler, an admin console) sit

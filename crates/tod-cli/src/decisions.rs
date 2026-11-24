@@ -360,6 +360,15 @@ fn ask(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
         guard_reask = false;
     }
     if guard_reask {
+        if let Some(why) = tod_core::missing_tool_request::refusal(
+            protocol.as_deref(),
+            &reason,
+            &question,
+            &brief.command,
+            &brief.error,
+        ) {
+            anyhow::bail!("{why}");
+        }
         refuse_babysitter_request(inv, node, protocol.as_deref(), &question)?;
     }
     // An auth failure's environment (and a container's start time, a `docker

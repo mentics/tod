@@ -63,6 +63,8 @@ mod tests {
         let out = with_codebase_rules("ctx".into(), &nested);
         assert!(out.starts_with("ctx"));
         assert!(out.contains("dev container"));
+        // Judging sessions find scope and base with plain tools, not a project helper.
+        assert!(out.contains("merge-base") && out.contains("--stat"));
         let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -55,6 +55,7 @@ pub mod review_leftovers;
 pub mod review_scoring;
 pub mod fix_escalation;
 pub mod follow_up_request;
+pub mod missing_tool_request;
 pub mod skills_context;
 pub mod environment_request;
 pub mod environment_reset;
