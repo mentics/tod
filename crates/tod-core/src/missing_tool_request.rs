@@ -13,20 +13,24 @@
 /// Protocols whose work is reading the change, so plain git always suffices.
 const JUDGING: &[&str] = &["evaluate", "verification", "review", "fix", "phase", "triage"];
 
-/// Phrases that say a command was absent or never answered.
+/// Phrases in `--error` that say the helper was absent or never answered.
 const SYMPTOMS: &[&str] = &[
     "command not found",
-    "not found",
     "not installed",
-    "no such file",
+    "not on path",
     "hung",
-    "hang",
+    "hangs",
     "timed out",
-    "timeout",
     "no output",
     "interrupted",
-    "not on path",
-    "not available",
+];
+
+/// Programs that are never a project helper: a failure of one is a real
+/// failure, whatever its error says.
+const KNOWN_TOOLS: &[&str] = &[
+    "git", "tod-cli", "tod", "cargo", "rustc", "gh", "docker", "docker-compose", "npm", "npx", "pnpm", "yarn", "node",
+    "bun", "python", "python3", "pip", "pip3", "uv", "psql", "pg_dump", "mysql", "redis-cli", "curl", "wget", "ssh",
+    "make", "go", "java", "mvn", "gradle", "terraform", "kubectl", "aws", "sh", "bash", "zsh", "sudo", "env",
 ];
 
 /// The error text a session is sent instead of the request.
@@ -37,21 +41,21 @@ pub const REFUSAL: &str = "not recorded: a project helper that is missing or han
     local ref is absent). Do not run the helper again. Carry on with the judgement, and record in your notes that the helper \
     was unavailable. Ask only if plain git itself fails.";
 
-/// The refusal for a `broken` request, if it is one a session may not raise.
-pub fn refusal(protocol: Option<&str>, reason: &str, question: &str, command: &str, error: &str) -> Option<&'static str> {
+/// The refusal for a `broken` request, if it is one a session may not raise:
+/// the `--command`'s program is not a known tool (so it is a project helper)
+/// and `--error` says it was not found or that it hung, timed out or printed
+/// nothing.
+pub fn refusal(protocol: Option<&str>, reason: &str, _question: &str, command: &str, error: &str) -> Option<&'static str> {
     if reason != "broken" || !protocol.is_some_and(|p| JUDGING.contains(&p)) {
         return None;
     }
-    let all = format!("{question}\n{command}\n{error}").to_lowercase();
-    if all.contains("tod-cli") || all.contains("tod_cli") {
+    let first = command.split_whitespace().next()?;
+    let program = first.rsplit('/').next().unwrap_or(first);
+    if KNOWN_TOOLS.contains(&program) {
         return None;
     }
-    // Plain git failing is a real fault.
-    let first = command.split_whitespace().next().unwrap_or("");
-    if first == "git" {
-        return None;
-    }
-    SYMPTOMS.iter().any(|s| all.contains(s)).then_some(REFUSAL)
+    let error = error.to_lowercase();
+    SYMPTOMS.iter().any(|s| error.contains(s)).then_some(REFUSAL)
 }
 
 #[cfg(test)]
@@ -72,12 +76,25 @@ mod tests {
     }
 
     #[test]
-    fn other_requests_pass() {
-        // Not broken, not a judging protocol, tod-cli or git itself failing, no symptom.
-        assert!(refusal(Some("evaluate"), "intent", "q", "git-info", "not found").is_none());
-        assert!(refusal(Some("implement"), "broken", "q", "git-info", "not found").is_none());
-        assert!(refusal(Some("review"), "broken", "q", "tod-cli plan list", "not found").is_none());
-        assert!(refusal(Some("review"), "broken", "q", "git diff x", "no such file").is_none());
-        assert!(refusal(Some("review"), "broken", "q", "", "disk full").is_none());
+    fn legitimate_failures_pass_through() {
+        for (command, error) in [
+            ("cargo test -p tod-core", "timed out after 600s"),
+            ("psql -h db -c 'select 1'", "connection refused: database not installed"),
+            ("docker exec app true", "hung with no output"),
+            ("gh pr view 12", "command not found"),
+            ("git worktree add x", "no such file or directory"),
+            ("tod-cli plan list", "command not found"),
+            ("./scripts/check", "exit 1: assertion failed"),
+            ("", "timed out"),
+        ] {
+            assert!(refusal(Some("review"), "broken", "q", command, error).is_none(), "{command}");
+        }
+        assert!(refusal(Some("evaluate"), "intent", "q", "git-info", "command not found").is_none());
+        assert!(refusal(Some("implementation"), "broken", "q", "git-info", "command not found").is_none());
+    }
+
+    #[test]
+    fn missing_helper_by_path_is_redirected() {
+        assert!(refusal(Some("verification"), "broken", "q", "/usr/local/bin/git-info base", "bash: git-info: command not found").is_some());
     }
 }

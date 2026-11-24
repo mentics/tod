@@ -99,6 +99,9 @@ reaches you. It is filed as follows:
   out when `--need` is given. Without `--option`, the choices are "Done,
   continue" and "Do not do it". Give the other flags when you have them and
   leave out the ones you do not.
+  A project helper that is missing or hangs (a `git-info`-style script a skill
+  names) is not a `broken` request in a judging session: it is refused. Fall
+  back to plain git as the codebase rules say.
 
 ```
 tod-cli decisions ask --reason access --need "A logged-in AWS SSO session for the prod database" \
