@@ -215,6 +215,31 @@ pub fn refresh_reviewers(data_root: &Path, pr: &NodePr) -> Result<Vec<Reviewer>,
     Ok(people)
 }
 
+/// Merge the base into `pr` on GitHub (the user's Update). A conflict is
+/// recorded exactly as the autopilot records one
+/// ([`crate::autopilot::api_work::note_base_conflict`]), so the agent is given
+/// it as `Work::Conflict`, and comes back as an error saying so.
+fn bring_base_in(
+    fleet: &tod_store::fleet::FleetStore,
+    node: uuid::Uuid,
+    feed: &dyn crate::pr_readiness::PrFeed,
+    pr: &NodePr,
+    head: Option<&str>,
+    phase: &str,
+) -> Result<(), String> {
+    match feed.update_branch(pr) {
+        Ok(crate::pr_readiness::BaseMerge::Merged) => Ok(()),
+        Ok(crate::pr_readiness::BaseMerge::Conflict(why)) => {
+            crate::autopilot::api_work::note_base_conflict(fleet, node, pr, head, &why, phase)
+                .map_err(|e| format!("could not record the conflict: {e}"))?;
+            Err(format!(
+                "the branch conflicts with its base ({why}), so GitHub cannot update it. tod has recorded the conflict and the agent will merge the base in and resolve it."
+            ))
+        }
+        Err(e) => Err(format!("could not update the branch from its base: {e}")),
+    }
+}
+
 /// Send what the user chose to GitHub: labels, then open or back to draft,
 /// then the reviewer. Opening a draft, and asking a reviewer of a draft, are
 /// refused until the code review is clean; nothing else waits. Stops at the
@@ -235,8 +260,11 @@ pub fn update(
     // Behind its base and nothing else: bring the base in here rather than
     // refuse and make the user do it.
     if facts.only_behind {
-        gh.update_pr_branch(&pr.owner, &pr.repo, pr.pr_number)
-            .map_err(|e| format!("could not update the branch from its base: {}", say(e)))?;
+        let feed = crate::pr_readiness::feed_for(data_root)
+            .ok_or_else(|| crate::pull_requests::NO_TOKEN.to_string())?;
+        let head = feed.snapshot(pr)?.status.head_sha;
+        let phase = if facts.draft { "pr_draft" } else { "pr_review" };
+        bring_base_in(fleet, node, feed.as_ref(), pr, head.as_deref(), phase)?;
         crate::pr_readiness::forget_snapshot(pr);
         facts = load(data_root, fleet, node, pr)?;
     }
@@ -319,6 +347,29 @@ mod tests {
 
     fn configured() -> PrReadinessSettings {
         PrReadinessSettings { bots: vec![PrReviewBotSettings::new("greptile", 4, 10)], ..Default::default() }
+    }
+
+    struct Conflicting;
+
+    impl PrFeed for Conflicting {
+        fn snapshot(&self, _: &NodePr) -> Result<PrSnapshot, String> {
+            Err("not read".into())
+        }
+
+        fn update_branch(&self, _: &NodePr) -> Result<crate::pr_readiness::BaseMerge, String> {
+            Ok(crate::pr_readiness::BaseMerge::Conflict("merge conflict between base and head".into()))
+        }
+    }
+
+    #[test]
+    fn the_users_update_records_a_conflict_for_the_agent() {
+        let fx = crate::interview::test_support::fixture();
+        let pr = NodePr { owner: "o".into(), repo: "conflict-r".into(), pr_number: 7, url: "https://github.com/o/conflict-r/pull/7".into() };
+        assert!(!crate::pr_readiness::base_conflict_recorded(&pr, Some("h1")));
+        let err = bring_base_in(&fx.fleet, fx.node, &Conflicting, &pr, Some("h1"), "pr_draft").unwrap_err();
+        assert!(err.contains("conflicts with its base"), "{err}");
+        assert!(err.contains("merge conflict between base and head"), "{err}");
+        assert!(crate::pr_readiness::base_conflict_recorded(&pr, Some("h1")));
     }
 
     #[test]
