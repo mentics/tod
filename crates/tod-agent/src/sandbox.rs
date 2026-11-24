@@ -152,6 +152,12 @@ impl SandboxLaunch {
         crate::codex_adapter::installed_path(command, &format!("cloud sandbox `{}`", self.sandbox))
     }
 
+    pub(crate) fn claude_adapter(&self) -> Result<String> {
+        let mut command = self.launcher_command();
+        command.args(["exec", &self.sandbox, "--", "sh", "-lc", &crate::codex_adapter::claude_install_script()]);
+        crate::codex_adapter::installed_path(command, &format!("cloud sandbox `{}`", self.sandbox))
+    }
+
     /// `program args…` in the sandbox, over stdio, as `tod-sandbox agent`
     /// runs it: it outlives a dropped connection and lets the sandbox sleep
     /// between requests. `env` is added to [`Self::env`] (a host `PATH` is

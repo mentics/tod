@@ -353,10 +353,13 @@ pub fn container_agent_bin(
             let command = container.command("sh", &script)?;
             return crate::codex_adapter::installed_path(command, &format!("dev container `{}`", container.name));
         }
-        AcpHost::Claude => (
-            &[crate::claude_adapter::BIN],
-            "npm install -g @agentclientprotocol/claude-agent-acp (and sign in to `claude` there)",
-        ),
+        AcpHost::Claude => {
+            // tod's own copy, refreshed daily, as for Codex; the user's
+            // `claude` sign-in in the container stays theirs.
+            let script = ["-c".to_string(), crate::codex_adapter::claude_install_script()];
+            let command = container.command("sh", &script)?;
+            return crate::codex_adapter::installed_path(command, &format!("dev container `{}`", container.name));
+        }
         AcpHost::Google => anyhow::bail!(
             "{} ACP is not supported in remote environments",
             host.label()
@@ -380,10 +383,7 @@ pub fn container_agent_bin(
 pub fn sandbox_agent_bin(host: AcpHost, launch: &crate::sandbox::SandboxLaunch) -> Result<String> {
     let (candidates, install): (&[&str], &str) = match host {
         AcpHost::OpenAi => return launch.codex_adapter(),
-        AcpHost::Claude => (
-            &[crate::claude_adapter::BIN],
-            "create the sandbox with `tod-sandbox create <name> --agents`, then sign in to `claude` there",
-        ),
+        AcpHost::Claude => return launch.claude_adapter(),
         AcpHost::Google => anyhow::bail!(
             "{} ACP is not supported in remote environments",
             host.label()

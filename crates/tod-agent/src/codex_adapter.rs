@@ -7,6 +7,14 @@ use std::sync::RwLock;
 use std::time::Duration;
 
 pub(crate) const INSTALL_SCRIPT: &str = include_str!("../../../assets/agent/codex-adapter.sh");
+/// [`INSTALL_SCRIPT`] for the Claude adapter (`claude-agent-acp`), installed
+/// into `tod/adapters/claude-agent-acp` in the environment's data directory.
+/// Run it where the adapter will run (container, sandbox); the host keeps
+/// `claude_adapter`'s own install.
+pub(crate) fn claude_install_script() -> String {
+    format!("TOD_ADAPTER=claude\n{INSTALL_SCRIPT}")
+}
+
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(240);
 const BIN_ENV: &str = "TOD_CODEX_ACP_BIN";
 static LOCAL_DIR: RwLock<Option<PathBuf>> = RwLock::new(None);
@@ -111,12 +119,12 @@ pub(crate) fn installed_path(command: Command, environment: &str) -> Result<Stri
         .map(str::trim)
         .rfind(|line| line.starts_with('/'))
         .map(str::to_owned)
-        .with_context(|| format!("Codex setup in {environment} did not return an adapter path"))
+        .with_context(|| format!("ACP adapter setup in {environment} did not return an adapter path"))
 }
 
 fn install_output(mut command: Command, environment: &str) -> Result<String> {
     command.stdin(Stdio::null());
-    let operation = format!("install or update Codex ACP in {environment}");
+    let operation = format!("install or update the ACP adapter in {environment}");
     let output = crate::sandbox::output_within(command, INSTALL_TIMEOUT, &operation)?;
     let stderr = String::from_utf8_lossy(&output.stderr);
     if !output.status.success() {
@@ -128,7 +136,7 @@ fn install_output(mut command: Command, environment: &str) -> Result<String> {
     }
     // The installer can still return a cached adapter after a registry error.
     if !stderr.trim().is_empty() {
-        tracing::info!(%environment, details = %stderr.trim(), "Codex ACP installer");
+        tracing::info!(%environment, details = %stderr.trim(), "ACP adapter installer");
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
@@ -218,5 +226,66 @@ done
         age_install();
         assert_eq!(Path::new(&ensure(true)), adapter);
         assert_eq!(count(), 3);
+    }
+
+    fn claude_run(root: &Path, prefix: &Path, path: &[PathBuf]) -> Result<String> {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", &claude_install_script(), "tod-claude-adapter"])
+            .arg(prefix)
+            .env("PATH", std::env::join_paths(path).unwrap())
+            .env_remove("TOD_ADAPTER")
+            .current_dir(root);
+        installed_path(command, "the test environment")
+    }
+
+    fn fake_npm(root: &Path, body: &str) {
+        let npm = root.join("npm");
+        fs::write(&npm, format!("#!/bin/sh\nset -eu\nprintf 'install %s\\n' \"$*\" >> installs\n{body}")).unwrap();
+        fs::set_permissions(&npm, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn claude_adapter_is_installed_into_tods_own_prefix_with_no_codex_packages() {
+        let root = tod_test_util::scratch_dir("claude-adapter");
+        let prefix = root.join("claude-agent-acp");
+        fake_npm(
+            &root,
+            "mkdir -p node_modules/.bin\nprintf '#!/bin/sh\\nexit 0\\n' > node_modules/.bin/claude-agent-acp\nchmod 755 node_modules/.bin/claude-agent-acp\n",
+        );
+        let path = [root.clone(), "/usr/bin".into(), "/bin".into()];
+        let bin = claude_run(&root, &prefix, &path).unwrap();
+        assert_eq!(Path::new(&bin), prefix.join("node_modules/.bin/claude-agent-acp"));
+        // Fresh: the second call does not run npm again.
+        claude_run(&root, &prefix, &path).unwrap();
+        let installs = fs::read_to_string(prefix.join("installs")).unwrap();
+        assert_eq!(installs.lines().count(), 1);
+        assert!(installs.contains("@agentclientprotocol/claude-agent-acp@latest"), "{installs}");
+        assert!(!installs.contains("codex"), "{installs}");
+    }
+
+    #[test]
+    fn claude_adapter_on_path_is_used_only_when_the_managed_install_fails() {
+        let root = tod_test_util::scratch_dir("claude-adapter-fallback");
+        let prefix = root.join("managed");
+        let elsewhere = root.join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        let existing = elsewhere.join("claude-agent-acp");
+        fs::write(&existing, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&existing, fs::Permissions::from_mode(0o755)).unwrap();
+        fake_npm(&root, "exit 1\n");
+        let path = [root.clone(), elsewhere, "/usr/bin".into(), "/bin".into()];
+        let bin = claude_run(&root, &prefix, &path).unwrap();
+        assert_eq!(Path::new(&bin), existing);
+    }
+
+    #[test]
+    fn claude_adapter_without_npm_says_so() {
+        let root = tod_test_util::scratch_dir("claude-adapter-no-npm");
+        let prefix = root.join("managed");
+        let err = claude_run(&root, &prefix, &["/usr/bin".into(), "/bin".into()]).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("npm is not installed"), "{text}");
+        assert!(text.contains("Claude"), "{text}");
     }
 }
