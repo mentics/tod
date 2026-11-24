@@ -64,16 +64,34 @@ trap 'rm -rf "$tmp"' EXIT
 trap '' PIPE
 : > "$tmp/in"
 # stdin goes along only to a command that reads it (a `-` value, or
-# `questions add`): an agent's stdin may be a pipe that never closes.
-reads_stdin=; questions=; add=
+# `questions add`, or `batch run`): an agent's stdin may be a pipe that never
+# closes. `batch run --file PATH` names a file in THIS environment, which the
+# machine running tod cannot read: it is sent as the script on stdin instead.
+reads_stdin=; questions=; add=; batch=; run=; file=; take_file=; bargs=()
 for arg in "$@"; do
+  if [ -n "$take_file" ]; then file="$arg"; take_file=; continue; fi
   case "$arg" in
     -) reads_stdin=1 ;;
     questions) questions=1 ;;
     add) add=1 ;;
+    batch) batch=1 ;;
+    run) [ -n "$batch" ] && run=1 ;;
+    --file) if [ -n "$run" ]; then take_file=1; continue; fi ;;
   esac
+  bargs+=("$arg")
 done
 if [ -n "$questions" ] && [ -n "$add" ]; then reads_stdin=1; fi
+if [ -n "$batch" ] && [ -n "$run" ]; then
+  if [ -n "$file" ]; then
+    if ! cat -- "$file" > "$tmp/in"; then
+      echo "tod-cli: batch run: cannot read the script file $file" >&2
+      exit 70
+    fi
+  else
+    reads_stdin=1
+  fi
+  set -- "${bargs[@]}"
+fi
 if [ -n "$reads_stdin" ]; then cat > "$tmp/in"; fi
 # `secrets run` starts its command in this container, here and with this PATH.
 export TOD_SHIM_CWD="$PWD" TOD_SHIM_PATH="$PATH"
@@ -238,15 +256,31 @@ esac
 tmp="$(mktemp -d)" || exit 70
 trap 'rm -rf "$tmp"' EXIT
 : > "$tmp/in"
-reads_stdin=; questions=; add=
+reads_stdin=; questions=; add=; batch=; run=; file=; take_file=; bargs=()
 for arg in "$@"; do
+  if [ -n "$take_file" ]; then file="$arg"; take_file=; continue; fi
   case "$arg" in
     -) reads_stdin=1 ;;
     questions) questions=1 ;;
     add) add=1 ;;
+    batch) batch=1 ;;
+    run) [ -n "$batch" ] && run=1 ;;
+    --file) if [ -n "$run" ]; then take_file=1; continue; fi ;;
   esac
+  bargs+=("$arg")
 done
 if [ -n "$questions" ] && [ -n "$add" ]; then reads_stdin=1; fi
+if [ -n "$batch" ] && [ -n "$run" ]; then
+  if [ -n "$file" ]; then
+    if ! cat -- "$file" > "$tmp/in"; then
+      echo "tod-cli: batch run: cannot read the script file $file" >&2
+      exit 70
+    fi
+  else
+    reads_stdin=1
+  fi
+  set -- "${bargs[@]}"
+fi
 if [ -n "$reads_stdin" ]; then cat > "$tmp/in"; fi
 names=()
 for name in $(compgen -e); do
@@ -963,6 +997,45 @@ mod tests {
         assert!(is_secrets_run(&a(&["--data-root", "C:x", "--json", "secrets", "run"])));
         assert!(!is_secrets_run(&a(&["secrets", "list"])));
         assert!(!is_secrets_run(&a(&["node", "run"])));
+    }
+
+    /// Gap 106: `batch run` reads its script from stdin, which the shim used
+    /// to drop (it forwarded stdin only to a `-` value), so the script arrived
+    /// empty. It also sends a `--file` the shim reads (the file is in this
+    /// environment, not on the machine running tod) as the script.
+    #[cfg(unix)]
+    #[test]
+    fn the_shim_sends_a_batch_script_from_stdin_or_a_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let cli = dir.path().join("fake-cli");
+        std::fs::write(&cli, "#!/bin/sh\necho \"args:$*\"\ncat\n").unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let shim = dir.path().join("tod-cli");
+        std::fs::write(&shim, SHIM_SCRIPT).unwrap();
+        let relay = start(dir.path().to_path_buf(), cli).unwrap();
+        let script = dir.path().join("script.txt");
+        std::fs::write(&script, "from the file\n").unwrap();
+        let run = |args: &[&str], stdin: &str| {
+            let mut child = Command::new("bash")
+                .arg(&shim)
+                .args(args)
+                .envs(relay.env())
+                .env(HOST_ENV, "127.0.0.1")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
+            let out = child.wait_with_output().unwrap();
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let out = run(&["batch", "run"], "from stdin\n");
+        assert!(out.contains("from stdin"), "{out}");
+        let out = run(&["batch", "run", "--file", script.to_str().unwrap()], "");
+        assert!(out.contains("from the file"), "{out}");
+        assert!(!out.contains("--file"), "the host cli must not see the path: {out}");
     }
 
     #[test]

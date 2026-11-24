@@ -19,9 +19,9 @@ ignored. The whole script is checked before anything runs; a malformed one
 runs nothing.
 
 COMMANDS:
-    run    [--file <PATH>]
+    run    [--file <PATH> | --script <TEXT>]
 
-`run` reads the script from --file, else from stdin. Lines run in order and
+`run` reads the script from --file, else --script (the text itself), else\nstdin. Lines run in order and
 independently: each that can be applied is, and the reply is a summary
 followed by only the lines that failed (with the line number and the
 command's own error) and the output of lines that read. Fix the failed lines
@@ -61,12 +61,29 @@ impl std::fmt::Display for ParseError {
 /// The reason a token is refused as a noun inside a batch.
 const REFUSED_NOUNS: &[&str] = &["batch", "secrets"];
 
+/// Why nothing ran when the script is empty. An empty script read from stdin
+/// almost always means the agent's shell gave this process no stdin (a tool
+/// that closes it, or a wrapper that drops it), not that the agent wrote an
+/// empty script, so the message names the forms that do not need stdin.
+pub(crate) fn empty_script_message(from_stdin: bool) -> String {
+    if from_stdin {
+        "malformed batch, nothing ran: the script on stdin was empty. This shell may not pass stdin \
+         to tod-cli. Nothing is wrong with tod or the script: write the script to a file and run \
+         `tod-cli batch run --file <PATH>`, or pass it as text with `tod-cli batch run --script '<commands>'`. \
+         Do not file a request for this."
+            .to_string()
+    } else {
+        "malformed batch, nothing ran: the script is empty".to_string()
+    }
+}
+
 pub(crate) fn run(inv: Invocation) -> anyhow::Result<String> {
     let mut rest = inv.rest.clone();
     if rest.first().map(String::as_str) == Some("run") {
         rest.remove(0);
     }
     let mut file: Option<String> = None;
+    let mut script: Option<String> = None;
     let mut i = 0;
     while i < rest.len() {
         match rest[i].as_str() {
@@ -78,23 +95,37 @@ pub(crate) fn run(inv: Invocation) -> anyhow::Result<String> {
                         .clone(),
                 );
             }
+            "--script" => {
+                i += 1;
+                script = Some(
+                    rest.get(i)
+                        .ok_or_else(|| anyhow::anyhow!("--script requires the script text"))?
+                        .clone(),
+                );
+            }
             "-" => {}
             other => anyhow::bail!("batch run: unexpected argument `{other}` (see `tod-cli batch --help`)"),
         }
         i += 1;
     }
-    let text = match file {
-        Some(path) => std::fs::read_to_string(&path)
+    let from_stdin = file.is_none() && script.is_none();
+    let text = match (file, script) {
+        (Some(_), Some(_)) => anyhow::bail!("batch run: give --file or --script, not both"),
+        (Some(path), None) => std::fs::read_to_string(&path)
             .map_err(|err| anyhow::anyhow!("cannot read {path}: {err}"))?,
-        None => {
+        (None, Some(text)) => text,
+        (None, None) => {
             let mut text = String::new();
             std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)?;
             text
         }
     };
+    if text.trim().is_empty() {
+        anyhow::bail!("{}", empty_script_message(from_stdin));
+    }
     let items = parse_script(&text).map_err(|err| anyhow::anyhow!("malformed batch, nothing ran: {err}"))?;
     if items.is_empty() {
-        anyhow::bail!("malformed batch, nothing ran: the script has no commands");
+        anyhow::bail!("malformed batch, nothing ran: the script has no commands (only blank lines and comments)");
     }
 
     let root = inv.data_root.to_string_lossy().to_string();

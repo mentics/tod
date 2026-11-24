@@ -5,10 +5,11 @@ Many commands in one call. When you have more than a few changes to make
 of one tool call each.
 
 ```
-tod-cli --data-root <DATA_ROOT> batch run [--file <PATH>]
+tod-cli --data-root <DATA_ROOT> batch run [--file <PATH> | --script <TEXT>]
 ```
 
-The script is read from stdin (a heredoc) or `--file`. Each line is one
+The script is read from `--file`, `--script` (the text itself), or stdin (a
+heredoc). Each line is one
 ordinary command, written as it would be after `tod-cli --data-root <DATA_ROOT>`:
 
 ```
@@ -23,6 +24,10 @@ node list --parent $a
 BATCH
 ```
 
+- Some agent shells give a command no stdin, so a heredoc arrives empty. If you
+  get `the script on stdin was empty`, nothing is broken: write the script to a
+  file and use `batch run --file <PATH>` (the form that works in every shell),
+  and do not file a request about it.
 - The whole script is checked first. If it is malformed (an unclosed quote or
   heredoc, an unknown `$name`), nothing runs and you get one error.
 - Then every line runs independently, in order. Each that can be applied is.
