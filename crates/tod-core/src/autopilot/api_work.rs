@@ -390,8 +390,14 @@ pub fn update_branches_now(
     phase: &str,
 ) -> Result<std::result::Result<(), String>> {
     for p in behind {
-        if let Err(err) = feed.update_branch(&p.pr) {
-            return Ok(Err(format!("updating {} with its base branch on GitHub: {err}", p.pr.url)));
+        match feed.update_branch(&p.pr) {
+            Ok(pr_readiness::BaseMerge::Merged) => {}
+            Ok(pr_readiness::BaseMerge::Conflict(why)) => {
+                // Agent work, not a refusal: the next look reads it as a conflict.
+                note_base_conflict(fleet, node, &p.pr, p.head_sha.as_deref(), &why, phase)?;
+                continue;
+            }
+            Err(err) => return Ok(Err(format!("updating {} with its base branch on GitHub: {err}", p.pr.url))),
         }
         let was = p.head_sha.clone();
         let mut waited = std::time::Duration::ZERO;
@@ -439,6 +445,33 @@ pub fn update_branches_now(
     }
     fleet.writer().flush()?;
     Ok(Ok(()))
+}
+
+/// GitHub refused to merge the base into `pr` because they conflict: records
+/// it (so every reader sees the conflict, and GitHub is not asked again for
+/// this head) and notes it on the Activity. The agent resolves it.
+pub fn note_base_conflict(
+    fleet: &FleetStore,
+    node: Uuid,
+    pr: &tod_store::github::NodePr,
+    head: Option<&str>,
+    why: &str,
+    phase: &str,
+) -> Result<()> {
+    pr_readiness::record_base_conflict(pr, head);
+    let entry = tod_store::node_timeline::TimelineEntry::new(
+        node,
+        tod_store::node_timeline::KIND_NOTE,
+        phase,
+        format!("{} conflicts with its base branch", pr_readiness::pr_label(pr)),
+        false,
+        format!(
+            "tod asked GitHub to merge the base into {} and GitHub answered: {why}. The branch conflicts with its base, so merging it in and resolving the conflict is the agent's work.",
+            pr.url
+        ),
+    );
+    fleet.enqueue(tod_store::fleet::FleetMutation::RecordTimeline(Box::new(entry)))?;
+    Ok(())
 }
 
 /// A CI job that was cancelled, timed out or lost its runner is the

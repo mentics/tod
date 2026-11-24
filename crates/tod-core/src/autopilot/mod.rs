@@ -547,7 +547,8 @@ const BRANCH_UPDATE_POLL: Duration = Duration::from_secs(5);
 enum BranchUpdate {
     /// Nothing was due.
     None,
-    /// A branch was updated on GitHub: look at the pull requests again.
+    /// A branch was updated on GitHub, or GitHub said it conflicts with its
+    /// base (agent work): look at the pull requests again.
     Updated,
     /// The run stops (GitHub failed, or the user stopped it).
     Stop(Outcome),
@@ -2816,13 +2817,24 @@ impl Autopilot {
         hook.working_on("merging the moved base branch in on GitHub, as its Update branch button does");
         let mut heads = Vec::new();
         for p in &behind {
-            if let Err(err) = feed.update_branch(&p.pr) {
-                return Ok(BranchUpdate::Stop(github_wait::github_look_failed(
-                    fleet,
-                    self.node,
-                    false,
-                    &format!("updating {} with its base branch on GitHub: {err}", p.pr.url),
-                )?));
+            match feed.update_branch(&p.pr) {
+                Ok(pr_readiness::BaseMerge::Merged) => {}
+                Ok(pr_readiness::BaseMerge::Conflict(why)) => {
+                    // A conflict is an answer, not a failed look: the agent
+                    // merges the base and resolves it (`Work::Conflict`).
+                    api_work::note_base_conflict(fleet, self.node, &p.pr, p.head_sha.as_deref(), &why, phase)?;
+                    self.state.loops.pr_base_updated_at_ms = now;
+                    self.save()?;
+                    return Ok(BranchUpdate::Updated);
+                }
+                Err(err) => {
+                    return Ok(BranchUpdate::Stop(github_wait::github_look_failed(
+                        fleet,
+                        self.node,
+                        false,
+                        &format!("updating {} with its base branch on GitHub: {err}", p.pr.url),
+                    )?));
+                }
             }
             pr_readiness::forget_snapshot(&p.pr);
             heads.push((p.pr.clone(), p.head_sha.clone()));

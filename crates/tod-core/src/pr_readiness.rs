@@ -2838,9 +2838,49 @@ pub trait PrFeed: Send + Sync {
     /// Merge the base branch into the pull request's branch on GitHub, as its
     /// "Update branch" button does: how tod brings a branch that is only
     /// behind up to date, with no agent (`Autopilot::update_branches`).
-    fn update_branch(&self, _pr: &tod_store::github::NodePr) -> Result<(), String> {
+    ///
+    /// A conflict with the base is [`BaseMerge::Conflict`], not an error: it is
+    /// the agent's work, never a failure to read GitHub.
+    fn update_branch(&self, _pr: &tod_store::github::NodePr) -> Result<BaseMerge, String> {
         Err("this feed does not update branches".to_string())
     }
+}
+
+/// What GitHub answered when asked to merge a pull request's base into it
+/// ([`PrFeed::update_branch`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BaseMerge {
+    /// GitHub accepted it and is making the merge commit.
+    Merged,
+    /// The base and the branch conflict (GitHub's words): agent work.
+    Conflict(String),
+}
+
+/// Pull requests whose update with their base was refused as a conflict, each
+/// with the head it was refused at. The snapshot may not show the conflict
+/// (a draft reports `draft`, `mergeable` may be unknown), so every reader of
+/// the pull request reads this too ([`assess`]); a new head (the agent's merge)
+/// no longer matches, and GitHub is not asked again for the same head.
+static BASE_CONFLICTS: std::sync::Mutex<Vec<(String, Option<String>)>> = std::sync::Mutex::new(Vec::new());
+
+/// Records that GitHub refused to merge the base into `pr` at `head` because
+/// they conflict.
+pub fn record_base_conflict(pr: &tod_store::github::NodePr, head: Option<&str>) {
+    let mut all = BASE_CONFLICTS.lock().unwrap_or_else(|e| e.into_inner());
+    let key = snapshot_key(pr);
+    all.retain(|(k, _)| *k != key);
+    all.push((key, head.map(str::to_string)));
+    forget_snapshot(pr);
+}
+
+/// Whether `pr` at `head` was refused as a conflict ([`record_base_conflict`]).
+pub fn base_conflict_recorded(pr: &tod_store::github::NodePr, head: Option<&str>) -> bool {
+    let key = snapshot_key(pr);
+    BASE_CONFLICTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|(k, h)| *k == key && h.as_deref() == head)
 }
 
 /// What tod's own review of a pull request posts: one review with `body` as
@@ -2891,8 +2931,12 @@ impl PrFeed for GithubFeed {
         self.0.rerun_job(&pr.owner, &pr.repo, job_id).map_err(|err| err.to_string())
     }
 
-    fn update_branch(&self, pr: &tod_store::github::NodePr) -> Result<(), String> {
-        self.0.update_pr_branch(&pr.owner, &pr.repo, pr.pr_number).map_err(|err| err.to_string())
+    fn update_branch(&self, pr: &tod_store::github::NodePr) -> Result<BaseMerge, String> {
+        match self.0.update_pr_branch(&pr.owner, &pr.repo, pr.pr_number) {
+            Ok(()) => Ok(BaseMerge::Merged),
+            Err(tod_store::github::GithubError::MergeConflict(why)) => Ok(BaseMerge::Conflict(why)),
+            Err(err) => Err(err.to_string()),
+        }
     }
 
     fn branch_prs(&self, owner: &str, repo: &str, branch: &str) -> Result<Vec<tod_store::github::PullSummary>, String> {
@@ -3228,6 +3272,14 @@ pub fn assess(
         feed.same_change(pr, base, reviewed, head).map_err(|err| format!("{}: {err}", pr.url))
     })
     .map(|assessment| assessment.with_unrelated(&pr_label(pr), &settings.unrelated_checks))
+    .map(|mut assessment| {
+        // GitHub refused to merge the base in at this head: a conflict, even
+        // where the snapshot does not show one yet.
+        if !assessment.merged && base_conflict_recorded(pr, assessment.head_sha.as_deref()) {
+            assessment.mergeable = Some(false);
+        }
+        assessment
+    })
 }
 
 /// How long a repository's recent pull requests are reused.

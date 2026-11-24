@@ -56,6 +56,12 @@ pub enum GithubError {
     PullRequestGone(String),
     #[error("GitHub API error: {0}")]
     Api(String),
+    /// The branch cannot be updated with its base on GitHub because the two
+    /// conflict (HTTP 409 or 422, "merge conflict between base and head"). A
+    /// semantic answer, not a failure to reach or read GitHub: the conflict is
+    /// work for whoever resolves it, and asking again fails the same way.
+    #[error("merge conflict between base and head: {0}")]
+    MergeConflict(String),
     /// HTTP 5xx: GitHub is down. Asking again later is expected to work.
     #[error("GitHub is unavailable ({0})")]
     Unavailable(String),
@@ -104,6 +110,12 @@ impl GithubError {
             _ => false,
         }
     }
+}
+
+/// Whether GitHub's words say the base and head conflict (what its
+/// update-branch call answers with a 409 or 422).
+pub fn is_merge_conflict_message(message: &str) -> bool {
+    message.to_ascii_lowercase().contains("merge conflict")
 }
 
 /// [`GithubError::is_transient`] for an error that has been turned into text
@@ -1447,12 +1459,18 @@ impl Github {
 
     /// Merge the base branch into the pull request's branch, as GitHub's
     /// "Update branch" button does. Refused (an error) when the merge conflicts.
+    /// A conflict is [`GithubError::MergeConflict`], never retried.
     pub fn update_pr_branch(&self, owner: &str, repo: &str, number: i64) -> Result<(), GithubError> {
-        self.put_json::<serde_json::Value>(
+        match self.put_json::<serde_json::Value>(
             &format!("/repos/{owner}/{repo}/pulls/{number}/update-branch"),
             serde_json::json!({}),
-        )?;
-        Ok(())
+        ) {
+            Ok(_) => Ok(()),
+            Err(GithubError::Api(message)) if is_merge_conflict_message(&message) => {
+                Err(GithubError::MergeConflict(message))
+            }
+            Err(err) => Err(err),
+        }
     }
 
     /// Ask `reviewers` (logins) to review the pull request.
@@ -3798,6 +3816,18 @@ mod tests {
             .unwrap_err();
         assert!(err.is_transient() && err.to_string().contains("Something went wrong"), "{err}");
         assert_eq!(handle.join().unwrap(), 3);
+    }
+
+    #[test]
+    fn updating_a_branch_that_conflicts_is_a_typed_conflict_and_never_retried() {
+        let (url, handle) = serve_canned(vec![(
+            "422 Unprocessable Entity",
+            r#"{"message":"merge conflict between base and head"}"#,
+        )]);
+        let err = client(&url, &[1, 1]).update_pr_branch("o", "r", 1).unwrap_err();
+        assert!(matches!(err, GithubError::MergeConflict(_)), "{err}");
+        assert!(!err.is_transient() && !is_transient_message(&err.to_string()), "{err}");
+        assert_eq!(handle.join().unwrap(), 1, "a conflict is not asked about again");
     }
 
     #[test]

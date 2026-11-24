@@ -6361,7 +6361,11 @@ fn a_branch_only_behind_is_updated_on_github_without_the_agent() {
     struct Behind {
         behind: std::sync::Mutex<bool>,
         conflict: bool,
+        /// GitHub's snapshot shows no conflict, but its update-branch call
+        /// answers "merge conflict between base and head" (ENG-3559).
+        refuses: bool,
         updates: AtomicUsize,
+        asked: AtomicUsize,
         turns: Arc<AtomicUsize>,
     }
     impl crate::pr_readiness::PrFeed for Behind {
@@ -6390,29 +6394,35 @@ fn a_branch_only_behind_is_updated_on_github_without_the_agent() {
             }
             Ok(snap)
         }
-        fn update_branch(&self, _: &tod_store::github::NodePr) -> Result<(), String> {
+        fn update_branch(&self, _: &tod_store::github::NodePr) -> Result<crate::pr_readiness::BaseMerge, String> {
             assert!(!self.conflict, "a conflicting branch is the agent's to merge");
             assert_eq!(self.turns.load(Ordering::SeqCst), 0, "updated before the agent's turn");
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            if self.refuses {
+                return Ok(crate::pr_readiness::BaseMerge::Conflict("merge conflict between base and head".into()));
+            }
             self.updates.fetch_add(1, Ordering::SeqCst);
             *self.behind.lock().unwrap() = false;
-            Ok(())
+            Ok(crate::pr_readiness::BaseMerge::Merged)
         }
     }
-    for conflict in [false, true] {
+    for (conflict, refuses) in [(false, false), (true, false), (false, true)] {
         let fx = bare();
         retire_outside_criteria(&fx);
         let turns = Arc::new(AtomicUsize::new(0));
         let feed = Arc::new(Behind {
             behind: std::sync::Mutex::new(true),
             conflict,
+            refuses,
             updates: AtomicUsize::new(0),
+            asked: AtomicUsize::new(0),
             turns: turns.clone(),
         });
         crate::pr_readiness::set_feed_override(Some(feed.clone()));
         linked_to_prs(&fx, "pr_review", &["https://github.com/acme/app/pull/42"]);
         let mut agent = FakeAgent::new(&fx.fleet);
         agent.shared_turns = Some(turns);
-        let _ = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO).run(&fx.fleet, &mut agent);
+        let outcome = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO).run(&fx.fleet, &mut agent);
         let notes: Vec<String> = fx
             .fleet
             .read(|conn| Ok(tod_store::node_timeline::TimelineRepo::new(conn).list(fx.node)?))
@@ -6421,7 +6431,21 @@ fn a_branch_only_behind_is_updated_on_github_without_the_agent() {
             .filter(|e| e.title.contains("with its base branch"))
             .map(|e| e.title)
             .collect();
-        if conflict {
+        if refuses {
+            // The run is not stopped, and GitHub is asked once for this head.
+            assert!(!matches!(outcome, Ok(Outcome::Stopped { .. })), "{outcome:?}");
+            assert_eq!(feed.asked.load(Ordering::SeqCst), 1, "asked again for a head it refused");
+            assert!(agent.turns > 0, "the conflict goes to the agent");
+            let told = agent.log.lock().unwrap().iter().any(|(_, sent)| sent.contains("conflicts with its base"));
+            assert!(told, "the agent was not told of the conflict");
+            let github_failed = fx
+                .fleet
+                .read(|conn| Ok(tod_store::node_timeline::TimelineRepo::new(conn).list(fx.node)?))
+                .unwrap()
+                .into_iter()
+                .any(|e| e.title.contains("could not be read"));
+            assert!(!github_failed);
+        } else if conflict {
             assert_eq!(feed.updates.load(Ordering::SeqCst), 0);
             assert!(agent.turns > 0, "the conflict goes to the agent");
             assert!(notes.is_empty(), "{notes:?}");
