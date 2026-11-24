@@ -142,26 +142,107 @@ fn back_to_active_reopens_every_verdict_as_before() {
 }
 
 #[test]
-fn the_same_move_on_unchanged_work_is_stopped_with_both_reasons() {
+fn the_same_move_for_the_same_reason_on_unchanged_work_is_stopped() {
     let fx = setup("review");
     let a = obligation(&fx, 0, "A");
     let review = conversation(&fx, ProtocolKind::Review);
-    send(&fx, ACTOR_AGENT, request(review, "active", "first reason")).unwrap();
+    send(&fx, ACTOR_AGENT, request(review, "active", "the build is wrong")).unwrap();
     return_to(&fx, "review");
 
-    let out = send(&fx, ACTOR_AGENT, request(review, "active", "second reason")).unwrap();
+    // Reworded only in spacing and case: still the same reason.
+    let out = send(&fx, ACTOR_AGENT, request(review, "active", "The  build is\nWRONG")).unwrap();
     assert_eq!(out["outcome"], OUTCOME_STOPPED);
     assert!(out["why"].as_str().unwrap().contains("unchanged"), "{out}");
     assert_eq!(state(&fx), "review", "a refused send-back does not move the node");
     let rows = SendBackRepo::new(&fx.conn).list_for_node(fx.node).unwrap();
     assert_eq!(rows.iter().map(|r| r.outcome.as_str()).collect::<Vec<_>>(), [OUTCOME_MOVED, OUTCOME_STOPPED]);
     let stopped = SendBackRepo::new(&fx.conn).stopped_since(fx.node, 0).unwrap();
-    assert_eq!(stopped[0].reason, "second reason");
-    assert_eq!(stopped[0].earlier, ["first reason"], "both reasons are kept");
+    assert_eq!(stopped[0].earlier, ["the build is wrong"], "both reasons are kept");
 
     // Once the work changed, the same move is allowed.
     ObligationRepo::new(&fx.conn).update_body(a, "A, corrected").unwrap();
-    assert_eq!(send(&fx, ACTOR_AGENT, request(review, "active", "third reason")).unwrap()["outcome"], OUTCOME_MOVED);
+    assert_eq!(send(&fx, ACTOR_AGENT, request(review, "active", "the build is wrong")).unwrap()["outcome"], OUTCOME_MOVED);
+}
+
+#[test]
+fn a_new_reason_or_new_findings_on_unchanged_work_are_not_a_repeat() {
+    let fx = setup("review");
+    obligation(&fx, 0, "A");
+    let review = conversation(&fx, ProtocolKind::Review);
+    send(&fx, ACTOR_AGENT, request(review, "active", "rebuild on main")).unwrap();
+    return_to(&fx, "review");
+    assert_eq!(
+        send(&fx, ACTOR_AGENT, request(review, "active", "run passes empty reports to _apply_org")).unwrap()["outcome"],
+        OUTCOME_MOVED
+    );
+    return_to(&fx, "review");
+    // Rule 2 backstop: the third to the same state since the user last acted.
+    let out = send(&fx, ACTOR_AGENT, request(review, "active", "a third, different reason")).unwrap();
+    assert_eq!(out["outcome"], OUTCOME_STOPPED, "{out}");
+    assert!(out["why"].as_str().unwrap().contains("since you last acted"), "{out}");
+
+    // The same words citing a different finding are new; the same finding again is a repeat.
+    let fx = setup("review");
+    obligation(&fx, 0, "A");
+    let review = conversation(&fx, ProtocolKind::Review);
+    let cite = |id: Uuid| {
+        let mut asked = request(review, "active", "blocking finding");
+        asked.evidence = vec![EvidenceRef { kind: "finding".into(), id }];
+        asked
+    };
+    let (one, two) = (Uuid::new_v4(), Uuid::new_v4());
+    assert_eq!(send(&fx, ACTOR_AGENT, cite(one)).unwrap()["outcome"], OUTCOME_MOVED);
+    return_to(&fx, "review");
+    assert_eq!(send(&fx, ACTOR_AGENT, cite(two)).unwrap()["outcome"], OUTCOME_MOVED);
+
+    let fx = setup("review");
+    obligation(&fx, 0, "A");
+    let review = conversation(&fx, ProtocolKind::Review);
+    let mut asked = request(review, "active", "blocking finding");
+    asked.evidence = vec![EvidenceRef { kind: "finding".into(), id: one }];
+    send(&fx, ACTOR_AGENT, asked.clone()).unwrap();
+    return_to(&fx, "review");
+    asked.reason = "reworded entirely".into();
+    assert_eq!(send(&fx, ACTOR_AGENT, asked).unwrap()["outcome"], OUTCOME_STOPPED);
+}
+
+#[test]
+fn a_second_send_back_after_implementation_wrote_code_is_allowed() {
+    let fx = setup("review");
+    obligation(&fx, 0, "A");
+    let review = conversation(&fx, ProtocolKind::Review);
+    send(&fx, ACTOR_AGENT, request(review, "active", "the build is wrong")).unwrap();
+    return_to(&fx, "review");
+    // An implementation session worked after it, as the live node's did.
+    std::thread::sleep(std::time::Duration::from_millis(3));
+    let implementation = conversation(&fx, ProtocolKind::Implementation);
+    ConversationRepo::new(&fx.conn)
+        .append_turn(implementation, crate::conversation::TurnRole::Agent, "committed the fix")
+        .unwrap();
+    let out = send(&fx, ACTOR_AGENT, request(review, "active", "the build is wrong")).unwrap();
+    assert_eq!(out["outcome"], OUTCOME_MOVED, "{out}");
+    assert_eq!(state(&fx), "active");
+    return_to(&fx, "review");
+    // With no code written since that one, the same again is a repeat.
+    let out = send(&fx, ACTOR_AGENT, request(review, "active", "the build is wrong")).unwrap();
+    assert_eq!(out["outcome"], OUTCOME_STOPPED, "{out}");
+}
+
+#[test]
+fn a_refusal_files_one_request_with_the_send_back_as_an_option() {
+    let fx = setup("review");
+    obligation(&fx, 0, "A");
+    let review = conversation(&fx, ProtocolKind::Review);
+    send(&fx, ACTOR_AGENT, request(review, "active", "the build is wrong")).unwrap();
+    return_to(&fx, "review");
+    send(&fx, ACTOR_AGENT, request(review, "active", "the build is wrong")).unwrap();
+    send(&fx, ACTOR_AGENT, request(review, "active", "the build is wrong")).unwrap();
+    let open = crate::decisions::DecisionRepo::new(&fx.conn).list_pending_for_node(fx.node).unwrap();
+    assert_eq!(open.len(), 1, "{open:?}");
+    assert_eq!(open[0].protocol.as_deref(), Some(LOOP_PROTOCOL));
+    assert_eq!(open[0].options, [SEND_ANYWAY, KEEP_HERE]);
+    assert_eq!(open[0].move_for(1), Some("active"));
+    assert_eq!(open[0].move_for(2), None);
 }
 
 #[test]

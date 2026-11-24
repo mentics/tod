@@ -37,10 +37,15 @@
 //! `stopped`, and the run stops for the user (`NeedsHuman::SendBackLoop` in
 //! `tod_core::autopilot`) when:
 //!
-//! - **Loop:** the same move (from `S` to `T`) was made before and the
+//! - **Loop:** the same move (from `S` to `T`) was made before for the same
+//!   reason (the same cited evidence, or with none the same words), the
 //!   node's obligations, plan and design content are unchanged since
-//!   ([`work_digest`] equals the one recorded then). Sending it back again
-//!   would hand the same work the same way.
+//!   ([`work_digest`] equals the one recorded then) and no implementation or
+//!   fix session has written since (the code is unchanged). Sending it back
+//!   again would hand the same work the same way; a real fix in between, or
+//!   a new finding, makes the second one new information. A refusal files a
+//!   request on the node ([`LOOP_PROTOCOL`]: "Send it back anyway" / "Keep it
+//!   here") so the stop always has a way forward.
 //! - **Limit:** it would be the third send-back to the same target since the
 //!   user last acted on the node ([`user_acted_at`]: a move of their own, a
 //!   request, an answer).
@@ -53,7 +58,7 @@
 //! (that needs the app's store, as with `tod-cli lifecycle set`).
 
 use crate::conversation::{ConversationRepo, ProtocolKind};
-use crate::decisions::{EVIDENCE_KINDS, EvidenceRef};
+use crate::decisions::{DecisionRepo, EVIDENCE_KINDS, EvidenceRef, NewDecision, OptionMove, REASON_OTHER};
 use crate::interview::short_id;
 use crate::lifecycle_reset::VerdictScope;
 use crate::node_timeline::{KIND_SEND_BACK, TimelineEntry, TimelineRepo};
@@ -423,6 +428,38 @@ pub fn work_digest(conn: &Connection, node: Uuid) -> Result<String> {
     Ok(crate::phase::digest(&inputs))
 }
 
+/// Whether an implementation or fix session wrote anything on `node` after
+/// `since`: the only way the code changes while the node's obligations, plan
+/// and design stay as they were. (Repository heads are not in the store; the
+/// turns of the sessions that commit are.)
+fn code_worked_on_since(conn: &Connection, node: Uuid, since: i64) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS (
+             SELECT 1 FROM conversation_turns t JOIN conversations c ON c.id = t.conversation_id
+             WHERE (c.focus_id = ?1 OR c.focus_node_id = ?1) AND c.protocol IN ('implementation', 'fix')
+               AND t.role = 'agent' AND t.created_at > ?2
+         )",
+        params![uuid_to_blob(node), since],
+        |row| row.get(0),
+    )?)
+}
+
+fn normalized(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+
+/// Whether a send-back citing `reason` and `evidence` is the one `earlier`
+/// made: the same evidence when either cites any, else the same words.
+fn same_cause(earlier: &SendBack, reason: &str, evidence: &[EvidenceRef]) -> bool {
+    if earlier.evidence.is_empty() && evidence.is_empty() {
+        return normalized(&earlier.reason) == normalized(reason);
+    }
+    let ids = |refs: &[EvidenceRef]| -> std::collections::BTreeSet<(String, Uuid)> {
+        refs.iter().map(|e| (e.kind.clone(), e.id)).collect()
+    };
+    ids(&earlier.evidence) == ids(evidence)
+}
+
 /// Why a send-back from `from` to `to` with `digest` must stop the run for
 /// the user, if it must, with the earlier send-backs it repeats (oldest
 /// first). See the module docs for the two rules.
@@ -432,6 +469,8 @@ pub fn guard(
     from: &str,
     to: &str,
     digest: &str,
+    reason: &str,
+    evidence: &[EvidenceRef],
 ) -> Result<Option<(String, Vec<SendBack>)>> {
     let moved: Vec<SendBack> = SendBackRepo::new(conn)
         .list_for_node(node)?
@@ -443,11 +482,13 @@ pub fn guard(
         .rev()
         .find(|s| s.from_state == from && s.to_state == to)
         && previous.digest == digest
+        && same_cause(previous, reason, evidence)
+        && !code_worked_on_since(conn, node, previous.created_at)?
     {
         return Ok(Some((
             format!(
-                "it was sent back from {from} to {to} before, and its obligations, plan and design are unchanged \
-                 since: sending it back again would hand over the same work the same way"
+                "it was sent back from {from} to {to} before for the same reason, and its obligations, plan, design \
+                 and code are unchanged since: sending it back again would hand over the same work the same way"
             ),
             vec![previous.clone()],
         )));
@@ -645,6 +686,52 @@ struct Mover<'a> {
     parent_id: Option<Uuid>,
 }
 
+/// The `protocol` of the request a refused send-back files.
+pub const LOOP_PROTOCOL: &str = "send_back_loop";
+/// Its options: the first moves the node ([`OptionMove`], answered as the
+/// user's own move, `tod_core::lifecycle::send_back`), the second leaves it.
+pub const SEND_ANYWAY: &str = "Send it back anyway";
+pub const KEEP_HERE: &str = "Keep it here";
+
+/// File the request that gives a refused send-back (`stopped`) a way forward:
+/// the user sees every reason given and either sends the node back anyway or
+/// keeps it where it is. One per target while one is open.
+fn file_loop_request(conn: &Connection, stopped: &SendBack) -> Result<()> {
+    let repo = DecisionRepo::new(conn);
+    let open = repo.list_open_for_node(stopped.node_id)?;
+    if open.iter().any(|d| {
+        d.protocol.as_deref() == Some(LOOP_PROTOCOL) && d.moves.iter().any(|m| m.to == stopped.to_state)
+    }) {
+        return Ok(());
+    }
+    let mut reasons = stopped.earlier.clone();
+    reasons.push(stopped.reason.clone());
+    let listed: String = reasons.iter().map(|r| format!("\n- {r}")).collect();
+    let question = format!(
+        "The {} asked to send this task back from {} to {}, and tod stopped it: {}. Reasons given:{listed}\n\n\
+         Send it back anyway, or keep it in {}?",
+        stopped.sender(),
+        stopped.from_state,
+        stopped.to_state,
+        stopped.stop_why,
+        stopped.from_state,
+    );
+    repo.create(
+        stopped.node_id,
+        None,
+        Some(LOOP_PROTOCOL),
+        &NewDecision {
+            question,
+            options: vec![SEND_ANYWAY.to_string(), KEEP_HERE.to_string()],
+            evidence: stopped.evidence.clone(),
+            reason: REASON_OTHER.to_string(),
+            moves: vec![OptionMove { option: 1, to: stopped.to_state.clone(), asked_in: None }],
+            ..Default::default()
+        },
+    )?;
+    Ok(())
+}
+
 /// The guard, the move, the row and the activity entry of a validated
 /// send-back: `{"outcome": "moved", ...}` or `{"outcome": "stopped", ...}`.
 fn record_move(conn: &Connection, m: &Mover<'_>) -> Result<Value> {
@@ -655,7 +742,7 @@ fn record_move(conn: &Connection, m: &Mover<'_>) -> Result<Value> {
         params![uuid_to_blob(m.conversation.id)],
         |row| row.get(0),
     )?;
-    let stop = guard(conn, node, from, to, &digest)?;
+    let stop = guard(conn, node, from, to, &digest, m.reason, m.evidence)?;
     let mut row = SendBack {
         id: Uuid::now_v7(),
         node_id: node,
@@ -686,6 +773,7 @@ fn record_move(conn: &Connection, m: &Mover<'_>) -> Result<Value> {
         SendBackRepo::new(conn).insert(&row)?;
         let title = format!("The {sender} asked to send it back to {to}; stopped for you");
         TimelineRepo::new(conn).record(&TimelineEntry::new(node, KIND_SEND_BACK, from, title, true, detail(&row)))?;
+        file_loop_request(conn, &row)?;
         return Ok(json!({ "outcome": OUTCOME_STOPPED, "why": why, "id": row.id }));
     }
 

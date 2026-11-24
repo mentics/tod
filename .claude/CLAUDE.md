@@ -182,10 +182,16 @@ conversation back after the turn that sent it, and the autopilot goes on in
 the new state (`Autopilot::sent_back_during`). **Loop guard**
 (`send_back::guard`): a send-back is refused, and the run stops with
 `NeedsHuman::SendBackLoop` and every reason given, when the same `from → to`
-was sent before and the obligations, plan and design are unchanged since
-(`send_back::work_digest`), or when it would be the third to the same state
-since the user last acted on the node (`send_back::user_acted_at`: a move,
-request or answer of theirs). Anyone else gets an error naming who may.
+was sent before for the same reason (the same cited evidence, or the same
+words), the obligations, plan and design are unchanged since
+(`send_back::work_digest`) and no implementation or fix session has written
+since (the code is unchanged), or when it would be the third to the same
+state since the user last acted on the node (`send_back::user_acted_at`: a
+move, request or answer of theirs). A refusal also files one pending request
+on the node (protocol `send_back_loop`, `send_back::file_loop_request`:
+"Send it back anyway", an option that moves the node as the user's own move,
+or "Keep it here"), so the stop always has a way forward. Anyone else gets an
+error naming who may.
 
 **Obligation authority and disputes** (`node_obligations.authority`, schema
 v108: `agent`, `user`, `approved`). The user's create, edit, or an answer's

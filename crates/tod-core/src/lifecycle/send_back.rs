@@ -761,4 +761,65 @@ mod tests {
         let steps = fx.fleet.list_plan_steps_for_node(fx.node).unwrap();
         assert!(steps.iter().all(|s| s.status == STATUS_VERIFIED), "{steps:?}");
     }
+
+    /// A send-back the loop guard refuses files a request on the node, and
+    /// answering "Send it back anyway" moves the node as the user's own move.
+    #[test]
+    fn a_refused_send_back_files_a_request_whose_answer_sends_it_back_anyway() {
+        use tod_store::conversation::{ProtocolKind, agent_actor_for};
+        let fx = fixture();
+        crate::lifecycle::set_lifecycle(&fx.fleet, fx.node, "review").unwrap();
+        let review = Uuid::new_v4();
+        fx.fleet
+            .interview(
+                ACTOR_USER,
+                InterviewCommand::CreateConversation {
+                    id: review,
+                    focus: tod_store::conversation::Focus::Node(fx.node),
+                    protocol: ProtocolKind::Review,
+                    platform: None,
+                    model: None,
+                    effort: None,
+                },
+            )
+            .unwrap();
+        let send = || {
+            fx.fleet
+                .interview(
+                    &agent_actor_for(review),
+                    InterviewCommand::SendBack(tod_store::send_back::Request {
+                        conversation_id: review,
+                        to: "active".into(),
+                        reason: "the build is wrong".into(),
+                        evidence: Vec::new(),
+                        obligations: Vec::new(),
+                    }),
+                )
+                .unwrap()
+        };
+        assert_eq!(send()["outcome"], "moved");
+        crate::lifecycle::set_lifecycle(&fx.fleet, fx.node, "review").unwrap();
+        assert_eq!(send()["outcome"], "stopped", "the same reason, the same work");
+        assert_eq!(current_state(&fx.fleet, fx.node).unwrap(), "review");
+
+        let is_loop = |d: &tod_store::decisions::Decision| d.protocol.as_deref() == Some(tod_store::send_back::LOOP_PROTOCOL);
+        let request = fx
+            .fleet
+            .read(|conn| DecisionRepo::new(conn).list_pending_for_node(fx.node))
+            .unwrap()
+            .into_iter()
+            .find(is_loop)
+            .expect("the refusal files a request");
+        assert_eq!(request.options, [tod_store::send_back::SEND_ANYWAY, tod_store::send_back::KEEP_HERE]);
+        assert!(request.question.contains("the build is wrong"), "{}", request.question);
+        assert_eq!(request.move_for(1), Some("active"));
+        // A second refusal while one is open does not file another.
+        assert_eq!(send()["outcome"], "stopped");
+        let open = fx.fleet.read(|conn| DecisionRepo::new(conn).list_pending_for_node(fx.node)).unwrap();
+        assert_eq!(open.iter().filter(|d| is_loop(d)).count(), 1);
+
+        let answered = answer_decision(&fx.fleet, request.id, Some(1), None).unwrap();
+        assert_eq!(answered.moved_to.as_deref(), Some("active"));
+        assert_eq!(current_state(&fx.fleet, fx.node).unwrap(), "active");
+    }
 }
