@@ -90,8 +90,8 @@ reaches you. It is filed as follows:
   task or edit obligations: those are never grouped). Leave it out otherwise.
 - `--need`, `--command`, `--error`, `--tried`, `--after`: only with `--reason
   access`, `broken` or `capability`. The app writes the request from these;
-  you do not word it. `--need` is what you need, in one line ("Read access to
-  the prod-kb Redis"); `--command` is the exact command for the user to paste,
+  you do not word it. `--need` is what you need, in one line ("A logged-in AWS
+  SSO session for the prod database"); `--command` is the exact command for the user to paste,
   every value filled in, when there is one; `--error` is the exact error text
   you got (required for `broken`; it is how the same failure on other tasks is
   recognized); `--tried` is one thing you tried per flag, repeated; `--after`
@@ -101,9 +101,9 @@ reaches you. It is filed as follows:
   leave out the ones you do not.
 
 ```
-tod-cli decisions ask --reason access --need "Read access to the prod-kb Redis" \
-  --command "tod-cli access list" --tried "access call redis-prod scan: not set up" \
-  --after "I rerun the scan and continue verification"
+tod-cli decisions ask --reason access --need "A logged-in AWS SSO session for the prod database" \
+  --command "aws sso login --profile <PROFILE>" --tried "db-query: the AWS SSO session has expired" \
+  --after "I rerun the query and continue verification"
 ```
 
 `list` shows a node's pending decisions, oldest first; `--all` also lists
