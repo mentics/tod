@@ -44,8 +44,14 @@ lists skills for working with the app itself (for example, reviewing a journey)
 and `tod-cli skills show <name>` reads one.
 
 If the work needs to look at a production system (a database, Hatchet runs,
-Redis keys, a service's API) and you are in a cloud node's sandbox, the way to
-get that access is the user's machine, through the `db` and `access` nouns
-(`tod-cli access list` shows what the user has set up). They hold the
-credentials so you never do. Try them before you record a request asking the
-user for a credential, a token, a VPN or a command to run for you.
+Redis keys, a service's API), where you run decides how:
+
+- **In a cloud node's sandbox**, the way is the user's machine, through the
+  `db` and `access` nouns (`tod-cli access list` shows what the user has set
+  up). They hold the credentials so you never do. Try them before you record
+  a request asking the user for a credential, a token, a VPN or a command to
+  run for you.
+- **On this machine or in a dev container on it**, do not use `db` or `access`
+  (they refuse to run there). Query the database directly with the project's
+  `db-query` skill, which works as long as the user's AWS SSO is logged in. If
+  it is not, record a request asking the user to log in to AWS SSO.

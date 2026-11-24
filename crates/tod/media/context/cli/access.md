@@ -1,7 +1,9 @@
 ## `tod-cli access`
 
-How you read a production system from a cloud node's sandbox when it is not a
-database: the user's Hatchet (workflow runs), a Redis (claim keys and the
+How you read a production system from a cloud node's sandbox (only there: on the
+user's machine or in a dev container on it, `access` refuses to run, and you use
+the project's own tooling, such as the `db-query` skill for a database, which
+needs the user's AWS SSO login) when it is not a database: the user's Hatchet (workflow runs), a Redis (claim keys and the
 like), a web API such as Flagship's. This is the way to get that access. Do
 not ask the user for a token, a VPN, or to run a command for you: the user's
 machine makes the call with the credential it holds, and the result comes

@@ -151,7 +151,8 @@ the real thing, with this branch's code:
 
 - **An external API:** call the real API, through the `secrets` noun.
 - **Production data the change reads:** query production read-only (the
-  `db` and `access` nouns).
+  `db` and `access` nouns in a cloud sandbox; the `db-query` skill on this
+  machine or in a dev container).
 - **Data the change writes:** run it against a local database seeded with
   data you craft to cover each case (including collisions and what it must
   skip), plus a read-only dry run against production. A one-off data

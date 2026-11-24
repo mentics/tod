@@ -135,6 +135,14 @@ list them in a `Databases` block and add the `cli/db` how-to only when the
 list is not empty. A node with none, and any run on this machine, is not told
 `db` exists.
 
+`db` and `access` are for cloud sandboxes only. An agent on this machine or in
+a dev container on it queries the database directly with the project's
+`db-query` skill, which works while AWS SSO is logged in (if it is not, that is
+a request to the user to log in). If such an agent runs `tod-cli db` or
+`access` anyway (`cli/intro` tells it which to use), the command is refused with
+an error naming the `db-query` skill (`incident_class::wrong_environment_message`),
+and that error is agent work, never a `tool_broken` incident: it parks no node.
+
 ### `db-query` in the sandbox
 
 The Cofactr workspace's own `db-query` (`scripts/shell/bin/db-query`) signs a

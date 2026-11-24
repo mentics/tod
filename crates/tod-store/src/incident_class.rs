@@ -148,8 +148,30 @@ fn host_of(text: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// What a brokered `tod-cli` noun (`db`, `access`) says when it runs outside a
+/// cloud sandbox. It is an agent using the wrong tool for its environment, not a
+/// broken tool: it never opens an incident ([`is_wrong_environment`]).
+pub fn wrong_environment_message(noun: &str) -> String {
+    let how = if noun == "db" {
+        "query the database directly with the `db-query` skill (requires AWS SSO login)".to_string()
+    } else {
+        "reach the service directly with the project's own tooling, such as the `db-query` skill for a database \
+         (requires AWS SSO login)"
+            .to_string()
+    };
+    format!("`tod-cli {noun}` is only for cloud sandboxes; on this machine or in a dev container, {how}")
+}
+
+/// Whether `error` is [`wrong_environment_message`]'s.
+pub fn is_wrong_environment(error: &str) -> bool {
+    error.contains("is only for cloud sandboxes; on this machine or in a dev container")
+}
+
 /// Classifies `error` seen at `source`.
 pub fn classify(source: Source, error: &str) -> Classification {
+    if is_wrong_environment(error) {
+        return Classification { kind: Kind::Work, signature: String::new(), summary: String::new() };
+    }
     let lower = error.to_lowercase();
     let github = source == Source::Github || lower.contains("github");
 
@@ -276,6 +298,9 @@ pub fn classify(source: Source, error: &str) -> Classification {
 /// agent-filed `broken` request whose error is that tool's (the request itself
 /// is `AgentRequest`, which names no tool).
 pub fn tool_signature(error: &str) -> Option<String> {
+    if is_wrong_environment(error) {
+        return None;
+    }
     let sig = of_text(error);
     (!sig.is_empty()).then(|| format!("tool_broken:{sig}"))
 }
@@ -300,6 +325,19 @@ mod tests {
         for text in ["Invalid API key · Please run /login", "Codex: you are not signed in. Run `codex login`", "Failed to authenticate. API Error: 401"] {
             let c = classify(Source::AgentRequest, text);
             assert_eq!((c.kind, c.signature.as_str()), (Kind::Auth, "auth:agent"), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_brokered_noun_outside_a_cloud_sandbox_is_agent_work_not_a_broken_tool() {
+        for noun in ["db", "access"] {
+            let text = wrong_environment_message(noun);
+            for source in [Source::Tool, Source::AgentRequest, Source::Agent, Source::Other] {
+                let c = classify(source, &text);
+                assert_eq!(c.kind, Kind::Work, "{text}");
+                assert!(!c.kind.parks() && c.signature.is_empty());
+            }
+            assert_eq!(tool_signature(&text), None);
         }
     }
 

@@ -1,7 +1,11 @@
 ## `tod-cli db`
 
 How you use one of the user's databases from a cloud node's sandbox, such as a
-production database that only lets the user's own machine in. You never hold
+production database that only lets the user's own machine in. This is for a
+cloud sandbox only: on the user's machine or in a dev container on it, `db`
+refuses to run, and you query the database directly with the project's
+`db-query` skill instead (it needs the user's AWS SSO login; if that is not
+logged in, record a request asking the user to log in). You never hold
 the login: the user's machine signs a short-lived one for you, `run` hands it
 to the command you start, and the command's output comes back with it masked.
 

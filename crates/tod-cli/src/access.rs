@@ -25,8 +25,8 @@ as Flagship's); `list` shows each by name with the actions it offers and their
 arguments. `call` makes one of those actions and prints the result as JSON, for
 example `call hatchet-prod runs-list since=24h statuses=FAILED` or
 `call redis-prod get key=claim:42`. Every action only reads. The call is made
-from the user's machine, which holds the credential. It works only for a node
-running in the cloud, and only while the user's machine is on and running tod;
+from the user's machine, which holds the credential. It is only for a node
+running in a cloud sandbox, and only while the user's machine is on and running tod;
 otherwise it says so.
 ";
 
@@ -61,7 +61,7 @@ fn parse_call(args: &[String]) -> Result<(String, String, BTreeMap<String, Strin
 }
 
 fn list(json: bool) -> Result<String> {
-    let reply = Broker::from_env()?.ask(&json!({"op": "services"}))?;
+    let reply = Broker::from_env("access")?.ask(&json!({"op": "services"}))?;
     let services = reply["services"].as_array().cloned().unwrap_or_default();
     if json {
         return Ok(serde_json::to_string_pretty(&services)?);
@@ -88,7 +88,7 @@ fn render_list(services: &[Value]) -> String {
 }
 
 fn call(service: &str, action: &str, args: &BTreeMap<String, String>) -> Result<String> {
-    let reply = Broker::from_env()?.ask(&json!({"op": "service", "name": service, "action": action, "args": args}))?;
+    let reply = Broker::from_env("access")?.ask(&json!({"op": "service", "name": service, "action": action, "args": args}))?;
     Ok(serde_json::to_string_pretty(&reply["result"])?)
 }
 
@@ -119,7 +119,14 @@ mod tests {
             return;
         }
         let err = run(&v(&["call", "redis-prod", "get", "key=k"]), false).unwrap_err().to_string();
-        assert!(err.contains("only in the sandbox of a node running in the cloud"), "{err}");
+        assert!(err.contains("`tod-cli access` is only for cloud sandboxes; on this machine or in a dev container"), "{err}");
+        assert!(err.contains("`db-query` skill") && err.contains("AWS SSO"), "{err}");
+        let db = crate::db::run(&v(&["psql", "prod"]), false).unwrap_err().to_string();
+        assert_eq!(
+            db,
+            "`tod-cli db` is only for cloud sandboxes; on this machine or in a dev container, query the database directly \
+             with the `db-query` skill (requires AWS SSO login)"
+        );
     }
 
     #[test]

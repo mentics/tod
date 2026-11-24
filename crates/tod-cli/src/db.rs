@@ -34,8 +34,8 @@ shows their names. `run` starts COMMAND with the connection in the standard
 PG* environment variables (PGHOST, PGPORT, PGUSER, PGDATABASE, PGPASSWORD,
 PGSSLMODE, PGSSLROOTCERT), so psql and any libpq-based client connect
 unchanged. The login is signed on the user's machine and lasts 15 minutes;
-its output has it masked. `psql NAME` is `run NAME -- psql`. It works only
-for a node running in the cloud, and only while the user's machine is on and
+its output has it masked. `psql NAME` is `run NAME -- psql`. It is only for
+a node running in a cloud sandbox (elsewhere, use the `db-query` skill), and only while the user's machine is on and
 running tod; otherwise it says so.
 ";
 
@@ -89,7 +89,7 @@ fn parse_run(args: &[String]) -> Result<(String, Vec<String>)> {
 }
 
 fn list(json: bool) -> Result<String> {
-    let reply = Broker::from_env()?.ask(&serde_json::json!({"op": "list"}))?;
+    let reply = Broker::from_env("db")?.ask(&serde_json::json!({"op": "list"}))?;
     let dbs = reply["databases"].as_array().cloned().unwrap_or_default();
     if json {
         return Ok(serde_json::to_string_pretty(&dbs)?);
@@ -120,12 +120,16 @@ pub(crate) struct Broker {
 }
 
 impl Broker {
-    pub(crate) fn from_env() -> Result<Self> {
+    pub(crate) fn from_env(noun: &str) -> Result<Self> {
         let var = |name: &str| {
             std::env::var(name).map_err(|_| {
-                anyhow!("{name} is not set: `db` works only in the sandbox of a node running in the cloud (the user's machine does the login)")
+                anyhow!("{name} is not set: `db` is only for a node running in a cloud sandbox (the user's machine does the login)")
             })
         };
+        // Outside a cloud sandbox the agent chose the wrong tool: say what to use.
+        if std::env::var(ORCHESTRATOR_CLI_URL_ENV).is_err() {
+            bail!("{}", tod_store::incident_class::wrong_environment_message(noun));
+        }
         let cli = var(ORCHESTRATOR_CLI_URL_ENV)?;
         let base = cli.trim_end_matches('/').trim_end_matches("/cli").to_string();
         let user = var(USER_ENV)?;
@@ -200,7 +204,7 @@ impl Broker {
 }
 
 fn run_command(name: &str, argv: &[String]) -> Result<i32> {
-    let broker = Broker::from_env()?;
+    let broker = Broker::from_env("db")?;
     let reply = broker.ask(&serde_json::json!({"op": "token", "name": name}))?;
     let login: Login = serde_json::from_value(reply["login"].clone()).context("the login reply")?;
     login.validate()?;
