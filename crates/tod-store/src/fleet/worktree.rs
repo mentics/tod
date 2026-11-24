@@ -929,62 +929,86 @@ struct TreehouseLeaseJson {
     lease_holder: String,
 }
 
-/// Whether Treehouse can serve `repo`: the configured executable here, or a
-/// `treehouse` in the repository's dev container or sandbox.
-fn treehouse_available_for(repo: &Workdir, settings: &TodSettings) -> bool {
+/// Whether Treehouse can serve `repo`: the configured executable here, or
+/// the `treehouse` in the repository's dev container or sandbox (`configured`
+/// there, else the one on its `PATH`).
+fn treehouse_available_for(repo: &Workdir, settings: &TodSettings, configured: Option<&str>) -> bool {
     match repo {
         Workdir::Host(_) => treehouse_available(settings),
         Workdir::Container { .. } | Workdir::Sandbox { .. } => {
-            matches!(remote_treehouse(repo), Ok(Some(_)))
+            matches!(remote_treehouse(repo, configured), Ok(Some(_)))
         }
     }
 }
 
 /// What to tell the user setting up a location whose nodes get worktrees when
-/// the worktree backend is "Treehouse required" and Treehouse cannot be found
-/// where `repo` is (this machine, or the dev container). `None` when nothing is
-/// wrong: another backend falls back to a plain git worktree, so a missing
-/// Treehouse is not a problem there. Runs programs (and may talk to Docker),
-/// so never on the UI thread.
-pub fn treehouse_required_problem(repo: &Workdir, settings: &TodSettings) -> Option<String> {
-    if settings.worktree_backend != WorktreeBackend::TreehouseRequired {
+/// Treehouse cannot be found where `repo` is (this machine, or the dev
+/// container): when the worktree backend is "Treehouse required", or when the
+/// location names a Treehouse (`configured`) that is not there. `None` when
+/// nothing is wrong: with no path configured, another backend falls back to a
+/// plain git worktree, so a missing Treehouse is not a problem there. Runs
+/// programs (and may talk to Docker), so never on the UI thread.
+pub fn treehouse_problem(repo: &Workdir, settings: &TodSettings, configured: Option<&str>) -> Option<String> {
+    if settings.worktree_backend == WorktreeBackend::GitOnly {
         return None;
     }
+    let required = settings.worktree_backend == WorktreeBackend::TreehouseRequired;
     match repo {
-        Workdir::Host(_) => (!treehouse_available(settings)).then(|| {
+        Workdir::Host(_) => (required && !treehouse_available(settings)).then(|| {
             format!(
                 "The worktree backend (Settings) is \"Treehouse required\", but Treehouse does not run on this machine ({}). \
                  Nodes here will fail to start. Install it, or change the backend to \"Treehouse default, Git fallback\".",
                 settings.treehouse_program().display()
             )
         }),
-        Workdir::Container { .. } | Workdir::Sandbox { .. } => match remote_treehouse(repo) {
+        Workdir::Container { .. } | Workdir::Sandbox { .. } => match remote_treehouse(repo, configured) {
             Ok(Some(_)) => None,
+            Ok(None) if !required => None,
             Ok(None) => Some(
                 "The worktree backend (Settings) is \"Treehouse required\", but there is no `treehouse` on the PATH in this \
-                 container. Nodes here will fail to start. Install it there, or change the backend to \
-                 \"Treehouse default, Git fallback\"."
+                 container. Nodes here will fail to start. Install it there, give its path under Treehouse, or change the \
+                 backend to \"Treehouse default, Git fallback\"."
                     .to_string(),
             ),
-            Err(err) => Some(format!("Could not look for `treehouse` in the container: {err:#}")),
+            Err(err) => Some(format!("{err:#}")),
         },
     }
 }
 
-/// The `treehouse` where `dir` is (a container or sandbox): the one on its
-/// `PATH`, which sets up its own environment there. Tod's settings for
-/// Treehouse name paths on this machine, so none of them apply.
-fn remote_treehouse(dir: &Workdir) -> Result<Option<String>> {
-    dir.find_remote_program("treehouse")
+/// The `treehouse` where `dir` is (a container or sandbox): `configured`, the
+/// absolute path the location gives (an error when nothing executable is
+/// there), else the one on its `PATH`, which sets up its own environment
+/// there. Tod's settings for Treehouse name paths on this machine, so none of
+/// them apply.
+fn remote_treehouse(dir: &Workdir, configured: Option<&str>) -> Result<Option<String>> {
+    let Some(path) = configured.map(str::trim).filter(|p| !p.is_empty()) else {
+        return dir
+            .find_remote_program("treehouse")
+            .with_context(|| format!("look for `treehouse` where {dir} is"));
+    };
+    let out = dir
+        .at("/")
+        .output("test", &["-x", path])
+        .with_context(|| format!("look for the Treehouse this location names ({path}) where {dir} is"))?;
+    if !out.status.success() {
+        bail!(
+            "The Treehouse this location names ({path}) is not an executable file where {dir} is: \
+             fix the path in the location (Locations), or clear it to use the `treehouse` on the PATH"
+        );
+    }
+    Ok(Some(path.to_string()))
 }
 
 /// Run Treehouse with `args` in `dir`, which is in a dev container or sandbox.
-fn run_container_treehouse(dir: &Workdir, args: &[&str]) -> Result<std::process::Output> {
+fn run_container_treehouse(dir: &Workdir, configured: Option<&str>, args: &[&str]) -> Result<std::process::Output> {
     if !dir.is_remote() {
         bail!("not a container or sandbox directory: {dir}");
     }
-    let program = remote_treehouse(dir)?.with_context(|| {
-        format!("No `treehouse` on the PATH where {dir} is: install it there")
+    let program = remote_treehouse(dir, configured)?.with_context(|| {
+        format!(
+            "No `treehouse` on the PATH where {dir} is (tod looked with `sh -c` and `bash -lc`, never an \
+             interactive shell): install it there, or give its path under Treehouse in the location (Locations)"
+        )
     })?;
     let no_update_check = format!("{TREEHOUSE_NO_UPDATE_CHECK_ENV}=1");
     // Treehouse runs git itself (in submodules too), which needs the same
@@ -1023,6 +1047,7 @@ fn lease_args(holder: &str, submodules: bool) -> Vec<&str> {
 
 fn treehouse_get_lease(
     repo: &Workdir,
+    configured: Option<&str>,
     holder: &str,
     settings: &TodSettings,
     paths: &TodPaths,
@@ -1040,7 +1065,7 @@ fn treehouse_get_lease(
                     .context("spawn treehouse get --lease")
             }
             Workdir::Container { .. } | Workdir::Sandbox { .. } => {
-                run_container_treehouse(repo, &args)
+                run_container_treehouse(repo, configured, &args)
             }
         }
     };
@@ -1239,6 +1264,7 @@ pub fn ensure_worktree(
     paths: &TodPaths,
     data_root: &Path,
     repo: &Workdir,
+    treehouse: Option<&str>,
     branch: &str,
     lease_holder: &str,
 ) -> Result<WorktreeHandle> {
@@ -1278,12 +1304,19 @@ pub fn ensure_worktree(
         progress.phase("adding the worktree");
         let mut handle = match backend {
             WorktreeBackend::GitOnly => git_worktree(data_root, repo, &branch_key)?,
+            // A Treehouse the location names is used or fails: falling back
+            // to git would hide that the configured one is broken.
+            WorktreeBackend::TreehouseRequired | WorktreeBackend::TreehouseWithGitFallback
+                if treehouse.is_some() && repo.is_remote() =>
+            {
+                treehouse_get_lease(repo, treehouse, lease_holder, settings, paths)?
+            }
             WorktreeBackend::TreehouseRequired => {
-                treehouse_get_lease(repo, lease_holder, settings, paths)?
+                treehouse_get_lease(repo, treehouse, lease_holder, settings, paths)?
             }
             WorktreeBackend::TreehouseWithGitFallback => {
-                if treehouse_available_for(repo, settings) {
-                    match treehouse_get_lease(repo, lease_holder, settings, paths) {
+                if treehouse_available_for(repo, settings, treehouse) {
+                    match treehouse_get_lease(repo, treehouse, lease_holder, settings, paths) {
                         Ok(h) => h,
                         Err(err) => {
                             tracing::warn!(
@@ -1592,6 +1625,7 @@ fn comparable_path(path: &Workdir) -> String {
 /// Return a Treehouse lease so the worktree goes back to the pool.
 pub fn treehouse_return(
     worktree: &Workdir,
+    treehouse: Option<&str>,
     lease_id: &str,
     settings: &TodSettings,
     paths: &TodPaths,
@@ -1610,6 +1644,7 @@ pub fn treehouse_return(
         }
         Workdir::Container { path, .. } | Workdir::Sandbox { path, .. } => run_container_treehouse(
             &worktree.at("/"),
+            treehouse,
             &["return", path, "--if-lease-id", lease_id],
         )?,
     };
@@ -1651,12 +1686,37 @@ mod tests {
         let mut settings = TodSettings::default();
         settings.treehouse_executable = Some(std::path::PathBuf::from("/nonexistent/treehouse"));
         settings.worktree_backend = WorktreeBackend::TreehouseWithGitFallback;
-        assert_eq!(treehouse_required_problem(&repo, &settings), None);
+        assert_eq!(treehouse_problem(&repo, &settings, None), None);
         settings.worktree_backend = WorktreeBackend::GitOnly;
-        assert_eq!(treehouse_required_problem(&repo, &settings), None);
+        assert_eq!(treehouse_problem(&repo, &settings, None), None);
         settings.worktree_backend = WorktreeBackend::TreehouseRequired;
-        let problem = treehouse_required_problem(&repo, &settings).expect("required and missing");
+        let problem = treehouse_problem(&repo, &settings, None).expect("required and missing");
         assert!(problem.contains("Treehouse required") && problem.contains("/nonexistent/treehouse"), "{problem}");
+    }
+
+    /// A Treehouse path the location names is used as given, and one that is
+    /// not there is an error (never the PATH's, never git), under either
+    /// Treehouse backend. Needs `TOD_TEST_DEV_CONTAINER` (any running container).
+    #[test]
+    fn a_configured_container_treehouse_is_used_or_is_an_error() {
+        let Ok(container) = std::env::var("TOD_TEST_DEV_CONTAINER") else {
+            eprintln!("skipped: TOD_TEST_DEV_CONTAINER is not set");
+            return;
+        };
+        let repo = Workdir::container(&container, "/");
+        assert_eq!(remote_treehouse(&repo, Some("/bin/sh")).unwrap().as_deref(), Some("/bin/sh"));
+        let err = remote_treehouse(&repo, Some("/nonexistent/treehouse")).unwrap_err();
+        assert!(format!("{err:#}").contains("(/nonexistent/treehouse) is not an executable file"), "{err:#}");
+        let mut settings = TodSettings::default();
+        for backend in [WorktreeBackend::TreehouseWithGitFallback, WorktreeBackend::TreehouseRequired] {
+            settings.worktree_backend = backend;
+            assert!(!treehouse_available_for(&repo, &settings, Some("/nonexistent/treehouse")));
+            let problem = treehouse_problem(&repo, &settings, Some("/nonexistent/treehouse")).expect("missing");
+            assert!(problem.contains("/nonexistent/treehouse"), "{problem}");
+            assert_eq!(treehouse_problem(&repo, &settings, Some("/bin/sh")), None);
+        }
+        settings.worktree_backend = WorktreeBackend::GitOnly;
+        assert_eq!(treehouse_problem(&repo, &settings, Some("/nonexistent/treehouse")), None);
     }
 
     #[test]
@@ -2369,6 +2429,7 @@ mod tests {
             &paths,
             &data_root,
             &repo,
+            None,
             "task/nested",
             "tod-test",
         )
@@ -2448,15 +2509,15 @@ mod tests {
         let paths = TodPaths::discover().unwrap();
         clear_data_root_override();
         let settings = TodSettings::default();
-        assert!(treehouse_available_for(&repo, &settings));
+        assert!(treehouse_available_for(&repo, &settings, None));
 
-        let handle = treehouse_get_lease(&repo, "tod-test", &settings, &paths).unwrap();
+        let handle = treehouse_get_lease(&repo, None, "tod-test", &settings, &paths).unwrap();
         assert_eq!(handle.path.container_name(), Some(container.as_str()));
         assert!(handle.path.is_dir());
         let lease = handle.lease.expect("a lease");
         assert_eq!(lease.lease_holder, "tod-test");
 
-        treehouse_return(&handle.path, &lease.lease_id, &settings, &paths).unwrap();
+        treehouse_return(&handle.path, None, &lease.lease_id, &settings, &paths).unwrap();
         let _ = scratch.output("rm", &["-rf", &dir]);
         let _ = fs::remove_dir_all(&data_root);
     }
@@ -2496,6 +2557,7 @@ git -c user.name=t -c user.email=t@t commit -q -m 'add sub'"#;
             &paths,
             &data_root,
             &repo,
+            None,
             "task/with-sub",
             "tod-test",
         )
@@ -2506,7 +2568,7 @@ git -c user.name=t -c user.email=t@t commit -q -m 'add sub'"#;
         assert_eq!(current_branch(&subs[0]).as_deref(), Some("task/with-sub"));
 
         let lease = handle.lease.expect("a lease");
-        treehouse_return(&handle.path, &lease.lease_id, &settings, &paths).unwrap();
+        treehouse_return(&handle.path, None, &lease.lease_id, &settings, &paths).unwrap();
         let _ = scratch.output("rm", &["-rf", &dir]);
         let _ = fs::remove_dir_all(&data_root);
     }
@@ -2749,6 +2811,7 @@ git -c user.name=t -c user.email=t@t commit -q -m 'add sub'"#;
             &paths,
             &data_root,
             &git_repo,
+            None,
             "feature",
             "tod-a",
         )
@@ -2760,6 +2823,7 @@ git -c user.name=t -c user.email=t@t commit -q -m 'add sub'"#;
             &paths,
             &data_root,
             &git_repo,
+            None,
             "dev",
             "tod-b",
         )
@@ -2788,6 +2852,7 @@ git -c user.name=t -c user.email=t@t commit -q -m 'add sub'"#;
             &paths,
             &data_root,
             &git_repo,
+            None,
             "feature",
             "tod-c",
         )

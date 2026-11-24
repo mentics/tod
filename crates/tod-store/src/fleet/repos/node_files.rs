@@ -51,6 +51,12 @@ pub struct DevContainerSetting {
     /// it there. Machine-local, like the rest.
     #[serde(default)]
     pub clone_url: Option<String>,
+    /// The `treehouse` to run in the container, as an absolute path there,
+    /// for a repository that lives in the container. `None` finds it on the
+    /// container's `PATH` (else a login shell's). Set when it is only on an
+    /// interactive shell's `PATH`, which tod never starts. Machine-local.
+    #[serde(default)]
+    pub treehouse: Option<String>,
 }
 
 /// What a node's new sandbox starts from.
@@ -131,6 +137,13 @@ impl DevContainerSetting {
 
     pub fn container(&self) -> Option<&str> {
         self.container.as_deref().map(str::trim).filter(|c| !c.is_empty())
+    }
+
+    /// The configured `treehouse` (see the field): only for a repository in
+    /// a Docker container.
+    pub fn treehouse(&self) -> Option<&str> {
+        self.repo_container()?;
+        self.treehouse.as_deref().map(str::trim).filter(|t| !t.is_empty())
     }
 
     /// The Docker container the repository lives in, when it lives in one.

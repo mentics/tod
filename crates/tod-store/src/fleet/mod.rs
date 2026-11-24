@@ -83,5 +83,5 @@ pub use treehouse::{
     treehouse_config_path, treehouse_home,
 };
 pub use workdir::Workdir;
-pub use worktree::{treehouse_required_problem, validate_git_repo, validate_interview_workspace};
+pub use worktree::{treehouse_problem, validate_git_repo, validate_interview_workspace};
 pub use writer::{FleetMutation, FleetWriter};

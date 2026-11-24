@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS files_places (
     sandbox_source         TEXT NOT NULL DEFAULT 'image',
     sandbox_from           TEXT NOT NULL DEFAULT '',
     clone_url              TEXT,
+    container_treehouse    TEXT,
     created_at             INTEGER NOT NULL,
     updated_at             INTEGER NOT NULL
 );
@@ -50,6 +51,22 @@ pub fn ensure_clone_url(conn: &Connection) -> Result<()> {
     }
     Ok(())
 }
+
+/// Stores `container_treehouse` on a `files_places` made before it existed.
+/// Idempotent, like [`ensure_clone_url`].
+pub fn ensure_container_treehouse(conn: &Connection) -> Result<()> {
+    let present = conn
+        .prepare("SELECT 1 FROM pragma_table_info('files_places') WHERE name = 'container_treehouse'")?
+        .exists([])?;
+    if !present {
+        conn.execute_batch("ALTER TABLE files_places ADD COLUMN container_treehouse TEXT;")?;
+    }
+    Ok(())
+}
+
+/// What a container's Treehouse path may be, said to the user.
+pub const TREEHOUSE_PATH_RULE: &str =
+    "The Treehouse path is where it is inside the container: an absolute path, like /workspace/.local/bin/treehouse";
 
 /// What a clone URL may be, said to the user.
 pub const CLONE_URL_RULE: &str =
@@ -141,6 +158,7 @@ impl FilesPlace {
             // An image's repository to clone, or the one whose golden a fork
             // of `golden` forks; a fork by name holds its own.
             clone_url: dev.repo_url().map(|u| u.trim_end_matches('/').to_string()),
+            treehouse: dev.treehouse().map(str::to_string),
             sandbox_from: if dev.sandbox { dev.sandbox_from } else { SandboxFrom::default() },
         });
         // The clone goes where tod always puts it, so the directory is that.
@@ -200,6 +218,11 @@ impl FilesPlace {
             {
                 return Some(format!("{err:#}"));
             }
+            if let Some(path) = dev.treehouse()
+                && (!path.starts_with('/') || path.chars().any(char::is_control))
+            {
+                return Some(TREEHOUSE_PATH_RULE.into());
+            }
         }
         None
     }
@@ -246,7 +269,8 @@ impl FilesPlace {
 }
 
 const COLUMNS: &str = "id, name, repo, use_worktree, dev_container, container,
-                       container_repo_on_host, container_kind, sandbox_source, sandbox_from, clone_url";
+                       container_repo_on_host, container_kind, sandbox_source, sandbox_from, clone_url,
+                       container_treehouse";
 
 fn row_to_place(row: &rusqlite::Row<'_>) -> rusqlite::Result<FilesPlace> {
     Ok(FilesPlace {
@@ -261,6 +285,7 @@ fn row_to_place(row: &rusqlite::Row<'_>) -> rusqlite::Result<FilesPlace> {
                 sandbox: row.get::<_, String>(7)? == "sandbox",
                 sandbox_from: SandboxFrom::from_columns(&row.get::<_, String>(8)?, row.get(9)?),
                 clone_url: row.get(10)?,
+                treehouse: row.get(11)?,
             })
         } else {
             None
@@ -336,8 +361,9 @@ impl<'a> FilesPlaceRepo<'a> {
         self.conn.execute(
             "INSERT INTO files_places
                (id, name, repo, use_worktree, dev_container, container, container_repo_on_host,
-                container_kind, sandbox_source, sandbox_from, clone_url, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)
+                container_kind, sandbox_source, sandbox_from, clone_url, container_treehouse,
+                created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13)
              ON CONFLICT(id) DO UPDATE SET
                name = excluded.name, repo = excluded.repo,
                use_worktree = excluded.use_worktree, dev_container = excluded.dev_container,
@@ -346,6 +372,7 @@ impl<'a> FilesPlaceRepo<'a> {
                container_kind = excluded.container_kind,
                sandbox_source = excluded.sandbox_source, sandbox_from = excluded.sandbox_from,
                clone_url = excluded.clone_url,
+               container_treehouse = excluded.container_treehouse,
                updated_at = excluded.updated_at",
             params![
                 place.id,
@@ -359,6 +386,7 @@ impl<'a> FilesPlaceRepo<'a> {
                 source,
                 from,
                 dev.and_then(|d| d.repo_url()),
+                dev.and_then(|d| d.treehouse()),
                 now,
             ],
         )?;
@@ -420,6 +448,7 @@ pub fn migrate_from_node_files(conn: &Connection) -> Result<()> {
                                 row.get(7)?,
                             ),
                             clone_url: None,
+                            treehouse: None,
                         })
                     })
                     .transpose()?,
@@ -738,5 +767,45 @@ mod tests {
         assert_ne!(a.recipe_key(), b.recipe_key());
         let none = image_place(None, Some("/workspace/repo")).normalized();
         assert_eq!(none.recipe_key(), "sandbox\n/workspace/repo\nimage:");
+    }
+
+    fn container_place(treehouse: &str, repo_on_host: bool) -> FilesPlace {
+        FilesPlace {
+            name: "dev".into(),
+            repo: Some("/workspace".into()),
+            use_worktree: true,
+            dev_container: Some(DevContainerSetting {
+                container: Some("workspace-dev-app-1".into()),
+                repo_on_host,
+                treehouse: Some(treehouse.into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// A dev container's Treehouse path is kept (trimmed) only for a
+    /// repository inside the container, must be absolute, round-trips, an old
+    /// table gets the column, and it never makes a node's location stale.
+    #[test]
+    fn a_container_treehouse_path_round_trips_and_is_not_part_of_the_recipe() {
+        let inside = container_place(" /workspace/.local/bin/treehouse ", false).normalized();
+        assert_eq!(inside.dev_container.as_ref().unwrap().treehouse(), Some("/workspace/.local/bin/treehouse"));
+        assert_eq!(inside.recipe_key(), container_place("", false).normalized().recipe_key());
+        let mounted = container_place("/workspace/.local/bin/treehouse", true).normalized();
+        assert_eq!(mounted.dev_container.unwrap().treehouse, None);
+        assert_eq!(container_place("   ", false).normalized().dev_container.unwrap().treehouse, None);
+        let relative = container_place(".local/bin/treehouse", false).normalized();
+        assert_eq!(relative.problem(&[]).as_deref(), Some(TREEHOUSE_PATH_RULE));
+
+        let (dir, conn) = test_writer_conn();
+        let repo = FilesPlaceRepo::new(&conn);
+        let saved = repo.save(&inside).unwrap();
+        assert_eq!(repo.get(&saved.id).unwrap().unwrap(), saved);
+        conn.execute_batch("ALTER TABLE files_places DROP COLUMN container_treehouse;").unwrap();
+        ensure_container_treehouse(&conn).unwrap();
+        ensure_container_treehouse(&conn).unwrap();
+        assert_eq!(repo.get(&saved.id).unwrap().unwrap().dev_container.unwrap().treehouse, None);
+        cleanup_test_dir(&dir);
     }
 }
