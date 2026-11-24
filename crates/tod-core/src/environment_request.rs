@@ -125,6 +125,19 @@ pub fn answer_message(name: &str, provided: bool) -> String {
     }
 }
 
+/// What the agent is told when the user answered a credential request with
+/// their own words instead of picking an option: the words, verbatim, as a reply
+/// to the request. It is neither "provided" nor "cannot provide": the user may
+/// say none is needed, or where to find another way in.
+pub fn text_answer_message(name: &str, text: &str) -> String {
+    format!(
+        "The user replied to your request for the credential `{name}` in their own words \
+         (they did not pick \"I've provided it\" or \"I can't provide it\", so nothing was stored \
+         for it):\n\n{}\n\nFollow what they say.",
+        text.trim()
+    )
+}
+
 /// The set environment variable of a process that runs where the user's
 /// credential store is not (the orchestrator answering a cloud node's
 /// `tod-cli`): a secret is then never "set" *here*, whatever the user did,

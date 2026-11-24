@@ -86,11 +86,16 @@ pub fn record_decision_answer_as(
     let credential = crate::environment_request::is_request(&after.decision)
         .then(|| crate::environment_request::parse_question(&after.decision.question))
         .flatten()
-        .map(|(name, _)| {
-            crate::environment_request::answer_message(
+        .map(|(name, _)| match text.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+            // The user's own words reach the agent as they wrote them; only
+            // an option stands for "provided" or "cannot provide".
+            Some(words) if option_index.is_none() => {
+                crate::environment_request::text_answer_message(&name, words)
+            }
+            _ => crate::environment_request::answer_message(
                 &name,
                 crate::environment_request::was_provided(&after.decision, option_index),
-            )
+            ),
         });
     let moved = answered.moved_to.as_ref().map(|to| {
         format!(

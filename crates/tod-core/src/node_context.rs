@@ -411,14 +411,31 @@ fn lowercase_first(s: &str) -> String {
 /// [`tod_store::decisions::REASK_WINDOW_MS`], with their answers: the agent's
 /// next turn carries them so it acts on the answer and never asks it again
 /// (`decisions ask` refuses the repeat, too). Empty when there are none. A
-/// permission (a standing grant) and a credential request (never to echo)
-/// are left out.
+/// permission (a standing grant) is left out. A credential request is
+/// included: what the user said (an option, or their own words) is no secret,
+/// and a fresh session that never saw the answer asked again, or went on
+/// believing it was blocked on the credential.
+///
+/// "Recent" is the earlier of [`tod_store::decisions::REASK_WINDOW_MS`] ago and the
+/// time the node entered its current state: a session that starts hours after
+/// the answer, in the same stay, still sees it ([`window_start`]).
 ///
 /// `sending` is the message this goes out with: an answer that message already
 /// carries ([`message_carries`]) is left out, so the agent is not told it twice.
 pub fn render_recent_answers(conn: &Connection, node_id: Uuid, sending: &str) -> Result<String> {
-    let since = tod_store::outline::uuid_blob::now_ms() - tod_store::decisions::REASK_WINDOW_MS;
-    render_answers_since(conn, node_id, since, sending)
+    render_answers_since(conn, node_id, window_start(conn, node_id)?, sending)
+}
+
+/// The earlier of the recency window's start and the moment the node entered
+/// its current lifecycle state, so an answer given in this stay stays visible
+/// to every session of it however long ago it was.
+fn window_start(conn: &Connection, node_id: Uuid) -> Result<i64> {
+    let window = tod_store::outline::uuid_blob::now_ms() - tod_store::decisions::REASK_WINDOW_MS;
+    let entered = tod_store::outline::repos::NodeRepo::new(conn)
+        .get_lifecycle_entered_for_nodes(&[node_id])?
+        .get(&node_id)
+        .map(|(_, entered)| *entered);
+    Ok(entered.map_or(window, |entered| entered.min(window)))
 }
 
 /// Whether `message` already tells the agent this answer: it is the message
@@ -447,7 +464,7 @@ fn message_carries(message: &str, question: &str, answer_text: Option<&str>) -> 
 /// answer reaches it once.
 pub fn render_unsent_answers(conn: &Connection, node_id: Uuid, conversation_id: Uuid, sending: &str) -> Result<String> {
     use tod_store::conversation::{ConversationRepo, TurnRole};
-    let window = tod_store::outline::uuid_blob::now_ms() - tod_store::decisions::REASK_WINDOW_MS;
+    let window = window_start(conn, node_id)?;
     let last_sent = ConversationRepo::new(conn)
         .turns(conversation_id)?
         .iter()
@@ -465,7 +482,6 @@ fn render_answers_since(conn: &Connection, node_id: Uuid, since: i64, sending: &
     for decision in repo.list_for_node(node_id)? {
         if decision.status != DECISION_ANSWERED
             || decision.protocol.as_deref() == Some(crate::permission::PROTOCOL)
-            || crate::environment_request::is_request(&decision)
         {
             continue;
         }
@@ -556,6 +572,66 @@ mod tests {
         assert!(text.contains("Leave PG 18 verification to CI?"), "{text}");
         assert!(text.contains("\"Carry on without it\""), "{text}");
         assert!(text.contains("do not ask them again"), "{text}");
+    }
+
+    /// An answer given earlier in the node's current stay still reaches a
+    /// session that starts long after it, a credential request's included; one
+    /// from before the stay and older than the window does not.
+    #[test]
+    fn an_answer_from_this_stay_outlives_the_recent_window() {
+        use tod_store::decisions::{DecisionRepo, NewDecision};
+        use tod_store::interview::InterviewCommand;
+        let fx = crate::interview::test_support::fixture();
+        let ask = |question: String, protocol: Option<String>, options: Vec<String>| {
+            fx.fleet
+                .interview(
+                    "user",
+                    InterviewCommand::AskDecision {
+                        node_id: fx.node,
+                        conversation_id: None,
+                        protocol,
+                        decision: NewDecision { question, options, ..Default::default() },
+                    },
+                )
+                .unwrap();
+            fx.fleet
+                .read(|conn| Ok(DecisionRepo::new(conn).list_pending_for_node(fx.node)?))
+                .unwrap()
+                .remove(0)
+        };
+        let credential = ask(
+            crate::environment_request::question("digikey_client_id", "to replay"),
+            Some(crate::environment_request::PROTOCOL.into()),
+            crate::environment_request::options(),
+        );
+        fx.fleet
+            .interview(
+                "user",
+                InterviewCommand::AnswerDecision {
+                    decision_id: credential.id,
+                    option: None,
+                    text: Some("none needed, use the skill".into()),
+                },
+            )
+            .unwrap();
+        let day = 24 * 60 * 60 * 1000i64;
+        let now = tod_store::outline::uuid_blob::now_ms();
+        let conn = rusqlite::Connection::open(fx.fleet.paths().db()).unwrap();
+        conn.execute("UPDATE decision_answers SET answered_at = answered_at - ?1", [3 * day]).unwrap();
+        // The node entered `verifying` four days ago, before the answer.
+        conn.execute(
+            "INSERT OR REPLACE INTO node_lifecycle (node_id, state, updated_at) VALUES (?1, 'verifying', ?2)",
+            rusqlite::params![tod_store::outline::uuid_blob::uuid_to_blob(fx.node), now - 4 * day],
+        )
+        .unwrap();
+        let text = fx.fleet.read(|conn| render_recent_answers(conn, fx.node, "")).unwrap();
+        assert!(text.contains("none needed, use the skill"), "{text}");
+        assert!(text.contains("digikey_client_id"), "{text}");
+
+        // The node moved on after the answer: it is out of the stay and the window.
+        conn.execute("UPDATE node_lifecycle SET updated_at = ?1", [now]).unwrap();
+        let text = fx.fleet.read(|conn| render_recent_answers(conn, fx.node, "")).unwrap();
+        assert_eq!(text, "");
     }
 
     /// A question tod settled itself (withdrawn) was not answered by the user: it never reaches the agent as an answer.

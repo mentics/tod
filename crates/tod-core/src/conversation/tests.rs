@@ -625,6 +625,72 @@ fn an_implementation_session_opens_and_continues_with_the_answer_once() {
     assert_eq!(continuation.matches(ANSWER_TEXT).count(), 0, "{continuation}");
 }
 
+/// A credential request answered with the user's own words: the asking
+/// conversation is told those words, not "cannot provide", and a fresh
+/// Implement or Verify session (the asking one is gone) opens with them, once.
+#[test]
+fn a_text_answer_to_a_credential_request_reaches_the_asker_and_every_next_session() {
+    use tod_store::decisions::NewDecision;
+    let fx = implementation_fixture();
+    let words = "No credential needed; use the digikey-api skill instead";
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut asker = ConversationDriver::new(config(&fx, 100_000), Focus::Node(fx.node), ProtocolKind::Outline);
+    say(&mut asker, &fx, &mut agent, "ask Hello?");
+    let asked = fx.user(InterviewCommand::AskDecision {
+        node_id: fx.node,
+        conversation_id: asker.conversation_id(),
+        protocol: Some(crate::environment_request::PROTOCOL.into()),
+        decision: NewDecision {
+            question: crate::environment_request::question("digikey_client_id", "to replay the live API"),
+            options: crate::environment_request::options(),
+            ..Default::default()
+        },
+    });
+    let decision_id = Uuid::parse_str(asked["id"].as_str().unwrap()).unwrap();
+    let (to, message) =
+        crate::lifecycle::answer::record_decision_answer(&fx.fleet, decision_id, None, Some(words.into()))
+            .unwrap()
+            .unwrap();
+    assert_eq!(Some(to), asker.conversation_id());
+    assert!(message.contains(words), "{message}");
+    assert!(!message.contains("cannot provide"), "{message}");
+
+    // The asker is gone: the next sessions are fresh ones of their own.
+    for kind in [ProtocolKind::Implementation, ProtocolKind::Verification] {
+        let mut agent = FakeAgent::new(&fx.fleet);
+        let mut driver = ConversationDriver::new(config(&fx, 100_000), Focus::Node(fx.node), kind);
+        driver.send(&fx.fleet, &mut agent, "Go.").unwrap();
+        let opening = everything_sent(agent.last());
+        assert_eq!(opening.matches(words).count(), 1, "{kind:?}: {opening}");
+    }
+}
+
+/// An option answer to a credential request reaches a fresh session as well.
+#[test]
+fn an_option_answer_to_a_credential_request_reaches_the_next_session() {
+    use tod_store::decisions::NewDecision;
+    let fx = implementation_fixture();
+    let asked = fx.user(InterviewCommand::AskDecision {
+        node_id: fx.node,
+        conversation_id: None,
+        protocol: Some(crate::environment_request::PROTOCOL.into()),
+        decision: NewDecision {
+            question: crate::environment_request::question("digikey_client_id", "to replay the live API"),
+            options: crate::environment_request::options(),
+            ..Default::default()
+        },
+    });
+    let decision_id = Uuid::parse_str(asked["id"].as_str().unwrap()).unwrap();
+    fx.user(InterviewCommand::AnswerDecision { decision_id, option: Some(2), text: None });
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut driver =
+        ConversationDriver::new(config(&fx, 100_000), Focus::Node(fx.node), ProtocolKind::Verification);
+    driver.send(&fx.fleet, &mut agent, "Go.").unwrap();
+    let opening = everything_sent(agent.last());
+    assert!(opening.contains("digikey_client_id"), "{opening}");
+    assert!(opening.contains("\"I can't provide it\""), "{opening}");
+}
+
 /// An answer to a plan step the agent handed back is recorded like any
 /// request's answer, so a later fresh session reads it, once.
 #[test]
