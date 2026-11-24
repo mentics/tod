@@ -566,6 +566,91 @@ pub fn prepare(launch: &DevContainerLaunch) -> Result<PreparedContainer> {
     Ok(prepared)
 }
 
+/// Where this machine keeps Codex's sign-in: `$CODEX_HOME/auth.json`, else
+/// `~/.codex/auth.json`. Takes the values so a test can give a fake home.
+pub fn host_codex_auth_path(codex_home: Option<&std::ffi::OsStr>, home: Option<&Path>) -> Option<PathBuf> {
+    match codex_home.filter(|value| !value.is_empty()) {
+        Some(dir) => Some(Path::new(dir).join("auth.json")),
+        None => home.map(|home| home.join(".codex").join("auth.json")),
+    }
+}
+
+/// This machine's Codex credential, when it has one. `Ok(None)` is only "no
+/// such file"; an unreadable one is an error.
+pub fn read_host_codex_auth(path: &Path) -> Result<Option<Vec<u8>>> {
+    match std::fs::read(path) {
+        Ok(bytes) if bytes.iter().any(|b| !b.is_ascii_whitespace()) => Ok(Some(bytes)),
+        Ok(_) => Ok(None),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err).with_context(|| format!("read this machine's Codex sign-in {}", path.display())),
+    }
+}
+
+/// Run as the container user with the host's `auth.json` on stdin. Does
+/// nothing (and discards stdin) when the container already has a Codex
+/// credential, a file in its Codex home (`CODEX_HOME`, else `~/.codex`) or an
+/// `OPENAI_API_KEY`; otherwise writes it there, mode 0600, atomically.
+pub const CODEX_AUTH_INSTALL: &str = r#"h="${CODEX_HOME:-$HOME/.codex}"
+if [ -s "$h/auth.json" ] || [ -n "$OPENAI_API_KEY" ]; then cat >/dev/null; echo present; exit 0; fi
+umask 077
+mkdir -p "$h" && cat > "$h/auth.json.tmp" && chmod 600 "$h/auth.json.tmp" && mv -f "$h/auth.json.tmp" "$h/auth.json" && echo installed
+"#;
+
+/// What [`ensure_codex_login`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexLogin {
+    /// The container already had a credential.
+    Present,
+    /// This machine's credential was installed.
+    Installed,
+    /// Neither side has one: the user signs in (the agent's own error says how).
+    NoHostCredential,
+}
+
+/// Give a Codex agent in `container` this machine's sign-in when the
+/// container has none (a restarted container loses its `~/.codex`). The
+/// credential travels on stdin, never a command line. Talks to Docker: never
+/// call it on the UI thread.
+pub fn ensure_codex_login(container: &PreparedContainer) -> Result<CodexLogin> {
+    let host = host_codex_auth_path(
+        std::env::var_os("CODEX_HOME").as_deref(),
+        std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from).as_deref(),
+    );
+    ensure_codex_login_from(container, host.as_deref())
+}
+
+fn ensure_codex_login_from(container: &PreparedContainer, host_auth: Option<&Path>) -> Result<CodexLogin> {
+    let auth = match host_auth {
+        Some(path) => read_host_codex_auth(path)?,
+        None => None,
+    };
+    let Some(auth) = auth else {
+        return Ok(CodexLogin::NoHostCredential);
+    };
+    let mut command = container.command("sh", &["-c".to_string(), CODEX_AUTH_INSTALL.to_string()])?;
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("run docker (is Docker installed and running?)")?;
+    child.stdin.take().context("docker stdin")?.write_all(&auth)?;
+    let out = child.wait_with_output()?;
+    if !out.status.success() {
+        bail!(
+            "install this machine's Codex sign-in in dev container `{}`: {}",
+            container.name,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(if String::from_utf8_lossy(&out.stdout).trim() == "present" {
+        CodexLogin::Present
+    } else {
+        tracing::info!(event = "agent", action = "codex_login_installed", container = %container.name, "installed the host's Codex sign-in");
+        CodexLogin::Installed
+    })
+}
+
 /// Write `file` into `container` as root, replacing it atomically.
 pub fn write_file(container: &str, file: &ContainerFile) -> Result<()> {
     validate_container_ref(container)?;
@@ -888,6 +973,89 @@ mod tests {
             path: None,
             working_dir: None,
         }
+    }
+
+    #[test]
+    fn host_codex_auth_path_prefers_codex_home() {
+        use std::ffi::OsStr;
+        let home = Path::new("/h");
+        assert_eq!(
+            host_codex_auth_path(Some(OsStr::new("/c")), Some(home)),
+            Some(PathBuf::from("/c/auth.json"))
+        );
+        assert_eq!(
+            host_codex_auth_path(Some(OsStr::new("")), Some(home)),
+            Some(PathBuf::from("/h/.codex/auth.json"))
+        );
+        assert_eq!(host_codex_auth_path(None, None), None);
+    }
+
+    #[test]
+    fn host_codex_auth_is_read_from_a_fake_home() {
+        let dir = tod_test_util::scratch_dir("codex-auth");
+        let file = dir.join(".codex").join("auth.json");
+        assert_eq!(read_host_codex_auth(&file).unwrap(), None);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "  \n").unwrap();
+        assert_eq!(read_host_codex_auth(&file).unwrap(), None);
+        std::fs::write(&file, "{\"k\":1}").unwrap();
+        assert_eq!(read_host_codex_auth(&file).unwrap().unwrap(), b"{\"k\":1}");
+        // Not a file at all: an error, not "no credential".
+        assert!(read_host_codex_auth(&dir).is_err());
+    }
+
+    #[test]
+    fn no_host_credential_installs_nothing_and_needs_no_docker() {
+        let container = PreparedContainer {
+            id: "abc".into(),
+            name: "dev".into(),
+            user: Some("vscode".into()),
+            cwd: "/w".into(),
+            path: "/bin".into(),
+            env: vec![],
+        };
+        let dir = tod_test_util::scratch_dir("codex-auth-none");
+        let missing = dir.join("auth.json");
+        assert_eq!(
+            ensure_codex_login_from(&container, Some(&missing)).unwrap(),
+            CodexLogin::NoHostCredential
+        );
+        assert_eq!(ensure_codex_login_from(&container, None).unwrap(), CodexLogin::NoHostCredential);
+    }
+
+    #[test]
+    fn codex_install_script_keeps_an_existing_login_and_writes_0600() {
+        // Run the script itself against a fake container home.
+        let dir = tod_test_util::scratch_dir("codex-install");
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let run = |stdin: &str, extra: &[(&str, &str)]| {
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", CODEX_AUTH_INSTALL]).env("HOME", &home).env_remove("CODEX_HOME").env_remove("OPENAI_API_KEY");
+            for (k, v) in extra {
+                cmd.env(k, v);
+            }
+            let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+            child.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
+            let out = child.wait_with_output().unwrap();
+            assert!(out.status.success());
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        assert_eq!(run("one", &[]), "installed");
+        let file = home.join(".codex/auth.json");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "one");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        // A container that has one keeps it.
+        assert_eq!(run("two", &[]), "present");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "one");
+        // CODEX_HOME is respected.
+        let custom = dir.join("custom");
+        assert_eq!(run("three", &[("CODEX_HOME", custom.to_str().unwrap())]), "installed");
+        assert_eq!(std::fs::read_to_string(custom.join("auth.json")).unwrap(), "three");
     }
 
     #[test]

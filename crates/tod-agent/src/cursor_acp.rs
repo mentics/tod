@@ -1772,6 +1772,10 @@ fn spawn_agent(
         }
         AgentEnvironment::DevContainer(launch) => {
             let container = crate::devcontainer::prepare(launch)?;
+            if host == AcpHost::OpenAi {
+                // A restarted container loses ~/.codex: give it this machine's sign-in.
+                crate::devcontainer::ensure_codex_login(&container)?;
+            }
             let bin = container_agent_bin(host, &container)?;
             tracing::info!(
                 event = "agent",

@@ -909,6 +909,9 @@ fn environment_startup(
         tod_agent::AgentEnvironment::Host => return Ok(None),
     };
     let container = devcontainer::prepare(&launch)?;
+    if inner.and_then(|c| c.split_whitespace().next()).is_some_and(|c| c.rsplit('/').next() == Some("codex")) {
+        devcontainer::ensure_codex_login(&container)?;
+    }
     let mut script = format!(
         "cd {} || exit 1\nexport PATH={}\n",
         sh_quote(&container.cwd),
