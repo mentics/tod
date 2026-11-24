@@ -106,6 +106,15 @@ each incident, the nodes parked on it, a sample error, and Dismiss
 
 Machine-local (schema v111, not synced): `incidents`, `incident_nodes`,
 `incident_sightings`. `incident_nodes` has a `journey_changes` trigger.
+`incident_auth_failures` (no schema version: created idempotently with the
+others) logs every `auth`-class failure with the environment the node's agent
+ran in (`host`, `container:<name>`, `sandbox:<name>`, or `unknown`) and when
+that environment last started (`docker inspect` State.StartedAt for a
+container; unknown, with the reason, when it cannot be read, for a sandbox or
+for the host). `tod-cli lessons stats` prints them by environment, with how
+many came within 30 minutes of the start: a restart that lost a login shows
+at once. It has no `journey_changes` trigger: it is a measure log that
+outlives its node.
 `incidents` and `incident_sightings` do not: they are this machine's
 bookkeeping, and a node's membership is what shows in a journey.
 

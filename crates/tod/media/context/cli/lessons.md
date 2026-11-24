@@ -21,7 +21,9 @@ tod-cli --data-root <DATA_ROOT> lessons apply [<LESSON_ID>] [--lesson <LESSON_ID
   prefix of its id is enough.
 - `stats` prints the measures of the improvement loop (requests by reason and
   asking protocol, who settled them, triage's rates, time to answer, cost at
-  list prices, incidents, send-backs by target phase). `--days` limits it to
+  list prices, incidents with their `auth` failures by environment (this machine,
+  dev container or sandbox) and how many came within 30 minutes of that
+  environment starting, send-backs by target phase). `--days` limits it to
   the recent past. It also says which figures the data cannot give.
 - `add` records a lesson in the user's own words about the task `--node`.
   `--category` is one of `asker_could_decide`, `app_should_handle`,

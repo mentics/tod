@@ -3,7 +3,7 @@
 //! something shared (GitHub auth, the model API, a broken tool) is one
 //! incident, not one request or one session per node.
 //!
-//! Three tables, all machine-local (the daemon on this machine is what parks,
+//! Four tables, all machine-local (the daemon on this machine is what parks,
 //! probes and resumes this machine's runs; nothing syncs):
 //!
 //! - `incidents`: signature, kind, summary, status (`open` / `investigating` /
@@ -17,6 +17,13 @@
 //! - `incident_sightings`: the first node seen failing a signature, so that a
 //!   second node within [`WINDOW_MS`] opens the incident. Scratch; not
 //!   journaled.
+//! - `incident_auth_failures`: one row per `auth`-class failure seen, with the
+//!   agent environment it ran in (this machine, a dev container, a sandbox) and
+//!   when that environment last started, so a login lost to a restart shows as
+//!   failures clustered just after one ([`auth_by_environment`], printed by
+//!   `tod-cli lessons stats`). A measure log, not journaled: it keeps its
+//!   failures after the node or the incident is gone, and a node's membership
+//!   is already `incident_nodes`.
 //!
 //! Every write is [`Op`], run on the fleet writer in one transaction with the
 //! decisions it reads, so two daemons' ticks and the CLI's refusal never
@@ -111,7 +118,43 @@ pub const CREATE_TABLES: &str = "
         decision_id  BLOB,
         PRIMARY KEY (signature, node_id)
     );
+    CREATE TABLE IF NOT EXISTS incident_auth_failures (
+        id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+        seen_at            INTEGER NOT NULL,
+        node_id            BLOB NOT NULL,
+        signature          TEXT NOT NULL,
+        operation          TEXT NOT NULL DEFAULT '',
+        env_kind           TEXT NOT NULL,
+        env_name           TEXT NOT NULL,
+        env_started_at     INTEGER,
+        env_start_unknown  TEXT,
+        incident_id        BLOB
+    );
+    CREATE INDEX IF NOT EXISTS idx_incident_auth_failures_env ON incident_auth_failures(env_kind, env_name, seen_at);
 ";
+
+/// Where a failure's agent ran, and when that place last started. Recorded
+/// with every `auth` failure ([`auth_by_environment`]).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EnvironmentSeen {
+    /// `host`, `container`, `sandbox`, or `unknown` (the node's location could
+    /// not be read).
+    pub kind: String,
+    /// The container or sandbox name; `this machine` for the host; the error
+    /// text for `unknown`.
+    pub name: String,
+    /// When it last started, in milliseconds since the epoch.
+    pub started_at_ms: Option<i64>,
+    /// Why `started_at_ms` is not known (never a guess).
+    pub start_unknown: Option<String>,
+}
+
+impl EnvironmentSeen {
+    /// The key the measure groups by: `container:workspace-dev-app-1`.
+    pub fn key(&self) -> String {
+        format!("{}:{}", self.kind, self.name)
+    }
+}
 
 /// One failure kept as evidence.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -238,7 +281,17 @@ pub struct Passed {
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Op {
     /// A node failed `operation` with `error`, seen at `source`.
-    Observe { node: Uuid, source: Source, operation: String, error: String, now: i64 },
+    Observe {
+        node: Uuid,
+        source: Source,
+        operation: String,
+        error: String,
+        now: i64,
+        /// Where the node's agent runs; read by the caller only for an `auth`
+        /// failure (`incident::observe_unchecked`).
+        #[serde(default)]
+        environment: Option<EnvironmentSeen>,
+    },
     /// An agent-filed request's error: attach the node to the open incident
     /// its signature matches, or note the sighting.
     ObserveRequest { node: Uuid, conversation: Option<Uuid>, operation: String, error: String, now: i64 },
@@ -267,8 +320,8 @@ pub enum Op {
 /// Runs `op` and returns its result as JSON.
 pub fn run_op(conn: &Connection, op: &Op) -> Result<serde_json::Value> {
     Ok(match op {
-        Op::Observe { node, source, operation, error, now } => {
-            serde_json::to_value(observe(conn, *node, *source, operation, error, *now)?)?
+        Op::Observe { node, source, operation, error, now, environment } => {
+            serde_json::to_value(observe_in(conn, *node, *source, operation, error, *now, environment.as_ref())?)?
         }
         Op::ObserveRequest { node, conversation, operation, error, now } => {
             serde_json::to_value(observe_request(conn, *node, *conversation, operation, error, *now)?)?
@@ -517,11 +570,111 @@ fn open_incident(conn: &Connection, c: &Classification, notice: bool, now: i64) 
 
 /// A node failed `operation` with `error`.
 pub fn observe(conn: &Connection, node: Uuid, source: Source, operation: &str, error: &str, now: i64) -> Result<Observed> {
+    observe_in(conn, node, source, operation, error, now, None)
+}
+
+/// [`observe`], and an `auth` failure is also logged with `environment`
+/// (`incident_auth_failures`), whether or not it opens or joins an incident.
+/// An `auth` failure given no environment is logged as `unknown`, so it is
+/// still counted.
+pub fn observe_in(
+    conn: &Connection,
+    node: Uuid,
+    source: Source,
+    operation: &str,
+    error: &str,
+    now: i64,
+    environment: Option<&EnvironmentSeen>,
+) -> Result<Observed> {
     let c = classify(source, error);
     if !c.kind.parks() {
         return Ok(Observed::none());
     }
-    observe_classified(conn, node, &c, operation, error, now, None)
+    let observed = observe_classified(conn, node, &c, operation, error, now, None)?;
+    if c.kind == Kind::Auth {
+        let unknown = EnvironmentSeen {
+            kind: "unknown".into(),
+            name: "no environment was given".into(),
+            started_at_ms: None,
+            start_unknown: Some("no environment was given".into()),
+        };
+        let env = environment.unwrap_or(&unknown);
+        conn.execute(
+            "INSERT INTO incident_auth_failures
+                 (seen_at, node_id, signature, operation, env_kind, env_name, env_started_at, env_start_unknown, incident_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                now,
+                uuid_to_blob(node),
+                c.signature,
+                operation,
+                env.kind,
+                env.name,
+                env.started_at_ms,
+                env.start_unknown,
+                observed.incident.as_ref().map(|i| uuid_to_blob(i.id)),
+            ],
+        )?;
+    }
+    Ok(observed)
+}
+
+/// `auth` failures within this long after their environment started count as
+/// "just after a restart" in [`auth_by_environment`].
+pub const RESTART_WINDOW_MS: i64 = 30 * 60 * 1000;
+
+/// What one environment's `auth` failures look like.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct AuthByEnvironment {
+    pub failures: u64,
+    /// Of those, the ones that were parked on an incident (the rest were first
+    /// sightings that retried).
+    pub in_incident: u64,
+    /// Seen within [`RESTART_WINDOW_MS`] of the environment starting.
+    pub within_restart_window: u64,
+    /// The environment's start time could not be read (never guessed).
+    pub start_unknown: u64,
+    /// Seconds from the environment's start to its latest failure, when known.
+    pub latest_age_secs: Option<i64>,
+}
+
+/// `auth` failures per environment (`container:<name>`, `sandbox:<name>`,
+/// `host:this machine`, `unknown:..`), seen at or after `since_ms`.
+pub fn auth_by_environment(
+    conn: &Connection,
+    since_ms: Option<i64>,
+) -> Result<std::collections::BTreeMap<String, AuthByEnvironment>> {
+    let mut stmt = conn.prepare(
+        "SELECT env_kind, env_name, seen_at, env_started_at, incident_id IS NOT NULL
+         FROM incident_auth_failures WHERE (?1 IS NULL OR seen_at >= ?1) ORDER BY seen_at",
+    )?;
+    let rows = stmt.query_map(params![since_ms], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, i64>(2)?,
+            r.get::<_, Option<i64>>(3)?,
+            r.get::<_, bool>(4)?,
+        ))
+    })?;
+    let mut out = std::collections::BTreeMap::<String, AuthByEnvironment>::new();
+    for row in rows {
+        let (kind, name, seen, started, in_incident) = row?;
+        let e = out.entry(format!("{kind}:{name}")).or_default();
+        e.failures += 1;
+        e.in_incident += u64::from(in_incident);
+        match started {
+            Some(start) => {
+                let age = seen - start;
+                if (0..=RESTART_WINDOW_MS).contains(&age) {
+                    e.within_restart_window += 1;
+                }
+                e.latest_age_secs = Some(age / 1000);
+            }
+            None => e.start_unknown += 1,
+        }
+    }
+    Ok(out)
 }
 
 fn observe_classified(

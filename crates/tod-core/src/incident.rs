@@ -19,7 +19,8 @@ use anyhow::Result;
 use tod_store::decisions::{Brief, NewDecision, REASON_ACCESS};
 use tod_store::fleet::FleetStore;
 use tod_store::incident_class::{Kind, Source};
-use tod_store::incidents::{self, Incident, Observed, Op, Parking, Passed, Verdict};
+use tod_store::incident_class;
+use tod_store::incidents::{self, EnvironmentSeen, Incident, Observed, Op, Parking, Passed, Verdict};
 use tod_store::interview::InterviewCommand;
 use uuid::Uuid;
 
@@ -91,11 +92,54 @@ pub(crate) fn observe_unchecked(
     operation: &str,
     error: &str,
 ) -> Result<Observed> {
+    // Where the node's agent runs is read only for a failure that is an auth
+    // one (a `docker inspect`), and only to measure it.
+    let environment = (incident_class::classify(source, error).kind == Kind::Auth).then(|| environment_of(fleet, node));
     let value = write(
         fleet,
-        Op::Observe { node, source, operation: operation.to_string(), error: error.to_string(), now: now_ms() },
+        Op::Observe {
+            node,
+            source,
+            operation: operation.to_string(),
+            error: error.to_string(),
+            now: now_ms(),
+            environment,
+        },
     )?;
     Ok(serde_json::from_value(value)?)
+}
+
+/// The environment `node`'s agent runs in and when it last started, for the
+/// per-environment auth measure (`incidents::auth_by_environment`). A failure
+/// to read the location, or the start time, is recorded as such: never
+/// guessed, never dropped.
+fn environment_of(fleet: &FleetStore, node: Uuid) -> EnvironmentSeen {
+    let files = match fleet.resolve_files_for_node(&node.to_string()) {
+        Ok(files) => files,
+        Err(e) => {
+            let why = format!("could not resolve the node's files: {e:#}");
+            return EnvironmentSeen { kind: "unknown".into(), name: why.clone(), started_at_ms: None, start_unknown: Some(why) };
+        }
+    };
+    let cwd = files
+        .as_ref()
+        .and_then(|f| f.ready_directory())
+        .unwrap_or_else(|| tod_store::fleet::Workdir::host(fleet.paths().root()));
+    let (kind, name) = tod_store::fleet::dev_container::environment_label(files.as_ref(), &cwd);
+    environment_seen(kind, name, tod_agent::devcontainer::started_at_ms)
+}
+
+/// The environment with its start time read by `start` (for a container only).
+fn environment_seen(kind: &str, name: String, start: impl Fn(&str) -> Result<i64>) -> EnvironmentSeen {
+    let (started_at_ms, start_unknown) = match kind {
+        "container" => match start(&name) {
+            Ok(ms) => (Some(ms), None),
+            Err(e) => (None, Some(format!("{e:#}"))),
+        },
+        "sandbox" => (None, Some("a sandbox's start time is not recorded".to_string())),
+        _ => (None, Some("this machine has no start time to compare".to_string())),
+    };
+    EnvironmentSeen { kind: kind.to_string(), name, started_at_ms, start_unknown }
 }
 
 /// `node`'s operation went through: it is no longer parked, and if it was
@@ -301,3 +345,24 @@ pub fn parks(kind: Kind) -> bool {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod environment_tests {
+    use super::*;
+
+    #[test]
+    fn a_containers_start_is_read_and_a_failed_read_is_recorded_as_unknown() {
+        let seen = environment_seen("container", "workspace-dev-app-1".into(), |c| {
+            assert_eq!(c, "workspace-dev-app-1");
+            Ok(42)
+        });
+        assert_eq!((seen.kind.as_str(), seen.started_at_ms, seen.start_unknown), ("container", Some(42), None));
+
+        let seen = environment_seen("container", "gone".into(), |_| anyhow::bail!("No container named `gone`"));
+        assert_eq!(seen.started_at_ms, None);
+        assert!(seen.start_unknown.unwrap().contains("No container named"));
+
+        let seen = environment_seen("host", "this machine".into(), |_| panic!("the host is not inspected"));
+        assert_eq!((seen.started_at_ms, seen.key()), (None, "host:this machine".to_string()));
+    }
+}

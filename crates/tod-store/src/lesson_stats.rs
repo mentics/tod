@@ -89,6 +89,9 @@ pub struct IncidentStats {
     /// `nodes_absorbed - incidents` (each beyond the first saved a session).
     pub sessions_saved: u64,
     pub by_kind: BTreeMap<String, u64>,
+    /// `auth` failures (opened an incident or not) by the environment the
+    /// node's agent ran in, with how many came soon after it started.
+    pub auth_by_environment: BTreeMap<String, crate::incidents::AuthByEnvironment>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -274,6 +277,8 @@ pub fn compute(conn: &Connection, since_ms: Option<i64>) -> Result<Stats> {
         }
     }
 
+    stats.incidents.auth_by_environment = crate::incidents::auth_by_environment(conn, since_ms)?;
+
     // Send-backs and disputes.
     {
         let mut stmt = conn.prepare(
@@ -406,6 +411,22 @@ impl Stats {
             i.nodes_absorbed,
             i.sessions_saved
         );
+        let _ = writeln!(
+            out,
+            "  auth failures by environment (a restart that lost a login shows as many within {} min of the start):",
+            crate::incidents::RESTART_WINDOW_MS / 60_000
+        );
+        if i.auth_by_environment.is_empty() {
+            let _ = writeln!(out, "    none");
+        }
+        for (env, a) in &i.auth_by_environment {
+            let age = a.latest_age_secs.map_or("unknown".to_string(), |s| format!("{}m after start", s / 60));
+            let _ = writeln!(
+                out,
+                "    {env}: {} failure(s), {} in an incident, {} within the window, {} with unknown start; latest {age}",
+                a.failures, a.in_incident, a.within_restart_window, a.start_unknown
+            );
+        }
 
         let _ = writeln!(out, "Send-backs by the phase they went back to: {}", map_text(&self.send_backs.send_backs_by_target));
         let _ = writeln!(out, "  of which disputes: {}", map_text(&self.send_backs.disputes_by_target));

@@ -293,3 +293,61 @@ fn the_same_bot_silent_on_several_nodes_is_one_notice_that_parks_nothing_and_exp
     pass(&conn, 2 * MIN + NOTICE_EXPIRES_MS + 1).unwrap();
     assert_eq!(get(&conn, id).unwrap().unwrap().status, STATUS_RESOLVED);
 }
+
+fn container(name: &str, started: Option<i64>) -> EnvironmentSeen {
+    EnvironmentSeen {
+        kind: "container".into(),
+        name: name.into(),
+        started_at_ms: started,
+        start_unknown: started.is_none().then(|| "docker inspect failed".to_string()),
+    }
+}
+
+const AGENT_AUTH: &str = "ACP error: Failed to authenticate. API Error: 401 invalid x-api-key";
+
+#[test]
+fn auth_failures_are_measured_per_environment_with_the_time_since_it_started() {
+    let (_dir, conn, n) = setup(3);
+    let start = 1_000 * MIN;
+    let env = container("workspace-dev-app-1", Some(start));
+    // The first sighting retries (no incident yet) and is still measured.
+    let first = observe_in(&conn, n[0], Source::Agent, "an agent turn", AGENT_AUTH, start + 2 * MIN, Some(&env)).unwrap();
+    assert_eq!(first.verdict, Verdict::Retry);
+    // The second opens the incident.
+    let second = observe_in(&conn, n[1], Source::Agent, "an agent turn", AGENT_AUTH, start + 5 * MIN, Some(&env)).unwrap();
+    assert!(second.opened);
+    // Much later, in an environment whose start could not be read.
+    let other = container("other-dev", None);
+    observe_in(&conn, n[2], Source::Agent, "an agent turn", AGENT_AUTH, start + 600 * MIN, Some(&other)).unwrap();
+    // A work failure is not an auth failure.
+    observe_in(&conn, n[2], Source::Agent, "a turn", "error[E0308]: mismatched types", start, Some(&env)).unwrap();
+
+    let by = auth_by_environment(&conn, None).unwrap();
+    assert_eq!(by.len(), 2);
+    let a = &by["container:workspace-dev-app-1"];
+    assert_eq!(
+        (a.failures, a.in_incident, a.within_restart_window, a.start_unknown, a.latest_age_secs),
+        (2, 1, 2, 0, Some(300))
+    );
+    let b = &by["container:other-dev"];
+    // The incident was already open, so this one parks on it too.
+    assert_eq!((b.failures, b.in_incident, b.within_restart_window, b.start_unknown, b.latest_age_secs), (1, 1, 0, 1, None));
+
+    // It shows in the stats the CLI prints.
+    let stats = crate::lesson_stats::compute(&conn, None).unwrap();
+    assert_eq!(stats.incidents.auth_by_environment["container:workspace-dev-app-1"].within_restart_window, 2);
+    let text = stats.render();
+    assert!(text.contains("container:workspace-dev-app-1: 2 failure(s), 1 in an incident, 2 within the window"), "{text}");
+
+    // `since` leaves out the old ones.
+    assert_eq!(auth_by_environment(&conn, Some(start + 100 * MIN)).unwrap().len(), 1);
+}
+
+#[test]
+fn an_auth_failure_with_no_environment_is_counted_as_unknown() {
+    let (_dir, conn, n) = setup(1);
+    observe(&conn, n[0], Source::Agent, "an agent turn", AGENT_AUTH, 5).unwrap();
+    let by = auth_by_environment(&conn, None).unwrap();
+    assert_eq!(by.values().map(|a| a.failures).sum::<u64>(), 1);
+    assert!(by.keys().all(|k| k.starts_with("unknown:")));
+}

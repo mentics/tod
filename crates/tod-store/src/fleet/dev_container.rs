@@ -117,6 +117,30 @@ pub fn sandbox_launch_for(cwd: &Workdir, data_root: &Path) -> Result<Option<Sand
     }))
 }
 
+/// Which environment an agent from a node with `files` running in `cwd` is in,
+/// as `(kind, name)`: `container` / `sandbox` with its name, else `host`. The
+/// same decision as [`launch_for`] and [`sandbox_launch_for`], with no side
+/// effect (no relay is started), for naming where something ran.
+pub fn environment_label(files: Option<&ResolvedFiles>, cwd: &Workdir) -> (&'static str, String) {
+    match cwd {
+        Workdir::Sandbox { sandbox, .. } => ("sandbox", sandbox.clone()),
+        Workdir::Container { container, .. } => ("container", container.clone()),
+        Workdir::Host(host_cwd) => {
+            let mounted = files.and_then(|files| {
+                let container = files.dev_container.as_ref()?.mounted_container()?;
+                let Some(Workdir::Host(root)) = files.ready_directory() else {
+                    return None;
+                };
+                host_cwd.starts_with(&root).then(|| container.to_string())
+            });
+            match mounted {
+                Some(container) => ("container", container),
+                None => ("host", "this machine".to_string()),
+            }
+        }
+    }
+}
+
 /// [`launch_for`] or [`sandbox_launch_for`] as the environment an agent runs in.
 pub fn environment_for(
     files: Option<&ResolvedFiles>,

@@ -206,6 +206,9 @@ pub struct ContainerInfo {
     /// `PATH` from the container's configured environment.
     pub path: Option<String>,
     pub working_dir: Option<String>,
+    /// When the container last started (`State.StartedAt`), in milliseconds
+    /// since the epoch; `None` when Docker gave none (never started).
+    pub started_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -421,7 +424,21 @@ fn parse_inspect(item: &Value) -> ContainerInfo {
         mounts,
         path,
         working_dir: str_at("/Config/WorkingDir"),
+        started_at_ms: str_at("/State/StartedAt")
+            .and_then(|at| chrono::DateTime::parse_from_rfc3339(&at).ok())
+            .map(|at| at.timestamp_millis())
+            // Docker's "never started" is the year 1.
+            .filter(|ms| *ms > 0),
     }
+}
+
+/// When `container` last started, read now from `docker inspect` (never the
+/// cache: the measure of an auth failure after a restart needs the real
+/// time). An error says why it could not be read.
+pub fn started_at_ms(container: &str) -> Result<i64> {
+    let info = inspect(container)?;
+    info.started_at_ms
+        .with_context(|| format!("docker inspect of `{container}` gave no State.StartedAt"))
 }
 
 /// The user a dev container's tools run as: the last `remoteUser` in its
@@ -972,6 +989,7 @@ mod tests {
                 .collect(),
             path: None,
             working_dir: None,
+            started_at_ms: None,
         }
     }
 
@@ -1110,7 +1128,7 @@ mod tests {
         let item = json!({
             "Id": "0123456789abcdef",
             "Name": "/my-dev",
-            "State": { "Running": true },
+            "State": { "Running": true, "StartedAt": "2026-11-24T10:00:00.250000000Z" },
             "Config": {
                 "Env": ["HOME=/root", "PATH=/usr/bin:/bin"],
                 "WorkingDir": "",
@@ -1129,6 +1147,7 @@ mod tests {
         assert_eq!(info.path.as_deref(), Some("/usr/bin:/bin"));
         assert_eq!(info.working_dir, None);
         assert_eq!(info.mounts.len(), 1);
+        assert_eq!(info.started_at_ms, Some(1_795_514_400_250));
     }
 
     #[test]
