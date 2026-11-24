@@ -496,7 +496,7 @@ mod tests {
                 NeedsHuman::ChecksNotConverging { rounds: 5, failing: vec!["lint".into()] },
                 kind::CHECKS_NOT_CONVERGING,
             ),
-            (NeedsHuman::ChecksUnfixed { failing: vec!["lint".into()] }, kind::CHECKS_UNFIXED),
+            (NeedsHuman::ChecksUnfixed { failing: vec!["lint".into()], said: String::new() }, kind::CHECKS_UNFIXED),
             (NeedsHuman::LostWork { why: "w".into() }, kind::LOST_WORK),
             (
                 NeedsHuman::SendBackLoop {

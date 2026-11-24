@@ -274,8 +274,14 @@ pub enum NeedsHuman {
     /// round limit allows and still fail.
     ChecksNotConverging { rounds: u32, failing: Vec<String> },
     /// The fix agent was sent the failing checks and left the files as they
-    /// were, so sending them again would not help.
-    ChecksUnfixed { failing: Vec<String> },
+    /// were, so sending them again would not help. `said` is the last thing
+    /// the fix (or quick fix) agent said, or the error that ended its turn:
+    /// the stop names it instead of sending the user to look.
+    ChecksUnfixed {
+        failing: Vec<String>,
+        #[serde(default)]
+        said: String,
+    },
     /// The node's implementation was reopened once because its branch held
     /// none of the code its done steps describe ([`crate::lost_work`]), and
     /// it is in that state again: the rebuilt work is gone too, or the steps
@@ -392,11 +398,19 @@ impl NeedsHuman {
                  and the fix transcripts, then run again for a fresh set of rounds",
                 failing.join("; ")
             ),
-            Self::ChecksUnfixed { failing } => format!(
-                "the fix agent was sent the failing checks ({}) and changed nothing, so sending them again \
-                 would not help. Look at what it said, or fix them yourself, then run again",
-                failing.join("; ")
-            ),
+            Self::ChecksUnfixed { failing, said } => {
+                let said = said.trim();
+                let said = if said.is_empty() {
+                    "It said nothing (an empty reply).".to_string()
+                } else {
+                    format!("What it said last: {said}")
+                };
+                format!(
+                    "the fix agent was sent the failing checks ({}) and changed nothing, so sending them again \
+                     would not help. {said}\n\nFix them yourself, or answer what it said, then run again",
+                    failing.join("; ")
+                )
+            }
             Self::LostWork { why } => format!(
                 "the node's code is missing again after tod reopened its implementation once: {why} \
                  Check where the work is being committed and pushed, then run it again"
@@ -1198,7 +1212,8 @@ impl Autopilot {
         let failed: Vec<&tod_store::check_runs::CheckRun> = round.failed().collect();
         let failing: Vec<String> = failed.iter().map(|r| crate::checks::run_name(r).to_string()).collect();
         if self.state.loops.checks_sent.as_deref() == Some(round.fingerprint.as_str()) {
-            return Ok(ChecksStep::Stop(Outcome::NeedsHuman { reason: NeedsHuman::ChecksUnfixed { failing } }));
+            let said = self.last_fix_words(fleet)?;
+            return Ok(ChecksStep::Stop(Outcome::NeedsHuman { reason: NeedsHuman::ChecksUnfixed { failing, said } }));
         }
         let limit = tod_store::TodSettings::load(&tod_store::TodPaths::at(&self.config.data_root))?
             .lifecycle
@@ -1209,9 +1224,6 @@ impl Autopilot {
                 reason: NeedsHuman::ChecksNotConverging { rounds: self.state.loops.check_rounds, failing },
             }));
         }
-        self.state.loops.check_rounds += 1;
-        self.state.loops.checks_sent = Some(round.fingerprint.clone());
-        self.save()?;
         // A phase agent's state has no fix protocol: its failing gate runs the
         // phase agent again, and the gate's detail carries the check's output.
         // The rounds and the unchanged-files guard above still bound it.
@@ -1221,10 +1233,18 @@ impl Autopilot {
         // Rung 1 of the escalation ladder: a cheap quick fix on each failing
         // check before the Fix protocol is asked; green ones need no Fix and no
         // new review round.
+        // The failing checks count as sent only once an agent turn has run to
+        // its end on them: a quick fix or fix that failed to start (no agent in
+        // the container, a login, a quota) or was interrupted left the files
+        // untouched through no fault of the agent, and the next run must send
+        // them again, not stop as "changed nothing" (gap 109).
         let quick = match self.quick_fix_checks(fleet, agent, hook, lifecycle, &round.fingerprint, &failed)? {
             Ok(quick) => quick,
             Err(outcome) => return Ok(ChecksStep::Stop(outcome)),
         };
+        self.state.loops.check_rounds += 1;
+        self.state.loops.checks_sent = Some(round.fingerprint.clone());
+        self.save()?;
         if quick.still_failing.is_empty() {
             // The quick fix's commit gets one cheap reviewer in `pr_draft`; no
             // Fix turn and no review round follow.
@@ -1236,11 +1256,42 @@ impl Autopilot {
         let remaining: Vec<&tod_store::check_runs::CheckRun> = quick.still_failing.iter().collect();
         crate::checks::record_findings_with_notes(fleet, node, &remaining, &quick.notes)?;
         if let Some(outcome) = self.converse(fleet, agent, hook, ProtocolKind::Fix, None)? {
+            // The Fix turn did not finish: nothing was sent for good.
+            self.state.loops.check_rounds = self.state.loops.check_rounds.saturating_sub(1);
+            self.state.loops.checks_sent = None;
+            self.save()?;
             return Ok(ChecksStep::Stop(outcome));
         }
         self.owe_groups(fleet, ProtocolKind::Fix, "fix", lifecycle)?;
         self.record(fleet, "fix_checks", lifecycle, None)?;
         Ok(ChecksStep::Fixed)
+    }
+
+    /// The last thing the node's fix or quick fix agent said (its reply, or
+    /// the error that ended its turn), newest session first; empty when it
+    /// has not spoken.
+    fn last_fix_words(&self, fleet: &FleetStore) -> Result<String> {
+        use tod_store::conversation::TurnRole;
+        let node = self.node;
+        fleet.read(|conn| {
+            let repo = ConversationRepo::new(conn);
+            let mut newest: Option<(i64, String)> = None;
+            for kind in [ProtocolKind::Fix, ProtocolKind::QuickFix] {
+                let Some(conversation) = repo.latest_for_focus_with_protocol(Focus::Node(node), kind)? else { continue };
+                let said = repo
+                    .turns(conversation.id)?
+                    .into_iter()
+                    .rev()
+                    .find(|t| matches!(t.role, TurnRole::Agent | TurnRole::Error) && !t.body.trim().is_empty())
+                    .map(|t| t.body);
+                if let Some(said) = said
+                    && newest.as_ref().is_none_or(|(at, _)| conversation.updated_at > *at)
+                {
+                    newest = Some((conversation.updated_at, said));
+                }
+            }
+            Ok(newest.map(|(_, said)| said).unwrap_or_default())
+        })
     }
 
     /// Another node has held the repository's worktree lock for longer than

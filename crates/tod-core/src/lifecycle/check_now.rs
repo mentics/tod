@@ -259,7 +259,7 @@ mod tests {
         use crate::run_state::kind;
         let fx = fixture();
         enable_lifecycle(&fx, "proposed");
-        stop_with(&fx, crate::autopilot::NeedsHuman::ChecksUnfixed { failing: vec!["lint".into()] });
+        stop_with(&fx, crate::autopilot::NeedsHuman::ChecksUnfixed { failing: vec!["lint".into()], said: String::new() });
         assert_eq!(run_row(&fx).reason_kind, kind::CHECKS_UNFIXED);
         retire_all_criteria(&fx);
         let found = check_now(&fx.fleet, fx.node, &fx.root).unwrap();
@@ -276,7 +276,7 @@ mod tests {
         let fx = fixture();
         // The gate fails: the stopped reason may still be true.
         enable_lifecycle(&fx, "ready");
-        stop_with(&fx, crate::autopilot::NeedsHuman::ChecksUnfixed { failing: vec!["lint".into()] });
+        stop_with(&fx, crate::autopilot::NeedsHuman::ChecksUnfixed { failing: vec!["lint".into()], said: String::new() });
         let found = check_now(&fx.fleet, fx.node, &fx.root).unwrap();
         assert!(!found.gate.clear());
         assert_eq!(run_row(&fx).reason_kind, kind::CHECKS_UNFIXED);

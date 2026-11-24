@@ -3827,13 +3827,42 @@ fn a_fix_that_changes_nothing_stops_the_run_instead_of_going_round() {
     let mut pilot = autopilot(&fx, Budget::default());
     let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
     match &outcome {
-        Outcome::NeedsHuman { reason: NeedsHuman::ChecksUnfixed { failing } } => {
+        Outcome::NeedsHuman { reason: NeedsHuman::ChecksUnfixed { failing, .. } } => {
             assert_eq!(failing, &["exit 1".to_string()], "a check with no label goes by its command");
         }
         other => panic!("{other:?} {:#?}", pilot.state().steps),
     }
     assert_eq!(lifecycle::current_state(&fx.fleet, fx.node).unwrap(), "review");
     assert!(outcome_words(&outcome).contains("changed nothing"));
+}
+
+#[test]
+fn a_fix_that_could_not_start_is_not_a_fix_that_changed_nothing() {
+    // Gap 109: the quick fix and Fix agents failed to start (no agent in the
+    // container). The failing checks must not count as sent: the next run
+    // sends them again, and a working agent fixes them.
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    let workspace = with_check(&fx, "review", "ok file", OK_FILE_CHECK);
+    let mut broken = FakeAgent::new(&fx.fleet);
+    broken.fail_turns = Some("No Claude ACP agent in dev container `c`".into());
+    let first = autopilot(&fx, Budget::default()).run(&fx.fleet, &mut broken).unwrap();
+    assert!(!matches!(first, Outcome::NeedsHuman { reason: NeedsHuman::ChecksUnfixed { .. } }), "{first:?}");
+    let mut pilot = autopilot(&fx, Budget::default());
+    let mut agent = FakeAgent::new(&fx.fleet);
+    agent.fix_writes = Some((workspace.join("ok.txt"), "fixed".into()));
+    agent.quick_fix_writes = Some((workspace.join("ok.txt"), "fixed".into()));
+    let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
+    assert_eq!(outcome, Outcome::Done, "{outcome:?} {:#?}", pilot.state().steps);
+}
+
+#[test]
+fn the_unfixed_stop_says_what_the_agent_said() {
+    let said = "ruff is not installed in this container".to_string();
+    let words = NeedsHuman::ChecksUnfixed { failing: vec!["lint".into()], said }.describe();
+    assert!(words.contains("What it said last: ruff is not installed in this container"), "{words}");
+    let words = NeedsHuman::ChecksUnfixed { failing: vec!["lint".into()], said: String::new() }.describe();
+    assert!(words.contains("It said nothing"), "{words}");
 }
 
 #[test]
