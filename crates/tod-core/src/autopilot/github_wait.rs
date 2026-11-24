@@ -186,6 +186,10 @@ pub fn github_look_failed(
     releasing: bool,
     error: &str,
 ) -> Result<Outcome> {
+    // Measured by class and operation, whatever happens next: a definite 4xx
+    // handled as an outage must show (`tod-cli lessons stats`).
+    let operation = if error.contains("with its base branch") { "update_branch" } else { read_wait_spec(releasing) };
+    crate::incident::record_github_look_failure(fleet, node, operation, error)?;
     // A failure other nodes have too is one incident, not one per node
     // (`doc/lifecycle/incidents.md`): an open incident parks the node, with
     // no retry of its own; the daemon probes and resumes it.

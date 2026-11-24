@@ -92,6 +92,18 @@ pub struct IncidentStats {
     /// `auth` failures (opened an incident or not) by the environment the
     /// node's agent ran in, with how many came soon after it started.
     pub auth_by_environment: BTreeMap<String, crate::incidents::AuthByEnvironment>,
+    /// Failed looks at GitHub by `<class>[:status]` and operation. A
+    /// `semantic_4xx` is GitHub's definite answer handled as a failure to read
+    /// it: a tod bug until shown otherwise.
+    pub github_look_failures: Vec<GithubLookFailureStat>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct GithubLookFailureStat {
+    pub class: String,
+    pub operation: String,
+    pub count: u64,
+    pub latest_error: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -278,6 +290,10 @@ pub fn compute(conn: &Connection, since_ms: Option<i64>) -> Result<Stats> {
     }
 
     stats.incidents.auth_by_environment = crate::incidents::auth_by_environment(conn, since_ms)?;
+    stats.incidents.github_look_failures = crate::incidents::github_look_failures(conn, since_ms)?
+        .into_iter()
+        .map(|((class, operation), f)| GithubLookFailureStat { class, operation, count: f.count, latest_error: f.latest_error })
+        .collect();
 
     // Send-backs and disputes.
     {
@@ -426,6 +442,15 @@ impl Stats {
                 "    {env}: {} failure(s), {} in an incident, {} within the window, {} with unknown start; latest {age}",
                 a.failures, a.in_incident, a.within_restart_window, a.start_unknown
             );
+        }
+
+        let _ = writeln!(out, "  failed looks at GitHub by class and operation (semantic_4xx is GitHub's definite answer, a tod bug until shown otherwise):");
+        if i.github_look_failures.is_empty() {
+            let _ = writeln!(out, "    none");
+        }
+        for f in &i.github_look_failures {
+            let flag = if f.class.starts_with("semantic_4xx") || f.class == "unclassified" { "  <-- LOOK" } else { "" };
+            let _ = writeln!(out, "    {} / {}: {}{flag}; latest: {}", f.class, f.operation, f.count, f.latest_error);
         }
 
         let _ = writeln!(out, "Send-backs by the phase they went back to: {}", map_text(&self.send_backs.send_backs_by_target));

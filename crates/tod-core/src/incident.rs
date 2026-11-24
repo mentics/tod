@@ -142,6 +142,17 @@ fn environment_seen(kind: &str, name: String, start: impl Fn(&str) -> Result<i64
     EnvironmentSeen { kind: kind.to_string(), name, started_at_ms, start_unknown }
 }
 
+/// A look at GitHub failed with `error`: logged by class and operation
+/// (`tod-cli lessons stats`). Always on this machine's store, whatever the
+/// incident switch says; a failure to write it is an error, not dropped.
+pub fn record_github_look_failure(fleet: &FleetStore, node: Uuid, operation: &str, error: &str) -> Result<()> {
+    write(
+        fleet,
+        Op::GithubLookFailure { node, operation: operation.to_string(), error: error.to_string(), now: now_ms() },
+    )?;
+    Ok(())
+}
+
 /// `node`'s operation went through: it is no longer parked, and if it was
 /// the incident's probe, the incident is resolved.
 pub fn node_ok(fleet: &FleetStore, node: Uuid) -> Result<()> {

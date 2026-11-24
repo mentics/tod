@@ -251,3 +251,25 @@ fn an_ok_report_from_a_cloud_node_frees_it() {
     assert!(parking(&fx.fleet, cloud_node).unwrap().is_none());
     set_enabled(false);
 }
+
+/// Gap 101: GitHub's definite 422 was handled as a failure to read it. Every
+/// failed look is now classified, so it shows in `lessons stats`.
+#[test]
+fn a_definite_4xx_and_a_5xx_look_failure_are_measured_by_class_and_operation() {
+    set_enabled(false);
+    let fx = fixture();
+    let conflict = format!(
+        "updating https://github.com/o/r/pull/1 with its base branch on GitHub: GitHub API error: \
+         merge conflict between base and head: Merge conflict (HTTP 422)"
+    );
+    github_look_failed(&fx.fleet, fx.node, false, &conflict).unwrap();
+    github_look_failed(&fx.fleet, fx.node, false, "GitHub is unavailable (HTTP 502)").unwrap();
+
+    let stats = fx.fleet.read(|conn| tod_store::lesson_stats::compute(conn, None)).unwrap();
+    let seen: Vec<(String, String, u64)> =
+        stats.incidents.github_look_failures.iter().map(|f| (f.class.clone(), f.operation.clone(), f.count)).collect();
+    assert!(seen.contains(&("semantic_4xx:422".into(), "update_branch".into(), 1)), "{seen:?}");
+    assert!(seen.contains(&("server".into(), "github:pr:read".into(), 1)), "{seen:?}");
+    let text = stats.render();
+    assert!(text.contains("semantic_4xx:422 / update_branch: 1  <-- LOOK"), "{text}");
+}

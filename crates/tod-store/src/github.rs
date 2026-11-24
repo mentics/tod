@@ -118,6 +118,89 @@ pub fn is_merge_conflict_message(message: &str) -> bool {
     message.to_ascii_lowercase().contains("merge conflict")
 }
 
+/// What a failed look at GitHub was, by the answer underneath it
+/// ([`classify_look_failure`]): the measure behind `tod-cli lessons stats`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LookFailureClass {
+    /// GitHub was not reached (connection, timeout).
+    Transport,
+    /// HTTP 5xx, or GraphQL's transient "something went wrong".
+    Server,
+    /// A spent quota.
+    RateLimit,
+    /// The credential is missing or rejected (HTTP 401).
+    Auth,
+    /// A definite 4xx answer (400, 403, 404, 409, 422, ...): GitHub understood
+    /// and said no. Asking again fails the same way, so it is a tod bug (a
+    /// request GitHub rejects) or work for someone, never an outage.
+    Semantic4xx(u16),
+    /// The text names none of the above. Counted, never dropped: it means the
+    /// classifier missed a message.
+    Unclassified,
+}
+
+impl LookFailureClass {
+    /// The name stored and printed.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Transport => "transport",
+            Self::Server => "server",
+            Self::RateLimit => "rate_limit",
+            Self::Auth => "auth",
+            Self::Semantic4xx(_) => "semantic_4xx",
+            Self::Unclassified => "unclassified",
+        }
+    }
+
+    /// The status of a [`Self::Semantic4xx`].
+    pub fn status(self) -> Option<u16> {
+        match self {
+            Self::Semantic4xx(status) => Some(status),
+            _ => None,
+        }
+    }
+}
+
+/// The class of a failed look, from the error's text (possibly with a prefix):
+/// [`GithubError`]'s own messages, which carry the status of a 4xx
+/// (`(HTTP 422)`) so that no caller has to keep the error value.
+pub fn classify_look_failure(message: &str) -> LookFailureClass {
+    use LookFailureClass::*;
+    if is_rate_limited_message(message) {
+        return RateLimit;
+    }
+    if message.contains("HTTP 401")
+        || message.contains("GitHub rejected the token")
+        || message.contains("GitHub token not configured")
+        || message.contains("credentials are not set up")
+    {
+        return Auth;
+    }
+    if message.contains("GitHub is unavailable (") || is_transient_graphql(message) {
+        return Server;
+    }
+    if message.contains("HTTP request failed:") {
+        return Transport;
+    }
+    // `(HTTP 422)` or `(HTTP 403)`: the last one, the status GitHub gave.
+    let mut status = None;
+    let mut rest = message;
+    while let Some(at) = rest.find("HTTP ") {
+        rest = &rest[at + 5..];
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if let Ok(n) = digits.parse::<u16>() {
+            status = Some(n);
+        }
+    }
+    if let Some(n) = status.filter(|n| (400..500).contains(n)) {
+        return Semantic4xx(n);
+    }
+    if message.contains("pull request not found") {
+        return Semantic4xx(404);
+    }
+    Unclassified
+}
+
 /// [`GithubError::is_transient`] for an error that has been turned into text
 /// (`tod_core::pr_readiness::PrFeed` reports `String`s), possibly with a
 /// prefix. Pinned to the variants' own messages by a test.
@@ -2499,11 +2582,13 @@ fn api_error(request: &str, status: u16, response: &mut ureq::http::Response<ure
     if status >= 500 {
         return GithubError::Unavailable(format!("HTTP {status}"));
     }
+    // The status stays in the text: it is what a failed look is classified by
+    // ([`classify_look_failure`]), the error having become a string by then.
     let message = response
         .body_mut()
         .read_json::<ErrorRaw>()
         .ok()
-        .map(ErrorRaw::describe)
+        .map(|raw| format!("{} (HTTP {status})", raw.describe()))
         .unwrap_or_else(|| format!("HTTP {status}"));
     GithubError::Api(message)
 }
@@ -4934,5 +5019,25 @@ mod tests {
         assert!(!prs.remove(node, &other).unwrap());
         assert_eq!(prs.read(node).unwrap().prs, vec![NodePr::new("acme", "app", 7)]);
         let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod look_failure_class_tests {
+    use super::*;
+    use LookFailureClass::*;
+
+    #[test]
+    fn a_look_failure_is_classified_by_the_answer_underneath() {
+        let c = classify_look_failure;
+        assert_eq!(c("HTTP request failed: timed out"), Transport);
+        assert_eq!(c("GitHub is unavailable (HTTP 503)"), Server);
+        assert_eq!(c("GitHub API error: Something went wrong while executing your query."), Server);
+        assert_eq!(c("GitHub rejected the token (HTTP 401): it is expired"), Auth);
+        assert_eq!(c("GitHub rate limit reached (primary limit); the token"), RateLimit);
+        assert_eq!(c("GitHub API error: Validation Failed (HTTP 422)"), Semantic4xx(422));
+        assert_eq!(c("GitHub refused the request (HTTP 403): the token lacks access"), Semantic4xx(403));
+        assert_eq!(c("pull request not found (GitHub also answers 404 ...)"), Semantic4xx(404));
+        assert_eq!(c("something nobody has seen"), Unclassified);
     }
 }

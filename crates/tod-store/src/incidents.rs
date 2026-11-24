@@ -3,7 +3,7 @@
 //! something shared (GitHub auth, the model API, a broken tool) is one
 //! incident, not one request or one session per node.
 //!
-//! Four tables, all machine-local (the daemon on this machine is what parks,
+//! Five tables, all machine-local (the daemon on this machine is what parks,
 //! probes and resumes this machine's runs; nothing syncs):
 //!
 //! - `incidents`: signature, kind, summary, status (`open` / `investigating` /
@@ -24,6 +24,11 @@
 //!   `tod-cli lessons stats`). A measure log, not journaled: it keeps its
 //!   failures after the node or the incident is gone, and a node's membership
 //!   is already `incident_nodes`.
+//! - `github_look_failures`: one row per failed look at GitHub, classified by the
+//!   answer underneath it (`transport`, `server`, `rate_limit`, `auth`,
+//!   `semantic_4xx` with its status) and the operation, so a definite 4xx that
+//!   was handled as an outage (gap 101) shows at once ([`github_look_failures`],
+//!   printed by `tod-cli lessons stats`). Same kind of log as the table above.
 //!
 //! Every write is [`Op`], run on the fleet writer in one transaction with the
 //! decisions it reads, so two daemons' ticks and the CLI's refusal never
@@ -129,6 +134,15 @@ pub const CREATE_TABLES: &str = "
         env_started_at     INTEGER,
         env_start_unknown  TEXT,
         incident_id        BLOB
+    );
+    CREATE TABLE IF NOT EXISTS github_look_failures (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        seen_at    INTEGER NOT NULL,
+        node_id    BLOB NOT NULL,
+        operation  TEXT NOT NULL,
+        class      TEXT NOT NULL,
+        status     INTEGER,
+        error      TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_incident_auth_failures_env ON incident_auth_failures(env_kind, env_name, seen_at);
 ";
@@ -300,6 +314,9 @@ pub enum Op {
     /// The node's operation went through: it is no longer parked, and if it
     /// was the probe, the incident is resolved.
     NodeOk { node: Uuid, now: i64 },
+    /// A look at GitHub failed with `error` (the measure
+    /// [`github_look_failures`]).
+    GithubLookFailure { node: Uuid, operation: String, error: String, now: i64 },
     /// The daemon's tick.
     Pass { now: i64 },
     /// Nodes that were resumed and not yet started: marks them consumed and
@@ -328,6 +345,10 @@ pub fn run_op(conn: &Connection, op: &Op) -> Result<serde_json::Value> {
         }
         Op::Notice { node, signature, summary, detail, now } => {
             serde_json::to_value(notice(conn, *node, signature, summary, detail, *now)?)?
+        }
+        Op::GithubLookFailure { node, operation, error, now } => {
+            record_github_look_failure(conn, *node, operation, error, *now)?;
+            serde_json::Value::Null
         }
         Op::NodeOk { node, now } => serde_json::to_value(node_ok(conn, *node, *now)?)?,
         Op::Pass { now } => serde_json::to_value(pass(conn, *now)?)?,
@@ -617,6 +638,50 @@ pub fn observe_in(
         )?;
     }
     Ok(observed)
+}
+
+/// Logs a failed look at GitHub, classified by its text
+/// ([`crate::github::classify_look_failure`]).
+pub fn record_github_look_failure(conn: &Connection, node: Uuid, operation: &str, error: &str, now: i64) -> Result<()> {
+    let class = crate::github::classify_look_failure(error);
+    conn.execute(
+        "INSERT INTO github_look_failures (seen_at, node_id, operation, class, status, error)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![now, uuid_to_blob(node), operation, class.name(), class.status(), error],
+    )?;
+    Ok(())
+}
+
+/// Failed looks at GitHub of one class and operation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct GithubLookFailures {
+    pub count: u64,
+    /// The latest error text, so a `semantic_4xx` can be read at once.
+    pub latest_error: String,
+}
+
+/// Failed looks at GitHub by class (`semantic_4xx:422` carries its status)
+/// and operation, seen at or after `since_ms`.
+pub fn github_look_failures(
+    conn: &Connection,
+    since_ms: Option<i64>,
+) -> Result<std::collections::BTreeMap<(String, String), GithubLookFailures>> {
+    let mut stmt = conn.prepare(
+        "SELECT class, status, operation, error FROM github_look_failures
+         WHERE (?1 IS NULL OR seen_at >= ?1) ORDER BY seen_at, id",
+    )?;
+    let rows = stmt.query_map(params![since_ms], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?))
+    })?;
+    let mut out = std::collections::BTreeMap::<(String, String), GithubLookFailures>::new();
+    for row in rows {
+        let (class, status, operation, error) = row?;
+        let class = status.map_or(class.clone(), |s| format!("{class}:{s}"));
+        let e = out.entry((class, operation)).or_default();
+        e.count += 1;
+        e.latest_error = error;
+    }
+    Ok(out)
 }
 
 /// `auth` failures within this long after their environment started count as

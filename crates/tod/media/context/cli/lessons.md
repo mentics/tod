@@ -23,7 +23,10 @@ tod-cli --data-root <DATA_ROOT> lessons apply [<LESSON_ID>] [--lesson <LESSON_ID
   asking protocol, who settled them, triage's rates, time to answer, cost at
   list prices, incidents with their `auth` failures by environment (this machine,
   dev container or sandbox) and how many came within 30 minutes of that
-  environment starting, send-backs by target phase). `--days` limits it to
+  environment starting, failed looks at GitHub by class (`transport`, `server`,
+  `rate_limit`, `auth`, `semantic_4xx:<status>`) and operation, with `semantic_4xx`
+  marked as GitHub's definite answer handled as a failure to read it, send-backs
+  by target phase). `--days` limits it to
   the recent past. It also says which figures the data cannot give.
 - `add` records a lesson in the user's own words about the task `--node`.
   `--category` is one of `asker_could_decide`, `app_should_handle`,

@@ -115,6 +115,15 @@ for the host). `tod-cli lessons stats` prints them by environment, with how
 many came within 30 minutes of the start: a restart that lost a login shows
 at once. It has no `journey_changes` trigger: it is a measure log that
 outlives its node.
+`github_look_failures` is the same kind of log, one row per failed look at GitHub
+(`github_wait::github_look_failed`), classified by the text of the error
+(`tod_store::github::classify_look_failure`: `transport`, `server`, `rate_limit`,
+`auth`, `semantic_4xx` with its status, `unclassified`) and the operation
+(`update_branch`, else the read wait). `tod-cli lessons stats` lists the counts
+and marks `semantic_4xx` and `unclassified`: GitHub's definite 4xx treated as a
+failure to read it is a tod bug (gap 101, the 422 on update-branch). Machine-local
+and without a `journey_changes` trigger, for the same reason: a measure log that
+outlives its node. It records; it never changes what the caller does.
 `incidents` and `incident_sightings` do not: they are this machine's
 bookkeeping, and a node's membership is what shows in a journey.
 
