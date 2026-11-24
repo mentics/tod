@@ -583,6 +583,7 @@ pub(crate) fn push_at_run_end(
                 state.quota_after_push = Some(outcome);
             }
             state.outcome = Some(waiting.clone());
+            state.workflow_wait = None;
             state.save(data_root, node)?;
             Ok(waiting)
         }

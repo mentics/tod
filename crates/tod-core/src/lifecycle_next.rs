@@ -14,6 +14,7 @@
 //! evaluator judges what it did.
 
 use crate::conversation::review::review_recorded_done;
+use crate::lifecycle::flow::{self, WorkAction};
 use crate::phase::{EvidenceAudit, PhaseStanding, PhaseStep, evidence_audit, has_phase_agent};
 use anyhow::Result;
 use rusqlite::Connection;
@@ -100,7 +101,7 @@ impl Standing {
             .into_iter()
             .filter(|s| s.phase == PHASE_ACTIVE || s.due_by(lifecycle))
             .collect();
-        let reviewing = lifecycle == "review";
+        let reviewing = flow::find_phase(lifecycle).is_some_and(|phase| phase.cycle.is_some());
         let open_findings = if reviewing {
             ReviewRepo::new(conn)
                 .list_for_node(node_id)?
@@ -168,6 +169,13 @@ impl Standing {
 /// can recommend: a node with no plan to implement, or steps waiting on the
 /// user.
 pub fn next_step(standing: &Standing) -> Option<NextStep> {
+    if let Some(cycle) = flow::find_phase(&standing.lifecycle).and_then(|phase| phase.cycle) {
+        return Some(match cycle.next(standing.review_done, standing.open_findings > 0, standing.review_clean) {
+            Some(WorkAction::Review) => NextStep::Review,
+            Some(WorkAction::Fix) => NextStep::Fix,
+            None => NextStep::GateCheck,
+        });
+    }
     match standing.lifecycle.as_str() {
         "active" if standing.plan_steps == 0 => None,
         "active" if standing.steps_open > 0 => Some(NextStep::Implement),
@@ -180,15 +188,10 @@ pub fn next_step(standing: &Standing) -> Option<NextStep> {
             Some(NextStep::GateCheck)
         }
         "verifying" if standing.verification_due() => Some(NextStep::Verify),
-        "verifying" if standing.steps_failed > 0 => Some(NextStep::FixFailed),
+        state if state == flow::FAILED_VERIFICATION.from && standing.steps_failed > 0 => Some(NextStep::FixFailed),
         // Verification is done and nothing failed: its evidence is audited
         // before the gate (independent evaluation on).
         "verifying" if standing.evidence == EvidenceAudit::Due => Some(NextStep::Evaluate),
-        "review" if !standing.review_done => Some(NextStep::Review),
-        "review" if standing.open_findings > 0 => Some(NextStep::Fix),
-        // Findings answered, but by the fixer: another review of the fixed
-        // change decides, never the fixer's own claim.
-        "review" if !standing.review_clean => Some(NextStep::Review),
         _ => match standing.phase {
             Some(PhaseStep::Work) => Some(NextStep::Phase),
             Some(PhaseStep::Evaluate) => Some(NextStep::Evaluate),

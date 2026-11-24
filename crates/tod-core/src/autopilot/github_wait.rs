@@ -16,7 +16,7 @@
 //! why it fails, as it always did.
 
 use super::{Autopilot, Outcome, api_work};
-use crate::release_watch::release_carrying;
+use crate::release_watch::{self, Inclusion};
 use anyhow::Result;
 use tod_store::fleet::FleetStore;
 use tod_store::github::{NodePr, NodePrRepo};
@@ -170,6 +170,29 @@ pub fn retry_delay_ms(attempt: u32) -> i64 {
     (30_000i64 << attempt.min(6)).min(10 * 60 * 1000)
 }
 
+pub(crate) fn read_retry(
+    now: i64,
+    attempt: u32,
+    error: &str,
+    incident_retry: bool,
+) -> (Option<i64>, bool) {
+    let transient = tod_store::github::is_transient_message(error) || incident_retry;
+    let limited = tod_store::github::is_rate_limited_message(error);
+    let due = transient.then(|| {
+        match tod_store::github::rate_limit_reset_ms(error).filter(|_| limited) {
+            Some(reset) => reset.saturating_add(RATE_LIMIT_SLACK_MS).max(now + retry_delay_ms(0)),
+            None => now + retry_delay_ms(attempt),
+        }
+    });
+    (due, limited)
+}
+
+pub(crate) fn read_failed_outcome(error: &str) -> Outcome {
+    Outcome::Stopped {
+        reason: format!("{}GitHub could not be read: {error}", crate::autopilot::local::FAILED_PREFIX),
+    }
+}
+
 /// A look at GitHub failed with `error`. Records it on the node's
 /// `github:*:read` wait (made if there is none), so it counts and shows,
 /// and says how the run ends:
@@ -234,16 +257,15 @@ pub fn github_look_failed(
     // A first sighting of a cause that can be an incident is retried with
     // backoff like a transient failure, so a second node's sighting can open
     // one before this node asks the user.
-    let transient = tod_store::github::is_transient_message(error)
-        || observed.verdict == tod_store::incidents::Verdict::Retry;
     // A spent rate limit is waited out until its reset, which GitHub told us:
     // looking sooner only fails again, so it spends none of the retry budget
     // and never stops the run.
-    let limited = tod_store::github::is_rate_limited_message(error);
-    let retry_due_at = transient.then(|| match tod_store::github::rate_limit_reset_ms(error).filter(|_| limited) {
-        Some(reset_ms) => (reset_ms + RATE_LIMIT_SLACK_MS).max(now + retry_delay_ms(0)),
-        None => now + retry_delay_ms(attempt),
-    });
+    let (retry_due_at, limited) = read_retry(
+        now,
+        attempt,
+        error,
+        observed.verdict == tod_store::incidents::Verdict::Retry,
+    );
     let result = fleet
         .interview(
             ACTOR,
@@ -264,9 +286,7 @@ pub fn github_look_failed(
                 due_at_ms,
             })
         }
-        _ => Ok(Outcome::Stopped {
-            reason: format!("{}GitHub could not be read: {error}", crate::autopilot::local::FAILED_PREFIX),
-        }),
+        _ => Ok(read_failed_outcome(error)),
     }
 }
 
@@ -457,21 +477,21 @@ fn look_at_github(
             standing.push(format!("{label} merged"));
             continue;
         }
-        // A repository that publishes no releases ships when it merges.
-        if lifecycle_settings.profile_for(&pr.owner, &pr.repo) == tod_store::RepoProfile::Merge {
-            standing.push(format!("{label} merged (this repository does not release)"));
-            continue;
-        }
-        let releases = match feed.releases(pr, &merge) {
-            Ok(releases) => releases,
+        let inclusion = match release_watch::inclusion(
+            feed.as_ref(), pr, &merge, lifecycle_settings.profile_for(&pr.owner, &pr.repo),
+        ) {
+            Ok(inclusion) => inclusion,
             Err(err) => return Ok(GithubCheck::Unreadable(format!("releases of {label} not readable: {err}"))),
         };
-        match release_carrying(pr, &merge, &releases) {
-            Some(release) => {
+        match inclusion {
+            Inclusion::MergedWithoutRelease => {
+                standing.push(format!("{label} merged (this repository does not release)"));
+            }
+            Inclusion::Published(release) => {
                 tracing::info!(%node, pr = %pr.url, tag = %release.tag, "release found");
                 standing.push(format!("{label} released in {}", release.tag));
             }
-            None => {
+            Inclusion::Pending => {
                 standing.push(format!("{label} merged, no release names it yet"));
                 pending.get_or_insert((pr, format!("a release whose notes name {}", pr.url)));
             }

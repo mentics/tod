@@ -6,7 +6,8 @@ Working requirements for the redesign. The workspace should let a user define th
 |---|---|
 | [Product definitions](product-definitions.md) | Durable descriptions of the product, requirements, constraints, and work that implements them |
 | [Tags and relationships](tags-and-relationships.md) | Reusable obligations, custom relationships, and how their effects are explained |
-| [Workbench](workbench.md) | Shared panels, queries, keyboard behavior, chat, and lifecycle management |
+| [Workbench](workbench.md) | Shared panels, queries, keyboard behavior, and chat |
+| [Lifecycle workflows](lifecycles.md) | Workflow authoring, typed gate conditions, execution, and self-improvement |
 | [Collection panel](collection-panel.md) | Collection config, inline chips, autosave, configurable row display, and collection pane interactions |
 | [Self-improvement](self-improvement.md) | Lessons, analysis, process changes, metrics, and alerts |
 | [Interactive prototype](prototype.md) | Mock data, keyboard bindings to try, and walkthroughs |

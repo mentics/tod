@@ -63,6 +63,11 @@ fn files_busy(fleet: &FleetStore, node: Uuid, err: &anyhow::Error) -> Result<Che
 /// Check `node`'s gate now, advance it when clear, and read GitHub where the
 /// state waits on it. An error (not a no-op) when a run holds the node.
 pub fn check_now(fleet: &FleetStore, node: Uuid, data_root: &std::path::Path) -> Result<CheckNow> {
+    if super::workflow::runner::Runner::new(fleet).current(node)?.is_some()
+        && fleet.read(|conn| tod_store::workflow_run::allows_local_execution(conn, node))?
+    {
+        bail!("This task has a saved workflow. Check its gates from Task workflow run.");
+    }
     let now = chrono::Utc::now().timestamp_millis();
     let held = fleet
         .read(|conn| tod_store::activity::ActivityRepo::new(conn).list_for_nodes(&[node]))?

@@ -43,7 +43,8 @@ CREATE TABLE IF NOT EXISTS node_lifecycle (
                     'verifying', 'review', 'pr', 'pr_draft', 'pr_review', 'approved', 'merged',
                     'released', 'learn', 'done'
                 )),
-    updated_at  INTEGER NOT NULL
+    updated_at  INTEGER NOT NULL,
+    stay_generation INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS outline_entries (

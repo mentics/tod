@@ -37,6 +37,7 @@ use tod_core::runner_place::RunnerPlace;
 use tod_store::activity::{ActivityRepo, Lease};
 use tod_store::deferrals::DeferralRepo;
 use tod_store::fleet::{FleetMutation, FleetStore};
+use tod_store::workflow_run::{self, ScheduledWait};
 use uuid::Uuid;
 
 /// Why this daemon does not run a node whose Files are in a cloud sandbox.
@@ -87,6 +88,8 @@ struct Slot {
     since: i64,
     /// How the last run ended, from this session or its saved state.
     outcome: Option<Outcome>,
+    /// The visit that owns a timed workflow outcome.
+    workflow_wait: Option<Uuid>,
     /// The node was seen waiting on the user since the run stopped for a
     /// request: once it no longer is, the run continues.
     seen_waiting: bool,
@@ -162,6 +165,18 @@ fn read_user_stop(root: &Path, node: Uuid) -> Result<Option<Desired>> {
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(err).with_context(|| format!("read the accepted pause or stop in {}", path.display())),
     }
+}
+
+fn recorded_user_stop(store: &FleetStore, node: Uuid) -> Result<Option<Desired>> {
+    use tod_core::run_state::kind;
+
+    store.read(|conn| {
+        Ok(tod_store::run_state::get(conn, node)?.and_then(|row| match row.reason_kind.as_str() {
+            kind::PAUSED => Some(Desired::Pause),
+            kind::STOPPED_NOW | kind::LEFT_STOPPED => Some(Desired::Stop),
+            _ => None,
+        }))
+    })
 }
 
 /// Called under the slot lock before signaling the worker, which can keep
@@ -343,7 +358,12 @@ impl Runners {
 
     fn load_saved_slots(&self) {
         let root = self.inner.store.paths().root().to_path_buf();
-        for node in saved_nodes(&root) {
+        let mut nodes = saved_nodes(&root);
+        match self.inner.store.read(workflow_run::scheduled_tasks) {
+            Ok(waiting) => nodes.extend(waiting),
+            Err(error) => tracing::error!("could not list saved workflow wakes: {error:#}"),
+        }
+        for node in nodes {
             // A node deleted from the store holds no slot: its saved run file
             // is left on disk (not ours to delete), noted once here.
             match self.node_exists(node) {
@@ -403,6 +423,37 @@ impl Runners {
             if let Err(err) = self.adopt_saved_quota_wait(node, &mut state) {
                 tracing::error!(%node, "could not restore the saved quota wait: {err:#}");
             }
+            match self.workflow_wait(node) {
+                Ok(Some(wait)) => {
+                    let (id, outcome) = workflow_outcome(wait);
+                    if can_restore_workflow_wait(&state, &outcome) {
+                        state.outcome = Some(outcome);
+                        state.workflow_wait = Some(id);
+                    }
+                }
+                Ok(None) if state.workflow_wait.is_some()
+                    && matches!(state.outcome, Some(Outcome::Waiting { .. })) =>
+                {
+                    match self.rollback_wait(node) {
+                        Ok(Some(outcome)) => {
+                            state.outcome = Some(outcome);
+                        }
+                        Ok(None) => {
+                            tracing::info!(%node, "the saved workflow wake no longer owns the current visit");
+                            continue;
+                        }
+                        Err(error) => {
+                            tracing::error!(%node, "could not restore the legacy wake after workflow rollback: {error:#}");
+                            continue;
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::error!(%node, "could not restore the saved workflow wake: {error:#}");
+                    continue;
+                }
+            }
             // Older builds saved a handover as stopped until their final
             // branch push returned. A quiet check may still say it is
             // waiting even though its GitHub wait has expired.
@@ -439,6 +490,7 @@ impl Runners {
                             slot.desired = Desired::Stop;
                         }
                     }
+                    slot.workflow_wait = state.workflow_wait.filter(|_| matches!(outcome, Outcome::Waiting { .. }));
                     slot.outcome = Some(outcome);
                     if reopened {
                         tracing::info!(%node, "the saved run is done but the node is not; it is desired to run");
@@ -447,6 +499,75 @@ impl Runners {
                 }
             }
         }
+    }
+
+    fn workflow_wait(&self, node: Uuid) -> Result<Option<ScheduledWait>> {
+        self.inner.store.read(|conn| {
+            if !workflow_run::allows_local_execution(conn, node)? {
+                return Ok(None);
+            }
+            workflow_run::scheduled_wait(conn, node)
+        })
+    }
+
+    /// An operator or separate CLI process can schedule a visit after the
+    /// daemon starts. Only take ownership where the daemon has no slot yet.
+    fn discover_workflow_waits(&self) -> Result<()> {
+        let waiting = self.inner.store.read(workflow_run::scheduled_tasks)?;
+        for node in waiting {
+            if let Err(error) = self.discover_workflow_wait(node) {
+                tracing::error!(%node, "could not take ownership of a newly scheduled workflow wake: {error:#}");
+            }
+        }
+        Ok(())
+    }
+
+    fn discover_workflow_wait(&self, node: Uuid) -> Result<()> {
+        if self.inner.slots.lock().expect("runner slots").contains_key(&node) {
+            return Ok(());
+        }
+        let store = &self.inner.store;
+        let root = store.paths().root();
+        let Some(wait) = self.workflow_wait(node)? else { return Ok(()) };
+        let (id, outcome) = workflow_outcome(wait);
+        if !can_restore_workflow_wait(&AutopilotState::load(root, node)?, &outcome)
+            || read_user_stop(root, node)?.is_some()
+            || recorded_user_stop(store, node)?.is_some()
+        {
+            return Ok(());
+        }
+        let mut slots = self.inner.slots.lock().expect("runner slots");
+        if let std::collections::hash_map::Entry::Vacant(entry) = slots.entry(node) {
+            entry.insert(Slot { workflow_wait: Some(id), outcome: Some(outcome), ..Slot::default() });
+            drop(slots);
+            self.inner.publish(node);
+        }
+        Ok(())
+    }
+
+    fn rollback_wait(&self, node: Uuid) -> Result<Option<Outcome>> {
+        self.inner.store.read(|conn| {
+            use tod_store::waits::{KIND_EVENT, WaitRepo, spec_states};
+            if workflow_run::current(conn, node)?.is_some()
+                || !workflow_run::history(conn, node)?.first().is_some_and(|run| run.detached_at.is_some())
+            {
+                return Ok(None);
+            }
+            let Some(stay) = workflow_run::legacy_stay(conn, node)? else { return Ok(None) };
+            if !matches!(stay.phase.as_str(), "approved" | "merged") {
+                return Ok(None);
+            }
+            Ok(WaitRepo::new(conn).list_pending_for_node(node)?.into_iter()
+                .filter(|wait| wait.kind == KIND_EVENT
+                    && wait.stay == Some(stay.entered_at_ms)
+                    && !wait.exhausted()
+                    && spec_states(&wait.match_spec).is_some_and(|phases| phases.contains(&stay.phase.as_str())))
+                .min_by_key(|wait| wait.due_at)
+                .map(|wait| Outcome::Waiting {
+                    what: wait.detail.unwrap_or(wait.match_spec),
+                    due_at_ms: wait.due_at,
+                }))
+        })
     }
 
     /// Older local runs stored a quota rejection as an agent failure with
@@ -706,6 +827,7 @@ impl Runners {
                 if let Some(slot) = slots.get(&node)
                     && (slot.starting
                         || slot.run.as_ref().is_some_and(|r| !r.is_finished())
+                        || slot.workflow_wait.is_some()
                         || matches!(slot.desired, Desired::Pause | Desired::Stop)
                         || matches!(&slot.outcome, Some(Outcome::Stopped { reason }) if reason.starts_with(FAILED_PREFIX)))
                 {
@@ -776,6 +898,7 @@ impl Runners {
                 if let Some(slot) = slots.get(&node)
                     && (slot.run.is_some()
                         || slot.starting
+                        || slot.workflow_wait.is_some()
                         || matches!(slot.desired, Desired::Pause | Desired::Stop)
                         // A start that failed is recorded on the node: not
                         // retried every tick behind a row that could not be
@@ -805,14 +928,22 @@ impl Runners {
     }
 
     fn start_due(&self) {
-        let (mut due, request_nodes, parked) = {
+        if let Err(error) = self.discover_workflow_waits() {
+            tracing::error!("could not list newly scheduled workflow wakes: {error:#}");
+        }
+        let (mut due, request_nodes, parked, workflow) = {
             let slots = self.inner.slots.lock().expect("runner slots");
             let now = now_ms();
             let mut due = Vec::new();
             let mut requests = Vec::new();
             let mut parked = Vec::new();
+            let mut workflow = Vec::new();
             for (node, slot) in slots.iter() {
                 if slot.run.is_some() || slot.starting || slot.desired.stop_reason().is_some() {
+                    continue;
+                }
+                if let Some(id) = slot.workflow_wait {
+                    workflow.push((*node, id));
                     continue;
                 }
                 match &slot.outcome {
@@ -826,8 +957,15 @@ impl Runners {
                     _ => {}
                 }
             }
-            (due, requests, parked)
+            (due, requests, parked, workflow)
         };
+        for (node, id) in workflow {
+            match self.check_workflow_wake(node, id) {
+                Ok(true) => due.push(node),
+                Ok(false) => {}
+                Err(error) => tracing::error!(%node, "could not check the workflow wake: {error:#}"),
+            }
+        }
         // A run parked on a silent review bot is woken by the user's answer
         // to the bot-silence question, not at the wait's time.
         for (node, since) in parked {
@@ -921,6 +1059,43 @@ impl Runners {
                 }
             });
         }
+    }
+
+    /// A migrated visit, detached workflow, or rewritten deadline can
+    /// supersede the appointment in an idle slot before its timer runs.
+    fn check_workflow_wake(&self, node: Uuid, expected: Uuid) -> Result<bool> {
+        let current = self.workflow_wait(node)?;
+        let (owner, outcome) = if let Some(wait) = current {
+            let (id, outcome) = workflow_outcome(wait);
+            (Some(id), Some(outcome))
+        } else {
+            // Keep checking the transferred appointment until it runs or is
+            // retired. A stale local Working row still belongs to the run
+            // that created this timer before rollback.
+            let rollback = self.rollback_wait(node)?;
+            (rollback.as_ref().map(|_| expected), rollback)
+        };
+        let due = matches!(&outcome, Some(Outcome::Waiting { due_at_ms, .. }) if *due_at_ms <= now_ms());
+        let changed = {
+            let mut slots = self.inner.slots.lock().expect("runner slots");
+            let Some(slot) = slots.get_mut(&node) else { return Ok(false) };
+            if slot.run.is_some() || slot.starting || slot.desired.stop_reason().is_some()
+                || slot.workflow_wait != Some(expected)
+            {
+                return Ok(false);
+            }
+            let changed = slot.workflow_wait != owner || slot.outcome != outcome;
+            slot.workflow_wait = owner;
+            slot.outcome = outcome;
+            if slot.outcome.is_none() {
+                slot.desired = Desired::Unset;
+            }
+            changed
+        };
+        if changed {
+            self.inner.publish(node);
+        }
+        Ok(due)
     }
 
     /// The reconciler: clear spent deferrals, start what should be running
@@ -1241,15 +1416,7 @@ impl Runners {
                 if slot.desired.stop_reason().is_none() && !saved_stop {
                     // A checkpoint interrupted by handover may be missing
                     // the user stop that is already durable in the run row.
-                    let stop = self.inner.store.read(|conn| {
-                        use tod_core::run_state::kind;
-                        Ok(tod_store::run_state::get(conn, node)?.and_then(|row| match row.reason_kind.as_str() {
-                            kind::PAUSED => Some(Desired::Pause),
-                            kind::STOPPED_NOW | kind::LEFT_STOPPED => Some(Desired::Stop),
-                            _ => None,
-                        }))
-                    })?;
-                    if let Some(stop) = stop {
+                    if let Some(stop) = recorded_user_stop(&self.inner.store, node)? {
                         slot.desired = stop;
                     }
                 }
@@ -1279,6 +1446,7 @@ impl Runners {
                 slot.live = Live::default();
                 slot.since = now_ms();
                 slot.outcome = None;
+                slot.workflow_wait = None;
                 slot.seen_waiting = false;
             })
         };
@@ -1373,6 +1541,7 @@ impl Runners {
     pub(crate) fn has_active_or_scheduled_work(&self) -> Result<bool> {
         use tod_store::run_state::{self, Phase, RESUMABLE_BY_RUNNER};
 
+        self.discover_workflow_waits()?;
         let scheduled: Vec<_> = {
             let slots = self.inner.slots.lock().expect("runner slots");
             if slots.values().any(|slot| slot.run.is_some() || slot.starting) {
@@ -1381,14 +1550,22 @@ impl Runners {
             slots
                 .iter()
                 .filter_map(|(&node, slot)| match &slot.outcome {
-                    Some(Outcome::Waiting { what, .. }) if slot.desired.stop_reason().is_none() => Some((node, what.clone())),
+                    Some(Outcome::Waiting { what, .. }) if slot.desired.stop_reason().is_none() => {
+                        Some((node, what.clone(), slot.workflow_wait))
+                    }
                     _ => None,
                 })
                 .collect()
         };
         let store = &self.inner.store;
-        for (node, what) in scheduled {
+        for (node, what, graph_wait) in scheduled {
             if read_user_stop(store.paths().root(), node)?.is_some() || RunnerPlace::of(store, node)? != RunnerPlace::Local {
+                continue;
+            }
+            if graph_wait.is_some() {
+                if self.workflow_wait(node)?.is_some() || self.rollback_wait(node)?.is_some() {
+                    return Ok(true);
+                }
                 continue;
             }
             let eligible = store.read(|conn| {
@@ -1486,6 +1663,7 @@ impl Inner {
         let root = self.store.paths().root();
         let mut state = AutopilotState::load(root, node).context("read the run's saved state")?;
         state.outcome = Some(outcome.clone());
+        state.workflow_wait = None;
         state.save(root, node).context("save the pause or stop in the run's saved state")?;
         std::fs::OpenOptions::new()
             .write(true)
@@ -1556,16 +1734,38 @@ impl Inner {
                         // still wins over its saved wait or handover.
                         this.finish_user_stop(node, slot, reason);
                     } else {
-                        slot.outcome = Some(match result {
+                        let outcome = match result {
                             Ok(outcome) => outcome,
                             Err(error) => Outcome::Stopped { reason: format!("{FAILED_PREFIX}{error}") },
-                        });
+                        };
+                        slot.workflow_wait = if matches!(outcome, Outcome::Waiting { .. }) {
+                            match AutopilotState::load(this.store.paths().root(), node) {
+                                Ok(state) => state.workflow_wait,
+                                Err(error) => {
+                                    tracing::error!(%node, "could not read the workflow wake's saved owner: {error:#}");
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        slot.outcome = Some(outcome);
                     }
                 }
             }
         }
         this.publish(node);
     }
+}
+
+fn workflow_outcome(wait: ScheduledWait) -> (Uuid, Outcome) {
+    (wait.id, Outcome::Waiting { what: wait.schedule.what, due_at_ms: wait.schedule.due_at_ms })
+}
+
+fn can_restore_workflow_wait(state: &AutopilotState, outcome: &Outcome) -> bool {
+    state.outcome.as_ref().is_none_or(|saved| {
+        saved == outcome || (state.workflow_wait.is_some() && matches!(saved, Outcome::Waiting { .. }))
+    })
 }
 
 /// What a run's conversations are configured with: the data root's settings
@@ -1755,6 +1955,223 @@ mod tests {
     fn standing_of(fx: &Fixture) -> NodeStanding {
         fx.runners.inner.store.reload_if_stale().unwrap();
         next_actor::compute(&fx.runners.inner.store, &fx.root).unwrap().remove(&fx.node).expect("Lifecycle")
+    }
+
+    #[test]
+    fn a_devcontainer_workflows_durable_wait_owns_the_restarted_daemon_timer() {
+        use std::collections::BTreeMap;
+        use tod_core::lifecycle::workflow::{
+            Comparison, Condition, Definition, FORMAT_VERSION, Field, Node, NodeKind, Observations,
+            Operand, Revision, Route, Source, Value, ValueType, catalog::Catalog, migration,
+            runner::Runner,
+        };
+        use tod_store::fleet::{DevContainerSetting, FilesPlace};
+        use tod_store::interview::{ACTOR_USER, InterviewCommand};
+        use tod_store::workflow_run::{Checkpoint, Mutation, RunStatus, Transition, WaitSchedule};
+
+        let fx = fixture_with_media(true);
+        let fleet = &fx.runners.inner.store;
+        fleet.enqueue_outline(OutlineMutation::EnableCapabilities {
+            node_id: fx.node,
+            capabilities: vec![tod_store::outline::Capability::Files],
+        }).unwrap();
+        fleet.writer().flush().unwrap();
+        tod_store::fleet::places::pick_matching(fleet, &fx.node.to_string(), &FilesPlace {
+            repo: Some("/workspace/test".into()),
+            dev_container: Some(DevContainerSetting { container: Some("fixture-dev".into()), ..Default::default() }),
+            ..Default::default()
+        }).unwrap();
+        tod_core::lifecycle::set_lifecycle(fleet, fx.node, "approved").unwrap();
+        let catalog = Catalog::new(fleet);
+        let draft = catalog.create("Waiting workflow", Definition {
+            format: FORMAT_VERSION,
+            revision: Revision { id: String::new(), number: 0 },
+            entry: "gate".into(),
+            task_phases: BTreeMap::from([
+                ("gate".into(), "approved".into()),
+                ("release".into(), "merged".into()),
+                ("finish".into(), "done".into()),
+            ]),
+            adoption_points: BTreeMap::from([("merged".into(), "release".into())]),
+            fields: BTreeMap::from([("approved".into(), Field {
+                value_type: ValueType::Boolean,
+                source: Source::Provider { binding: "manual".into(), field: "approved".into() },
+            })]),
+            nodes: BTreeMap::from([
+                ("gate".into(), Node {
+                    label: "Wait for evidence".into(), kind: NodeKind::Decision, outputs: BTreeMap::new(),
+                    routes: vec![Route {
+                        id: "ready".into(), to: "release".into(),
+                        when: Some(Condition::Compare {
+                            left: Operand::Field("approved".into()), op: Comparison::Equal,
+                            right: Operand::Literal(Value::Boolean(true)),
+                        }),
+                    }],
+                }),
+                ("release".into(), Node {
+                    label: "Wait for release".into(), kind: NodeKind::Decision, outputs: BTreeMap::new(),
+                    routes: vec![Route {
+                        id: "released".into(), to: "finish".into(),
+                        when: Some(Condition::Compare {
+                            left: Operand::Field("approved".into()), op: Comparison::Equal,
+                            right: Operand::Literal(Value::Boolean(true)),
+                        }),
+                    }],
+                }),
+                ("finish".into(), Node {
+                    label: "Finish".into(), kind: NodeKind::Finish,
+                    outputs: BTreeMap::new(), routes: Vec::new(),
+                }),
+            ]),
+        }).unwrap();
+        let workflow = catalog.publish(&draft.definition.revision.id, draft.generation).unwrap();
+        let runner = Runner::new(fleet);
+        let run = runner.assign(fx.node, &workflow.definition.revision, 10).unwrap();
+        let schedule = |due_at_ms| {
+            let run = runner.get(run.id).unwrap().unwrap();
+            let trace = workflow.definition.validate().unwrap()
+                .decide(&run.node, run.visit, &Observations::new()).unwrap();
+            // The daemon's store writer also applies operator/CLI RPCs.
+            fleet.interview(ACTOR_USER, InterviewCommand::WorkflowRun {
+                mutation: Mutation::Decide {
+                    checkpoint: Checkpoint { run: run.id, visit: run.visit, generation: run.generation },
+                    trace: serde_json::to_string(&trace).unwrap(),
+                    transition: Transition::Stay(RunStatus::Waiting),
+                    wait: Some(WaitSchedule { what: "external approval".into(), due_at_ms }),
+                },
+            }).unwrap();
+            fleet.read(|conn| workflow_run::scheduled_wait(conn, fx.node)).unwrap().unwrap()
+        };
+        let restart = || {
+            let daemon = Runners::new(fleet.clone(), fx.runners.inner.agent.clone());
+            daemon.load_saved_slots();
+            daemon
+        };
+        let assert_slot = |daemon: &Runners, expected: ScheduledWait| {
+            let (id, outcome) = workflow_outcome(expected);
+            let slots = daemon.inner.slots.lock().unwrap();
+            let slot = &slots[&fx.node];
+            assert_eq!(slot.workflow_wait, Some(id));
+            assert_eq!(slot.outcome, Some(outcome));
+            assert!(slot.run.is_none());
+        };
+        fx.runners.start_due();
+        assert!(fx.runners.inner.slots.lock().unwrap().is_empty());
+        let future = schedule(now_ms() + 60_000);
+
+        // A timed graph evaluation can happen before the local runner writes
+        // any checkpoint. Its wait still gets a timer after restart.
+        assert!(!tod_core::autopilot::state_path(&fx.root, fx.node).exists());
+        assert_slot(&restart(), future.clone());
+        assert!(matches!(standing_of(&fx).actor, NextActor::Others { wait }
+            if wait.next_check_ms == Some(future.schedule.due_at_ms)));
+
+        // A separate process can schedule a visit after the daemon starts.
+        // A pause persisted outside a slot still takes precedence.
+        let path = tod_core::autopilot::state_path(&fx.root, fx.node);
+        AutopilotState { outcome: Some(Outcome::Stopped { reason: PAUSED.into() }), ..AutopilotState::fresh() }
+            .save(&fx.root, fx.node).unwrap();
+        fx.runners.start_due();
+        assert!(fx.runners.inner.slots.lock().unwrap().is_empty());
+        assert!(!fx.runners.has_active_or_scheduled_work().unwrap());
+        std::fs::remove_file(path).unwrap();
+        fx.runners.start_due();
+        assert_slot(&fx.runners, future.clone());
+
+        let native = Runners::new(fleet.clone(), fx.runners.inner.agent.clone());
+        let push_wait = Outcome::Waiting { what: "branch push".into(), due_at_ms: now_ms() + 30_000 };
+        native.inner.slots.lock().unwrap().insert(fx.node, Slot { outcome: Some(push_wait.clone()), ..Slot::default() });
+        native.start_due();
+        {
+            let mut slots = native.inner.slots.lock().unwrap();
+            let slot = slots.get_mut(&fx.node).unwrap();
+            assert_eq!(slot.outcome, Some(push_wait));
+            assert!(slot.workflow_wait.is_none());
+            slot.outcome = None;
+            slot.starting = true;
+        }
+        native.start_due();
+        {
+            let slots = native.inner.slots.lock().unwrap();
+            assert!(slots[&fx.node].starting);
+            assert!(slots[&fx.node].outcome.is_none());
+        }
+
+        // A daemon that crashed between the graph commit and Autopilot finish
+        // has an unfinished checkpoint. It must still sleep until the deadline.
+        AutopilotState::fresh().save(&fx.root, fx.node).unwrap();
+        let daemon = restart();
+        // The run row can also still say Working at the crash boundary. Its
+        // abandoned lease is not a reason to bypass the committed schedule.
+        fleet.interview(
+            tod_core::run_state::ACTOR,
+            InterviewCommand::SetRunState {
+                node_id: fx.node,
+                draft: tod_core::run_state::working("old work"),
+                writer: tod_core::run_state::LOCAL_WRITER.into(),
+                at: now_ms() - 2 * tod_core::run_state::GHOST_GRACE_MS,
+            },
+        ).unwrap();
+        daemon.adopt_cut_off_runs();
+        daemon.start_due();
+        assert_slot(&daemon, future.clone());
+        assert!(daemon.has_active_or_scheduled_work().unwrap());
+        assert!(matches!(standing_of(&fx).actor, NextActor::Others { wait }
+            if wait.next_check_ms == Some(future.schedule.due_at_ms)));
+
+        // Expired appointments are refreshed from the current durable visit.
+        let expired = schedule(now_ms() - 1);
+        let daemon = restart();
+        assert_slot(&daemon, expired.clone());
+        assert!(daemon.check_workflow_wake(fx.node, expired.id).unwrap());
+        let postponed = schedule(now_ms() + 120_000);
+        daemon.start_due();
+        assert_slot(&daemon, postponed.clone());
+
+        AutopilotState {
+            outcome: Some(Outcome::Stopped { reason: PAUSED.into() }),
+            ..AutopilotState::fresh()
+        }.save(&fx.root, fx.node).unwrap();
+        let paused = restart();
+        assert_eq!(paused.inner.slots.lock().unwrap()[&fx.node].desired, Desired::Pause);
+        assert!(!paused.has_active_or_scheduled_work().unwrap());
+
+        // Moving the task retires the old timed owner immediately, including
+        // when its deadline was far in the future.
+        let (id, outcome) = workflow_outcome(postponed);
+        AutopilotState { workflow_wait: Some(id), outcome: Some(outcome), ..AutopilotState::fresh() }
+            .save(&fx.root, fx.node).unwrap();
+        tod_core::lifecycle::set_lifecycle_by_user(fleet, fx.node, "merged").unwrap();
+        assert!(!daemon.has_active_or_scheduled_work().unwrap());
+        daemon.start_due();
+        assert!(daemon.inner.slots.lock().unwrap()[&fx.node].outcome.is_none());
+        assert!(!restart().inner.slots.lock().unwrap().contains_key(&fx.node));
+        assert!(!matches!(standing_of(&fx).actor, NextActor::Others { wait }
+            if wait.detail.as_deref() == Some("external approval")));
+
+        // The new visit can schedule a sooner wait. Rollback then hands its
+        // actual deadline to the matching legacy wait in this phase.
+        let soon = schedule(now_ms() + 30_000);
+        assert_ne!(id, soon.id);
+        let daemon = restart();
+        assert_slot(&daemon, soon.clone());
+        let (rollback_from, outcome) = workflow_outcome(soon);
+        AutopilotState {
+            workflow_wait: Some(rollback_from),
+            outcome: Some(outcome.clone()),
+            ..AutopilotState::fresh()
+        }.save(&fx.root, fx.node).unwrap();
+        migration::detach(fleet, &migration::preview_detach(fleet, run.id).unwrap()).unwrap();
+        daemon.start_due();
+        for daemon in [daemon, restart()] {
+            daemon.adopt_cut_off_runs();
+            assert!(daemon.has_active_or_scheduled_work().unwrap());
+            let slots = daemon.inner.slots.lock().unwrap();
+            let slot = &slots[&fx.node];
+            assert_eq!(slot.workflow_wait, Some(rollback_from));
+            assert_eq!(slot.outcome, Some(outcome.clone()));
+            assert!(slot.run.is_none());
+        }
     }
 
     fn save_legacy_quota_failure(fx: &Fixture, reset_secs: Option<i64>) -> AutopilotState {

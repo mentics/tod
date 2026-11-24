@@ -17,6 +17,8 @@
 //! `resolve-dispute` is the receiving phase agent's answer to a send-back that
 //! disputed an obligation.
 
+mod workflow;
+
 use crate::Invocation;
 use crate::args::Args;
 use tod_core::conversation::implement::IMPLEMENT_CONVERSATION_ENV;
@@ -31,6 +33,7 @@ tod-cli lifecycle — move a node's lifecycle state
 
 COMMANDS:
     set <NODE> <STATE> --reason <TEXT>
+    workflow help
     send-back --to <STATE> --reason <TEXT> [--evidence <KIND>:<ID>]... [--obligation <ID>]...
     resolve-dispute --as <fixed|upheld|passed-up> --note <TEXT> [--send-back <ID>]
 
@@ -65,6 +68,9 @@ sent to it is open.
 ";
 
 pub fn run(inv: Invocation) -> anyhow::Result<String> {
+    if inv.rest.first().is_some_and(|command| command == "workflow") {
+        return workflow::run(inv);
+    }
     let mut rest = inv.rest.clone();
     if rest.is_empty() || rest.iter().any(|a| a == "-h" || a == "--help") {
         return Ok(USAGE.trim_end().to_string());

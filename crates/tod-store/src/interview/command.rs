@@ -12,10 +12,22 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "kebab-case")]
 pub enum InterviewCommand {
+    /// Atomically replace an in-flight workflow run with a new revision.
+    MigrateWorkflow { request: crate::workflow_migration::Request },
+
+    /// Publish an immutable version of authored agent instructions.
+    PublishWorkflowAction { request: crate::workflow_actions::Publish },
+
+    /// Create, save, or publish a workflow definition as the operator.
+    WorkflowCatalog(crate::workflow_catalog::Command),
+
     /// An obligation or content write.
     Outline {
         mutation: OutlineMutation,
     },
+
+    /// Advance or record evidence for an assigned user-defined workflow.
+    WorkflowRun { mutation: crate::workflow_run::Mutation },
 
     /// Append a note to a node's notes list.
     AddNote {
@@ -472,6 +484,24 @@ pub fn execute(
     }
 
     match command {
+        InterviewCommand::MigrateWorkflow { request } => {
+            if actor != ACTOR_USER {
+                bail!("only the user may change an active workflow's revision");
+            }
+            Ok(serde_json::to_value(crate::workflow_migration::apply(conn, request)?)?)
+        }
+        InterviewCommand::PublishWorkflowAction { request } => {
+            if actor != ACTOR_USER {
+                bail!("only the user may publish workflow actions");
+            }
+            Ok(serde_json::to_value(crate::workflow_actions::publish(conn, request)?)?)
+        }
+        InterviewCommand::WorkflowCatalog(command) => {
+            if actor != ACTOR_USER {
+                bail!("only the user may edit workflow definitions");
+            }
+            crate::workflow_catalog::execute(conn, command)
+        }
         InterviewCommand::Outline { mutation } => {
             if actor != ACTOR_USER {
                 crate::outline::check_references(conn, mutation)?;
@@ -499,6 +529,11 @@ pub fn execute(
             let mutation = crate::conversation::normalize(mutation.clone());
             crate::conversation::record_direct(conn, actor, &mutation, media_root)?;
             Ok(json!({}))
+        }
+
+        InterviewCommand::WorkflowRun { mutation } => {
+            anyhow::ensure!(actor == ACTOR_USER, "Only an operator can change a workflow run.");
+            crate::workflow_run::apply(conn, mutation)
         }
 
         InterviewCommand::CreateConversation {

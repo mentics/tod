@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 117;
+pub const CURRENT_USER_VERSION: i32 = 123;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -862,6 +862,28 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         crate::quick_fixes::migrate_review_source(conn)?;
         conn.pragma_update(None, "user_version", 117)?;
     }
+    if version < 118 {
+        conn.execute_batch(crate::workflow_catalog::DDL)?;
+        conn.execute_batch(crate::workflow_run::DDL)?;
+        conn.pragma_update(None, "user_version", 118)?;
+    }
+    if version < 119 {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(crate::workflow_actions::DDL)?;
+        crate::workflow_catalog::add_action_bundle(&tx)?;
+        tx.pragma_update(None, "user_version", 119)?;
+        tx.commit()?;
+    }
+    if version < 120 {
+        conn.execute_batch(crate::workflow_migration::DDL)?;
+        conn.pragma_update(None, "user_version", 120)?;
+    }
+    if version < 123 {
+        let tx = conn.unchecked_transaction()?;
+        add_workflow_handoff_columns(&tx)?;
+        tx.pragma_update(None, "user_version", 123)?;
+        tx.commit()?;
+    }
     // Other branches (the task panel) numbered their own steps 66–67 at the
     // same time as 66–70 above, so a store may be past a version without
     // having these. Every one is idempotent: make sure of them all.
@@ -977,6 +999,28 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     // first seeded it (`INSERT OR IGNORE` alone would never update labels
     // on an install that already ran that migration long ago).
     crate::outline::gate_criteria_seed::seed_gate_criteria(conn)?;
+    Ok(())
+}
+
+/// Workflow waits (121), adoption (122), and exact stay identity (123) are
+/// additive and may already be present on a database stamped at an older version.
+fn add_workflow_handoff_columns(conn: &Connection) -> Result<()> {
+    for (table, column, definition) in [
+        ("workflow_runs", "wait_due_at", "INTEGER"),
+        ("workflow_runs", "wait_reason", "TEXT"),
+        ("workflow_runs", "adopted_phase", "TEXT"),
+        ("workflow_runs", "adopted_stay", "INTEGER"),
+        ("workflow_runs", "detached_at", "INTEGER"),
+        ("workflow_runs", "adopted_stay_generation", "INTEGER"),
+        ("node_lifecycle", "stay_generation", "INTEGER NOT NULL DEFAULT 0"),
+    ] {
+        let present = conn
+            .prepare("SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2")?
+            .exists([table, column])?;
+        if !present {
+            conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {definition};"))?;
+        }
+    }
     Ok(())
 }
 

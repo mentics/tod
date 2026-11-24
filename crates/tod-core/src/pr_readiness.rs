@@ -9,7 +9,7 @@
 //! both read it, so they cannot disagree.
 
 use chrono::{DateTime, Utc};
-use tod_store::github::{PrSnapshot, ReviewThread};
+use tod_store::github::{PrSnapshot, PrStatus, ReviewThread};
 use tod_store::settings::{PrReadinessSettings, PrReviewBotSettings, UnrelatedCheck, UnrelatedStanding};
 
 /// A review bot whose comment carries a score. Built in; the project's
@@ -2744,6 +2744,17 @@ Not safe.
 /// fake in tests ([`set_feed_override`]).
 pub trait PrFeed: Send + Sync {
     fn snapshot(&self, pr: &tod_store::github::NodePr) -> Result<PrSnapshot, String>;
+    /// Read only the pull request status when the caller does not need review
+    /// conversations. A supplied snapshot can also answer this question.
+    fn status(&self, pr: &tod_store::github::NodePr) -> Result<PrStatus, String> {
+        self.snapshot(pr).map(|snapshot| snapshot.status)
+    }
+    fn reviews(
+        &self,
+        pr: &tod_store::github::NodePr,
+    ) -> Result<Vec<tod_store::github::PrReview>, String> {
+        self.snapshot(pr).map(|snapshot| snapshot.reviews)
+    }
     /// The pull request's title and merge: what `crate::release_watch` looks
     /// for in a release's notes. Unsupported unless a feed says otherwise.
     fn merge(&self, _pr: &tod_store::github::NodePr) -> Result<tod_store::github::PrMerge, String> {
@@ -2899,6 +2910,21 @@ pub struct ReviewPost {
 pub struct GithubFeed(pub tod_store::github::Github);
 
 impl PrFeed for GithubFeed {
+    fn status(&self, pr: &tod_store::github::NodePr) -> Result<PrStatus, String> {
+        self.0
+            .get_pr_status(&pr.owner, &pr.repo, pr.pr_number)
+            .map_err(|err| err.to_string())
+    }
+
+    fn reviews(
+        &self,
+        pr: &tod_store::github::NodePr,
+    ) -> Result<Vec<tod_store::github::PrReview>, String> {
+        self.0
+            .list_reviews(&pr.owner, &pr.repo, pr.pr_number)
+            .map_err(|err| err.to_string())
+    }
+
     fn viewer_login(&self) -> Result<String, String> {
         self.0.viewer_login_cached().map_err(|err| err.to_string())
     }

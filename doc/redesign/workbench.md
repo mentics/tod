@@ -26,8 +26,4 @@ The composer takes ordinary conversation. A turn can return a short text reply a
 
 **Acceptance** — Start a chat from a task, switch the results selection without moving an open draft, and answer a structured decision with a keyboard shortcut. The updated decision appears in the inspector and the conversation.
 
-## REQ-LIFECYCLE-01 · Define and assign lifecycles
-
-A user can define multiple lifecycles with stages, transitions, agents, gates, and rules. The user can assign one to a task or a selection and see the current stage, what's blocking progress, and what will move it forward. A new definition can be tested against sample work, and revising a published definition can preview its effect on running tasks. The current tod lifecycle can serve as a starter.
-
-**Acceptance** — Define two lifecycles with different gates, assign each to a different task, and see its transition rationale. Preview a rule revision against existing tasks and see which tasks it would affect.
+See [Define and assign lifecycles](lifecycles.md#req-lifecycle-01--define-and-assign-lifecycles) for workflow authoring and execution.

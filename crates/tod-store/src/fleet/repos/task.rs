@@ -180,7 +180,8 @@ impl<'a> TaskRepo<'a> {
                -- When the node entered this state: setting the state it is
                -- already in does not start a new stay (`crate::phase`).
                updated_at = CASE WHEN node_lifecycle.state = excluded.state
-                                 THEN node_lifecycle.updated_at ELSE excluded.updated_at END",
+                                 THEN node_lifecycle.updated_at ELSE excluded.updated_at END,
+               stay_generation = node_lifecycle.stay_generation + (node_lifecycle.state <> excluded.state)",
             params![uuid_to_blob(node_id), lifecycle, now],
         )?;
         Ok(())

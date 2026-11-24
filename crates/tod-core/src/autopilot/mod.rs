@@ -29,6 +29,7 @@ pub mod api_work;
 mod process_review;
 mod quick_fix;
 mod triage;
+mod workflow;
 pub use api_work::{ApiAction, Classification, classify};
 pub use github_wait::{
     GithubCheck, Look as GithubLook, check_github_as, PUSH_WAIT_SPEC, PushRetrier, branch_push_failed, push_retry_delay_ms, branch_push_ok, check_github, check_now, github_look_failed, look_failed_next_look, read_wait_spec,
@@ -745,7 +746,7 @@ impl Autopilot {
         Ok(outcome)
     }
 
-    fn over_budget(&self) -> Option<BudgetLimit> {
+    pub(crate) fn over_budget(&self) -> Option<BudgetLimit> {
         if self.state.sessions >= self.budget.max_sessions {
             return Some(BudgetLimit::Sessions {
                 used: self.state.sessions,
@@ -757,6 +758,16 @@ impl Autopilot {
             elapsed_secs: elapsed.as_secs(),
             used: self.state.sessions,
         })
+    }
+
+    pub(crate) fn record_workflow_launch(&mut self) -> Result<()> {
+        let before = self.state.sessions;
+        self.state.sessions = before.saturating_add(1);
+        if let Err(error) = self.save() {
+            self.state.sessions = before;
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Take the node along until it is done, a human is needed, or the budget
@@ -782,6 +793,60 @@ impl Autopilot {
         agent: &mut A,
         hook: &mut H,
     ) -> Result<Outcome> {
+        use crate::lifecycle::workflow::{
+            builtin::ACTIONS,
+            execute,
+            runner::{RunStatus, Runner},
+        };
+
+        if let Some(run) = Runner::new(fleet).current(self.node)?
+            && fleet.read(|conn| tod_store::workflow_run::allows_local_execution(conn, self.node))?
+        {
+            self.begin_run(fleet)?;
+            let config = self.config.clone();
+            let poll = self.poll;
+            let progress = match execute::resume_agent(fleet, run, agent, hook, self, &config, poll) {
+                Err(err) if tod_store::fleet::worktree::is_lock_busy(&err) => {
+                    let outcome = self.files_busy(fleet, &err)?;
+                    return self.finish(outcome);
+                }
+                other => other?,
+            };
+            let pending = if progress.pending_action.as_ref().is_some_and(|request| {
+                ACTIONS.iter().all(|(action, _)| request.action.id != *action)
+            }) {
+                fleet.read(|conn| Ok(DecisionRepo::new(conn).list_open_for_node(self.node)?.len()))?
+            } else {
+                0
+            };
+            let outcome = if progress.run.status == RunStatus::Complete {
+                Outcome::Done
+            } else if let Some(outcome) = progress.native_outcome {
+                outcome
+            } else if let Some(limit) = progress.budget_limit {
+                Outcome::BudgetExhausted { limit }
+            } else if let Some(wait) = progress.external_wait {
+                self.state.workflow_wait = fleet.read(|conn| {
+                    Ok(tod_store::workflow_run::scheduled_wait(conn, self.node)?
+                        .filter(|recorded| recorded.schedule == wait)
+                        .map(|recorded| recorded.id))
+                })?;
+                hook.waiting(Some(&wait.what), Some(wait.due_at_ms));
+                Outcome::Waiting { what: wait.what, due_at_ms: wait.due_at_ms }
+            } else if pending > 0 {
+                Outcome::NeedsHuman { reason: NeedsHuman::Decision { pending } }
+            } else {
+                let reason = progress.stopped.unwrap_or_else(|| {
+                    if let Some(action) = progress.pending_action {
+                        format!("Workflow step {} needs an action result.", action.node)
+                    } else {
+                        format!("Workflow step {}: {:?}.", progress.run.node, progress.run.status)
+                    }
+                });
+                Outcome::Stopped { reason }
+            };
+            return self.finish(outcome);
+        }
         match self.run_steps(fleet, agent, hook) {
             Err(err) if tod_store::fleet::worktree::is_lock_busy(&err) => {
                 let outcome = self.files_busy(fleet, &err)?;
@@ -791,15 +856,11 @@ impl Autopilot {
         }
     }
 
-    fn run_steps<A: AgentAccess + ?Sized, H: StepHook + ?Sized>(
-        &mut self,
-        fleet: &FleetStore,
-        agent: &mut A,
-        hook: &mut H,
-    ) -> Result<Outcome> {
+    fn begin_run(&mut self, fleet: &FleetStore) -> Result<()> {
         // Called again after it stopped: the user has presumably dealt with
         // what it stopped for.
         self.state.outcome = None;
+        self.state.workflow_wait = None;
         self.state.quota_after_push = None;
         // The user's explicit requests on the node (`tod_store::node_requests`)
         // are consumed as the run starts: the first boundary of a local runner.
@@ -828,7 +889,16 @@ impl Autopilot {
             }
         }
         self.state.begin_active();
-        self.save()?;
+        self.save()
+    }
+
+    fn run_steps<A: AgentAccess + ?Sized, H: StepHook + ?Sized>(
+        &mut self,
+        fleet: &FleetStore,
+        agent: &mut A,
+        hook: &mut H,
+    ) -> Result<Outcome> {
+        self.begin_run(fleet)?;
         // A send-back the loop guard refused during this run stops it for the
         // user (`tod_store::send_back::guard`); one refused before it started
         // was what the user dealt with by running it again.
@@ -1013,47 +1083,8 @@ impl Autopilot {
             {
                 return Ok(outcome);
             }
-            if step == NextStep::Review {
-                let round_limit = tod_store::TodSettings::load(&tod_store::TodPaths::at(&self.config.data_root))?
-                    .lifecycle
-                    .review_round_limit
-                    .max(1);
-                let node = self.node;
-                let floor = self.state.loops.review_floor_ms;
-                let rounds_made = self.state.loops.review_rounds;
-                // At the limit a review stops only if its rounds repeat
-                // themselves (`review_progress`); the hard stop is twice it.
-                if rounds_made >= round_limit
-                    && crate::review_progress::limit_reached(
-                        rounds_made,
-                        round_limit,
-                        &fleet.read(|conn| crate::review_progress::finding_rounds(conn, node, floor, false))?,
-                    )
-                {
-                    let standing = fleet.read(|conn| {
-                        // What the latest review round (both reviewers) recorded
-                        // and the fixer claims to have fixed.
-                        let latest = tod_store::conversation::ConversationRepo::new(conn)
-                            .latest_for_focus_with_protocol(Focus::Node(node), ProtocolKind::Review)?
-                            .map(|c| c.id);
-                        let members = match latest {
-                            Some(lead) => tod_store::review::round::conversations(conn, lead)?,
-                            None => Vec::new(),
-                        };
-                        Ok(tod_store::review::ReviewRepo::new(conn)
-                            .list_for_node(node)?
-                            .iter()
-                            .filter(|f| f.conversation_id.is_some_and(|c| members.contains(&c)))
-                            .filter(|f| f.stands())
-                            .map(|f| format!("[{}] {} ({})", tod_store::interview::short_id(f.id), f.summary, f.status))
-                            .collect::<Vec<_>>())
-                    })?;
-                    // Nothing standing is not non-convergence (the failed
-                    // attempts that filled the count recorded nothing): review again.
-                    if let Some(reason) = NeedsHuman::review_not_converging(self.state.loops.review_rounds, standing) {
-                        return Ok(Outcome::NeedsHuman { reason });
-                    }
-                }
+            if step == NextStep::Review && let Some(reason) = self.review_limit_reached(fleet)? {
+                return Ok(Outcome::NeedsHuman { reason });
             }
             let stopped = match step {
                 NextStep::Implement => self.converse(fleet, agent, hook, ProtocolKind::Implementation, None)?,
@@ -1075,8 +1106,7 @@ impl Autopilot {
                         return Ok(Outcome::NeedsHuman { reason });
                     }
                     self.state.loops.fix_cycles += 1;
-                    // Back to `active`; the next round implements the fix.
-                    lifecycle::revert(fleet, self.node)?;
+                    lifecycle::revert_to(fleet, self.node, lifecycle::flow::FAILED_VERIFICATION.to)?;
                     self.record(fleet, step_name(step), &lifecycle, None)?;
                     None
                 }
@@ -1120,6 +1150,50 @@ impl Autopilot {
                 return Ok(outcome);
             }
         }
+    }
+
+    fn review_limit_reached(&self, fleet: &FleetStore) -> Result<Option<NeedsHuman>> {
+        let round_limit = tod_store::TodSettings::load(&tod_store::TodPaths::at(&self.config.data_root))?
+            .lifecycle
+            .review_round_limit
+            .max(1);
+        let node = self.node;
+        let floor = self.state.loops.review_floor_ms;
+        let rounds_made = self.state.loops.review_rounds;
+        // At the limit a review stops only if its rounds repeat
+        // themselves (`review_progress`); the hard stop is twice it.
+        if rounds_made >= round_limit
+            && crate::review_progress::limit_reached(
+                rounds_made,
+                round_limit,
+                &fleet.read(|conn| crate::review_progress::finding_rounds(conn, node, floor, false))?,
+            )
+        {
+            let standing = fleet.read(|conn| {
+                // What the latest review round (both reviewers) recorded
+                // and the fixer claims to have fixed.
+                let latest = tod_store::conversation::ConversationRepo::new(conn)
+                    .latest_for_focus_with_protocol(Focus::Node(node), ProtocolKind::Review)?
+                    .map(|c| c.id);
+                let members = match latest {
+                    Some(lead) => tod_store::review::round::conversations(conn, lead)?,
+                    None => Vec::new(),
+                };
+                Ok(tod_store::review::ReviewRepo::new(conn)
+                    .list_for_node(node)?
+                    .iter()
+                    .filter(|f| f.conversation_id.is_some_and(|c| members.contains(&c)))
+                    .filter(|f| f.stands())
+                    .map(|f| format!("[{}] {} ({})", tod_store::interview::short_id(f.id), f.summary, f.status))
+                    .collect::<Vec<_>>())
+            })?;
+            // Nothing standing is not non-convergence (the failed
+            // attempts that filled the count recorded nothing): review again.
+            if let Some(reason) = NeedsHuman::review_not_converging(self.state.loops.review_rounds, standing) {
+                return Ok(Some(reason));
+            }
+        }
+        Ok(None)
     }
 
     /// The lost-work rule ([`crate::lost_work`]): in `verifying`, `review` or
@@ -1620,6 +1694,17 @@ impl Autopilot {
         hook: &mut H,
     ) -> Result<Option<Outcome>> {
         let node = self.node;
+        // A draft can already exist even when its link never reached the task.
+        if let Err(error) =
+            crate::pr_discovery::discover_if_unlinked(fleet, node, &self.config.data_root)
+        {
+            return Ok(Some(github_wait::github_look_failed(
+                fleet,
+                node,
+                false,
+                &error.to_string(),
+            )?));
+        }
         let certified = |fleet: &FleetStore| -> Result<bool> {
             fleet.read(|conn| {
                 Ok(matches!(
@@ -3114,7 +3199,8 @@ impl Autopilot {
         made_at: i64,
         lifecycle: &str,
     ) -> Result<Option<Outcome>> {
-        use crate::pr_draft_review::{self, ChangeStep};
+        use crate::lifecycle::flow::WorkAction;
+        use crate::pr_draft_review;
         let node = self.node;
         let round_limit = tod_store::TodSettings::load(&tod_store::TodPaths::at(&self.config.data_root))?
             .lifecycle
@@ -3136,17 +3222,16 @@ impl Autopilot {
             if let Some(reason) = hook.at(fleet, Boundary::Step)? {
                 return Ok(Some(Outcome::Stopped { reason }));
             }
-            let step = fleet.read(|conn| pr_draft_review::change_step(conn, node, made_at))?;
+            let Some(step) = fleet.read(|conn| pr_draft_review::change_step(conn, node, made_at))? else {
+                return Ok(None);
+            };
             // As in `review`: a review of the pull request's changes that keeps
             // finding one cause, or that the fixes make grow, goes back to design.
-            if step != ChangeStep::Clean
-                && let Some(outcome) = self.escalate_fixes(fleet, lifecycle, self.state.loops.review_floor_ms, true)?
-            {
+            if let Some(outcome) = self.escalate_fixes(fleet, lifecycle, self.state.loops.review_floor_ms, true)? {
                 return Ok(Some(outcome));
             }
             match step {
-                ChangeStep::Clean => return Ok(None),
-                ChangeStep::Fix => {
+                WorkAction::Fix => {
                     let open = open_of_round(fleet)?;
                     hook.working_on("fixing what tod's review found in the change, before it is pushed");
                     if let Some(outcome) = self.converse(fleet, agent, hook, ProtocolKind::Fix, None)? {
@@ -3162,7 +3247,7 @@ impl Autopilot {
                         }));
                     }
                 }
-                ChangeStep::Review => {
+                WorkAction::Review => {
                     // Only consecutive reviews that did not come back clean count: a
                     // clean one of an earlier head proves convergence.
                     let floor = self.state.loops.review_floor_ms;

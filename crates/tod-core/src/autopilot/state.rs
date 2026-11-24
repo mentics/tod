@@ -52,6 +52,9 @@ pub struct AutopilotState {
     pub steps: Vec<StepRecord>,
     /// How the last run stopped; `None` while one runs.
     pub outcome: Option<Outcome>,
+    /// The workflow visit that owns the saved timed outcome, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_wait: Option<Uuid>,
     /// The quota wait to restore after a local branch retry takes over the
     /// next wake. The branch and the agent can be ready at different times.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -345,6 +348,7 @@ impl AutopilotState {
             current: None,
             steps: Vec::new(),
             outcome: None,
+            workflow_wait: None,
             quota_after_push: None,
             acp_quota_retries: AcpQuotaRetries::default(),
             fresh_session: false,

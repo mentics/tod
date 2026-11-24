@@ -22,6 +22,7 @@ use tod_store::settings::InterviewContextSettings;
 
 mod agent_incident;
 mod ci_quick_fix;
+mod default_parity;
 mod guidance;
 mod lost_work;
 mod push_failure;
@@ -2054,48 +2055,49 @@ fn the_wait_for_a_person_records_who_was_asked_to_review() {
     assert_eq!(crate::next_actor::WaitKind::from_spec(&waits[0].match_spec), crate::next_actor::WaitKind::HumanReview);
 }
 
+struct SplitPrReadinessFeed {
+    reads_of_7: std::sync::atomic::AtomicU32,
+}
+impl crate::pr_readiness::PrFeed for SplitPrReadinessFeed {
+    fn viewer_login(&self) -> Result<String, String> {
+        Ok("tod-test-user".to_string())
+    }
+    fn snapshot(&self, pr: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
+        use tod_store::github::{PrSnapshot, PrStatus};
+        // #7's checks finish on its third read.
+        let checks = if pr.pr_number == 7 && self.reads_of_7.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
+            "pending"
+        } else {
+            "success"
+        };
+        Ok(PrSnapshot {
+            status: PrStatus {
+                mergeable: Some(true),
+                mergeable_state: Some("blocked".into()),
+                behind_by: Some(0),
+                checks: Some(checks.into()),
+                head_sha: Some("abcdef1".into()),
+                head_committed_at: Some("2020-01-01T00:00:00Z".into()),
+                reviewers: vec!["maria".into()],
+                open: true,
+                ..Default::default()
+            },
+            threads: vec![],
+            comments: vec![],
+            reviews: vec![],
+        })
+    }
+}
+
 /// Seen live with three repositories: one pull request waiting for a person
 /// put another's running checks on the review cadence (the run ended with
 /// "a review of" the first, and the checks finishing woke nothing).
 #[test]
 fn one_pull_request_waiting_for_a_person_does_not_end_the_poll_on_anothers_checks() {
     use std::sync::atomic::{AtomicU32, Ordering};
-    struct Feed {
-        reads_of_7: AtomicU32,
-    }
-    impl crate::pr_readiness::PrFeed for Feed {
-        fn viewer_login(&self) -> Result<String, String> {
-            Ok("tod-test-user".to_string())
-        }
-        fn snapshot(&self, pr: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
-            use tod_store::github::{PrSnapshot, PrStatus};
-            // #7's checks finish on its third read.
-            let checks = if pr.pr_number == 7 && self.reads_of_7.fetch_add(1, Ordering::SeqCst) < 2 {
-                "pending"
-            } else {
-                "success"
-            };
-            Ok(PrSnapshot {
-                status: PrStatus {
-                    mergeable: Some(true),
-                    mergeable_state: Some("blocked".into()),
-                    behind_by: Some(0),
-                    checks: Some(checks.into()),
-                    head_sha: Some("abcdef1".into()),
-                    head_committed_at: Some("2020-01-01T00:00:00Z".into()),
-                    reviewers: vec!["maria".into()],
-                    open: true,
-                    ..Default::default()
-                },
-                threads: vec![],
-                comments: vec![],
-                reviews: vec![],
-            })
-        }
-    }
     let fx = bare();
     retire_outside_criteria(&fx);
-    let feed = Arc::new(Feed { reads_of_7: AtomicU32::new(0) });
+    let feed = Arc::new(SplitPrReadinessFeed { reads_of_7: AtomicU32::new(0) });
     crate::pr_readiness::set_feed_override(Some(feed.clone()));
     linked_to_prs(
         &fx,
@@ -5663,6 +5665,11 @@ fn unrelated_decisions(fx: &Fixture) -> Vec<tod_store::decisions::Decision> {
 fn failing_check_node(says_unrelated: bool) -> (Fixture, Arc<FailingCheckFeed>, FakeAgent, Arc<std::sync::Mutex<Vec<String>>>) {
     let fx = bare();
     retire_outside_criteria(&fx);
+    let (feed, agent, sent) = failing_check_on(&fx, says_unrelated);
+    (fx, feed, agent, sent)
+}
+
+fn failing_check_on(fx: &Fixture, says_unrelated: bool) -> (Arc<FailingCheckFeed>, FakeAgent, Arc<std::sync::Mutex<Vec<String>>>) {
     std::fs::write(fx.root.join("tod.yml"), "pr_readiness:\n  max_rounds: 2\n").unwrap();
     let feed = Arc::new(FailingCheckFeed {
         fixed: std::sync::atomic::AtomicBool::new(false),
@@ -5677,7 +5684,7 @@ fn failing_check_node(says_unrelated: bool) -> (Fixture, Arc<FailingCheckFeed>, 
         reruns: std::sync::Mutex::new(Vec::new()),
     });
     crate::pr_readiness::set_feed_override(Some(feed.clone()));
-    linked_to_prs(&fx, "pr_review", &["https://github.com/acme/app/pull/42"]);
+    linked_to_prs(fx, "pr_review", &["https://github.com/acme/app/pull/42"]);
     let mut agent = FakeAgent::new(&fx.fleet);
     let sent = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let (fleet, node, log, feed_seen) = (fx.fleet.clone(), fx.node, sent.clone(), feed.clone());
@@ -5710,7 +5717,7 @@ fn failing_check_node(says_unrelated: bool) -> (Fixture, Arc<FailingCheckFeed>, 
                 .unwrap();
         }
     }));
-    (fx, feed, agent, sent)
+    (feed, agent, sent)
 }
 
 fn run_babysitter(fx: &Fixture, agent: &mut FakeAgent) -> Outcome {

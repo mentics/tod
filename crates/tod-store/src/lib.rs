@@ -64,6 +64,11 @@ pub mod node_problems;
 pub mod node_requests;
 pub mod run_state;
 pub mod waits;
+pub mod workflow_run;
+mod workflow_user_move;
+pub mod workflow_actions;
+pub mod workflow_catalog;
+pub mod workflow_migration;
 
 /// Agent launch options and live traffic counters live in `tod-agent` (they
 /// describe how a session is started and how it is doing, not how it is

@@ -258,7 +258,8 @@ impl<'a> NodeRepo<'a> {
                -- When the node entered this state: setting the state it is
                -- already in does not start a new stay (`crate::phase`).
                updated_at = CASE WHEN node_lifecycle.state = excluded.state
-                                 THEN node_lifecycle.updated_at ELSE excluded.updated_at END",
+                                 THEN node_lifecycle.updated_at ELSE excluded.updated_at END,
+               stay_generation = node_lifecycle.stay_generation + (node_lifecycle.state <> excluded.state)",
             params![uuid_to_blob(node_id), state, now],
         )?;
         // Moving back restarts from there: what certified the states being
@@ -304,7 +305,8 @@ impl<'a> NodeRepo<'a> {
         // Strictly later than anything the old stay recorded, even in the
         // same millisecond.
         self.conn.execute(
-            "UPDATE node_lifecycle SET updated_at = MAX(?2, updated_at + 1) WHERE node_id = ?1",
+            "UPDATE node_lifecycle SET updated_at = MAX(?2, updated_at + 1),
+                stay_generation = stay_generation + 1 WHERE node_id = ?1",
             params![uuid_to_blob(node_id), now_ms()],
         )?;
         crate::waits::cancel_for_node(self.conn, node_id, &format!("{state} was run again"))?;
