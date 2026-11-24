@@ -22,7 +22,9 @@ fn local_dir() -> Option<PathBuf> {
         .clone()
 }
 
-pub(crate) fn resolve_bin() -> Result<PathBuf> {
+/// Ensure the adapter is available on this machine, installing or refreshing
+/// tod's managed copy when needed. Also used by the app's startup check.
+pub fn resolve_bin() -> Result<PathBuf> {
     if let Some(bin) = std::env::var_os(BIN_ENV).filter(|value| !value.is_empty()) {
         return Ok(bin.into());
     }

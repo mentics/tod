@@ -1403,6 +1403,10 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
         && tod_store::AgentRole::ALL
             .iter()
             .any(|role| app_settings.platform_for(*role) == AgentPlatform::Claude);
+    let uses_openai = !matches!(agent_backend, AgentBackend::Mock)
+        && tod_store::AgentRole::ALL
+            .iter()
+            .any(|role| app_settings.platform_for(*role) == AgentPlatform::OpenAi);
     let agent: SharedAgent = agent_backend.create(traffic_log.clone());
 
     let fleet_open = open_fleet_store(traffic_log.clone());
@@ -1724,6 +1728,26 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 });
                             })
                             .detach();
+                            // Codex ACP is managed by tod and normally installed on
+                            // first use. Check it now so setup errors are visible
+                            // before an OpenAI agent is started.
+                            if uses_openai {
+                                let adapter_entity = cx.weak_entity();
+                                let check = cx.background_spawn(async {
+                                    tod_agent::codex_adapter::resolve_bin()
+                                });
+                                cx.spawn(async move |_, cx| {
+                                    if let Err(err) = check.await {
+                                        let _ = adapter_entity.update(cx, |shell, cx| {
+                                            shell.queue_error_toast(
+                                                format!("Could not set up the OpenAI ACP adapter: {err:#}"),
+                                                cx,
+                                            );
+                                        });
+                                    }
+                                })
+                                .detach();
+                            }
                             #[cfg(feature = "agent-socket")]
                             {
                                 if let Ok(mut slot) = shell_for_socket.lock() {
