@@ -432,12 +432,54 @@ fn parse_inspect(item: &Value) -> ContainerInfo {
     }
 }
 
+/// How long `docker inspect` may take for [`started_at_ms`]: a hung daemon
+/// must not hold up whoever is measuring.
+pub const INSPECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
+fn drain(mut pipe: impl std::io::Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = pipe.read_to_end(&mut buf);
+        buf
+    })
+}
+
 /// When `container` last started, read now from `docker inspect` (never the
 /// cache: the measure of an auth failure after a restart needs the real
-/// time). An error says why it could not be read.
+/// time), giving up after [`INSPECT_TIMEOUT`]. An error says why it could not
+/// be read, a timeout included.
 pub fn started_at_ms(container: &str) -> Result<i64> {
-    let info = inspect(container)?;
-    info.started_at_ms
+    validate_container_ref(container)?;
+    let mut child = docker_command()?
+        .args(["inspect", "--type", "container", container])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| "run docker (is Docker installed and running?)")?;
+    let out = drain(child.stdout.take().context("docker inspect stdout")?);
+    let err = drain(child.stderr.take().context("docker inspect stderr")?);
+    let deadline = std::time::Instant::now() + INSPECT_TIMEOUT;
+    let status = loop {
+        if let Some(status) = child.try_wait().context("wait for docker inspect")? {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("docker inspect of `{container}` timed out after {}s", INSPECT_TIMEOUT.as_secs());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let out = out.join().unwrap_or_default();
+    let err = err.join().unwrap_or_default();
+    if !status.success() {
+        bail!("No container named `{container}` (docker: {})", String::from_utf8_lossy(&err).trim());
+    }
+    let value: Value = serde_json::from_slice(&out).context("parse docker inspect")?;
+    let item = value.as_array().and_then(|items| items.first()).context("docker inspect returned nothing")?;
+    parse_inspect(item)
+        .started_at_ms
         .with_context(|| format!("docker inspect of `{container}` gave no State.StartedAt"))
 }
 

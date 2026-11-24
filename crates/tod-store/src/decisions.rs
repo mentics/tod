@@ -418,6 +418,12 @@ pub struct NewDecision {
     /// for none.
     #[serde(default)]
     pub cause: String,
+    /// Where the asking node's agent runs, resolved by the caller before the
+    /// write when this is an `access`/`broken` request whose error is an auth
+    /// failure ([`crate::incidents::request_needs_environment`]); the writer
+    /// never resolves it (that is a `docker inspect`). Not stored.
+    #[serde(default)]
+    pub environment: Option<crate::incidents::EnvironmentSeen>,
 }
 
 /// `decision_answers.decided_by`: the user picked an option or settled it in

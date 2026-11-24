@@ -314,8 +314,8 @@ pub enum Op {
         operation: String,
         error: String,
         now: i64,
-        /// Where the node's agent runs; read from the node's location when
-        /// absent.
+        /// Where the node's agent runs, resolved before the write; unknown
+        /// when absent.
         #[serde(default)]
         environment: Option<EnvironmentSeen>,
     },
@@ -730,9 +730,10 @@ pub fn auth_by_environment(
 
 /// The one place every source of a failure ends (a turn, GitHub, a tool, an
 /// agent-filed request): an `auth` one is logged in `incident_auth_failures`
-/// with `environment`, or with the node's own as the store reads it
-/// ([`environment_for_node`]) when the caller gave none, so no path skips the
-/// measure.
+/// with `environment`, or as unknown (with the reason) when the caller gave
+/// none, so no path skips the measure. This runs on the single writer, so it
+/// never resolves an environment itself (that is a `docker inspect`): callers
+/// resolve it first.
 #[allow(clippy::too_many_arguments)]
 fn observe_classified(
     conn: &Connection,
@@ -746,14 +747,8 @@ fn observe_classified(
 ) -> Result<Observed> {
     let observed = observe_classified_inner(conn, node, c, operation, error, now, decision)?;
     if c.kind == Kind::Auth {
-        let resolved;
-        let env = match environment {
-            Some(env) => env,
-            None => {
-                resolved = environment_for_node(conn, node);
-                &resolved
-            }
-        };
+        let unresolved = EnvironmentSeen::unresolved();
+        let env = environment.unwrap_or(&unresolved);
         conn.execute(
             "INSERT INTO incident_auth_failures
                  (seen_at, node_id, signature, operation, env_kind, env_name, env_started_at, env_start_unknown, incident_id)
@@ -774,24 +769,48 @@ fn observe_classified(
     Ok(observed)
 }
 
-/// The environment `node`'s agent runs in and when it last started, read from
-/// the node's Files location (a container's start from `docker inspect`).
-/// Anything that cannot be read is recorded as unknown with the reason, never
-/// guessed.
-pub fn environment_for_node(conn: &Connection, node: Uuid) -> EnvironmentSeen {
+/// Whether an `access`/`broken` request carrying `error` is an `auth` failure,
+/// so its caller should resolve the environment ([`environment_target`],
+/// [`environment_resolved`]) before sending it.
+pub fn request_needs_environment(reason: &str, error: &str) -> bool {
+    use crate::decisions::{REASON_ACCESS, REASON_BROKEN};
+    let reason = reason.trim();
+    (reason == REASON_ACCESS || reason == REASON_BROKEN)
+        && !error.trim().is_empty()
+        && classify(Source::AgentRequest, error).kind == Kind::Auth
+}
+
+/// Where `node`'s agent runs, `(kind, name)`, from its Files location: a read
+/// only, no Docker (run it on a reader, never the writer). `Err` is the
+/// environment as unknown, with the reason.
+pub fn environment_target(conn: &Connection, node: Uuid) -> std::result::Result<(&'static str, String), EnvironmentSeen> {
     use crate::fleet::dev_container::environment_label;
-    let files = match crate::fleet::node_actions::resolve_files_for_node(conn, &node.to_string()) {
-        Ok(files) => files,
-        Err(e) => {
-            let why = format!("could not resolve the node's files: {e:#}");
-            return EnvironmentSeen { kind: "unknown".into(), name: why.clone(), started_at_ms: None, start_unknown: Some(why) };
-        }
-    };
-    let (kind, name) = match files.as_ref().and_then(|f| f.ready_directory()) {
+    let files = crate::fleet::node_actions::resolve_files_for_node(conn, &node.to_string()).map_err(|e| {
+        let why = format!("could not resolve the node's files: {e:#}");
+        EnvironmentSeen { kind: "unknown".into(), name: why.clone(), started_at_ms: None, start_unknown: Some(why) }
+    })?;
+    Ok(match files.as_ref().and_then(|f| f.ready_directory()) {
         Some(cwd) => environment_label(files.as_ref(), &cwd),
         None => ("host", "this machine".to_string()),
-    };
-    environment_seen(kind, name, tod_agent::devcontainer::started_at_ms)
+    })
+}
+
+/// [`environment_target`] with a container's start read from `docker inspect`
+/// (with a timeout; a failure or timeout is an unknown start, with its
+/// reason). Talks to Docker: never inside the writer.
+pub fn environment_resolved(target: std::result::Result<(&'static str, String), EnvironmentSeen>) -> EnvironmentSeen {
+    match target {
+        Ok((kind, name)) => environment_seen(kind, name, tod_agent::devcontainer::started_at_ms),
+        Err(unknown) => unknown,
+    }
+}
+
+impl EnvironmentSeen {
+    /// What a failure is logged with when its caller resolved no environment.
+    pub fn unresolved() -> Self {
+        let why = "no environment was resolved before the write".to_string();
+        Self { kind: "unknown".into(), name: why.clone(), started_at_ms: None, start_unknown: Some(why) }
+    }
 }
 
 /// The environment with its start time read by `start` (a container only).
@@ -926,7 +945,7 @@ pub fn observe_request(
 }
 
 /// [`observe_request`] with the environment of an `auth` failure given (else
-/// read from the node's location).
+/// logged as unknown).
 pub fn observe_request_in(
     conn: &Connection,
     node: Uuid,
@@ -1001,7 +1020,15 @@ pub fn attach_request(
     {
         return Ok(None);
     }
-    let seen = observe_request(conn, node, conversation, "asking the user", &decision.brief.error, now)?;
+    let seen = observe_request_in(
+        conn,
+        node,
+        conversation,
+        "asking the user",
+        &decision.brief.error,
+        now,
+        decision.environment.as_ref(),
+    )?;
     if seen.verdict != Verdict::Parked {
         return Ok(None);
     }

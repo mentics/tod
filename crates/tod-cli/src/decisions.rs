@@ -362,11 +362,32 @@ fn ask(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
     if guard_reask {
         refuse_babysitter_request(inv, node, protocol.as_deref(), &question)?;
     }
+    // An auth failure's environment (and a container's start time, a `docker
+    // inspect`) is read here, before the write: the single writer never waits
+    // on Docker.
+    let environment = if guard_reask && tod_store::incidents::request_needs_environment(&reason, &brief.error) {
+        let target = inv.client().read(|conn| Ok(tod_store::incidents::environment_target(conn, node)));
+        Some(match target {
+            Ok(target) => tod_store::incidents::environment_resolved(target),
+            Err(e) => {
+                let why = format!("could not read the node's location: {e:#}");
+                tod_store::incidents::EnvironmentSeen {
+                    kind: "unknown".into(),
+                    name: why.clone(),
+                    started_at_ms: None,
+                    start_unknown: Some(why),
+                }
+            }
+        })
+    } else {
+        None
+    };
     let result = inv.client().interview(InterviewCommand::AskDecision {
         node_id: node,
         conversation_id,
         protocol,
         decision: NewDecision {
+            environment,
             question,
             options,
             evidence,

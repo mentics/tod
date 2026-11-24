@@ -183,7 +183,7 @@ pub fn classify(source: Source, error: &str) -> Classification {
     if lower.contains("blaxel") && has(&lower, &["401", "unauthorized", "authentication", "invalid api key"]) {
         return named(Kind::Auth, "blaxel", "Blaxel auth failing");
     }
-    if matches!(source, Source::Agent)
+    if matches!(source, Source::Agent | Source::AgentRequest)
         && has(
             &lower,
             &[
@@ -296,6 +296,11 @@ mod tests {
         }
         assert_eq!(classify(Source::Other, "An error occurred (ExpiredToken) when calling").signature, "auth:aws");
         assert_eq!(classify(Source::Agent, "Invalid API key · Please run /login").signature, "auth:agent");
+        // The same login texts in an agent-filed request (Claude's and Codex's).
+        for text in ["Invalid API key · Please run /login", "Codex: you are not signed in. Run `codex login`", "Failed to authenticate. API Error: 401"] {
+            let c = classify(Source::AgentRequest, text);
+            assert_eq!((c.kind, c.signature.as_str()), (Kind::Auth, "auth:agent"), "{text}");
+        }
     }
 
     #[test]
