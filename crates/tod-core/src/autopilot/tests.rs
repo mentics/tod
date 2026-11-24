@@ -3857,6 +3857,32 @@ fn a_fix_that_could_not_start_is_not_a_fix_that_changed_nothing() {
 }
 
 #[test]
+fn checks_saved_as_sent_before_any_agent_ran_are_sent_again_not_stopped_on_old_words() {
+    // Gap 111: a run saved by a build older than gap 109 holds the failing
+    // checks as sent although the quick fix only ever errored (no agent in the
+    // container). Resumed, the new build stopped at once as "changed nothing",
+    // quoting that old error, with no agent started.
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    let workspace = with_check(&fx, "review", "ok file", OK_FILE_CHECK);
+    let mut broken = FakeAgent::new(&fx.fleet);
+    broken.fail_turns = Some("No Claude ACP agent in dev container `c`".into());
+    autopilot(&fx, Budget::default()).run(&fx.fleet, &mut broken).unwrap();
+    let round = crate::checks::run_stale_notifying(&fx.fleet, fx.node, "review", &mut |_| {}).unwrap();
+    let mut saved = AutopilotState::load(&fx.root, fx.node).unwrap();
+    saved.loops.checks_sent = Some(round.fingerprint.clone());
+    saved.loops.check_rounds = 1;
+    saved.outcome = None;
+    saved.save(&fx.root, fx.node).unwrap();
+    let mut pilot = autopilot(&fx, Budget::default());
+    let mut agent = FakeAgent::new(&fx.fleet);
+    agent.fix_writes = Some((workspace.join("ok.txt"), "fixed".into()));
+    agent.quick_fix_writes = Some((workspace.join("ok.txt"), "fixed".into()));
+    let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
+    assert_eq!(outcome, Outcome::Done, "{outcome:?} {:#?}", pilot.state().steps);
+}
+
+#[test]
 fn the_unfixed_stop_says_what_the_agent_said() {
     let said = "ruff is not installed in this container".to_string();
     let words = NeedsHuman::ChecksUnfixed { failing: vec!["lint".into()], said }.describe();
