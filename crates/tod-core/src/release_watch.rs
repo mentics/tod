@@ -11,6 +11,29 @@
 use chrono::{DateTime, FixedOffset};
 use tod_store::github::{NodePr, PrMerge, Release};
 
+pub(crate) enum Inclusion {
+    MergedWithoutRelease,
+    Published(Release),
+    Pending,
+}
+
+/// Check release policy and evidence for one merged change.
+pub(crate) fn inclusion(
+    feed: &dyn crate::pr_readiness::PrFeed,
+    pr: &NodePr,
+    merge: &PrMerge,
+    profile: tod_store::RepoProfile,
+) -> Result<Inclusion, String> {
+    if profile == tod_store::RepoProfile::Merge {
+        return Ok(Inclusion::MergedWithoutRelease);
+    }
+    let releases = feed.releases(pr, merge)?;
+    Ok(match release_carrying(pr, merge, &releases) {
+        Some(release) => Inclusion::Published(release.clone()),
+        None => Inclusion::Pending,
+    })
+}
+
 /// The newest release in `releases` (newest first, as GitHub lists them)
 /// whose notes name `pr`, by its title or by a link or `#number` reference,
 /// and that was published after `pr` was merged. `None` while no release does.

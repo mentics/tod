@@ -5139,6 +5139,7 @@ dependencies = [
  "tod-palette",
  "tod-store",
  "tokio",
+ "uuid",
  "zgx",
  "zgx-desktop",
  "zgx-script",

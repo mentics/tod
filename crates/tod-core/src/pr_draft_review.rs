@@ -585,34 +585,24 @@ pub fn reviews_since(conn: &Connection, node: Uuid, since_ms: i64) -> Result<Vec
     Ok(out)
 }
 
-/// What the review of a change made in `pr_draft` does next.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChangeStep {
-    /// Review the change (again).
-    Review,
-    /// Resolve the latest review's open findings.
-    Fix,
-    /// The latest review recorded nothing that stands.
-    Clean,
-}
+/// Next work in the review cycle for a change made at `since_ms`.
+/// `None` means the review cleared the change for push.
+pub fn change_step(
+    conn: &Connection,
+    node: Uuid,
+    since_ms: i64,
+) -> Result<Option<crate::lifecycle::flow::WorkAction>> {
+    use crate::lifecycle::flow::REVIEW_CYCLE;
 
-/// [`ChangeStep`] for the change made at `since_ms`, decided as `review`
-/// decides its own (`crate::lifecycle_next::next_step`): no finished review
-/// of it yet, review; the latest left findings open, fix; it recorded
-/// nothing that stands, clean; otherwise (its findings answered by the
-/// fixer, whose claim is not the verdict) review again.
-pub fn change_step(conn: &Connection, node: Uuid, since_ms: i64) -> Result<ChangeStep> {
     let Some(latest) = reviews_since(conn, node, since_ms)?.pop() else {
-        return Ok(ChangeStep::Review);
+        return Ok(Some(REVIEW_CYCLE.check));
     };
     if !tod_store::review::round::done(conn, latest.id)? {
-        return Ok(ChangeStep::Review);
+        return Ok(Some(REVIEW_CYCLE.check));
     }
     let findings = own_findings(conn, node)?;
-    if findings.iter().any(|f| f.created_at >= latest.created_at && f.is_open()) {
-        return Ok(ChangeStep::Fix);
-    }
-    Ok(if round_clean(&findings, &latest) { ChangeStep::Clean } else { ChangeStep::Review })
+    let open = findings.iter().any(|f| f.created_at >= latest.created_at && f.is_open());
+    Ok(REVIEW_CYCLE.next(true, open, round_clean(&findings, &latest)))
 }
 
 /// What the latest review of the change made at `since_ms` left standing, in

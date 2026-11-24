@@ -368,7 +368,7 @@ pub fn for_remote_agent(context: String) -> String {
     }
 }
 
-fn render_block(block: DynamicBlock, ctx: &DynamicContext<'_>, out: &mut String) {
+pub(crate) fn render_block(block: DynamicBlock, ctx: &DynamicContext<'_>, out: &mut String) {
     match block {
         DynamicBlock::DataRoot => {
             let Some(root) = ctx.data_root else { return };

@@ -1,6 +1,11 @@
 mod collection;
+mod lifecycle;
+mod lifecycle_editor;
 #[cfg(feature = "live")]
 mod live;
+#[cfg(feature = "live")]
+mod workflow_assets;
+mod workflow_runs;
 mod workspace;
 
 use std::{
@@ -33,12 +38,26 @@ const RESULTS_HEIGHT: f32 = 319.;
 enum Surface {
     Workspace,
     Collections,
+    Lifecycle,
+    Workflows,
+    WorkflowRun,
+    #[cfg(feature = "live")]
+    WorkflowActions,
 }
 
 #[derive(Clone)]
 struct App {
     workspace: Signal<Workspace>,
     collections: Option<collection::Panels>,
+    lifecycle: lifecycle::Panel,
+    workflow_editor: lifecycle_editor::Editor,
+    workflow_runs: workflow_runs::Panel,
+    #[cfg(feature = "live")]
+    workflow_assets: workflow_assets::Panel,
+    #[cfg(feature = "live")]
+    draft_generation: Rc<RefCell<Option<(String, u64)>>>,
+    #[cfg(feature = "live")]
+    workflow_busy: Signal<bool>,
     #[cfg(feature = "live")]
     outline: Option<collection::OutlinePanel>,
     surface: Signal<Surface>,
@@ -166,6 +185,285 @@ impl App {
     fn show_workspace(&self) {
         self.surface.set(Surface::Workspace);
         self.focus_list();
+    }
+
+    fn show_lifecycle(&self) {
+        if self.surface.get() == Surface::Lifecycle || self.lifecycle.busy.get() {
+            return;
+        }
+        #[cfg(feature = "live")]
+        let outlined = if self.surface.get() == Surface::Collections {
+            self.outline
+                .as_ref()
+                .and_then(|outline| outline.palette_context()?.focused)
+        } else {
+            None
+        };
+        #[cfg(not(feature = "live"))]
+        let outlined: Option<String> = None;
+        #[cfg(feature = "live")]
+        let live = self.backend.is_some();
+        #[cfg(not(feature = "live"))]
+        let live = false;
+        let snapshot = self.workspace.with(|workspace| {
+            let id = outlined.as_deref().unwrap_or(&workspace.detail);
+            workspace
+                .record(id)
+                .filter(|record| {
+                    use tod_palette::Kind::*;
+                    record.item.kind == Task
+                        || (live && matches!(record.item.kind, Node | ProductDefinition))
+                })
+                .map(|record| (id.to_owned(), record.item.title.clone()))
+        });
+        self.surface.set(Surface::Lifecycle);
+        #[cfg(feature = "live")]
+        if let (Some(backend), Some((id, title))) = (&self.backend, snapshot.as_ref()) {
+            self.lifecycle.open(lifecycle::Data {
+                node: Some(id.clone()),
+                title: title.clone(),
+                ..Default::default()
+            });
+            self.lifecycle.busy.set(true);
+            self.lifecycle
+                .notice
+                .set("Loading lifecycle details…".into());
+            let task = backend.load_lifecycle(id.clone());
+            let panel = self.lifecycle.clone();
+            self.tasks.spawn(async move {
+                let result = task.await;
+                panel.busy.set(false);
+                match result {
+                    Ok(Ok(data)) => panel.open(data),
+                    Ok(Err(error)) => {
+                        panel.notice.set(error);
+                    }
+                    Err(error) => {
+                        panel
+                            .notice
+                            .set(format!("Could not load lifecycle details. {error}"));
+                    }
+                }
+            });
+            return;
+        }
+        let mut data = lifecycle::Data::default();
+        if let Some((_, title)) = snapshot {
+            data.title = title;
+            data.phase = "review".into();
+        }
+        self.lifecycle.open(data);
+    }
+
+    fn show_workflows(&self) {
+        self.surface.set(Surface::Workflows);
+        self.workflow_event(lifecycle_editor::Event::Refresh);
+    }
+
+    fn workflow_event(&self, event: lifecycle_editor::Event) {
+        #[cfg(feature = "live")]
+        if matches!(event, lifecycle_editor::Event::ManageActions) && self.backend.is_some() {
+            self.surface.set(Surface::WorkflowActions);
+            self.workflow_assets_command(workflow_assets::Command::Load);
+            return;
+        }
+        #[cfg(feature = "live")]
+        if let Some(backend) = &self.backend {
+            if self.workflow_busy.get() {
+                return;
+            }
+            let submitted = match &event {
+                lifecycle_editor::Event::Save { definition, .. }
+                | lifecycle_editor::Event::Publish { definition, .. } => Some(definition.clone()),
+                _ => None,
+            };
+            let generation = submitted.as_ref().and_then(|definition| {
+                self.draft_generation
+                    .borrow()
+                    .as_ref()
+                    .filter(|(id, _)| id == &definition.revision.id)
+                    .map(|(_, generation)| *generation)
+            });
+            self.workflow_busy.set(true);
+            self.workflow_editor.set_busy(true);
+            let task = backend.workflow_catalog(event, generation);
+            let app = self.clone();
+            self.tasks.spawn(async move {
+                let result = task.await;
+                app.workflow_busy.set(false);
+                app.workflow_editor.set_busy(false);
+                match result {
+                    Ok(Ok(update)) => {
+                        if let Some(draft) = update.draft {
+                            app.draft_generation.replace(Some((
+                                draft.definition.revision.id.clone(),
+                                draft.generation,
+                            )));
+                            if let Some(submitted) = submitted {
+                                app.workflow_editor.accept_saved(
+                                    draft.title,
+                                    draft.definition,
+                                    submitted,
+                                );
+                            } else {
+                                app.workflow_editor.open(draft.title, draft.definition);
+                            }
+                        }
+                        app.workflow_editor.update_library(update.library);
+                        app.workflow_editor.set_actions(update.actions);
+                        app.workflow_editor.status(update.notice);
+                    }
+                    Ok(Err(error)) => app.workflow_editor.status(error),
+                    Err(error) => app
+                        .workflow_editor
+                        .status(format!("Workflow catalog failed. {error}")),
+                }
+            });
+            return;
+        }
+        if !matches!(event, lifecycle_editor::Event::Refresh) {
+            self.workflow_editor
+                .status("Open a live TOD data root to save workflow drafts.".into());
+        }
+    }
+
+    #[cfg(feature = "live")]
+    fn workflow_assets_command(&self, command: workflow_assets::Command) {
+        let Some(backend) = &self.backend else { return };
+        if self.workflow_assets.busy.get() {
+            return;
+        }
+        let panel = self.workflow_assets.clone();
+        let editor = self.workflow_editor.clone();
+        panel.busy.set(true);
+        panel.status.set(String::new());
+        let task = backend.workflow_assets(command);
+        self.tasks.spawn(async move {
+            let result = task.await;
+            panel.busy.set(false);
+            match result {
+                Ok(Ok(update)) => {
+                    editor.set_actions(
+                        update
+                            .library
+                            .iter()
+                            .map(|asset| (asset.spec.title.clone(), asset.revision.clone()))
+                            .collect(),
+                    );
+                    panel.library.set(update.library);
+                    if let Some(history) = update.history {
+                        panel.history.set(history);
+                    }
+                    if let Some(saved) = update.saved {
+                        panel.status.set(format!(
+                            "Published action revision {}.",
+                            saved.revision.number
+                        ));
+                        panel.open_published(saved);
+                    }
+                }
+                Ok(Err(error)) => {
+                    panel.status.set(error);
+                }
+                Err(error) => {
+                    panel.status.set(format!("Agent actions failed. {error}"));
+                }
+            }
+        });
+    }
+
+    fn show_workflow_run(&self) {
+        if self.workflow_runs.busy.get() {
+            return;
+        }
+        let task = self
+            .lifecycle
+            .data
+            .with(|data| data.node.clone().map(|id| (id, data.title.clone())));
+        self.surface.set(Surface::WorkflowRun);
+        self.workflow_runs.open(task);
+        self.workflow_run_command(workflow_runs::Command::Load);
+    }
+
+    fn workflow_run_command(&self, command: workflow_runs::Command) {
+        #[cfg(feature = "live")]
+        if let (Some(backend), Some((task, title))) = (&self.backend, self.workflow_runs.task.get())
+        {
+            if self.workflow_runs.busy.get() {
+                return;
+            }
+            let panel = self.workflow_runs.clone();
+            panel.busy.set(true);
+            panel.notice.set(String::new());
+            let expected = task.clone();
+            let operation = backend.workflow_run(task, title, command);
+            self.tasks.spawn(async move {
+                let outcome = operation.await;
+                panel.busy.set(false);
+                if !panel
+                    .task
+                    .with(|task| task.as_ref().is_some_and(|(id, _)| id == &expected))
+                {
+                    return;
+                }
+                match outcome {
+                    Ok(Ok((snapshot, notice))) => {
+                        panel.state.set(snapshot);
+                        panel.notice.set(notice);
+                    }
+                    Ok(Err(error)) => {
+                        panel.notice.set(error);
+                    }
+                    Err(error) => {
+                        panel.notice.set(format!("Workflow action failed. {error}"));
+                    }
+                }
+            });
+            return;
+        }
+        let _ = command;
+    }
+
+    fn save_lifecycle_agent(
+        &self,
+        key: &'static str,
+        skills: Option<String>,
+        model: String,
+        effort: String,
+    ) {
+        #[cfg(feature = "live")]
+        if let (Some(backend), Some(id)) = (
+            &self.backend,
+            self.lifecycle.data.with(|data| data.node.clone()),
+        ) {
+            if self.lifecycle.busy.get() {
+                return;
+            }
+            let panel = self.lifecycle.clone();
+            panel.busy.set(true);
+            panel.notice.set("Saving…".into());
+            let task = backend.save_lifecycle_agent(id, key, skills, model, effort);
+            self.tasks.spawn(async move {
+                let result = task.await;
+                panel.busy.set(false);
+                match result {
+                    Ok(Ok(data)) => {
+                        panel.data.set(data);
+                        panel.saved();
+                    }
+                    Ok(Err(error)) => {
+                        panel.notice.set(error);
+                    }
+                    Err(error) => {
+                        panel
+                            .notice
+                            .set(format!("Could not save lifecycle settings. {error}"));
+                    }
+                }
+            });
+            return;
+        }
+        let _ = (key, skills, model, effort);
     }
 
     fn escape(&self) {
@@ -800,6 +1098,15 @@ fn mount(
     let app = App {
         workspace: cx.ui.signal(workspace),
         collections: collection_data.map(|data| collection::Panels::new(cx, data)),
+        lifecycle: lifecycle::Panel::new(cx),
+        workflow_editor: lifecycle_editor::Editor::new(cx),
+        workflow_runs: workflow_runs::Panel::new(cx),
+        #[cfg(feature = "live")]
+        workflow_assets: workflow_assets::Panel::new(cx),
+        #[cfg(feature = "live")]
+        draft_generation: Default::default(),
+        #[cfg(feature = "live")]
+        workflow_busy: cx.ui.signal(false),
         #[cfg(feature = "live")]
         outline,
         surface: cx.ui.signal(Surface::Workspace),
@@ -816,15 +1123,57 @@ fn mount(
         #[cfg(feature = "live")]
         tasks: cx.tasks.clone(),
     };
+    app.workflow_editor
+        .set_starter(tod_core::lifecycle::workflow::builtin::review_workflow());
+    let workflow_surface = app.surface.clone();
+    let workflow_actions = app.clone();
+    let workflow_tab = app.clone();
+    let run_surface = app.surface.clone();
     let shortcut = app.clone();
     let search = app.clone();
     let context = app.clone();
     let message = app.workspace.clone();
     let tasks_screen = app.surface.clone();
-    let mut screens = overlay().grow().min_h(0.).child(
-        workspace_view(&app)
-            .reactive_style(move || surface_style(&tasks_screen, Surface::Workspace)),
-    );
+    let lifecycle_screen = app.surface.clone();
+    let lifecycle_tab = app.clone();
+    let mut screens = overlay()
+        .grow()
+        .min_h(0.)
+        .child(
+            workspace_view(&app)
+                .reactive_style(move || surface_style(&tasks_screen, Surface::Workspace)),
+        )
+        .child(
+            app.lifecycle
+                .view(&app)
+                .reactive_style(move || surface_style(&lifecycle_screen, Surface::Lifecycle)),
+        )
+        .child(
+            app.workflow_editor
+                .view(move |event| workflow_actions.workflow_event(event))
+                .reactive_style(move || surface_style(&workflow_surface, Surface::Workflows)),
+        )
+        .child(
+            app.workflow_runs
+                .view(&app)
+                .reactive_style(move || surface_style(&run_surface, Surface::WorkflowRun)),
+        );
+    #[cfg(feature = "live")]
+    {
+        let actions = app.clone();
+        let back = app.clone();
+        let active = app.surface.clone();
+        screens = screens.child(
+            app.workflow_assets
+                .view(
+                    move |action| actions.workflow_assets_command(action),
+                    move || {
+                        back.surface.set(Surface::Workflows);
+                    },
+                )
+                .reactive_style(move || surface_style(&active, Surface::WorkflowActions)),
+        );
+    }
     let mut header = row()
         .items_center()
         .gap(10.)
@@ -846,8 +1195,39 @@ fn mount(
         );
         header = header.child(surface_tabs(&app));
     } else {
-        header = header.child(text(app.workspace.with(Workspace::label)).text_color(rgb(MUTED)));
+        let tasks = app.clone();
+        header = header.child(
+            control("Tasks")
+                .id("show-tasks")
+                .on_click(move || tasks.show_workspace()),
+        );
     }
+    let active = app.surface.clone();
+    header = header.child(
+        control("Lifecycle")
+            .id("show-lifecycle")
+            .reactive_style(move || {
+                Styles::new().bg(rgb(if active.get() == Surface::Lifecycle {
+                    ACCENT
+                } else {
+                    PANEL
+                }))
+            })
+            .on_click(move || lifecycle_tab.show_lifecycle()),
+    );
+    let active_workflows = app.surface.clone();
+    header = header.child(
+        control("Workflows")
+            .id("show-workflows")
+            .reactive_style(move || {
+                Styles::new().bg(rgb(if active_workflows.get() == Surface::Workflows {
+                    ACCENT
+                } else {
+                    PANEL
+                }))
+            })
+            .on_click(move || workflow_tab.show_workflows()),
+    );
     let view = cx.render(
         column()
             .takes_unfocused_keys()

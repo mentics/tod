@@ -305,6 +305,8 @@ pub struct RunFacts {
     pub permission: Option<(String, i64)>,
     /// How the last run ended, and when.
     pub last_outcome: Option<(Outcome, i64)>,
+    /// The outcome comes from the current durable graph visit.
+    pub workflow_wait: bool,
 }
 
 /// A cloud node whose sandbox is gone (`cloud_nodes.lost_at`).
@@ -500,9 +502,12 @@ pub fn compute_in(conn: &Connection, data_root: &std::path::Path) -> Result<Hash
             .filter(|row| row.lost_at.is_none())
             .map(|row| row.node_id)
             .collect();
+        let timed_workflows: std::collections::HashSet<_> =
+            tod_store::workflow_run::scheduled_tasks(conn)?.into_iter().collect();
         for node in with_lifecycle.keys().filter(|n| !in_cloud.contains(n)) {
             let path = state_path(data_root, *node);
-            if !path.exists() {
+            let saved = path.exists().then(|| AutopilotState::load(data_root, *node));
+            if saved.is_none() && !timed_workflows.contains(node) {
                 continue;
             }
             let at = std::fs::metadata(&path)
@@ -510,12 +515,30 @@ pub fn compute_in(conn: &Connection, data_root: &std::path::Path) -> Result<Hash
                 .ok()
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map_or(now_ms, |d| d.as_millis() as i64);
-            let outcome = match AutopilotState::load(data_root, *node) {
-                Ok(state) => state.outcome,
-                Err(err) => Some(Outcome::Stopped { reason: format!("{FAILED_PREFIX}{err:#}") }),
+            let current_workflow_wait = || -> Result<Option<(Outcome, i64)>> {
+                if !timed_workflows.contains(node)
+                    || !tod_store::workflow_run::allows_local_execution(conn, *node)?
+                {
+                    return Ok(None);
+                }
+                Ok(tod_store::workflow_run::scheduled_wait(conn, *node)?.map(|wait| {
+                    (
+                        Outcome::Waiting { what: wait.schedule.what, due_at_ms: wait.schedule.due_at_ms },
+                        wait.recorded_at,
+                    )
+                }))
+            };
+            let (outcome, workflow_wait) = match saved {
+                None => (current_workflow_wait()?, true),
+                Some(Ok(state)) => match state.outcome {
+                    None => (current_workflow_wait()?, true),
+                    Some(Outcome::Waiting { .. }) if state.workflow_wait.is_some() => (current_workflow_wait()?, true),
+                    outcome => (outcome.map(|outcome| (outcome, at)), false),
+                },
+                Some(Err(err)) => (Some((Outcome::Stopped { reason: format!("{FAILED_PREFIX}{err:#}") }, at)), false),
             };
             if let Some(outcome) = outcome {
-                inputs.runs.insert(*node, RunFacts { last_outcome: Some((outcome, at)), ..Default::default() });
+                inputs.runs.insert(*node, RunFacts { last_outcome: Some(outcome), workflow_wait, ..Default::default() });
             }
         }
         for_nodes(conn, &ids, &inputs)
@@ -648,6 +671,9 @@ fn starting_row<'a>(facts: &Facts<'a>) -> Option<&'a RunState> {
 fn run_end(facts: &Facts<'_>) -> Option<(YouReason, i64)> {
     let run = facts.run;
     let run_state = facts.run_state;
+    let superseded_by_workflow = |at| {
+        run.workflow_wait && run.last_outcome.as_ref().is_some_and(|(_, recorded_at)| at <= *recorded_at)
+    };
     // Sent to the cloud and nothing reported in for longer than a boot and a
     // seed may take: a failure that says so (never the silence of "not
     // started"). Within that time it is `Working` (`actor_for`), not an end.
@@ -723,7 +749,9 @@ fn run_end(facts: &Facts<'_>) -> Option<(YouReason, i64)> {
     }
     // Processing that stopped answering: its owner died or hung. Said, not
     // left to look like nothing is happening.
-    if let Some(lease) = facts.leases.iter().filter(|l| l.is_lifecycle()).find(|l| !l.is_live(facts.now_ms)) {
+    if let Some(lease) = facts.leases.iter().find(|lease| {
+        lease.is_lifecycle() && !lease.is_live(facts.now_ms) && !superseded_by_workflow(lease.heartbeat_at)
+    }) {
         let error = format!(
             "processing was lost: {} held by {} stopped responding {} ago",
             lease.kind,
@@ -737,6 +765,7 @@ fn run_end(facts: &Facts<'_>) -> Option<(YouReason, i64)> {
     // shown as working. The stale-lease case above words its own error; this
     // is the row with no lease left at all.
     if let Some(row) = run_state
+        && !superseded_by_workflow(row.updated_at)
         && let Some(ghost) = crate::run_state::ghost_working(row, facts.leases, facts.now_ms)
     {
         return Some((YouReason::Failed { error: ghost.describe(row, facts.now_ms) }, ghost.silent_since));

@@ -26,8 +26,14 @@ pub const STARTER: &str = "Investigate the incident below.";
 /// The incident `node`'s session is about: the one claimed for it.
 pub fn incident_for(fleet: &tod_store::fleet::FleetStore, node: Uuid) -> Result<Incident> {
     fleet
-        .read(|conn| Ok(incidents::list_open(conn)?.into_iter().find(|i| i.escalation_node == Some(node) && !i.notice)))?
+        .read(|conn| claimed_for(conn, node))?
         .with_context(|| format!("no incident is claimed for node {node}"))
+}
+
+pub(crate) fn claimed_for(conn: &rusqlite::Connection, node: Uuid) -> Result<Option<Incident>> {
+    Ok(incidents::list_open(conn)?.into_iter().find(|incident| {
+        incident.escalation_node == Some(node) && !incident.notice
+    }))
 }
 
 /// The incident as the session sees it.

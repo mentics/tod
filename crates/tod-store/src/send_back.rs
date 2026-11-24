@@ -492,6 +492,9 @@ pub fn apply_move(conn: &Connection, m: &Move<'_>) -> Result<Option<String>> {
     if before.as_deref() != Some(m.to) {
         crate::decisions::DecisionRepo::new(conn).withdraw_moving_for_node(m.node, m.keep_decision)?;
         if let Some(from) = before.as_deref() {
+            if m.by_user {
+                crate::workflow_user_move::apply(conn, m.node, from, m.to, m.reason)?;
+            }
             crate::lifecycle_reset::rework_after_user_move(conn, m.node, from, m.to, m.reason, m.keep_decision)?;
         }
     }

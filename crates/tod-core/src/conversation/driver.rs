@@ -11,11 +11,14 @@
 //! Nothing runs on its own: there are no automatic turns, no backoff, and no
 //! summaries. A turn starts only from [`ConversationDriver::send`].
 
-use crate::conversation::context::{ReportedStale, focus_selection, last_action_at};
+use crate::conversation::context::{
+    ReportedStale, focus_selection, last_action_at, opening_with, resume_snapshot_with,
+};
 use crate::conversation::protocol::{
     Next, Protocol, ProtocolEnv, RunNotice, TurnContext, protocol_for,
 };
 use crate::conversation::quota;
+use crate::conversation::workflow_context::{ContextUnavailable, WorkflowContext};
 use crate::interview::context::estimate_tokens;
 use crate::media::MediaPaths;
 use crate::session_name::session_name;
@@ -205,6 +208,9 @@ pub struct ConversationDriver {
     last_error: Option<String>,
     live_usage: Option<TokenUsage>,
     launched: Option<AgentLaunchOptions>,
+    /// A versioned workflow action supplies its own launch settings.
+    launch_override: Option<AgentLaunchOptions>,
+    workflow_context: Option<WorkflowContext>,
     /// Where this driver last started a turn (this machine, a dev container,
     /// a sandbox). A live agent session stays where it started, so a turn
     /// that now belongs elsewhere closes it and resumes it there.
@@ -241,6 +247,8 @@ impl ConversationDriver {
             last_error: None,
             live_usage: None,
             launched: None,
+            launch_override: None,
+            workflow_context: None,
             session_place: None,
             notices: Vec::new(),
             lease: None,
@@ -251,6 +259,16 @@ impl ConversationDriver {
     /// instead of the phase agent's own: a session of its own for that group.
     pub fn with_skill_group(mut self, group: usize) -> Self {
         self.skill_group = group;
+        self
+    }
+
+    pub(crate) fn with_launch_override(mut self, launch: AgentLaunchOptions) -> Self {
+        self.launch_override = Some(launch);
+        self
+    }
+
+    pub(crate) fn with_workflow_context(mut self, context: WorkflowContext) -> Self {
+        self.workflow_context = Some(context);
         self
     }
 
@@ -413,6 +431,9 @@ impl ConversationDriver {
     /// [`Self::launch_options`] for a launch: an unreadable setting is an
     /// error, never a quiet change of what the agent runs with.
     fn try_launch_options(&self, fleet: &FleetStore) -> Result<AgentLaunchOptions> {
+        if let Some(launch) = &self.launch_override {
+            return Ok(launch.clone());
+        }
         let kind = self.protocol.kind();
         match &self.config.settings_path {
             Some(path) => crate::conversation::launch::try_resolve_from(fleet, path, self.focus, kind, self.reviewer()),
@@ -428,6 +449,9 @@ impl ConversationDriver {
     /// Lifecycle config's model and effort for the phase over that. Reads
     /// the settings file and the store.
     pub fn launch_options(&self, fleet: &FleetStore) -> AgentLaunchOptions {
+        if let Some(launch) = &self.launch_override {
+            return launch.clone();
+        }
         let kind = self.protocol.kind();
         match &self.config.settings_path {
             Some(path) => crate::conversation::launch::resolve_from(fleet, path, self.focus, kind, self.reviewer()),
@@ -507,6 +531,17 @@ impl ConversationDriver {
         agent: &mut A,
         text: &str,
         images: Vec<PromptImage>,
+    ) -> Result<i64> {
+        self.send_with_prelaunch(fleet, agent, text, images, &mut || Ok(()))
+    }
+
+    pub(crate) fn send_with_prelaunch<A: AgentAccess + ?Sized>(
+        &mut self,
+        fleet: &FleetStore,
+        agent: &mut A,
+        text: &str,
+        images: Vec<PromptImage>,
+        before_launch: &mut dyn FnMut() -> Result<()>,
     ) -> Result<i64> {
         if self.run.is_some() {
             bail!("the agent is still working on the previous message");
@@ -611,6 +646,7 @@ impl ConversationDriver {
                     images.clone(),
                     conversation.agent_session_id.clone().filter(|_| !live),
                     launch.clone(),
+                    Some(before_launch),
                 )
             } else if has_history || switch_session {
                 let reason = if switch_session {
@@ -633,12 +669,13 @@ impl ConversationDriver {
                     reason,
                     marker,
                     launch.clone(),
+                    Some(before_launch),
                 )
             } else {
                 // The first turn: the opening context, then the message.
                 let context = self.with_recent_answers(
                     fleet,
-                    self.protocol.opening(&self.env(fleet, id))?,
+                    self.opening_context(fleet, id)?,
                     text,
                 )?;
                 // Kept so the user can read what the agent was given, with
@@ -665,6 +702,7 @@ impl ConversationDriver {
                     images.clone(),
                     None,
                     launch.clone(),
+                    Some(before_launch),
                 )
             };
             // An agent that takes no images still gets the message: the same
@@ -869,7 +907,7 @@ impl ConversationDriver {
                         launch.platform, limit.reset_at_ms);
                     let destination = next.platform.label();
                     match self.rotate_and_start(fleet, agent, &conversation, run.user_seq, &handoff,
-                        &text, images, "provider quota exhausted", Some(&marker), next)
+                        &text, images, "provider quota exhausted", Some(&marker), next, None)
                     {
                         Ok(()) => {
                             if let Some(run) = &mut self.run {
@@ -998,6 +1036,7 @@ impl ConversationDriver {
                     "sandbox lost",
                     Some(ROTATION_NOTE),
                     self.launched.clone().context("no launch for the turn being retried")?,
+                    None,
                 )?;
                 events.push(ConversationEvent::Rotated);
             }
@@ -1019,6 +1058,7 @@ impl ConversationDriver {
                     "cold resume failed",
                     Some(ROTATION_NOTE),
                     self.launched.clone().context("no launch for the turn being retried")?,
+                    None,
                 )?;
                 events.push(ConversationEvent::Rotated);
             }
@@ -1231,7 +1271,7 @@ impl ConversationDriver {
         if launch.platform != previous.platform {
             let marker = quota_switch_note(previous.platform, launch.platform);
             return self.rotate_and_start(fleet, agent, &conversation, last_seq, "", &message,
-                Vec::new(), "provider quota exhausted", Some(&marker), launch);
+                Vec::new(), "provider quota exhausted", Some(&marker), launch, None);
         }
         let live = agent.with(|a| a.session_id(&Self::session_key(id)).is_some());
         let resume = conversation.agent_session_id.clone().filter(|_| !live);
@@ -1245,6 +1285,7 @@ impl ConversationDriver {
             Vec::new(),
             resume,
             launch,
+            None,
         )
     }
 
@@ -1387,6 +1428,7 @@ impl ConversationDriver {
         reason: &str,
         marker: Option<&str>,
         launch: AgentLaunchOptions,
+        before_launch: Option<&mut dyn FnMut() -> Result<()>>,
     ) -> Result<()> {
         let id = conversation.id;
         agent.with(|a| a.close_session(&Self::session_key(id)));
@@ -1416,12 +1458,13 @@ impl ConversationDriver {
             )?;
         }
         let budget = self.config.context.context_budget_tokens as i64;
-        let context = self.with_recent_answers(
-            fleet,
-            self.protocol
-                .resume_snapshot(&self.env(fleet, id), budget, Some(user_seq))?,
-            text,
-        )?;
+        let env = self.env(fleet, id);
+        let snapshot = if let Some(recipe) = self.workflow_context.as_ref().and_then(WorkflowContext::recipe) {
+            fleet.read(|conn| resume_snapshot_with(conn, env.media, env.data_root, id, budget, Some(user_seq), recipe))?
+        } else {
+            self.protocol.resume_snapshot(&env, budget, Some(user_seq))?
+        };
+        let context = self.with_recent_answers(fleet, snapshot, text)?;
         self.session_tokens = Some(0);
         self.start(
             fleet,
@@ -1433,6 +1476,7 @@ impl ConversationDriver {
             images,
             None,
             launch,
+            before_launch,
         )
     }
 
@@ -1462,6 +1506,7 @@ impl ConversationDriver {
         images: Vec<PromptImage>,
         resume: Option<String>,
         options: AgentLaunchOptions,
+        before_launch: Option<&mut dyn FnMut() -> Result<()>>,
     ) -> Result<()> {
         let id = conversation.id;
         let key = Self::session_key(id);
@@ -1548,6 +1593,13 @@ impl ConversationDriver {
         // it can be a prefix two sessions share.
         let context = match context {
             Some(mut context) => {
+                if let Some(workflow_context) = &self.workflow_context {
+                    let snapshot = workflow_context.render(fleet, &cwd).map_err(ContextUnavailable)?;
+                    if !snapshot.is_empty() {
+                        context.push_str("\n\n");
+                        context.push_str(&snapshot);
+                    }
+                }
                 if let Some(tail) = self.protocol.opening_tail(&self.env(fleet, id))? {
                     context.push_str("\n\n");
                     context.push_str(&tail);
@@ -1569,6 +1621,9 @@ impl ConversationDriver {
                 fleet.paths().root().to_path_buf()
             }
         };
+        if let Some(before_launch) = before_launch {
+            before_launch()?;
+        }
         // Everything sent besides the user's text is kept on the user turn,
         // so the transcript can show it: the opening context or snapshot
         // (only on the turn that actually sent it), then the delta.
@@ -1709,10 +1764,19 @@ impl ConversationDriver {
         Ok(session_name(Some(&surface), &focus.title, chrono::Local::now()))
     }
 
+    fn opening_context(&self, fleet: &FleetStore, id: Uuid) -> Result<String> {
+        let env = self.env(fleet, id);
+        if let Some(recipe) = self.workflow_context.as_ref().and_then(WorkflowContext::recipe) {
+            fleet.read(|conn| opening_with(conn, env.media, env.data_root, id, recipe))
+        } else {
+            self.protocol.opening(&env)
+        }
+    }
+
     /// The session's size when this driver did not see it grow: the opening
     /// (or the latest snapshot) plus every turn since the latest rotation.
     fn estimate_from_transcript(&self, fleet: &FleetStore, id: Uuid) -> Result<i64> {
-        let base = self.protocol.opening(&self.env(fleet, id))?;
+        let base = self.opening_context(fleet, id)?;
         fleet.read(|conn| {
             let turns = ConversationRepo::new(conn).turns(id)?;
             let since = turns

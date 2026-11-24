@@ -61,6 +61,46 @@ the UI thread and use the daemon for local runners. The live outline pane
 is read-only for outline data. The demo exercises editable collection
 configs, pinning, and multi-task chat.
 
+## Lifecycle
+
+Open **Lifecycle** from the window header. The diagram shows the Default
+lifecycle, including review and fix work and the paths that send a task back.
+Select a phase, gate, or return arrow to see its details beside the diagram.
+In a live workspace, the tab uses the item open in Tasks or focused in a
+saved outline. If the item has **Lifecycle config** enabled, the inspector
+can save skills, model, and effort overrides for its agents.
+
+Open **Workflows** to build a draft, load **Review and fix**, or copy the
+operator-driven **Default phases**. Default phases maps the existing phase order
+and shows rework and redesign as explicit routes. Most steps take operator
+confirmation. Its review gate reads the task checkout. Its merge and release
+gates use linked GitHub pull requests and their repository policy.
+**Try automated Default** opens the candidate with native task actions and
+phase mappings. In **Task workflow run**, select a mapped workflow to preview
+adoption at the task's current phase. **Preview return to legacy runner**
+shows what will be preserved before detaching.
+Workflow execution targets local devcontainers. Tasks with a cloud sandbox
+location continue to use their legacy runner.
+The [parity matrix](../../doc/redesign/lifecycle-parity.md) tracks cutover evidence.
+Select an arrow to edit its typed condition. **Data sources** binds declared
+step outputs, current-task fields, linked GitHub pull requests, or typed
+operator observations. Preview walks the graph on supplied values.
+
+In a live data root, save a draft and publish a revision. Use **Agent actions**
+to publish versioned prompts, skill instructions, context, and model settings.
+An action node pins the revision you select. An agent action uses the task's
+configured runner and working files. Add **Runtime context sources** to resolve
+task data, current workflow records, inherited settings, or prior outputs at
+launch. **View recorded context** on the run shows the saved launch input.
+
+Open a task, enter **Lifecycle → Task workflow run**, and assign a published
+revision. Record manual action results or start the configured task runner
+when an agent action is ready. The run view highlights its current node,
+records the observations and route decisions, and supports replay against
+the current draft, metrics by revision, and lessons linked to specific steps,
+rules, sources, prompts, skills, or context. Migration previews a
+restart at the new revision's entry and preserves the old run history.
+
 ## Boundaries
 
 - [tod-palette](../../crates/tod-palette/src/lib.rs) owns targets, ranking,

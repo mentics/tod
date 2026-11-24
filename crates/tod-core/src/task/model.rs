@@ -338,8 +338,7 @@ pub const LIFECYCLE_STATES: [&str; 15] = [
 /// The state one step ahead of `lifecycle` in `LIFECYCLE_STATES`, if any.
 /// Returns `None` for the last state or an unrecognized one.
 pub fn next_lifecycle(lifecycle: &str) -> Option<&'static str> {
-    let rank = lifecycle_rank(lifecycle);
-    LIFECYCLE_STATES.get(rank + 1).copied()
+    crate::lifecycle::flow::next_phase(lifecycle).map(|phase| phase.id)
 }
 
 /// The state one step behind `lifecycle` in `LIFECYCLE_STATES`, if any.

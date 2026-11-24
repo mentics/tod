@@ -573,10 +573,21 @@ pub fn write_file(container: &str, file: &ContainerFile) -> Result<()> {
     if !path.starts_with('/') || path.contains('\'') {
         bail!("not a usable container path: {path}");
     }
-    let dir = path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("/");
+    let dir = path
+        .rsplit_once('/')
+        .map(|(dir, _)| dir)
+        .filter(|dir| !dir.is_empty())
+        .unwrap_or("/");
     let mode = if file.executable { "755" } else { "644" };
     let script = format!(
-        "mkdir -p '{dir}' && chmod 755 '{dir}' && cat > '{path}.tmp' && chmod {mode} '{path}.tmp' && mv -f '{path}.tmp' '{path}'"
+        "set -e\n\
+         mkdir -p '{dir}'\n\
+         chmod 755 '{dir}'\n\
+         tmp=$(mktemp '{path}.tmp.XXXXXXXX')\n\
+         trap 'rm -f \"$tmp\"' 0\n\
+         cat > \"$tmp\"\n\
+         chmod {mode} \"$tmp\"\n\
+         mv -f \"$tmp\" '{path}'"
     );
     let mut child = docker_command()?
         .args(["exec", "-i", "-u", "0", container, "sh", "-c", &script])
@@ -845,6 +856,44 @@ pub fn prepare_sshd(container: &str, user: &str, public_key: &str) -> Result<()>
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Needs `TOD_TEST_DEV_CONTAINER`: a running disposable Docker container.
+    #[test]
+    fn concurrent_installers_write_complete_files_in_a_devcontainer() {
+        let Ok(container) = std::env::var("TOD_TEST_DEV_CONTAINER") else {
+            return;
+        };
+        let dir = format!("/tmp/tod-install-test-{}", uuid::Uuid::new_v4());
+        let path = format!("{dir}/tod-cli");
+        let contents: Vec<_> = (0..8)
+            .map(|index| format!("{index}\n").repeat(8_192))
+            .collect();
+        let barrier = std::sync::Barrier::new(contents.len());
+        std::thread::scope(|scope| {
+            let jobs: Vec<_> = contents
+                .iter()
+                .map(|contents| {
+                    let (container, path, barrier) = (&container, &path, &barrier);
+                    scope.spawn(move || {
+                        let file = ContainerFile {
+                            path: path.clone(),
+                            contents: contents.clone(),
+                            executable: true,
+                        };
+                        barrier.wait();
+                        write_file(container, &file)
+                    })
+                })
+                .collect();
+            for job in jobs {
+                job.join().unwrap().unwrap();
+            }
+        });
+        let installed = docker(&["exec", &container, "cat", &path]).unwrap();
+        assert!(contents.contains(&installed));
+        docker(&["exec", &container, "test", "-x", &path]).unwrap();
+        docker(&["exec", "-u", "0", &container, "rm", "-r", &dir]).unwrap();
+    }
 
     #[test]
     fn prepare_sshd_rejects_bad_input_before_docker() {

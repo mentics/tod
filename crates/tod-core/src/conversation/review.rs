@@ -266,6 +266,12 @@ impl Protocol for ReviewProtocol {
 /// ([`Protocol::opening_tail`]). A review from before there were two (no
 /// reviewer) sweeps every lens on its own.
 pub fn assignment(reviewer: Option<Reviewer>) -> String {
+    render_assignment(reviewer, true)
+}
+
+/// A graph can schedule its reviewers separately. Only the live paired
+/// legacy runner should promise that both reviewers are running together.
+pub(crate) fn render_assignment(reviewer: Option<Reviewer>, simultaneous: bool) -> String {
     let lenses = |reviewer: Reviewer| {
         let slugs = reviewer.lenses();
         tod_store::review::LENSES
@@ -277,19 +283,25 @@ pub fn assignment(reviewer: Option<Reviewer>) -> String {
     };
     let mut out = String::from("# Your assignment\n\n");
     match reviewer {
-        Some(Reviewer::Main) => out.push_str(&format!(
-            "You are this round's **main reviewer**. The risk reviewer works beside you at the same \
-             time, sweeping only the lenses where defects that survive review usually live. Sweep \
-             every lens:\n\n{}\n",
-            lenses(Reviewer::Main)
-        )),
-        Some(Reviewer::Risk) => out.push_str(&format!(
-            "You are this round's **risk reviewer**. The main reviewer works beside you at the same \
-             time and sweeps every lens; you sweep only these, and go deeper in each than a review \
-             of every lens can:\n\n{}\n\nRecord coverage for these lenses only. Your saturation pass \
-             looks again at these same lenses.\n",
-            lenses(Reviewer::Risk)
-        )),
+        Some(Reviewer::Main) => {
+            out.push_str("You are this round's **main reviewer**. ");
+            if simultaneous {
+                out.push_str("The risk reviewer works beside you at the same time, sweeping only the lenses where defects that survive review usually live. ");
+            }
+            out.push_str(&format!("Sweep every lens:\n\n{}\n", lenses(Reviewer::Main)));
+        }
+        Some(Reviewer::Risk) => {
+            out.push_str("You are this round's **risk reviewer**. ");
+            let assignment = if simultaneous {
+                "The main reviewer works beside you at the same time and sweeps every lens; you sweep only these, and go deeper in each than a review of every lens can"
+            } else {
+                "Sweep only these lenses, and go deeper in each than a review of every lens can"
+            };
+            out.push_str(&format!(
+                "{assignment}:\n\n{}\n\nRecord coverage for these lenses only. Your saturation pass looks again at these same lenses.\n",
+                lenses(Reviewer::Risk)
+            ));
+        }
         None => out.push_str(&format!(
             "You are this round's only reviewer. Sweep every lens:\n\n{}\n",
             lenses(Reviewer::Main)

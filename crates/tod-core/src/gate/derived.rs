@@ -173,7 +173,7 @@ fn pass(detail: impl Into<String>) -> DerivedOutcome {
 
 /// A node leaves `proposed` only with something concrete to do: at least one
 /// requirement of its own.
-fn has_requirements_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutcome> {
+pub(crate) fn has_requirements_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutcome> {
     let count = ObligationRepo::new(conn)
         .list_for_node(node_id)?
         .iter()
@@ -231,7 +231,7 @@ fn learn_recorded_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOut
 
 /// Implementation needs an Agent and a ready Files directory, each on the node
 /// or inherited from the nearest ancestor that has the capability.
-fn implementation_setup_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutcome> {
+pub(crate) fn implementation_setup_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutcome> {
     let node_id = node_id.to_string();
     let Some(agent) = resolve_agent_for_node(conn, &node_id)? else {
         return Ok(fail(
@@ -289,7 +289,7 @@ fn implementation_setup_outcome(conn: &Connection, node_id: Uuid) -> Result<Deri
 /// planning for it. Which requirements those are is their `acts_in`: one that
 /// acts in `design` is carried out by design obligations and one that acts in
 /// `verifying` only needs checking (`NodeObligation::needs_plan_step`).
-fn requirements_traceable_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutcome> {
+pub(crate) fn requirements_traceable_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutcome> {
     let requirements: Vec<_> = ObligationRepo::new(conn)
         .list_for_node(node_id)?
         .into_iter()
@@ -323,7 +323,7 @@ fn requirements_traceable_outcome(conn: &Connection, node_id: Uuid) -> Result<De
 /// `implemented` step is real is verification's question, not this gate's: a
 /// step verification fails goes back to open, and this gate is what sends it
 /// through again. A later phase's steps wait for that phase.
-fn plan_implemented_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutcome> {
+pub(crate) fn plan_implemented_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutcome> {
     let steps: Vec<_> = PlanStepRepo::new(conn)
         .list_for_node(node_id)?
         .into_iter()
@@ -586,18 +586,11 @@ fn findings_answered_outcome(conn: &Connection, node_id: Uuid) -> Result<Derived
     )))
 }
 
-/// A GitHub client authenticated the same way `tod-cli pr` is
-/// (`resolve_github_auth`: the sandbox's proxy in an autonomous node's
-/// sandbox, else the OS keyring, the encrypted file, or `GITHUB_TOKEN`),
-/// using the data root the open `Connection` itself lives under (`tod.db`
-/// sits directly at the data root, same as `FleetPaths::db()`), since
-/// `evaluate_derived_criterion` only has a `Connection` in scope, not a
-/// `CredentialStore`.
-fn github_client(conn: &Connection) -> Option<tod_store::github::Github> {
-    let db_path = conn.path()?;
-    let data_root = std::path::Path::new(db_path).parent()?;
-    let store = tod_store::credentials::CredentialStore::from_data_root(data_root);
-    tod_store::credentials::resolve_github_auth(&store).map(tod_store::github::Github::new)
+// The connection identifies the credential root. Use the same provider as
+// the PR watcher so a snapshot source can drive both readiness and the gate.
+fn github_feed(conn: &Connection) -> Option<std::sync::Arc<dyn crate::pr_readiness::PrFeed>> {
+    let data_root = std::path::Path::new(conn.path()?).parent()?;
+    crate::pr_readiness::feed_for(data_root)
 }
 
 /// The node's linked pull requests (the Ticket capability's links), or why
@@ -606,7 +599,7 @@ fn github_client(conn: &Connection) -> Option<tod_store::github::Github> {
 fn linked_prs(
     conn: &Connection,
     node_id: Uuid,
-) -> Result<std::result::Result<(Vec<NodePr>, tod_store::github::Github), DerivedOutcome>> {
+) -> Result<std::result::Result<(Vec<NodePr>, std::sync::Arc<dyn crate::pr_readiness::PrFeed>), DerivedOutcome>> {
     let links = NodePrRepo::new(conn).read(node_id)?;
     if let Some(link) = links.unrecognized.first() {
         return Ok(Err(fail(format!(
@@ -618,7 +611,7 @@ fn linked_prs(
             "No pull request is linked to this node — link one in its Ticket settings,              or open one with `tod-cli pr open` from the `pr` state.",
         )));
     }
-    let Some(github) = github_client(conn) else {
+    let Some(github) = github_feed(conn) else {
         return Ok(Err(fail(
             "No GitHub token configured — see `tod-cli secrets` — cannot check PR status.",
         )));
@@ -642,7 +635,7 @@ fn own_review_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutcome
     };
     let mut heads = std::collections::BTreeMap::new();
     for pr in &prs {
-        let snapshot = match crate::pr_readiness::cached_snapshot(&github, pr) {
+        let snapshot = match github.snapshot(pr) {
             Ok(snapshot) => snapshot,
             Err(err) => return Ok(fail(format!("Could not read {}: {err}", pr.url))),
         };
@@ -663,12 +656,8 @@ fn unlinked_branches_failure(conn: &Connection, node_id: Uuid, prs: &[NodePr]) -
     let Some(prefix) = crate::pr_readiness::node_branch_prefix(conn, node_id)? else {
         return Ok(None);
     };
-    let feed: std::sync::Arc<dyn crate::pr_readiness::PrFeed> = match crate::pr_readiness::feed_override() {
-        Some(feed) => feed,
-        None => match github_client(conn) {
-            Some(github) => std::sync::Arc::new(crate::pr_readiness::GithubFeed(github)),
-            None => return Ok(None),
-        },
+    let Some(feed) = github_feed(conn) else {
+        return Ok(None);
     };
     let others = crate::pr_readiness::branches_of_other_nodes(conn, node_id)?;
     Ok(match crate::pr_readiness::unlinked_branches(feed.as_ref(), prs, &prefix, &others) {
@@ -692,7 +681,7 @@ fn pr_open_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutcome> {
     };
     let mut passed = Vec::new();
     for pr in &prs {
-        let status = match github.get_pr_status(&pr.owner, &pr.repo, pr.pr_number) {
+        let status = match github.status(pr) {
             Ok(status) => status,
             Err(err) => return Ok(fail(format!("Could not read {}: {err}", pr.url))),
         };
@@ -789,7 +778,7 @@ fn pr_ready_for_review_outcome(conn: &Connection, node_id: Uuid) -> Result<Deriv
     };
     let mut passed = Vec::new();
     for pr in &prs {
-        let status = match github.get_pr_status(&pr.owner, &pr.repo, pr.pr_number) {
+        let status = match github.status(pr) {
             Ok(status) => status,
             Err(err) => return Ok(fail(format!("Could not read {}: {err}", pr.url))),
         };
@@ -813,7 +802,7 @@ fn pr_reviewer_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutcom
         Ok(found) => found,
         Err(outcome) => return Ok(outcome),
     };
-    let own_login = match github.viewer_login_cached() {
+    let own_login = match github.viewer_login() {
         Ok(login) => login,
         Err(err) => {
             return Ok(fail(format!(
@@ -823,7 +812,7 @@ fn pr_reviewer_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutcom
     };
     let mut passed = Vec::new();
     for pr in &prs {
-        let status = match github.get_pr_status(&pr.owner, &pr.repo, pr.pr_number) {
+        let status = match github.status(pr) {
             Ok(status) => status,
             Err(err) => return Ok(fail(format!("Could not read {}: {err}", pr.url))),
         };
@@ -831,7 +820,7 @@ fn pr_reviewer_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutcom
         let reviews = if status.merged || !requested_people(&status, &own_login).is_empty() {
             Vec::new()
         } else {
-            match github.list_reviews(&pr.owner, &pr.repo, pr.pr_number) {
+            match github.reviews(pr) {
                 Ok(reviews) => reviews,
                 Err(err) => return Ok(fail(format!("Could not read the reviews of {}: {err}", pr.url))),
             }
@@ -859,7 +848,7 @@ fn pr_mergeable_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutco
     };
     let mut passed = Vec::new();
     for pr in &prs {
-        let status = match github.get_pr_status(&pr.owner, &pr.repo, pr.pr_number) {
+        let status = match github.status(pr) {
             Ok(status) => status,
             Err(err) => return Ok(fail(format!("Could not read {}: {err}", pr.url))),
         };
@@ -949,22 +938,16 @@ fn pr_readiness_outcome(conn: &Connection, node_id: Uuid, which: Readiness) -> R
     };
     let settings = crate::bot_silence::settings_for_node(conn, node_id, configured)?;
     let now = chrono::Utc::now();
-    // The feed (the override in tests, else GitHub), so the bot's review is
-    // compared with the head the same way the babysitter compares it.
-    let feed: std::sync::Arc<dyn crate::pr_readiness::PrFeed> = match crate::pr_readiness::feed_override() {
-        Some(feed) => feed,
-        None => std::sync::Arc::new(crate::pr_readiness::GithubFeed(github)),
-    };
     let mut assessed = Vec::new();
     for pr in &prs {
-        let snapshot = match feed.snapshot(pr) {
+        let snapshot = match github.snapshot(pr) {
             Ok(snapshot) => snapshot,
             Err(err) => return Ok(fail(format!("Could not read {}: {err}", pr.url))),
         };
         if let Some(why) = crate::pr_readiness::own_review_head_missing(&snapshot, &settings) {
             return Ok(fail(format!("{}: {why}", pr.url)));
         }
-        let assessment = match crate::pr_readiness::assess(feed.as_ref(), pr, &snapshot, &settings, now) {
+        let assessment = match crate::pr_readiness::assess(github.as_ref(), pr, &snapshot, &settings, now) {
             Ok(assessment) => assessment,
             Err(err) => return Ok(fail(format!("Could not compare the bot's review with the head: {err}"))),
         };
@@ -1037,7 +1020,7 @@ fn pr_merged_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutcome>
     };
     let mut passed = Vec::new();
     for pr in &prs {
-        let status = match github.get_pr_status(&pr.owner, &pr.repo, pr.pr_number) {
+        let status = match github.status(pr) {
             Ok(status) => status,
             Err(err) => return Ok(fail(format!("Could not read {}: {err}", pr.url))),
         };

@@ -14,10 +14,12 @@
 
 pub mod answer;
 mod check_now;
+pub mod flow;
 pub mod operator;
 pub use check_now::{CheckNow, check_now};
 
 pub mod send_back;
+pub mod workflow;
 
 use crate::task::model::{next_lifecycle, previous_lifecycle};
 use anyhow::{Context, Result};
