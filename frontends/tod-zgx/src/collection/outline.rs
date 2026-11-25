@@ -146,6 +146,10 @@ impl OutlinePanel {
         self.collection.focus(|focus| focus.list.as_ref());
     }
 
+    pub fn focused_item(&self) -> Option<String> {
+        self.palette_context()?.focused
+    }
+
     pub fn palette_context(&self) -> Option<Context> {
         if !self.ready() {
             return None;

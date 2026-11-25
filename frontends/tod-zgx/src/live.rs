@@ -104,6 +104,52 @@ impl Backend {
         Some((command, task))
     }
 
+    pub fn load_chat(
+        &self,
+        mut context: crate::chat::Context,
+    ) -> tokio::task::JoinHandle<Result<(crate::chat::Context, Vec<crate::chat::Session>), String>> {
+        use tod_store::conversation::{ConversationRepo, Focus, ProtocolKind};
+        use tod_store::fleet::node_actions::resolve_files_for_node;
+
+        let access = self.access.clone();
+        self.runtime.spawn_blocking(move || {
+            let load = || -> Result<_, Box<dyn std::error::Error>> {
+                let id = context.key.parse()?;
+                let (_opening, session) = access.open()?;
+                let (cwd, focus, previous) = session.fleet.read(|conn| {
+                    let focus = tod_core::conversation::context::focus_selection(conn, Focus::Node(id))?;
+                    let cwd = resolve_files_for_node(conn, &context.key)?
+                        .and_then(|files| files.worktree_dir().or_else(|| files.repo_dir()))
+                        .and_then(|dir| dir.host_path().map(Path::to_owned));
+                    let repo = ConversationRepo::new(conn);
+                    let mut previous = Vec::new();
+                    for conversation in repo.conversations_for_focus(Focus::Node(id))? {
+                        if conversation.protocol == ProtocolKind::Outline {
+                            let turns = repo.turns(conversation.id)?;
+                            previous.push(crate::chat::Session::from_tod(conversation, turns));
+                        }
+                    }
+                    Ok((cwd, focus, previous))
+                })?;
+                context.cwd = cwd.filter(|path| path.is_dir());
+                context.title = focus.title;
+                if !focus.path.is_empty() {
+                    context.description.push_str(&format!("\nOutline: {}", focus.path.join(" / ")));
+                }
+                for (label, lines) in focus.sections {
+                    if !lines.is_empty() {
+                        context.description.push_str(&format!("\n\n{label}\n{}", lines.join("\n")));
+                    }
+                }
+                if context.cwd.is_none() {
+                    context.note = Some("This item has no local checkout. The agent can discuss its TOD context.".into());
+                }
+                Ok((context, previous))
+            };
+            load().map_err(|error| format!("Could not open task chat. {error}"))
+        })
+    }
+
     pub fn load_outline(&self, id: String) -> tokio::task::JoinHandle<Result<OutlineData, String>> {
         let access = self.access.clone();
         self.runtime.spawn_blocking(move || {

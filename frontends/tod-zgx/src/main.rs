@@ -1,3 +1,4 @@
+mod chat;
 mod collection;
 mod lifecycle;
 mod lifecycle_editor;
@@ -48,6 +49,9 @@ enum Surface {
 #[derive(Clone)]
 struct App {
     workspace: Signal<Workspace>,
+    chat: chat::Slot,
+    #[cfg(feature = "live")]
+    chat_request: Rc<std::cell::Cell<u64>>,
     collections: Option<collection::Panels>,
     lifecycle: lifecycle::Panel,
     workflow_editor: lifecycle_editor::Editor,
@@ -510,6 +514,17 @@ impl App {
             self.show_page(palette);
             return;
         };
+        if let Effect::Run { command: "conversation", targets } = &effect
+            && let [id] = targets.as_slice()
+        {
+            let mut workspace = self.workspace.get();
+            workspace.record_use("conversation");
+            self.save_frequency(&mut workspace);
+            self.workspace.set(workspace);
+            self.open.set(false);
+            self.open_chat(id);
+            return;
+        }
         if let Some(panels) = &self.collections {
             match &effect {
                 Effect::Open(id) if panels.contains(id) => {
@@ -571,7 +586,7 @@ impl App {
             || matches!(
                 &effect,
                 Effect::Run {
-                    command: "shortcuts" | "conversation",
+                    command: "shortcuts",
                     ..
                 }
             );
@@ -686,6 +701,47 @@ impl App {
         }
         event.prevent_default();
         event.stop_propagation();
+    }
+
+    fn open_chat(&self, id: &str) {
+        let Some(record) = self.workspace.with(|workspace| workspace.record(id).cloned()) else {
+            self.workspace.update(|workspace| workspace.message = "This item is no longer available.".into());
+            return;
+        };
+        if !self.chat.can_open(id) {
+            return;
+        }
+        let context = chat::Context {
+            key: id.into(),
+            title: record.item.title,
+            description: record.description,
+            ..Default::default()
+        };
+        #[cfg(feature = "live")]
+        if let Some(backend) = &self.backend {
+            let request = self.chat_request.get() + 1;
+            self.chat_request.set(request);
+            let task = backend.load_chat(context);
+            let app = self.clone();
+            self.tasks.spawn(async move {
+                let result = task.await;
+                if app.chat_request.get() != request {
+                    return;
+                }
+                match result {
+                    Ok(Ok((context, previous))) => app.chat.open(context, previous),
+                    Ok(Err(error)) => { app.workspace.update(|workspace| workspace.message = error); },
+                    Err(error) => { app.workspace.update(|workspace| workspace.message = format!("Could not open chat. {error}")); },
+                }
+            });
+            return;
+        }
+        let mut context = context;
+        match std::env::current_dir() {
+            Ok(cwd) => context.cwd = Some(cwd),
+            Err(error) => context.note = Some(format!("Could not find the working directory. {error}")),
+        }
+        self.chat.open(context, #[cfg(feature = "live")] Vec::new());
     }
 
     fn open_item(&self, id: String) {
@@ -1017,6 +1073,7 @@ fn workspace_view(app: &App) -> View {
     let chips = app.workspace.clone();
     let chip_app = app.clone();
     let detail = app.workspace.clone();
+    let detail_app = app.clone();
     column().id("task-workspace").w_full().h_full().gap(14.)
         .child(switch(move || chips.get(), move |workspace, _| {
             row().gap(6.).children(workspace.collections().map(|record| {
@@ -1031,16 +1088,24 @@ fn workspace_view(app: &App) -> View {
             .child(switch(move || detail.get(), move |workspace, _| {
                 let (title, body) = if workspace.detail == "shortcuts" {
                     ("Keyboard shortcuts".into(), "⌘/Ctrl+K searches across tod. Arrow keys move by row. Option/Alt+↑/↓ moves by section. Enter opens or runs. Shift+Enter opens actions. Esc goes back.".into())
-                } else if workspace.detail == "conversation" {
-                    ("Agent conversation".into(), workspace.conversation.join(" · "))
                 } else {
                     workspace.record(&workspace.detail).map_or((String::new(), String::new()), |record| {
                         (record.item.title.clone(), record.description.clone())
                     })
                 };
-                column().w(290.).p(14.).gap(8.).rounded(7.).bg(rgb(PANEL))
+                let mut detail = column().w(290.).p(14.).gap(8.).rounded(7.).bg(rgb(PANEL))
                     .child(text(title).text_size(20.).text_wrap(true))
-                    .child(text(body).text_wrap(true).text_color(rgb(MUTED)))
+                    .child(text(body).text_wrap(true).text_color(rgb(MUTED)));
+                if let Some(record) = workspace.record(&workspace.detail)
+                    && matches!(record.item.kind, tod_palette::Kind::Task | tod_palette::Kind::Node | tod_palette::Kind::ProductDefinition)
+                {
+                    let id = record.item.id.clone();
+                    let app = detail_app.clone();
+                    detail = detail.child(control("Chat with an agent about this")
+                        .id("chat-about-this")
+                        .on_click(move || app.open_chat(&id)));
+                }
+                detail
             })))
 }
 
@@ -1087,6 +1152,7 @@ fn surface_tabs(app: &App) -> View {
 
 fn mount(
     cx: &mut WindowContext,
+    chat: chat::Slot,
     workspace: Workspace,
     usage_path: Option<PathBuf>,
     collection_data: Option<&collection::Data>,
@@ -1096,6 +1162,9 @@ fn mount(
     let outline = (backend.is_some() && workspace.collections().next().is_some())
         .then(|| collection::OutlinePanel::new(cx));
     let app = App {
+        chat,
+        #[cfg(feature = "live")]
+        chat_request: Default::default(),
         workspace: cx.ui.signal(workspace),
         collections: collection_data.map(|data| collection::Panels::new(cx, data)),
         lifecycle: lifecycle::Panel::new(cx),
@@ -1138,6 +1207,7 @@ fn mount(
     let lifecycle_tab = app.clone();
     let mut screens = overlay()
         .grow()
+        .min_w(0.)
         .min_h(0.)
         .child(
             workspace_view(&app)
@@ -1179,7 +1249,20 @@ fn mount(
         .gap(10.)
         .child(text("tod").text_size(23.));
     #[cfg(feature = "live")]
-    let live_screen = app.outline.as_ref().map(|outline| outline.view(cx));
+    let live_screen = app.outline.as_ref().map(|outline| {
+        let focused = outline.clone();
+        let action = app.clone();
+        let target = outline.clone();
+        column().w_full().h_full().gap(6.)
+            .child(switch_or_none(move || focused.focused_item(), move |id, _| {
+                id.map(|id| {
+                    let app = action.clone();
+                    row().child(control("Chat with an agent about this").id("outline-chat-about-this")
+                        .on_click(move || app.open_chat(&id)))
+                })
+            }))
+            .child(overlay().grow().min_h(0.).child(target.view(cx)))
+    });
     #[cfg(not(feature = "live"))]
     let live_screen: Option<View> = None;
     let collection_screen = app
@@ -1268,7 +1351,7 @@ fn mount(
                         .on_click(move || search.open(None, false)),
                     ),
             )
-            .child(screens)
+            .child(row().w_full().grow().min_h(0.).gap(10.).child(screens).child(app.chat.view()))
             .child(switch_or_none(
                 move || message.with(|workspace| workspace.message.clone()),
                 |message, _| {
@@ -1323,6 +1406,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut smoke = false;
     let mut data_root: Option<PathBuf> = None;
     let mut collection_state = None;
+    let mut chat_state = None;
     let mut args = std::env::args_os().skip(1);
     while let Some(arg) = args.next() {
         if arg == "--smoke-test" {
@@ -1331,6 +1415,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             data_root = Some(args.next().ok_or("--data-root needs a directory")?.into());
         } else if arg == "--state" {
             path = args.next().ok_or("--state needs a file")?.into();
+        } else if arg == "--chat-state" {
+            chat_state = Some(PathBuf::from(args.next().ok_or("--chat-state needs a directory")?));
         } else if arg == "--collection-state" {
             collection_state = Some(args.next().ok_or("--collection-state needs a file")?.into());
         } else {
@@ -1350,7 +1436,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => Workspace::demo(frequency),
     };
     #[cfg(not(feature = "live"))]
-    let workspace = if let Some(root) = data_root {
+    let workspace = if let Some(root) = &data_root {
         return Err(format!(
             "Opening {} requires building with --features live",
             root.display()
@@ -1373,9 +1459,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if socket {
         zgx_script::inspect::prepare();
     }
+    let chat_state = chat_state.unwrap_or_else(|| {
+        data_root.as_ref().map_or_else(|| path.with_extension("chats"), |root| root.join("zgx-chats"))
+    });
+    let chat_runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
+    let chat_handle = chat_runtime.handle().clone();
+    let chat_error = Rc::new(RefCell::new(None));
+    let capture_chat_error = chat_error.clone();
     let smoke_result = Rc::new(std::cell::Cell::new(false));
     let result = smoke_result.clone();
-    Application::new()
+    chat::with_fonts(Application::new())?
         .window(WindowOptions {
             title: "tod · ZGX".into(),
             width: if demo { 1160. } else { 930. },
@@ -1384,8 +1477,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ..Default::default()
         })
         .run(move |cx| {
+            let chat = match chat::Slot::new(cx, chat_handle.clone(), chat_state.clone()) {
+                Ok(chat) => chat,
+                Err(error) => {
+                    capture_chat_error.replace(Some(error));
+                    cx.window.close();
+                    return;
+                }
+            };
             let (app, view) = mount(
                 cx,
+                chat,
                 workspace.clone(),
                 (!smoke).then(|| path.clone()),
                 collection_data.as_ref(),
@@ -1429,6 +1531,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 });
             }
         })?;
+    if let Some(error) = chat_error.take() {
+        return Err(format!("Could not load the chat panel. {error}").into());
+    }
     #[cfg(feature = "agent-socket")]
     if let Some(error) = socket_error.take() {
         return Err(error.into());

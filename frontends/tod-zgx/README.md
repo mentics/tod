@@ -1,8 +1,7 @@
 # tod · ZGX
 
-This standalone native frontend brings together the redesigned command palette
-and collection panels. It uses its own Cargo workspace and pins the ZGX
-revision used by the chat experiment.
+This standalone native frontend brings together the redesigned command palette,
+collection panels, and agent chat. It uses its own Cargo workspace.
 
 Run the demo from the repository root.
 
@@ -15,9 +14,8 @@ Press **Cmd/Ctrl+K**, then try `p rn`, `nmd`, or `keyboard shortcuts`.
 **Escape** returns to the previous palette page or workspace focus.
 
 The default demo uses an in-memory workspace. Mark two tasks with **Space**
-and run **Pin tasks** or **Open agent conversation**. Right-click a
-different task to invoke actions on that row while retaining the marks
-and open detail. Command frequency is saved separately from app data.
+and run **Pin tasks**. Right-click a different task to invoke actions on that
+row while retaining the marks and open detail. Command frequency is saved separately from app data.
 Pass `-- --state <file>` to choose the frequency file.
 
 ## Collection panels
@@ -59,7 +57,34 @@ the current saved tree.
 Live **Pause runner** and **Resume runner** call TOD's runner operator off
 the UI thread and use the daemon for local runners. The live outline pane
 is read-only for outline data. The demo exercises editable collection
-configs, pinning, and multi-task chat.
+configs and pinning.
+
+## Agent chat
+
+Choose **Chat with an agent about this** from item details or a live outline.
+For tasks, the command is also in the palette. The source panel stays open
+and the item's chat appears in the right slot. **Sessions** expands or collapses the conversation list. Select a
+previous session to view it, or choose **New chat** to start another one for
+the same task. The new session appears in the list when you send its first
+message.
+
+Install `claude-agent-acp` and/or `codex-acp` and sign in to their respective
+CLIs. ZGX can use TOD’s managed adapters or the paths set in
+`CLAUDE_ACP_BIN` and `CODEX_ACP_BIN`. Select a model in the composer to switch
+providers. Live chats use the item’s local worktree or repository when one is
+available. For other items, the agent receives the item’s TOD context and
+works in a chat directory. The demo uses the current directory. Saved ZGX
+chats reopen with their transcript and pass prior messages to the new ACP
+session when you continue. Existing TOD freeform conversations can be
+opened for reading from the same picker.
+
+New ZGX chats are stored in `zgx-chats` under the live data root. In demo mode
+they are stored next to the palette state under `palette-usage.chats`.
+Pass `-- --chat-state <directory>` to choose another location.
+
+The bundled Luau chat view and design system come from Zeron (MIT). See
+[LICENSE-zeron](chat/LICENSE-zeron) and the font licenses under
+[chat/fonts](chat/fonts/).
 
 ## Lifecycle
 

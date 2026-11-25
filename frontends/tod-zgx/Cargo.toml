@@ -7,13 +7,14 @@ edition = "2024"
 publish = false
 
 [features]
-live = ["dep:tokio", "dep:tod-store"]
-agent-socket = ["dep:zgx-script"]
+live = ["dep:tod-store"]
+agent-socket = ["zgx-script/inspect"]
 
-# Match the ZGX revision and host patches used by the separate zgx-chat experiment.
 [dependencies]
+tod-agent = { path = "../../crates/tod-agent" }
 tod-palette = { path = "../../crates/tod-palette" }
-tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "process", "io-util", "macros"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 tod-core = { path = "../../crates/tod-core" }
 tod-store = { path = "../../crates/tod-store", optional = true }
 serde = { version = "1", features = ["derive"] }
@@ -21,7 +22,10 @@ serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
 zgx = { git = "https://github.com/zeronsh/zgx", rev = "b8f298b6b9d1a363adf9e21655334a6e260dc4c7" }
 zgx-desktop = { git = "https://github.com/zeronsh/zgx", rev = "b8f298b6b9d1a363adf9e21655334a6e260dc4c7" }
-zgx-script = { git = "https://github.com/zeronsh/zgx", rev = "b8f298b6b9d1a363adf9e21655334a6e260dc4c7", default-features = false, features = ["inspect"], optional = true }
+zgx-script = { git = "https://github.com/zeronsh/zgx", rev = "b8f298b6b9d1a363adf9e21655334a6e260dc4c7", default-features = false, features = ["i18n", "svg", "png"] }
+
+[build-dependencies]
+zgx-script = { git = "https://github.com/zeronsh/zgx", rev = "b8f298b6b9d1a363adf9e21655334a6e260dc4c7", default-features = false }
 
 [patch.crates-io]
 wgpu-hal = { git = "https://github.com/zeronsh/zgx", rev = "b8f298b6b9d1a363adf9e21655334a6e260dc4c7" }

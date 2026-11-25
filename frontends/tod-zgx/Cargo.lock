@@ -1401,6 +1401,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2214fb00f669ee96bee5bb29dfb1ddabe058b2bc426817efc79afa03c9bc55ae"
 dependencies = [
  "displaydoc",
+ "ryu",
  "smallvec",
  "writeable",
 ]
@@ -2112,6 +2113,29 @@ dependencies = [
  "zerofrom",
  "zerovec",
 ]
+
+[[package]]
+name = "icu_decimal"
+version = "2.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1150ad5e272740670464934ee76facda43ef2e11f85c27b7ba76ccb33edf2d05"
+dependencies = [
+ "displaydoc",
+ "fixed_decimal",
+ "icu_decimal_data",
+ "icu_locale_core",
+ "icu_locale_fallback",
+ "icu_plurals",
+ "icu_provider",
+ "writeable",
+ "zerovec",
+]
+
+[[package]]
+name = "icu_decimal_data"
+version = "2.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5595ab78370d48abd24a062f3db115d5108dd0b65634352036cae532aebb0df8"
 
 [[package]]
 name = "icu_locale_core"
@@ -5133,8 +5157,10 @@ dependencies = [
 name = "tod-zgx"
 version = "0.0.0"
 dependencies = [
+ "chrono",
  "serde",
  "serde_json",
+ "tod-agent",
  "tod-core",
  "tod-palette",
  "tod-store",
@@ -6939,8 +6965,12 @@ name = "zgx"
 version = "0.1.10"
 source = "git+https://github.com/zeronsh/zgx?rev=b8f298b6b9d1a363adf9e21655334a6e260dc4c7#b8f298b6b9d1a363adf9e21655334a6e260dc4c7"
 dependencies = [
+ "fixed_decimal",
  "foldhash 0.2.0",
  "icu_collections",
+ "icu_decimal",
+ "icu_locale_core",
+ "icu_plurals",
  "icu_provider",
  "icu_segmenter",
  "libc",

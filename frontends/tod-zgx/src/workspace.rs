@@ -30,7 +30,6 @@ pub struct Workspace {
     pub selected: BTreeSet<String>,
     pub pinned: BTreeSet<String>,
     pub message: String,
-    pub conversation: Vec<String>,
     pub frequency: BTreeMap<String, u32>,
 }
 
@@ -58,10 +57,10 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         id: "conversation",
-        label: "Open agent conversation",
+        label: "Chat with an agent about this",
         plural: None,
-        aliases: "chat discuss",
-        target: Target::Many(Kind::Task),
+        aliases: "chat discuss open agent conversation",
+        target: Target::One(Kind::Task),
     },
     Command {
         id: "edit-collection",
@@ -209,7 +208,6 @@ impl Workspace {
             selected: BTreeSet::new(),
             pinned: BTreeSet::new(),
             message: String::new(),
-            conversation: Vec::new(),
             frequency,
         }
     }
@@ -225,7 +223,7 @@ impl Workspace {
             demo_collections: BTreeMap::new(),
             commands: COMMANDS
                 .iter()
-                .filter(|command| matches!(command.id, "shortcuts" | "pause" | "resume"))
+                .filter(|command| matches!(command.id, "shortcuts" | "pause" | "resume" | "conversation"))
                 .cloned()
                 .collect(),
             live: true,
@@ -235,7 +233,6 @@ impl Workspace {
             selected: BTreeSet::new(),
             pinned: BTreeSet::new(),
             message: String::new(),
-            conversation: Vec::new(),
             frequency,
         };
         if let Some(task) = workspace.visible_tasks().first() {
@@ -393,11 +390,6 @@ impl Workspace {
                     "pin" => {
                         self.pinned.extend(targets);
                         format!("Pinned {} to Pinned tasks.", names.join(", "))
-                    }
-                    "conversation" => {
-                        self.conversation = names;
-                        self.detail = "conversation".into();
-                        String::new()
                     }
                     "edit-collection" => {
                         self.detail = targets[0].clone();
