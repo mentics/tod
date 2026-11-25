@@ -3137,6 +3137,34 @@ fn annotation_evidence(annotations: &[AnnotationRaw], actions: bool) -> String {
         .join("\n")
 }
 
+/// `line` without ANSI escapes (`ESC [ ... letter`).
+fn strip_ansi(line: &str) -> String {
+    if !line.contains('\u{1b}') {
+        return line.to_string();
+    }
+    let mut plain = String::new();
+    let mut it = line.chars();
+    while let Some(c) = it.next() {
+        if c == '\u{1b}' {
+            for n in it.by_ref() {
+                if n.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            plain.push(c);
+        }
+    }
+    plain
+}
+
+/// A runtime's own warning, never a check's failure: Node's `(node:PID)
+/// [DEPxxxx] DeprecationWarning: ...` (or `ExperimentalWarning`, ...) and the
+/// `(Use `node --trace-deprecation ...`)` hint after it.
+fn is_runtime_warning(plain: &str) -> bool {
+    (plain.starts_with("(node:") && plain.contains("Warning:")) || plain.starts_with("(Use `node --")
+}
+
 /// The lines of a job's log that say how `step` failed: the step's own
 /// section (lines stamped between its start and end; when the step's times
 /// are not known, only the log's `##[error]` lines), and in it every line that
@@ -3176,12 +3204,21 @@ fn failing_step_log(log: &str, step: &JobStepRaw) -> String {
         "conflict", "timeout", "timed out", "must ", "required",
     ];
     let content = |l: &str| -> Option<String> {
-        let l = l.trim();
+        // Real Actions logs colour their lines (`ESC[32m✓ESC[39m ...`), so
+        // every test below reads the line without its escapes.
+        let plain = strip_ansi(l);
+        let l = plain.trim();
         // A test runner's line for a test that passed (`✓ draws a box 3ms`)
         // is not how the step failed, though its words (`fails`, `expected`)
         // match a keyword, and its duration changes on every run: kept, no two
         // runs of one failure would ever have the same lines.
         if l.starts_with(['✓', '✔', '√']) {
+            return None;
+        }
+        // A runtime's warning (`(node:2862) [DEP0169] DeprecationWarning: ...
+        // prone to errors ...`) is not a failure, whatever words it holds, and
+        // whether one lands in the step's window is a matter of milliseconds.
+        if is_runtime_warning(l) {
             return None;
         }
         if l.starts_with("##[") && !l.starts_with("##[error]") && !l.starts_with("##[warning]") {
@@ -3191,12 +3228,12 @@ fn failing_step_log(log: &str, step: &JobStepRaw) -> String {
         (!l.is_empty() && !generic_failure_text(l)).then(|| l.to_string())
     };
     let flagged: Vec<String> = if window.is_none() {
-        section.iter().filter(|l| l.trim().starts_with("##[error]")).filter_map(|l| content(l)).collect()
+        section.iter().filter(|l| strip_ansi(l).trim().starts_with("##[error]")).filter_map(|l| content(l)).collect()
     } else {
         section
             .iter()
-            .filter(|l| l.trim().starts_with("##[error]") || {
-                let low = l.to_ascii_lowercase();
+            .filter(|l| strip_ansi(l).trim().starts_with("##[error]") || {
+                let low = strip_ansi(l).to_ascii_lowercase();
                 KEYWORDS.iter().any(|k| low.contains(k))
             })
             .filter_map(|l| content(l))
@@ -3435,6 +3472,16 @@ fn scrub_word(word: &str) -> Option<String> {
         return Some(word.to_string());
     }
     let low = core_t.to_ascii_lowercase();
+    // A process id (`(node:2862)`, `pid=2862`, `pid:2862`), which differs on every run.
+    if let Some((name, id)) = core_t.split_once([':', '=']) {
+        if matches!(name.to_ascii_lowercase().as_str(), "node" | "pid" | "ppid" | "tid")
+            && !id.is_empty()
+            && id.chars().all(|c| c.is_ascii_digit())
+        {
+            let lead = &word[..word.len() - word.trim_start_matches(edge).len()];
+            return Some(format!("{lead}{name}"));
+        }
+    }
     if is_duration(core_t) || is_iso_timestamp(core_t) || is_clock_time(core_t) || is_uuid(core_t) || is_hex_run(core_t) || low.starts_with("h1:") || low.starts_with("zh:") {
         return None;
     }
@@ -3518,20 +3565,7 @@ pub(crate) fn normalize_failure_text(text: &str) -> String {
 pub fn normalized_failure_lines(text: &str) -> Vec<String> {
     let mut lines = std::collections::BTreeSet::new();
     for line in text.lines() {
-        // ANSI escapes: `ESC [ ... letter`.
-        let mut plain = String::new();
-        let mut it = line.chars();
-        while let Some(c) = it.next() {
-            if c == '\u{1b}' {
-                for n in it.by_ref() {
-                    if n.is_ascii_alphabetic() {
-                        break;
-                    }
-                }
-            } else {
-                plain.push(c);
-            }
-        }
+        let plain = strip_ansi(line);
         let words: Vec<String> = plain.split_whitespace().filter_map(scrub_word).collect();
         if !words.is_empty() {
             lines.insert(words.join(" "));
@@ -4795,25 +4829,50 @@ mod tests {
         found
     }
 
-    /// A vitest job log as the failing "Run tests" step wrote it: every passing
-    /// test echoed with its duration (some with words that match a failure
-    /// keyword), two real failures, the file line with its own duration.
-    fn vitest_log(clock: &str, ms: [u32; 3]) -> String {
+    /// A vitest job log as the failing "Run tests" step wrote it, shaped like
+    /// the real ones (Cofactr/ui run 45563857756 and 45540062885): ANSI colour
+    /// codes everywhere, every passing test echoed as `ESC[32m✓ESC[39m ...` with
+    /// a coloured duration (some with words that match a failure keyword), two
+    /// real failures with coloured `FAIL` banners, and Node's deprecation
+    /// warning, whose process id differs on every run and which is stamped just
+    /// after the step ended.
+    fn vitest_log(clock: &str, ms: [u32; 3], pid: u32) -> String {
         let t = |s: u32| format!("2026-11-25T{clock}:{s:02}.123Z");
+        let warn = |s: u32| {
+            format!(
+                "2026-11-25T{clock}:{s:02}.700Z (node:{pid}) [DEP0169] DeprecationWarning: `url.parse()` behavior is not standardized and prone to errors that have security implications. Use the WHATWG URL API instead. CVEs are not issued for `url.parse()` vulnerabilities.\n\
+                 2026-11-25T{clock}:{s:02}.701Z (Use `node --trace-deprecation ...` to show where the warning was created)\n"
+            )
+        };
         let mut out = String::new();
         out.push_str(&format!("{} ##[group]Run pnpm test\n", t(31)));
-        out.push_str(&format!("{} ✓ keeps planned ship endpoints when arrivals are expected {}ms\n", t(32), ms[0]));
-        out.push_str(&format!("{} ✓ disables the broker option when the profiles request fails {}ms\n", t(32), ms[1]));
-        out.push_str(&format!("{} ❯ src/views/KitScheduler/utils.test.ts (237 tests | 2 failed) {}ms\n", t(33), ms[2]));
+        out.push_str(&warn(31));
         out.push_str(&format!(
-            "{} FAIL  src/views/KitScheduler/utils.test.ts > draws a today ship box on a worked scope due tomorrow (partial false)\n",
+            "{} \u{1b}[32m✓\u{1b}[39m src/views/Order/utils.test.ts \u{1b}[2m(\u{1b}[22m\u{1b}[2m127 tests\u{1b}[22m\u{1b}[2m)\u{1b}[22m\u{1b}[32m {}\u{1b}[2mms\u{1b}[22m\u{1b}[39m\n",
+            t(32),
+            ms[0]
+        ));
+        out.push_str(&format!(
+            "{}      \u{1b}[32m✓\u{1b}[39m keeps planned ship endpoints when arrivals are expected\u{1b}[32m {}\u{1b}[2mms\u{1b}[22m\u{1b}[39m\n",
+            t(32),
+            ms[1]
+        ));
+        out.push_str(&format!(
+            "{} \u{1b}[31m❯\u{1b}[39m src/views/KitScheduler/utils.test.ts \u{1b}[2m(\u{1b}[22m\u{1b}[2m237 tests | \u{1b}[22m\u{1b}[31m2 failed\u{1b}[39m\u{1b}[2m)\u{1b}[22m\u{1b}[32m {}\u{1b}[2mms\u{1b}[22m\u{1b}[39m\n",
+            t(33),
+            ms[2]
+        ));
+        out.push_str(&format!(
+            "{} \u{1b}[41m\u{1b}[1m FAIL \u{1b}[22m\u{1b}[49m src/views/KitScheduler/utils.test.ts\u{1b}[2m > \u{1b}[22mdraws a today ship box on a worked scope due tomorrow (partial false)\n",
             t(34)
         ));
         out.push_str(&format!(
-            "{} AssertionError: expected 91.93548387096774 to be close to 91.66666666666666, received difference is 0.2688172043010866, but expected 0.005\n",
+            "{} \u{1b}[31m\u{1b}[1mAssertionError\u{1b}[22m: expected 91.93548387096774 to be close to 91.66666666666666, received difference is 0.2688172043010866, but expected 0.005\u{1b}[39m\n",
             t(34)
         ));
         out.push_str(&format!("{} ##[error]Process completed with exit code 1.\n", t(35)));
+        // Past the step's end, inside the slack.
+        out.push_str(&warn(36));
         out
     }
 
@@ -4832,14 +4891,16 @@ mod tests {
     /// no two runs had the same signature and the base was never proof.
     #[test]
     fn the_same_test_failures_in_two_runs_with_other_durations_are_the_same_failure() {
-        let pr_log = vitest_log("06:53", [2, 948, 205]);
-        let base_log = vitest_log("03:27", [3, 864, 257]);
+        let pr_log = vitest_log("06:53", [62, 948, 205], 2862);
+        let base_log = vitest_log("03:27", [58, 864, 257], 2858);
         let pr_step = run_tests_step("06:53", "06:53");
         let base_step = run_tests_step("03:27", "03:27");
         let pr_evidence = failing_step_log(&pr_log, &pr_step);
         let base_evidence = failing_step_log(&base_log, &base_step);
         assert!(pr_evidence.contains("AssertionError"), "{pr_evidence}");
         assert!(!pr_evidence.contains("✓"), "{pr_evidence}");
+        assert!(!pr_evidence.contains("DeprecationWarning"), "a runtime warning is not a failure: {pr_evidence}");
+        assert!(!pr_evidence.contains('\u{1b}'), "{pr_evidence}");
         let pr_sig = failure_signature("failure", "Run tests", &pr_evidence);
         assert!(!pr_sig.is_empty());
         assert_eq!(pr_sig, failure_signature("failure", "Run tests", &base_evidence));
@@ -4857,8 +4918,59 @@ mod tests {
 
         // A different assertion in the same step is still a different failure.
         let other = base_log.replace("0.005", "0.5");
-        let other_sig = failure_signature("failure", "Run tests", &failing_step_log(&other, &base_step));
+        let other_evidence = failing_step_log(&other, &base_step);
+        let other_sig = failure_signature("failure", "Run tests", &other_evidence);
         assert_ne!(pr_sig, other_sig);
+        let other_runs = vec![BaseRun {
+            name: "Test (2/2)".into(),
+            url: None,
+            signature: other_sig,
+            lines: normalized_failure_lines(&other_evidence),
+        }];
+        assert!(base_proof("Test (2/2)", &pr_sig, &lines, &other_runs, &mut || Ok(Vec::new())).unwrap().is_none());
+
+        // The second proof: another job's run (any name) holds every one of
+        // the check's lines, and the pull request does not touch the file.
+        let renamed = vec![BaseRun { name: "Other job".into(), ..runs[0].clone() }];
+        let found = base_proof("Test (2/2)", "", &lines, &renamed, &mut || Ok(vec!["web/app.ts".into()])).unwrap();
+        assert!(matches!(found, Some((_, BaseProof::SameErrors { .. }))), "{found:?}");
+        // A pull request that does change that file has no such proof.
+        let touched = vec!["src/views/KitScheduler/utils.test.ts".to_string()];
+        assert!(base_proof("Test (2/2)", "", &lines, &renamed, &mut || Ok(touched.clone())).unwrap().is_none());
+
+        // A new failing test, or another `##[error]`, is a different failure.
+        let more = base_log.replace(
+            "##[error]Process completed with exit code 1.",
+            "FAIL src/views/Other/thing.test.ts > breaks\n2026-11-25T03:27:35.123Z ##[error]Cannot find module './gone'",
+        );
+        assert_ne!(pr_sig, failure_signature("failure", "Run tests", &failing_step_log(&more, &base_step)));
+    }
+
+    /// Reads the two real logs (`gh api repos/Cofactr/ui/actions/jobs/<job>/logs`,
+    /// the PR's "Run tests" step 06:53:07-06:56:20 and the base's 03:27:31-03:30:40)
+    /// from `TOD_TEST_LOG_PR` and `TOD_TEST_LOG_BASE`, and says whether they compare equal.
+    #[test]
+    #[ignore = "needs TOD_TEST_LOG_PR and TOD_TEST_LOG_BASE"]
+    fn the_real_logs_compare_equal() {
+        let read = |k: &str| std::fs::read_to_string(std::env::var(k).unwrap_or_else(|_| panic!("{k} not set"))).unwrap();
+        let step = |a: &str, b: &str| JobStepRaw {
+            name: "Run tests".into(),
+            conclusion: Some("failure".into()),
+            started_at: Some(a.into()),
+            completed_at: Some(b.into()),
+        };
+        let pr = failing_step_log(&read("TOD_TEST_LOG_PR"), &step("2026-11-25T06:53:07Z", "2026-11-25T06:56:20.4Z"));
+        let base = failing_step_log(&read("TOD_TEST_LOG_BASE"), &step("2026-11-25T03:27:31Z", "2026-11-25T03:30:40.4Z"));
+        let (pl, bl) = (normalized_failure_lines(&pr), normalized_failure_lines(&base));
+        eprintln!("pr lines {} base lines {}", pl.len(), bl.len());
+        for l in pl.iter().filter(|l| !bl.contains(l)) {
+            eprintln!("only PR: {l}");
+        }
+        for l in bl.iter().filter(|l| !pl.contains(l)) {
+            eprintln!("only base: {l}");
+        }
+        assert_eq!(pl, bl);
+        assert_eq!(failure_signature("failure", "Run tests", &pr), failure_signature("failure", "Run tests", &base));
     }
 
     fn unique_repo() -> String {
