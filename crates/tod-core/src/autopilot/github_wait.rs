@@ -170,13 +170,34 @@ pub fn retry_delay_ms(attempt: u32) -> i64 {
     (30_000i64 << attempt.min(6)).min(10 * 60 * 1000)
 }
 
+/// Whether GitHub has been read for `node` before: a head of one of its pull
+/// requests is on record (`tod_store::pr_pushes`, written by the first look
+/// that reads the pull request). A 404 on a pull request tod has read is not
+/// believed at once ([`read_retry`]).
+pub(crate) fn pull_requests_read_before(fleet: &FleetStore, node: uuid::Uuid) -> Result<bool> {
+    Ok(!fleet.read(|conn| tod_store::pr_pushes::PrPushRepo::new(conn).list_for_node(node))?.is_empty())
+}
+
+/// When to look again after a failed look, and whether it was a spent rate
+/// limit. `None` when asking again cannot help.
+///
+/// This is the one guard shared by every path that turns a GitHub failure into
+/// a node's failure (`github_look_failed` and the workflow runner's
+/// `recover`). A 404 on a pull request that `read_before` is a transient
+/// answer (GitHub shows a pull request as missing for a moment, a GraphQL
+/// `pullRequest: null` among them): it is retried with backoff, shown as
+/// waiting with its error, and fails the node only when it persists across the
+/// whole retry budget. A 404 on the first read stays final.
 pub(crate) fn read_retry(
     now: i64,
     attempt: u32,
     error: &str,
     incident_retry: bool,
+    read_before: bool,
 ) -> (Option<i64>, bool) {
-    let transient = tod_store::github::is_transient_message(error) || incident_retry;
+    let transient = tod_store::github::is_transient_message(error)
+        || incident_retry
+        || (read_before && tod_store::github::is_not_found_message(error));
     let limited = tod_store::github::is_rate_limited_message(error);
     let due = transient.then(|| {
         match tod_store::github::rate_limit_reset_ms(error).filter(|_| limited) {
@@ -265,6 +286,7 @@ pub fn github_look_failed(
         attempt,
         error,
         observed.verdict == tod_store::incidents::Verdict::Retry,
+        pull_requests_read_before(fleet, node)?,
     );
     let result = fleet
         .interview(

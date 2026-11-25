@@ -212,6 +212,15 @@ pub fn is_transient_message(message: &str) -> bool {
 }
 
 /// Whether `message` (an error turned into text, maybe with a prefix) is
+/// GitHub's 404 for a pull request or other resource: any of the
+/// [`GithubError::NotFound`] family. GitHub answers 404 for a pull request it
+/// cannot show for a moment as well as for one that is gone, so a caller that
+/// has read the resource before asks again before believing it.
+pub fn is_not_found_message(message: &str) -> bool {
+    message.contains("pull request not found")
+}
+
+/// Whether `message` (an error turned into text, maybe with a prefix) is
 /// [`GithubError::RateLimited`]'s.
 pub fn is_rate_limited_message(message: &str) -> bool {
     message.contains("GitHub rate limit reached (")
@@ -5498,5 +5507,19 @@ mod look_failure_class_tests {
         assert_eq!(c("GitHub refused the request (HTTP 403): the token lacks access"), Semantic4xx(403));
         assert_eq!(c("pull request not found (GitHub also answers 404 ...)"), Semantic4xx(404));
         assert_eq!(c("something nobody has seen"), Unclassified);
+    }
+
+    #[test]
+    fn every_pull_request_404_message_is_a_not_found_message() {
+        for e in [
+            GithubError::NotFound,
+            GithubError::NoTokenRouted("o/r".into()),
+            GithubError::RepoNotVisible("o/r".into()),
+            GithubError::PullRequestGone("o/r".into()),
+        ] {
+            assert!(is_not_found_message(&format!("o/r#1 not readable: {e}")), "{e}");
+            assert!(!e.is_transient(), "{e}");
+        }
+        assert!(!is_not_found_message("GitHub is unavailable (HTTP 503)"));
     }
 }

@@ -429,6 +429,77 @@ mod tests {
         crate::pr_readiness::set_feed_override(None);
     }
 
+    /// A feed that reads the pull request, then answers 404 once, then reads it
+    /// again (shepherd gap 120, ENG-2504: one 404 five minutes after good reads
+    /// stopped the node failed).
+    struct ReadsThenOneNotFound(Arc<std::sync::atomic::AtomicBool>);
+    impl crate::pr_readiness::PrFeed for ReadsThenOneNotFound {
+        fn viewer_login(&self) -> Result<String, String> {
+            Ok("tod-test-user".to_string())
+        }
+        fn snapshot(&self, pr: &tod_store::github::NodePr) -> Result<PrSnapshot, String> {
+            if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err("pull request not found (GitHub also answers 404 when tod's token cannot see the repository)".into());
+            }
+            Draft.snapshot(pr)
+        }
+    }
+
+    /// A pull request read before, then one 404, then read again: the node
+    /// waits with the error and a retry count (never failed), and the good read
+    /// ends the failure. A 404 that persists across every retry does fail it.
+    #[test]
+    fn one_404_on_a_pull_request_read_before_is_retried_not_failed() {
+        let fx = fixture();
+        fx.fleet
+            .enqueue_outline(OutlineMutation::EnableCapabilities { node_id: fx.node, capabilities: vec![Capability::Ticket] })
+            .unwrap();
+        fx.fleet.writer().flush().unwrap();
+        fx.fleet
+            .enqueue(FleetMutation::UpdateTaskLinkedPrs {
+                id: fx.node.to_string(),
+                linked_prs: vec!["https://github.com/acme/app/pull/42".into()],
+            })
+            .unwrap();
+        fx.fleet.writer().flush().unwrap();
+        fx.fleet.reload_if_stale().ok();
+        enable_lifecycle(&fx, "pr_draft");
+        let not_found =Arc::new(std::sync::atomic::AtomicBool::new(false));
+        crate::pr_readiness::set_feed_override(Some(Arc::new(ReadsThenOneNotFound(not_found.clone()))));
+
+        // First look reads the pull request fine; tod records its head.
+        let first = crate::autopilot::check_github(&fx.fleet, fx.node, &fx.root, "pr_draft").unwrap();
+        assert!(!matches!(first, GithubCheck::Unreadable(_)), "{first:?}");
+        crate::pr_pushes::record_mechanical(&fx.fleet, fx.node, &tod_store::github::NodePr::new("acme", "app", 42), None, "abc", "pr_draft")
+            .unwrap();
+
+        not_found.store(true, std::sync::atomic::Ordering::SeqCst);
+        // The next look is one 404: waiting, with the error, not failed.
+        let second = crate::autopilot::check_github(&fx.fleet, fx.node, &fx.root, "pr_draft").unwrap();
+        let GithubCheck::Unreadable(why) = second else { panic!("{second:?}") };
+        let outcome = crate::autopilot::github_look_failed(&fx.fleet, fx.node, false, &why).unwrap();
+        let crate::autopilot::Outcome::Waiting { what, .. } = outcome else { panic!("not waiting: {outcome:?}") };
+        assert!(what.contains("1 of") && what.contains("not found"), "{what}");
+        let waits = fx.fleet.read(|conn| tod_store::waits::WaitRepo::new(conn).list_pending_for_node(fx.node)).unwrap();
+        let read = waits.iter().find(|w| w.match_spec == "github:pr:read").expect("recorded");
+        assert!(!read.exhausted(), "one 404 on a pull request read before must not stop the node: {read:?}");
+
+        // The look after reads it again: the failure ends.
+        not_found.store(false, std::sync::atomic::Ordering::SeqCst);
+        let third = crate::autopilot::check_github(&fx.fleet, fx.node, &fx.root, "pr_draft").unwrap();
+        assert!(!matches!(third, GithubCheck::Unreadable(_)), "{third:?}");
+        let waits = fx.fleet.read(|conn| tod_store::waits::WaitRepo::new(conn).list_pending_for_node(fx.node)).unwrap();
+        assert!(!waits.iter().any(|w| w.match_spec == "github:pr:read"), "{waits:?}");
+
+        // A 404 that persists across the whole budget does fail the node.
+        let mut last = None;
+        for _ in 0..tod_store::waits::DEFAULT_MAX_ATTEMPTS + 1 {
+            last = Some(crate::autopilot::github_look_failed(&fx.fleet, fx.node, false, &why).unwrap());
+        }
+        assert!(matches!(last, Some(crate::autopilot::Outcome::Stopped { .. })), "{last:?}");
+        crate::pr_readiness::set_feed_override(None);
+    }
+
     /// A spent GitHub rate limit is waited out until its reset: the run
     /// waits (never stops), the next look is at the reset, and no retry is
     /// spent however many looks it refuses.

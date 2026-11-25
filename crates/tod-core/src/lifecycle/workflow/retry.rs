@@ -158,7 +158,13 @@ fn recover(
     }
 
     let (due_at_ms, rate_limited) =
-        github_wait::read_retry(now, previous, error, observed.verdict == Verdict::Retry);
+        github_wait::read_retry(
+            now,
+            previous,
+            error,
+            observed.verdict == Verdict::Retry,
+            github_wait::pull_requests_read_before(fleet, run.task)?,
+        );
     let max = DEFAULT_MAX_ATTEMPTS;
     let attempt = match due_at_ms {
         Some(_) if rate_limited => previous.min(max.saturating_sub(1)),
