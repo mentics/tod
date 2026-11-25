@@ -307,6 +307,48 @@ pub struct RunFacts {
     pub last_outcome: Option<(Outcome, i64)>,
     /// The outcome comes from the current durable graph visit.
     pub workflow_wait: bool,
+    /// The run stopped on its budget, and today's budget no longer holds it
+    /// there ([`crate::autopilot::AutopilotState::budget_stop_outgrown`]):
+    /// the stop, the saved outcome's or the run's row, reads as an ordinary
+    /// stop that Resume carries on ([`outgrown_budget`]).
+    pub budget_outgrown: bool,
+}
+
+/// What a budget stop that today's budget no longer holds says after its own
+/// words: the runner menu reads it as an ordinary stop
+/// ([`is_budget_stop`]).
+pub const BUDGET_OUTGROWN: &str = "today's budget is not spent, so Resume carries on";
+
+/// A budget stop that today's budget no longer holds: the same stop, saying
+/// so (an earlier build stopped it under smaller limits, or the limits were
+/// raised since).
+fn outgrown_budget(why: YouReason) -> YouReason {
+    match why {
+        YouReason::Stopped { reason } => {
+            YouReason::Stopped { reason: format!("{reason}, under the budget of its time; {BUDGET_OUTGROWN}") }
+        }
+        other => other,
+    }
+}
+
+/// Whether a stop's words are those of a spent budget that still holds the
+/// node (the local runner's "budget spent: ...", the supervisor's "its budget
+/// is spent", an answer to leave it stopped on its budget), and not one today's
+/// budget has outgrown ([`BUDGET_OUTGROWN`]).
+pub fn is_budget_stop(reason: &str) -> bool {
+    reason.to_lowercase().contains("budget") && !reason.contains(BUDGET_OUTGROWN)
+}
+
+/// Whether `why`, or the end beside a request or permission, is a budget stop
+/// today's budget has outgrown.
+pub fn budget_outgrown(why: &YouReason) -> bool {
+    match why {
+        YouReason::Stopped { reason } => reason.contains(BUDGET_OUTGROWN),
+        YouReason::Request { ended: Some(ended), .. } | YouReason::Permission { ended: Some(ended), .. } => {
+            budget_outgrown(ended)
+        }
+        _ => false,
+    }
 }
 
 /// A cloud node whose sandbox is gone (`cloud_nodes.lost_at`).
@@ -528,6 +570,16 @@ pub fn compute_in(conn: &Connection, data_root: &std::path::Path) -> Result<Hash
                     )
                 }))
             };
+            // A budget stop is judged again against the budget the daemon
+            // runs nodes with today, from the run's saved counts: an older
+            // build's stop, or one under limits raised since, no longer holds.
+            let budget_outgrown = match &saved {
+                Some(Ok(state)) => {
+                    let lifecycle = with_lifecycle.get(node).map(String::as_str).unwrap_or_default();
+                    state.budget_stop_outgrown(lifecycle, &crate::autopilot::Budget::default())
+                }
+                _ => false,
+            };
             let (outcome, workflow_wait) = match saved {
                 None => (current_workflow_wait()?, true),
                 Some(Ok(state)) => match state.outcome {
@@ -538,7 +590,10 @@ pub fn compute_in(conn: &Connection, data_root: &std::path::Path) -> Result<Hash
                 Some(Err(err)) => (Some((Outcome::Stopped { reason: format!("{FAILED_PREFIX}{err:#}") }, at)), false),
             };
             if let Some(outcome) = outcome {
-                inputs.runs.insert(*node, RunFacts { last_outcome: Some(outcome), workflow_wait, ..Default::default() });
+                inputs.runs.insert(
+                    *node,
+                    RunFacts { last_outcome: Some(outcome), workflow_wait, budget_outgrown, ..Default::default() },
+                );
             }
         }
         for_nodes(conn, &ids, &inputs)
@@ -674,6 +729,13 @@ fn run_end(facts: &Facts<'_>) -> Option<(YouReason, i64)> {
     let superseded_by_workflow = |at| {
         run.workflow_wait && run.last_outcome.as_ref().is_some_and(|(_, recorded_at)| at <= *recorded_at)
     };
+    // The row's stop, a budget stop that today's budget has outgrown reading
+    // as an ordinary one.
+    let row_reason = |row: &RunState| {
+        crate::run_state::you_reason(row).map(|why| {
+            if run.budget_outgrown && row.reason_kind == crate::run_state::kind::BUDGET { outgrown_budget(why) } else { why }
+        })
+    };
     // Sent to the cloud and nothing reported in for longer than a boot and a
     // seed may take: a failure that says so (never the silence of "not
     // started"). Within that time it is `Working` (`actor_for`), not an end.
@@ -707,7 +769,7 @@ fn run_end(facts: &Facts<'_>) -> Option<(YouReason, i64)> {
         // needs; the sandbox's state is beside it, never over it (seen live:
         // a failed supervisor's reason hidden behind "sandbox is gone").
         if let Some(row) = run_state
-            && let Some(why) = crate::run_state::you_reason(row)
+            && let Some(why) = row_reason(row)
         {
             let beside = if lost.deleted_by_user { "its sandbox was deleted" } else { "its sandbox is gone" };
             return Some((
@@ -728,7 +790,7 @@ fn run_end(facts: &Facts<'_>) -> Option<(YouReason, i64)> {
     // The run stopped and said why, as a row. Skipped when a later wake (an
     // old supervisor's beat) or a later saved run speaks after it.
     if let Some(row) = run_state
-        && let Some(why) = crate::run_state::you_reason(row)
+        && let Some(why) = row_reason(row)
         && facts.cloud.is_none_or(|b| b.heartbeat_at <= row.updated_at + RUN_STATE_SKEW_MS)
         && run.last_outcome.as_ref().is_none_or(|(_, at)| *at <= row.updated_at + RUN_STATE_SKEW_MS)
     {
@@ -745,6 +807,10 @@ fn run_end(facts: &Facts<'_>) -> Option<(YouReason, i64)> {
         && !run_state.is_some_and(|row| row.updated_at + RUN_STATE_SKEW_MS >= *at)
         && let Some(why) = outcome_reason(outcome)
     {
+        let why = match outcome {
+            Outcome::BudgetExhausted { .. } if run.budget_outgrown => outgrown_budget(why),
+            _ => why,
+        };
         return Some((why, *at));
     }
     // Processing that stopped answering: its owner died or hung. Said, not

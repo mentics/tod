@@ -358,7 +358,14 @@ pub fn derive_run_state(f: &RunFacts) -> RunState {
     }
     // The last local run's own word, when it has one.
     match f.outcome {
-        Some(Outcome::BudgetExhausted { .. }) => return RunState::Ended(EndedHow::Budget),
+        // A spent budget, unless today's budget has outgrown the stop: who is
+        // next judged it again from the run's saved counts
+        // (`AutopilotState::budget_stop_outgrown`), and then it is an
+        // ordinary stop that a plain Resume carries on.
+        Some(Outcome::BudgetExhausted { .. }) => {
+            let outgrown = matches!(f.actor, Some(NextActor::You { why, .. }) if crate::next_actor::budget_outgrown(why));
+            return RunState::Ended(if outgrown { EndedHow::Stopped } else { EndedHow::Budget });
+        }
         Some(Outcome::Stopped { .. }) => return RunState::Ended(EndedHow::Stopped),
         // The run stopped for a request: that is its end only while
         // who-is-next still shows one, and shows no other end beside it (a
@@ -405,7 +412,7 @@ fn ended_how(why: &YouReason) -> RunState {
         }
         YouReason::Request { .. } | YouReason::Permission { .. } => RunState::Ended(EndedHow::Request),
         YouReason::Paused => RunState::Ended(EndedHow::Paused),
-        YouReason::Stopped { reason } if reason.to_lowercase().contains("budget") => RunState::Ended(EndedHow::Budget),
+        YouReason::Stopped { reason } if crate::next_actor::is_budget_stop(reason) => RunState::Ended(EndedHow::Budget),
         YouReason::Stopped { .. } => RunState::Ended(EndedHow::Stopped),
         YouReason::Failed { .. } => RunState::Ended(EndedHow::Failed),
         YouReason::NotStarted => RunState::NeverRun,

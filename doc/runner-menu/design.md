@@ -187,7 +187,7 @@ rest. Entries show whenever they make sense.
 | Entry | Shown when | Does |
 |---|---|---|
 | **Start** (default) | idle, never run (or done and moved back), not done | Starts the autopilot where `runner_place` says: the daemon's local runner, or the supervisor in the node's sandbox (made if need be). |
-| **Resume** (default) | idle, the runner ended before `done` (paused, stopped, failed, a request), **except** after a spent budget | Continues the same agent session. Locally `start(node, false)`; supervised, a `keep_going` request, which also answers a "leave it stopped" stop question (`continue_over_stop_answer`). Not shown for a run that ended only to wait: the daemon or scheduler wakes it. |
+| **Resume** (default) | idle, the runner ended before `done` (paused, stopped, failed, a request), **except** after a budget that is still spent | Continues the same agent session. Locally `start(node, false)`; supervised, a `keep_going` request, which also answers a "leave it stopped" stop question (`continue_over_stop_answer`). Not shown for a run that ended only to wait: the daemon or scheduler wakes it. |
 | **Resume with a fresh budget** | with Resume; and **the default** after a spent budget, when plain Resume is hidden | Resume with the session and time budget reset (the stay's and the run's); the session is kept. Locally `start(node, true)`; supervised, a new `fresh_budget` request. |
 | **Run with a new session** | with Start or Resume (including after a spent budget) | The current step in a new agent session. |
 | **Pause** (default while running) | the runner is active | Stops once the current turn ends. Supervised: a new `pause` request, read at the supervisor's next boundary. |
@@ -231,6 +231,15 @@ Locally `run` comes from `NodeRunners`. Supervised it comes from the standing
 or `You::Failed`, or a `cloud_activity.stopped` reason, is Ended (Budget when
 the reason is the budget stop question); a pending wait with nothing stopped is
 Ended(Waiting).
+
+A budget stop is judged again whenever it is read, never trusted as saved
+(`AutopilotState::budget_stop_outgrown`, over `budget_spent_in`, the same test
+the autopilot stops on): a local stop whose saved counts are within today's
+budget (one reached under older limits, or a state from before per-stay counts,
+which only the run ceiling can judge) is an ordinary Stopped, and plain Resume is
+offered and works. A supervised node's counts are in its sandbox, so the app
+still shows its budget question; the supervisor withdraws that question on its
+next wake when the budget it was given no longer counts as spent.
 
 ### Check now
 

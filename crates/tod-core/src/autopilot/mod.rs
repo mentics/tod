@@ -309,7 +309,69 @@ impl BudgetLimit {
     }
 }
 
-/// What the user is needed for.
+impl AutopilotState {
+    /// Whether this run has spent `budget` with the node in `lifecycle`,
+    /// judged from the saved counts alone: nothing is entered or saved. This
+    /// is the one judgement of a budget, for the autopilot as it runs
+    /// ([`Autopilot::over_budget_in`]) and for whatever reads a saved budget
+    /// stop ([`Self::budget_stop_outgrown`]). A state other than the stay's
+    /// is a stay not begun, with nothing spent in it yet; so is every state
+    /// of a run saved before stays were counted (no `stay_state`), which is
+    /// then held to the run's ceilings alone.
+    pub fn budget_spent_in(&self, lifecycle: &str, budget: &Budget) -> Option<BudgetLimit> {
+        let worked = self.worked_ms();
+        let counts = &self.session_counts;
+        let in_stay = counts.in_stay(lifecycle);
+        if in_stay >= budget.max_sessions {
+            return Some(BudgetLimit::Sessions {
+                used: in_stay,
+                elapsed_secs: counts.stay_worked_ms(lifecycle, worked) / 1000,
+                stay: Some(lifecycle.to_string()),
+                breakdown: counts.stay_breakdown(),
+            });
+        }
+        if self.sessions >= budget.max_run_sessions {
+            return Some(BudgetLimit::Sessions {
+                used: self.sessions,
+                elapsed_secs: worked / 1000,
+                stay: None,
+                breakdown: counts.run_breakdown(),
+            });
+        }
+        self.time_spent_in(lifecycle, budget)
+    }
+
+    /// The time half of [`Self::budget_spent_in`]: the stay in `stay` (when
+    /// it is the stay counted), then the run.
+    fn time_spent_in(&self, stay: &str, budget: &Budget) -> Option<BudgetLimit> {
+        let worked = self.worked_ms();
+        let counts = &self.session_counts;
+        let stay_ms = counts.stay_worked_ms(stay, worked);
+        if !stay.is_empty() && counts.stay_state == stay && Duration::from_millis(stay_ms) >= budget.max_duration {
+            return Some(BudgetLimit::Time {
+                elapsed_secs: stay_ms / 1000,
+                used: counts.in_stay(stay),
+                stay: Some(stay.to_string()),
+            });
+        }
+        (Duration::from_millis(worked) >= budget.max_run_duration).then(|| BudgetLimit::Time {
+            elapsed_secs: worked / 1000,
+            used: self.sessions,
+            stay: None,
+        })
+    }
+
+    /// The run stopped on its budget, and that stop no longer holds: under
+    /// `budget` (today's limits, which a deploy or a setting may have
+    /// raised) the saved counts are within it, with the node in `lifecycle`.
+    /// A budget stop is a verdict reached under the limits of its time, so
+    /// whatever offers or refuses a plain Resume judges it again here rather
+    /// than trusting the stop; the saved stop itself is left as it is.
+    pub fn budget_stop_outgrown(&self, lifecycle: &str, budget: &Budget) -> bool {
+        matches!(self.outcome, Some(Outcome::BudgetExhausted { .. })) && self.budget_spent_in(lifecycle, budget).is_none()
+    }
+}
+
 /// What [`Autopilot::checks_round`] decided.
 enum ChecksStep {
     /// Nothing configured, or everything passes: carry on with the phase.
@@ -865,46 +927,15 @@ impl Autopilot {
     pub(crate) fn over_budget_in(&mut self, lifecycle: &str) -> Option<BudgetLimit> {
         let worked = self.state.worked_ms();
         self.state.session_counts.enter(lifecycle, worked);
-        let counts = &self.state.session_counts;
-        let in_stay = counts.in_stay(lifecycle);
-        if in_stay >= self.budget.max_sessions {
-            return Some(BudgetLimit::Sessions {
-                used: in_stay,
-                elapsed_secs: counts.stay_worked_ms(lifecycle, worked) / 1000,
-                stay: Some(lifecycle.to_string()),
-                breakdown: counts.stay_breakdown(),
-            });
-        }
-        if self.state.sessions >= self.budget.max_run_sessions {
-            return Some(BudgetLimit::Sessions {
-                used: self.state.sessions,
-                elapsed_secs: worked / 1000,
-                stay: None,
-                breakdown: counts.run_breakdown(),
-            });
-        }
-        self.over_time_budget()
+        self.state.budget_spent_in(lifecycle, &self.budget)
     }
 
     /// Whether the stay the node is in, or the run, has worked as long as
     /// its budget allows (also checked while a turn runs, where the session
     /// it is in already counted).
     fn over_time_budget(&self) -> Option<BudgetLimit> {
-        let worked = self.state.worked_ms();
-        let counts = &self.state.session_counts;
-        let stay_ms = worked.saturating_sub(counts.stay_since_ms);
-        if !counts.stay_state.is_empty() && Duration::from_millis(stay_ms) >= self.budget.max_duration {
-            return Some(BudgetLimit::Time {
-                elapsed_secs: stay_ms / 1000,
-                used: counts.in_stay(&counts.stay_state),
-                stay: Some(counts.stay_state.clone()),
-            });
-        }
-        (Duration::from_millis(worked) >= self.budget.max_run_duration).then(|| BudgetLimit::Time {
-            elapsed_secs: worked / 1000,
-            used: self.state.sessions,
-            stay: None,
-        })
+        let stay = self.state.session_counts.stay_state.clone();
+        self.state.time_spent_in(&stay, &self.budget)
     }
 
     /// One session of `kind` (`ProtocolKind::as_str`) starts with the node

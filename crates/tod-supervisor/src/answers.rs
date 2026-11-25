@@ -156,6 +156,42 @@ pub fn before_wake_requested(
     Ok(Before::Go(granted(budget, acted.budget_grants)))
 }
 
+/// The node's latest stop question is the budget one, still unanswered, and
+/// the run it stopped no longer spends `budget` (the limits of this wake,
+/// grants included): an older build counted the whole run, or the limits were
+/// raised since. The question is withdrawn, as the stop it asks about no
+/// longer holds the node (`AutopilotState::budget_stop_outgrown`, the same
+/// judgement the app's menu reads), and the wake goes on as after any other
+/// stop; a pending decision would stop the run again before it began. A
+/// question still answered by the counts is left for the user. Returns
+/// whether it was withdrawn. The autopilot's state is read from `data_root`.
+pub fn withdraw_outgrown_budget_question(
+    fleet: &FleetStore,
+    node: Uuid,
+    data_root: &Path,
+    budget: &Budget,
+) -> Result<bool> {
+    let Some(latest) = fleet.read(|conn| stop_questions::latest(conn, node))? else {
+        return Ok(false);
+    };
+    if latest.answer != Answer::Pending || latest.kind != stop_questions::BUDGET {
+        return Ok(false);
+    }
+    let state = tod_core::autopilot::AutopilotState::load(data_root, node)?;
+    let lifecycle = tod_core::lifecycle::current_state(fleet, node)?;
+    if !state.budget_stop_outgrown(&lifecycle, budget) {
+        return Ok(false);
+    }
+    fleet
+        .interview(
+            crate::waits::ACTOR,
+            tod_store::interview::InterviewCommand::WithdrawDecision { decision_id: latest.decision },
+        )
+        .map_err(|e| anyhow::anyhow!("withdraw the budget question {} its run has outgrown: {e}", latest.decision))?;
+    tracing::info!(decision = %latest.decision, "the budget question's stop no longer holds under today's budget; withdrawn");
+    Ok(true)
+}
+
 /// Whether the node's latest stop question is still unanswered, so a new one
 /// would only repeat it.
 pub fn still_asking(fleet: &FleetStore, node: Uuid) -> Result<bool> {

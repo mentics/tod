@@ -725,6 +725,14 @@ pub fn wake(config: Config) -> Result<Woke> {
         }
         answers::Before::Go(budget) => budget,
     };
+    // A budget question this run's counts no longer answer (asked under an
+    // older build's whole-run count, or limits raised since) is withdrawn
+    // before anything looks at the node's pending decisions: its stop is an
+    // ordinary one now, and the wake goes on.
+    {
+        let data_root = replica.lock().unwrap_or_else(|e| e.into_inner()).root().to_path_buf();
+        answers::withdraw_outgrown_budget_question(&store, config.node, &data_root, &budget)?;
+    }
 
     // A request for a new session is a request to run now: what the node
     // waits on is looked at again by the run, which records it afresh. Left

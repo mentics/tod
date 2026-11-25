@@ -39,6 +39,25 @@ fn git(dir: &Path, args: &[&str]) {
     assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
 }
 
+/// The node's checkout, with an `origin` whose `main` it branched from: a
+/// run that works on the node (once the first wake's budget question no
+/// longer holds it) reads what the branch changed against it.
+fn workspace(base: &Path) {
+    let origin = base.join("origin.git");
+    std::fs::create_dir_all(&origin).unwrap();
+    git(&origin, &["init", "--quiet", "--bare"]);
+    let workspace = base.join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    git(&workspace, &["init", "--quiet"]);
+    git(&workspace, &["checkout", "--quiet", "-b", "main"]);
+    std::fs::write(workspace.join("README"), "hi\n").unwrap();
+    git(&workspace, &["add", "README"]);
+    git(&workspace, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "--quiet", "-m", "init"]);
+    git(&workspace, &["remote", "add", "origin", origin.to_str().unwrap()]);
+    git(&workspace, &["push", "--quiet", "origin", "main"]);
+    git(&workspace, &["checkout", "--quiet", "-b", "node-branch"]);
+}
+
 /// A node in `active` with Files and a two-step plan, running in the cloud.
 fn app_database(root: &Path) -> Uuid {
     let fleet = FleetStore::open(root).unwrap();
@@ -130,9 +149,7 @@ fn a_requested_new_session_is_taken_when_the_supervisor_wakes() {
     assert_eq!(seeded.status(), 200);
     let orchestrator = Orchestrator::new(orch_url.clone(), "alice", node.to_string());
 
-    let workspace = base.join("workspace");
-    std::fs::create_dir_all(&workspace).unwrap();
-    git(&workspace, &["init", "--quiet"]);
+    workspace(&base);
     let state_dir = base.join("supervisor");
     let request = state_dir.join(tod_core::autopilot::FRESH_SESSION_REQUEST_FILE);
 
@@ -178,9 +195,7 @@ fn a_requested_new_session_runs_despite_a_pending_wait() {
     assert_eq!(seeded.status(), 200);
     let orchestrator = Orchestrator::new(orch_url.clone(), "alice", node.to_string());
 
-    let workspace = base.join("workspace");
-    std::fs::create_dir_all(&workspace).unwrap();
-    git(&workspace, &["init", "--quiet"]);
+    workspace(&base);
     let state_dir = base.join("supervisor");
 
     let woke = wake(config(&orchestrator, node, &base)).unwrap();

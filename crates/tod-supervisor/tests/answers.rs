@@ -226,6 +226,32 @@ fn keep_going_after_the_budget_grants_another() {
     );
 }
 
+/// Gap 123: a budget question asked under smaller limits (an older build's
+/// whole-run count, or limits raised since) no longer holds the node once
+/// the run's counts are within the wake's budget: it is withdrawn and the
+/// wake goes on, as after any other stop. Under the same limits it stays.
+#[test]
+fn a_budget_question_the_raised_budget_outgrew_is_withdrawn_and_the_wake_goes_on() {
+    let s = setup("budget-outgrown");
+    let woke = wake_once(&s, fake_relay().0, 1);
+    assert!(matches!(woke, Woke::Ran(Outcome::BudgetExhausted { .. })), "{woke:?}");
+    let pending = || {
+        let conn = rusqlite::Connection::open(&s.remote_db).unwrap();
+        conn.busy_timeout(Duration::from_secs(10)).unwrap();
+        stop_questions::latest(&conn, s.node).unwrap().is_some_and(|l| l.answer == stop_questions::Answer::Pending)
+    };
+    assert!(pending());
+
+    let turns = count(&s.remote_db, "SELECT COUNT(*) FROM conversation_turns");
+    let woke = wake_once(&s, fake_relay().0, 1000);
+    assert!(!matches!(woke, Woke::Ran(Outcome::BudgetExhausted { .. })), "{woke:?}");
+    assert!(!pending(), "the question its run outgrew is no longer pending");
+    assert!(
+        count(&s.remote_db, "SELECT COUNT(*) FROM conversation_turns") > turns,
+        "the wake went on without anyone answering"
+    );
+}
+
 #[test]
 fn leave_it_stopped_after_failures_keeps_the_node_stopped() {
     let s = setup("failures");

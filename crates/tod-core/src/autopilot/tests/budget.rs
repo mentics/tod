@@ -148,6 +148,54 @@ fn a_state_saved_before_stays_were_counted_loads_and_a_stop_saved_then_reads_as_
     assert_eq!(crate::run_state::budget_text(&limit), "budget spent: 60 sessions");
 }
 
+/// Gap 123: a budget stop is a verdict reached under the limits of its time.
+/// ENG-3038 stopped with "budget spent: 61 sessions" under the old whole-run
+/// count, and after gap 122 its saved counts are within today's budget: the
+/// stop no longer holds it. Judged from the saved counts, never the stop.
+#[test]
+fn a_saved_budget_stop_is_judged_again_against_todays_budget() {
+    // Saved before stays were counted: 61 sessions, no per-stay counts.
+    let old: AutopilotState = serde_json::from_str(
+        r#"{"started_at_ms":1,"active_ms":12871588,"sessions":61,"current":null,"steps":[],
+            "outcome":{"kind":"budget_exhausted","limit":{"kind":"sessions","used":61,"elapsed_secs":12871}}}"#,
+    )
+    .unwrap();
+    // Held to the run's ceilings alone (160 sessions, 64 hours): within them.
+    assert_eq!(old.budget_spent_in("review", &Budget::default()), None);
+    assert!(old.budget_stop_outgrown("review", &Budget::default()));
+    // Under the limits it stopped with, the stop still holds.
+    let then = Budget { max_run_sessions: 60, ..Budget::default() };
+    assert!(!old.budget_stop_outgrown("review", &then));
+    // So does one past today's ceiling.
+    let mut past = old.clone();
+    past.sessions = RUN_SESSIONS;
+    assert!(!past.budget_stop_outgrown("review", &Budget::default()));
+
+    // A stay that truly spent today's per-stay budget still holds, in that
+    // state; a move to another state starts a stay with nothing spent.
+    let mut stay = AutopilotState::fresh();
+    for _ in 0..STAY_SESSIONS {
+        stay.sessions += 1;
+        stay.session_counts.note("review", "review", 0);
+    }
+    stay.outcome = Some(Outcome::BudgetExhausted {
+        limit: BudgetLimit::Sessions { used: STAY_SESSIONS, elapsed_secs: 0, stay: Some("review".into()), breakdown: Vec::new() },
+    });
+    assert!(matches!(
+        stay.budget_spent_in("review", &Budget::default()),
+        Some(BudgetLimit::Sessions { used: STAY_SESSIONS, stay: Some(_), .. })
+    ));
+    assert!(!stay.budget_stop_outgrown("review", &Budget::default()));
+    assert!(stay.budget_stop_outgrown("design", &Budget::default()));
+    // Raised limits outgrow it, as a deploy or a setting may raise them.
+    let raised = Budget { max_sessions: 2 * STAY_SESSIONS, ..Budget::default() };
+    assert!(stay.budget_stop_outgrown("review", &raised));
+
+    // Only a budget stop is judged: any other end is not "outgrown".
+    stay.outcome = Some(Outcome::Stopped { reason: "x".into() });
+    assert!(!stay.budget_stop_outgrown("design", &Budget::default()));
+}
+
 /// A `pr_draft` stay lasts as long as people take to review: once the pull
 /// request rests with them, the next wave of feedback starts the stay's count
 /// again (ENG-3559 spent days in `pr_draft`, a few sessions a wave).

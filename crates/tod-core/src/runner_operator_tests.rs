@@ -155,6 +155,85 @@ fn the_menu_after_a_spent_budget_offers_a_fresh_one_and_after_a_stop_resume() {
     assert!(entries.contains(&"resume-fresh-budget") && entries.contains(&"run-fresh"), "{entries:?}");
 }
 
+/// The run stopped on its budget, saved as the daemon saves it: the
+/// autopilot's state and the run's row.
+fn stopped_on_budget(fx: &Fixture, state: crate::autopilot::AutopilotState) -> Outcome {
+    let outcome = state.outcome.clone().expect("a budget stop");
+    state.save(&fx.root, fx.node).unwrap();
+    crate::run_state::record(
+        &fx.fleet,
+        fx.node,
+        crate::run_state::for_outcome(&outcome, crate::run_state::Words::local()),
+        crate::run_state::LOCAL_WRITER,
+    )
+    .unwrap();
+    outcome
+}
+
+/// Gap 123: ENG-3038 was stopped with "budget spent: 61 sessions" under the
+/// whole-run count before gap 122; after the deploy its saved counts are
+/// within today's budget, yet `runner resume` was refused and the menu
+/// offered only a fresh budget, trusting the old stop. The stop is judged
+/// again: an old one within today's budget is an ordinary stop.
+#[test]
+fn an_old_budget_stop_within_todays_budget_is_plainly_resumed() {
+    let fx = fixture();
+    active(&fx);
+    // Saved before stays were counted: no per-stay counts at all.
+    let old: crate::autopilot::AutopilotState = serde_json::from_str(
+        r#"{"started_at_ms":1,"active_ms":12871588,"sessions":61,"current":null,"steps":[],
+            "outcome":{"kind":"budget_exhausted","limit":{"kind":"sessions","used":61,"elapsed_secs":12871}}}"#,
+    )
+    .unwrap();
+    let outcome = stopped_on_budget(&fx, old);
+    let daemon = FakeDaemon::with(fx.node, false, false, Some(outcome));
+    let report = menu(&fx, &daemon);
+    assert_eq!(report.default.as_ref().map(|e| e.verb), Some("resume"), "{report:?}");
+    assert_eq!(report.run, "stopped");
+    assert!(verbs(&report.entries).contains(&"resume-fresh-budget"), "{report:?}");
+    // Who is next says it is an ordinary stop now, and why.
+    let standing = crate::next_actor::compute(&fx.fleet, &fx.root).unwrap().remove(&fx.node).unwrap();
+    let NextActor::You { why: crate::next_actor::YouReason::Stopped { reason }, .. } = &standing.actor else {
+        panic!("{standing:?}")
+    };
+    assert!(reason.starts_with("budget spent: 61 sessions") && reason.contains(crate::next_actor::BUDGET_OUTGROWN), "{reason}");
+
+    go(&fx, &daemon, Verb::Resume, &Options::default(), &Who::Shepherd("s1".into())).unwrap();
+    assert_eq!(daemon.calls(), [format!("start {} renew=false", fx.node)]);
+    // The stop itself is left as it was saved.
+    let saved = crate::autopilot::AutopilotState::load(&fx.root, fx.node).unwrap();
+    assert!(matches!(saved.outcome, Some(Outcome::BudgetExhausted { .. })));
+}
+
+/// A stay that truly spent today's per-stay budget still offers only a fresh
+/// budget, and a plain Resume is refused.
+#[test]
+fn a_budget_stop_still_over_todays_budget_offers_only_a_fresh_one() {
+    let fx = fixture();
+    active(&fx);
+    let mut state = crate::autopilot::AutopilotState::fresh();
+    for _ in 0..crate::autopilot::STAY_SESSIONS {
+        state.sessions += 1;
+        state.session_counts.note("active", "implement", 0);
+    }
+    state.outcome = Some(Outcome::BudgetExhausted {
+        limit: BudgetLimit::Sessions {
+            used: crate::autopilot::STAY_SESSIONS,
+            elapsed_secs: 0,
+            stay: Some("active".into()),
+            breakdown: state.session_counts.stay_breakdown(),
+        },
+    });
+    let outcome = stopped_on_budget(&fx, state);
+    let daemon = FakeDaemon::with(fx.node, false, false, Some(outcome));
+    let report = menu(&fx, &daemon);
+    assert_eq!(report.default.as_ref().map(|e| e.verb), Some("resume-fresh-budget"), "{report:?}");
+    assert!(!verbs(&report.entries).contains(&"resume"), "{report:?}");
+    let err = go(&fx, &daemon, Verb::Resume, &Options::default(), &Who::Operator).unwrap_err().to_string();
+    assert!(err.contains("is not offered"), "{err}");
+    assert!(daemon.calls().is_empty());
+}
+
 #[test]
 fn the_menu_of_a_done_node_has_no_default() {
     let fx = fixture();
