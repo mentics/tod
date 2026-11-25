@@ -15,7 +15,10 @@
 //! for a judgment (intent, risk, a missing rule, a conflict, anything other),
 //! the stop questions about failures, a budget or a sleeping sandbox, and the
 //! bot-silence and permission requests are left alone: a deploy changes none of
-//! their causes. The configuration stop question (`supervisor:config`, "Fixed,
+//! their causes. Only a request on a node whose run will start again is
+//! withdrawn ([`run_will_continue`]): on a stopped (budget, failed), paused or
+//! never-started node nothing would ask again, and the request, often one only
+//! the user can answer (an expired SSO login), would be lost (gap 118). The configuration stop question (`supervisor:config`, "Fixed,
 //! try again") is re-examined: withdrawing it is what that answer does.
 //!
 //! Run by `tod-agentd` at its first reconcile; the measure is
@@ -49,14 +52,47 @@ pub fn cause_can_be_fixed_by_a_deploy(decision: &Decision) -> bool {
     }
 }
 
+/// Whether withdrawing a request on `node` makes its run start again, which is
+/// the only thing that asks the request again if its cause still holds: the
+/// run is waiting on a request (the daemon's tick continues it once none is
+/// pending), or is starting or working (it carries on). A run that is stopped
+/// (budget, failure, the user's stop), paused, done, or was never started has
+/// nobody to ask again, so the request is the user's only way in (gap 118:
+/// the AWS SSO login request of a node stopped on its budget was withdrawn and
+/// never asked again).
+fn run_will_continue(fleet: &FleetStore, node: uuid::Uuid) -> Result<bool> {
+    use tod_store::run_state::Phase;
+    Ok(match fleet.read(|conn| tod_store::run_state::get(conn, node))? {
+        None => false,
+        Some(row) => match row.phase {
+            Phase::Starting | Phase::Working => true,
+            Phase::Waiting => row.reason_kind == crate::run_state::kind::REQUEST,
+            Phase::Stopped | Phase::Done => false,
+        },
+    })
+}
+
 /// The pending requests filed before `built_at_ms` whose cause a deploy can
-/// remove.
+/// remove, on nodes whose run will start again to ask them again. This is the
+/// one place every deploy-time withdrawal passes through.
 pub fn pending_older_than(fleet: &FleetStore, built_at_ms: i64) -> Result<Vec<Decision>> {
     let all = fleet.read(|conn| DecisionRepo::new(conn).list_pending())?;
-    Ok(all
-        .into_iter()
-        .filter(|d| d.created_at < built_at_ms && cause_can_be_fixed_by_a_deploy(d))
-        .collect())
+    let mut out = Vec::new();
+    let mut will_continue: std::collections::HashMap<uuid::Uuid, bool> = std::collections::HashMap::new();
+    for d in all.into_iter().filter(|d| d.created_at < built_at_ms && cause_can_be_fixed_by_a_deploy(d)) {
+        let go = match will_continue.get(&d.node_id) {
+            Some(go) => *go,
+            None => {
+                let go = run_will_continue(fleet, d.node_id)?;
+                will_continue.insert(d.node_id, go);
+                go
+            }
+        };
+        if go {
+            out.push(d);
+        }
+    }
+    Ok(out)
 }
 
 /// Withdraw [`pending_older_than`] and say so on each node's activity. Returns
@@ -98,6 +134,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use tod_store::decisions::NewDecision;
+    use tod_store::run_state::{Draft, Phase};
     use tod_store::outline::{CreatePosition, OutlineMutation};
     use uuid::Uuid;
 
@@ -146,6 +183,22 @@ mod tests {
         reply["id"].as_str().unwrap().parse().unwrap()
     }
 
+    fn record_run(fleet: &FleetStore, node: Uuid, phase: Phase, kind: &str) {
+        let draft = Draft {
+            phase,
+            reason_kind: kind.into(),
+            reason_text: kind.into(),
+            resumable_by: tod_store::run_state::RESUMABLE_BY_YOU.into(),
+        };
+        crate::run_state::record(fleet, node, draft, "test").unwrap();
+    }
+
+    /// The run is stopped on a request, as the autopilot leaves it: it starts
+    /// again when the request is gone.
+    fn waits_on_request(fleet: &FleetStore, node: Uuid) {
+        record_run(fleet, node, Phase::Waiting, crate::run_state::kind::REQUEST);
+    }
+
     fn pending(fleet: &FleetStore) -> Vec<Uuid> {
         fleet.read(|c| Ok(DecisionRepo::new(c).list_pending()?.into_iter().map(|d| d.id).collect())).unwrap()
     }
@@ -153,6 +206,7 @@ mod tests {
     #[test]
     fn a_broken_request_filed_before_the_build_is_withdrawn_once() {
         let (fleet, node) = fleet_with_node();
+        waits_on_request(&fleet, node);
         let stale = ask(&fleet, node, REASON_BROKEN, "implement");
         let config = ask(&fleet, node, "other", stop_questions::CONFIG);
         let mut ids: Vec<Uuid> = sweep(&fleet, later()).unwrap().iter().map(|d| d.id).collect();
@@ -167,6 +221,7 @@ mod tests {
     #[test]
     fn only_causes_a_deploy_can_fix_are_re_examined_and_only_when_older_than_the_build() {
         let (fleet, node) = fleet_with_node();
+        waits_on_request(&fleet, node);
         let broken = ask(&fleet, node, REASON_BROKEN, "implement");
         let intent = ask(&fleet, node, "intent", "implement");
         let risk = ask(&fleet, node, "risk", "implement");
@@ -185,5 +240,46 @@ mod tests {
         for id in [intent, risk, budget, bot, permission, unrelated] {
             assert!(left.contains(&id), "{id} should still be pending");
         }
+    }
+
+    /// Gap 118: a node stopped on its budget (or failed, paused, stopped by
+    /// the user, or never started) has no run to ask again, so withdrawing
+    /// its access request only lost the one thing only the user could do.
+    #[test]
+    fn a_request_on_a_node_whose_run_will_not_start_again_stays_pending() {
+        use crate::run_state::kind;
+        for (phase, why) in [
+            (Phase::Stopped, kind::BUDGET),
+            (Phase::Stopped, kind::FAILED),
+            (Phase::Stopped, kind::PAUSED),
+            (Phase::Stopped, kind::STOPPED_NOW),
+            (Phase::Done, kind::DONE),
+        ] {
+            let (fleet, node) = fleet_with_node();
+            record_run(&fleet, node, phase, why);
+            let access = ask(&fleet, node, REASON_ACCESS, "verify");
+            assert!(sweep(&fleet, later()).unwrap().is_empty(), "{why}");
+            assert_eq!(pending(&fleet), vec![access], "{why}");
+        }
+        // Never started: no run row at all.
+        let (fleet, node) = fleet_with_node();
+        let access = ask(&fleet, node, REASON_ACCESS, "verify");
+        assert!(sweep(&fleet, later()).unwrap().is_empty());
+        assert_eq!(pending(&fleet), vec![access]);
+    }
+
+    /// A node whose run waits on the request (or is working) is run again
+    /// when the request is withdrawn, so it is re-examined as before.
+    #[test]
+    fn a_request_on_a_node_whose_run_continues_is_still_withdrawn() {
+        let (fleet, node) = fleet_with_node();
+        waits_on_request(&fleet, node);
+        let access = ask(&fleet, node, REASON_ACCESS, "verify");
+        let done: Vec<Uuid> = sweep(&fleet, later()).unwrap().into_iter().map(|d| d.id).collect();
+        assert_eq!(done, vec![access]);
+        let (fleet, node) = fleet_with_node();
+        record_run(&fleet, node, Phase::Working, crate::run_state::kind::WORKING);
+        ask(&fleet, node, REASON_ACCESS, "verify");
+        assert_eq!(sweep(&fleet, later()).unwrap().len(), 1);
     }
 }
