@@ -20,7 +20,7 @@ fn main() {
         .unwrap_or_else(|_| manifest_dir.join("../../target"));
     let dest = target_root.join(&profile).join("process");
 
-    if let Err(err) = copy_dir_all(&process_src, &dest) {
+    if let Err(err) = mirror_dir(&process_src, &dest) {
         println!("cargo:warning=tod: failed to copy process bundle: {err}");
     }
 
@@ -28,7 +28,7 @@ fn main() {
     let skills_src = manifest_dir.join("../../assets/skills");
     if skills_src.join("README.md").is_file() {
         println!("cargo:rerun-if-changed={}", skills_src.display());
-        if let Err(err) = copy_dir_all(&skills_src, &target_root.join(&profile).join("skills")) {
+        if let Err(err) = mirror_dir(&skills_src, &target_root.join(&profile).join("skills")) {
             println!("cargo:warning=tod: failed to copy skills bundle: {err}");
         }
     } else {
@@ -41,7 +41,7 @@ fn main() {
     if media_src.join("context").is_dir() {
         println!("cargo:rerun-if-changed={}", media_src.display());
         let media_dest = target_root.join(&profile).join("media");
-        if let Err(err) = copy_dir_all(&media_src, &media_dest) {
+        if let Err(err) = mirror_dir(&media_src, &media_dest) {
             println!("cargo:warning=tod: failed to copy media bundle: {err}");
         }
     } else {
@@ -61,6 +61,17 @@ fn embed_windows_icon(manifest_dir: &PathBuf) {
     embed_resource::compile(icon_dir.join("tod.rc"), embed_resource::NONE)
         .manifest_optional()
         .unwrap();
+}
+
+/// Makes `dst` a copy of `src`, without the files `src` no longer has: a doc
+/// deleted from the sources must not live on in the bundle `scripts/install.sh`
+/// ships (shepherd gap 121 found `target/release/process` still holding the
+/// interview agents a month after they were deleted).
+fn mirror_dir(src: &PathBuf, dst: &PathBuf) -> std::io::Result<()> {
+    if dst.exists() {
+        fs::remove_dir_all(dst)?;
+    }
+    copy_dir_all(src, dst)
 }
 
 fn copy_dir_all(src: &PathBuf, dst: &PathBuf) -> std::io::Result<()> {

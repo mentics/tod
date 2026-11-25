@@ -29,8 +29,9 @@ Gate **checklist criteria** live in the app database (`gate_criteria`); see [gat
 ## Finding the bundle at runtime
 
 1. `TOD_PROCESS_ROOT` environment variable
-2. `{executable_dir}/process/` (installed layout)
-3. Walk up from cwd for `assets/process/README.md` (dev checkout)
+2. `assets/process/` of the checkout the build came from, when the binary is in that checkout's `target/` (dev build)
+3. `{executable_dir}/process/` (installed layout)
+4. Walk up from cwd for `assets/process/README.md` (dev checkout)
 
 User data (obligations, interviews, DB) lives under the app **data root** — not in this directory.
 

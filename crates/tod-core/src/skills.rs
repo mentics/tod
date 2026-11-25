@@ -20,15 +20,21 @@ pub struct SkillsPaths {
 impl SkillsPaths {
     /// Resolution order:
     /// 1. `TOD_SKILLS_ROOT` env override
-    /// 2. `{executable_dir}/skills` (installed layout)
-    /// 3. `{executable_dir}/../skills` (a cloud sandbox: `tod-cli` is in
+    /// 2. `assets/skills` of the checkout this build came from, when the
+    ///    program is one of that checkout's build outputs
+    ///    ([`crate::bundle_source`]: the copy in `target/<profile>/` can be stale)
+    /// 3. `{executable_dir}/skills` (installed layout)
+    /// 4. `{executable_dir}/../skills` (a cloud sandbox: `tod-cli` is in
     ///    `/opt/tod/bin`, the bundles in `/opt/tod`)
-    /// 4. Walk up from cwd for `assets/skills` (dev checkout)
+    /// 5. Walk up from cwd for `assets/skills` (dev checkout)
     pub fn discover() -> Result<Self> {
         if let Ok(raw) = std::env::var("TOD_SKILLS_ROOT") {
             return Self::from_root(PathBuf::from(raw));
         }
         if let Some(dir) = tod_store::install::program_dir() {
+            if let Some(source) = crate::bundle_source::dev_source(&dir, crate::bundle_source::SKILLS, "README.md") {
+                return Self::from_root(source);
+            }
             let candidate = dir.join("skills");
             if candidate.join("README.md").is_file() {
                 return Self::from_root(candidate);

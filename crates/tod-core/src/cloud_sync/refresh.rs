@@ -123,12 +123,13 @@ pub fn install_files(root: &Path) -> Result<InstallFiles> {
     let relay_path = tod_store::fleet::sandbox::relay_path()?;
     let dir = relay_path.parent().context("the sandbox binaries' directory")?;
     let relay = std::fs::read(&relay_path).with_context(|| format!("read {}", relay_path.display()))?;
-    let mut bundles = tod_sandbox::node::bundle_files(crate::process_bundle::TodInstallPaths::discover()?.process_root(), "process")?;
-    bundles.extend(tod_sandbox::node::bundle_files(
+    // Found the same way by every program of one build (the app, the daemon,
+    // `tod-sandbox golden refresh` from another profile): `crate::bundle_source`.
+    let mut bundles = tod_bundles(
+        crate::process_bundle::TodInstallPaths::discover()?.process_root(),
         crate::media::MediaPaths::discover().map_err(|e| anyhow::anyhow!("media bundle: {e}"))?.media_root(),
-        "media",
-    )?);
-    bundles.extend(tod_sandbox::node::bundle_files(crate::skills::SkillsPaths::discover()?.root(), "skills")?);
+        crate::skills::SkillsPaths::discover()?.root(),
+    )?;
     // The user's command redirects (Settings -> Cloud sandboxes) are part of
     // what a sandbox is given, so changing them makes an install stale.
     let config = tod_sandbox::config::Config::load(&root.join(tod_sandbox::config::FILE_NAME))?;
@@ -139,6 +140,15 @@ pub fn install_files(root: &Path) -> Result<InstallFiles> {
         local_cli: tod_sandbox::node::local_cli_from(dir),
         bundles,
     })
+}
+
+/// The `process/...`, `media/...` and `skills/...` files of the bundles at
+/// these roots, as a sandbox is given them.
+fn tod_bundles(process: &Path, media: &Path, skills: &Path) -> Result<Vec<(String, Vec<u8>)>> {
+    let mut bundles = tod_sandbox::node::bundle_files(process, "process").with_context(|| format!("read {}", process.display()))?;
+    bundles.extend(tod_sandbox::node::bundle_files(media, "media").with_context(|| format!("read {}", media.display()))?);
+    bundles.extend(tod_sandbox::node::bundle_files(skills, "skills").with_context(|| format!("read {}", skills.display()))?);
+    Ok(bundles)
 }
 
 /// What is recorded for one node: the install, and why it was last made.
@@ -375,6 +385,56 @@ mod tests {
             h.update(bytes);
         }
         assert_ne!(i.stamp, hex(h.finalize()));
+    }
+
+    /// Shepherd gap 121: `scripts/deploy.sh` makes the golden with `cargo run
+    /// --release -p tod-sandbox-cli` (program dir `target/release`, beside an
+    /// old copy of the bundles), and the daemon checks it from `target/dev-fast`
+    /// (no copy). The same build must give the same install identity from
+    /// both, or every deploy's golden is forked again at once; and a bundle
+    /// that really differs must still give another.
+    #[test]
+    fn the_golden_refresh_and_the_daemon_give_one_build_the_same_install() {
+        use crate::bundle_source::{MEDIA, PROCESS, SKILLS, source_in_checkout};
+        let dir = tempfile::tempdir().unwrap();
+        let c = dir.path();
+        let write = |rel: &str, text: &str| {
+            let path = c.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write("assets/process/README.md", "process");
+        write("assets/process/agents/state/base.md", "now");
+        write("crates/tod/media/context/stance/one-shot.md", "now");
+        write("assets/skills/README.md", "skills");
+        // What `crates/tod/build.rs` left in target/release when tod was last
+        // built in release, a month and a deleted doc ago.
+        write("target/release/process/README.md", "process");
+        write("target/release/process/agents/state/base.md", "now");
+        write("target/release/process/agents/interview/asker.md", "deleted since");
+        write("target/release/media/context/stance/one-shot.md", "now");
+        write("target/release/skills/README.md", "skills");
+        std::fs::create_dir_all(c.join("target/dev-fast")).unwrap();
+        let targets = [c.join("target")];
+        let install_from = |program: &str| {
+            let program = c.join(program);
+            let find = |source, marker| source_in_checkout(&program, c, &targets, source, marker).expect("a build output reads its checkout's sources");
+            let bundles = tod_bundles(&find(PROCESS, "README.md"), &find(MEDIA, "context"), &find(SKILLS, "README.md")).unwrap();
+            install_of(b"relay", Some(b"sup"), Some(b"cli"), &bundles)
+        };
+        let golden = install_from("target/release");
+        let daemon = install_from("target/dev-fast");
+        assert_eq!(golden, daemon);
+
+        // The stale copy (what the golden was given before) is another install.
+        let r = c.join("target/release");
+        let stale = install_of(b"relay", Some(b"sup"), Some(b"cli"), &tod_bundles(&r.join("process"), &r.join("media"), &r.join("skills")).unwrap());
+        assert_ne!(stale.stamp, daemon.stamp);
+        assert_eq!(reinstall_reason(Some(&stale), &daemon), "process changed");
+
+        // A real change to the sources is still a different install.
+        write("assets/process/agents/state/base.md", "changed");
+        assert_ne!(install_from("target/release").stamp, daemon.stamp);
     }
 
     #[test]

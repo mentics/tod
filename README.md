@@ -63,8 +63,11 @@ Use this for distributable installs. Dev builds keep `agent-socket` on by defaul
 **At runtime**, the app resolves bundled docs via `TodInstallPaths`:
 
 1. `TOD_PROCESS_ROOT` environment variable (override for testing)
-2. `{executable_dir}/process/` — **installed layout** (binary and `process/` side by side)
-3. Walk up from cwd for `assets/process/README.md` — **dev checkout fallback**
+2. `assets/process/` of the checkout the build came from, when the binary is in that checkout's `target/` — **dev build** (the copy in `target/<profile>/` is only refreshed when `tod` itself is built in that profile, so it can be stale; `tod_core::bundle_source`)
+3. `{executable_dir}/process/` — **installed layout** (binary and `process/` side by side)
+4. Walk up from cwd for `assets/process/README.md` — **dev checkout fallback**
+
+`media/` and `skills/` resolve the same way.
 
 User data (obligations, interviews, scratchpads) lives under a **data root** — not in `assets/process/`.
 

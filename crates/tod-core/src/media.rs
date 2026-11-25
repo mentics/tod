@@ -20,14 +20,20 @@ pub struct MediaPaths {
 impl MediaPaths {
     /// Resolution order:
     /// 1. `TOD_MEDIA_ROOT` env override
-    /// 2. `{executable_dir}/media` (installed layout)
-    /// 3. Walk up from cwd for `crates/tod/media` (dev checkout)
+    /// 2. `crates/tod/media` of the checkout this build came from, when the
+    ///    program is one of that checkout's build outputs
+    ///    ([`crate::bundle_source`]: the copy in `target/<profile>/` can be stale)
+    /// 3. `{executable_dir}/media` (installed layout)
+    /// 4. Walk up from cwd for `crates/tod/media` (dev checkout)
     pub fn discover() -> Result<Self> {
         if let Ok(raw) = std::env::var("TOD_MEDIA_ROOT") {
             return Self::from_media_root(PathBuf::from(raw));
         }
 
         if let Some(dir) = tod_store::install::program_dir() {
+            if let Some(source) = crate::bundle_source::dev_source(&dir, crate::bundle_source::MEDIA, "context") {
+                return Self::from_media_root(source);
+            }
             let candidate = dir.join("media");
             if candidate.join("context").is_dir() {
                 return Self::from_media_root(candidate);
