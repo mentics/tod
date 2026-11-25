@@ -166,7 +166,7 @@ fn wake_once(s: &Setup, relay: String, max_sessions: u32) -> Woke {
         holder: Arc::new(RelayHolder::new(relay)),
         transcripts: None,
         media: media(),
-        budget: Budget { max_sessions, max_duration: Duration::from_secs(600) },
+        budget: Budget { max_sessions, max_run_sessions: max_sessions, max_duration: Duration::from_secs(600) },
         guards: Default::default(),
         poll: Duration::from_millis(20),
         push_branch: false,
@@ -204,8 +204,8 @@ fn keep_going_after_the_budget_grants_another() {
         (question, tod_store::cloud_activity::get(&conn, s.node).unwrap().unwrap())
     };
     assert!(
-        question.starts_with("Used 1 of 1 sessions (")
-            && question.contains("Keep going gives it 1 more sessions and ")
+        question.starts_with("Used 1 of 1 sessions in ")
+            && question.contains("Keep going gives it 1 more sessions in ")
             && question.contains("Leave it stopped keeps it stopped until you change this answer."),
         "{question}"
     );
@@ -452,7 +452,7 @@ fn before_wake_requested_grants_a_fresh_budget_request_once() {
     std::fs::create_dir_all(&tmp.0).unwrap();
     let fleet = FleetStore::open(&tmp.0).unwrap();
     let state = tmp.0.join("state");
-    let budget = Budget { max_sessions: 10, max_duration: Duration::from_secs(100) };
+    let budget = Budget { max_sessions: 10, max_run_sessions: 10, max_duration: Duration::from_secs(100) };
     let node = Uuid::new_v4();
     let request = Uuid::new_v4();
     let go = |ids: &[Uuid]| match tod_supervisor::answers::before_wake_requested(&fleet, node, &state, budget, false, ids).unwrap() {

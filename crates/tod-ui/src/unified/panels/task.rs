@@ -2159,7 +2159,7 @@ mod tests {
         }
         assert_eq!(derive_run_state(&facts(false, None)), RunState::NeverRun);
         // A local outcome beats the standing; a finished one says nothing.
-        let spent = Outcome::BudgetExhausted { limit: tod_core::autopilot::BudgetLimit::Sessions { used: 6, elapsed_secs: 0 } };
+        let spent = Outcome::BudgetExhausted { limit: tod_core::autopilot::BudgetLimit::Sessions { used: 6, elapsed_secs: 0, stay: None, breakdown: Vec::new() } };
         let mut f = facts(false, None);
         f.outcome = Some(&spent);
         assert_eq!(derive_run_state(&f), RunState::Ended(EndedHow::Budget));

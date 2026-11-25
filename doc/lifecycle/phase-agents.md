@@ -103,7 +103,8 @@ so both the local runner and the cloud supervisor use it.
   rejection in the same stay means the phase agent changed nothing in
   between. The runner then stops with `NeedsHuman::EvaluationStuck` and shows
   both sides. Rejections that lead to real changes are not capped, other than
-  by the runner's overall budget.
+  by the runner's session budget for one stay in a state (and its ceiling for
+  the whole run; `doc/cloud-sandboxes/autonomous-nodes.md`, "A runaway loop").
 - **Off:** one phase-agent session does the work, evaluates it against the same
   checklist, fixes whatever it finds, and certifies. No evaluator runs.
 

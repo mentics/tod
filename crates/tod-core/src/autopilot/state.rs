@@ -44,8 +44,15 @@ pub struct AutopilotState {
     /// new one).
     #[serde(skip)]
     pub active_since_ms: Option<i64>,
-    /// Conversations started or reopened.
+    /// Conversations started or reopened over the whole run (every state),
+    /// held to the run's ceiling (`Budget::max_run_sessions`).
     pub sessions: u32,
+    /// The same sessions by the stay in a lifecycle state they were spent
+    /// in, and by state over the run: the per-stay budget
+    /// (`Budget::max_sessions`) counts the stay, and a stop for either says
+    /// what the sessions were.
+    #[serde(default)]
+    pub session_counts: SessionCounts,
     /// The conversation in progress, reopened by a restart.
     pub current: Option<CurrentStep>,
     /// Every finished step, in order.
@@ -183,6 +190,65 @@ pub struct PrChange {
     /// the pull request's agent made for feedback.
     #[serde(default)]
     pub held: bool,
+}
+
+/// The run's sessions by where they were spent
+/// ([`AutopilotState::session_counts`]). The run's total is
+/// [`AutopilotState::sessions`]; this says what it was made of.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCounts {
+    /// The lifecycle state of the stay counted in `stay` (empty before the
+    /// first session, and in a state saved before stays were counted).
+    #[serde(default)]
+    pub stay_state: String,
+    /// The current stay's sessions, by protocol (`ProtocolKind::as_str`,
+    /// `workflow` for a workflow's agent action).
+    #[serde(default)]
+    pub stay: BTreeMap<String, u32>,
+    /// The run's sessions by the lifecycle state they were spent in.
+    #[serde(default)]
+    pub by_state: BTreeMap<String, u32>,
+}
+
+impl SessionCounts {
+    /// One session of `kind` started in `state`. A state other than the
+    /// stay's begins a new stay: a move on or back (a send-back is one; its
+    /// own guard caps those loops) starts its count again.
+    pub fn note(&mut self, state: &str, kind: &str) {
+        if self.stay_state != state {
+            self.stay_state = state.to_string();
+            self.stay.clear();
+        }
+        *self.stay.entry(kind.to_string()).or_insert(0) += 1;
+        *self.by_state.entry(state.to_string()).or_insert(0) += 1;
+    }
+
+    /// The sessions of the stay in `state` so far: none when the node is
+    /// no longer in the state the last ones were spent in.
+    pub fn in_stay(&self, state: &str) -> u32 {
+        if self.stay_state == state { self.stay.values().sum() } else { 0 }
+    }
+
+    /// The current stay's sessions by protocol, most first (ties by name).
+    pub fn stay_breakdown(&self) -> Vec<(String, u32)> {
+        most_first(&self.stay)
+    }
+
+    /// The run's sessions by state, most first (ties by name).
+    pub fn run_breakdown(&self) -> Vec<(String, u32)> {
+        most_first(&self.by_state)
+    }
+
+    /// The stay starts its count again (the user asked to redo the state).
+    pub fn clear_stay(&mut self) {
+        self.stay.clear();
+    }
+}
+
+fn most_first(counts: &BTreeMap<String, u32>) -> Vec<(String, u32)> {
+    let mut out: Vec<(String, u32)> = counts.iter().map(|(k, v)| (k.clone(), *v)).collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    out
 }
 
 /// The later skill groups (`lifecycle_config::groups`, 1 and up) a finished
@@ -345,6 +411,7 @@ impl AutopilotState {
             active_ms: 0,
             active_since_ms: None,
             sessions: 0,
+            session_counts: SessionCounts::default(),
             current: None,
             steps: Vec::new(),
             outcome: None,
@@ -389,6 +456,9 @@ impl AutopilotState {
         state.pending_groups = None;
         state.loops.clear();
         state.loops.review_floor_ms = now_ms();
+        // Redone from the top: the stay's sessions count from here (the
+        // run's ceiling still holds).
+        state.session_counts.clear_stay();
         state.outcome = None;
         state.quota_after_push = None;
         state.acp_quota_retries = AcpQuotaRetries::default();

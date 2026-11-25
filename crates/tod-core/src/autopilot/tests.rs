@@ -21,6 +21,7 @@ use tod_store::outline::{Capability, OutlineMutation};
 use tod_store::settings::InterviewContextSettings;
 
 mod agent_incident;
+mod budget;
 mod ci_quick_fix;
 mod default_parity;
 mod guidance;
@@ -3138,7 +3139,7 @@ fn the_loop_counters_survive_a_restart_mid_loop() {
         0,
         Arc::new(|_, due| due.to_vec()),
         // Two of them are the guidance selector's.
-        Budget { max_sessions: 11, ..Budget::default() },
+        Budget { max_sessions: 11, max_run_sessions: 11, ..Budget::default() },
     );
     assert!(matches!(outcome, Outcome::BudgetExhausted { .. }), "{outcome:?} {:?}", pilot.state().steps);
     let saved = AutopilotState::load(&fx.root, fx.node).unwrap();

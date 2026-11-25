@@ -25,7 +25,7 @@
 
 use crate::attention::{self, NodeAttention};
 use crate::autopilot::local::{FAILED_PREFIX, stopped_by_user};
-use crate::autopilot::{BudgetLimit, NeedsHuman, Outcome};
+use crate::autopilot::{NeedsHuman, Outcome};
 use crate::runner_status::{DONE_STATE, format_elapsed};
 use anyhow::Result;
 use rusqlite::Connection;
@@ -1028,14 +1028,7 @@ pub(crate) fn outcome_reason(outcome: &Outcome) -> Option<YouReason> {
             Some(error) => YouReason::Failed { error: error.to_string() },
             None => YouReason::Stopped { reason: reason.clone() },
         }),
-        Outcome::BudgetExhausted { limit } => Some(YouReason::Stopped {
-            reason: match limit {
-                BudgetLimit::Sessions { used, .. } => format!("budget spent: {used} sessions"),
-                BudgetLimit::Time { elapsed_secs, .. } => {
-                    format!("budget spent: {} of work", format_elapsed(*elapsed_secs as i64 * 1000))
-                }
-            },
-        }),
+        Outcome::BudgetExhausted { limit } => Some(YouReason::Stopped { reason: crate::run_state::budget_text(limit) }),
     }
 }
 
@@ -1668,7 +1661,7 @@ mod tests {
         assert!(matches!(standing(&c).actor, NextActor::You { why: YouReason::Stopped { .. }, since: 2 }));
 
         c.run.last_outcome = Some((
-            Outcome::BudgetExhausted { limit: BudgetLimit::Sessions { used: 6, elapsed_secs: 0 } },
+            Outcome::BudgetExhausted { limit: crate::autopilot::BudgetLimit::Sessions { used: 6, elapsed_secs: 0, stay: None, breakdown: Vec::new() } },
             3,
         ));
         assert_eq!(
@@ -2332,7 +2325,7 @@ mod tests {
             assert_eq!(standing(&c).actor, you(YouReason::Paused, 800), "{reason}");
         }
         c.run_state = Some(supervisor(&Outcome::BudgetExhausted {
-            limit: BudgetLimit::Sessions { used: 6, elapsed_secs: 60 },
+            limit: crate::autopilot::BudgetLimit::Sessions { used: 6, elapsed_secs: 60, stay: None, breakdown: Vec::new() },
         }));
         assert_eq!(
             standing(&c).actor,

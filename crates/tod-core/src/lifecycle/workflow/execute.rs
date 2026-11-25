@@ -60,8 +60,8 @@ pub(crate) fn resume_agent<A: AgentAccess + ?Sized, H: StepHook + ?Sized>(
 
 trait Driver {
     fn stop_requested(&mut self) -> Result<Option<String>>;
-    fn budget_limit(&self) -> Option<BudgetLimit> {
-        None
+    fn budget_limit(&self) -> Result<Option<BudgetLimit>> {
+        Ok(None)
     }
     fn external_wait(
         &self,
@@ -118,8 +118,8 @@ impl<A: AgentAccess + ?Sized, H: StepHook + ?Sized> Driver for WithAgent<'_, A, 
         self.hook.at(self.fleet, Boundary::Step)
     }
 
-    fn budget_limit(&self) -> Option<BudgetLimit> {
-        self.autopilot.over_budget()
+    fn budget_limit(&self) -> Result<Option<BudgetLimit>> {
+        self.autopilot.over_budget(self.fleet)
     }
 
     fn external_wait(
@@ -180,7 +180,7 @@ impl<A: AgentAccess + ?Sized, H: StepHook + ?Sized> Driver for WithAgent<'_, A, 
             action,
             &node.outputs,
             self.poll,
-            || self.autopilot.record_workflow_launch(),
+            || self.autopilot.record_workflow_launch(self.fleet),
             |id, status| {
                 self.hook.watch(Turn {
                     protocol: tod_store::conversation::ProtocolKind::Chat,
@@ -258,7 +258,7 @@ fn resume_with(
                 native_outcome: None,
             });
         }
-        if let Some(limit) = driver.budget_limit() {
+        if let Some(limit) = driver.budget_limit()? {
             return Ok(Progress {
                 run,
                 pending_action: None,

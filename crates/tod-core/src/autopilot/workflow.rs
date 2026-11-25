@@ -75,7 +75,7 @@ impl Autopilot {
                     "The task moved to a different workflow visit.",
                 ));
             }
-            if let Some(limit) = self.over_budget() {
+            if let Some(limit) = self.over_budget(fleet)? {
                 return Ok(StepResult::Suspended(Outcome::BudgetExhausted { limit }));
             }
             let phase = lifecycle::current_state(fleet, self.node)?;

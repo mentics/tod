@@ -11,7 +11,8 @@
 //! it stops when the node is `done`, when a human is needed (a pending
 //! decision, a `blocked` plan step, a failing criterion no agent can fix, an
 //! evaluator that rejected the same work twice, a step that changed nothing),
-//! or when its budget (sessions started, time spent working) runs out.
+//! or when its budget (sessions started in one stay in a state, or over the
+//! whole run against a larger ceiling; time spent working) runs out.
 //! Spec: `doc/lifecycle/phase-agents.md`.
 //!
 //! It has no GPUI and blocks while it drives the agent, so it can run in a
@@ -41,7 +42,7 @@ mod state;
 #[cfg(test)]
 mod tests;
 
-pub use state::{AutopilotState, CYCLE_LIMIT, REVIEW_ROUND_LIMIT, CurrentStep, FRESH_SESSION_REQUEST_FILE, LoopCounters, STOP_NOW_REQUEST_FILE, StepRecord, state_path};
+pub use state::{AutopilotState, CYCLE_LIMIT, REVIEW_ROUND_LIMIT, CurrentStep, FRESH_SESSION_REQUEST_FILE, LoopCounters, STOP_NOW_REQUEST_FILE, SessionCounts, StepRecord, state_path};
 
 use crate::conversation::driver::{
     AgentAccess, ConversationConfig, ConversationDriver, ConversationEvent, ConversationStatus,
@@ -65,19 +66,36 @@ use uuid::Uuid;
 /// The message that reopens a conversation a restart interrupted.
 pub const RESUME_MESSAGE: &str = "Continue where you left off.";
 
-/// How much one run may spend before it stops for the user.
+/// How much one run may spend before it stops for the user. The budget
+/// catches a runaway, not a node that has simply lived long: the sessions
+/// are counted per stay in a lifecycle state, and the run as a whole only
+/// against a ceiling several stays wide, for a cycle across states that no
+/// other guard catches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Budget {
-    /// Conversations started (or reopened after a restart).
+    /// Conversations started (or reopened after a restart) in one stay in a
+    /// lifecycle state; a move to another state (on, or back) starts the
+    /// count again.
     pub max_sessions: u32,
+    /// Conversations started over the whole run, every state.
+    pub max_run_sessions: u32,
     /// Time spent working, summed over the run's wakes (not time asleep).
     pub max_duration: Duration,
 }
 
+/// The default [`Budget::max_sessions`]. A stay in `review` that goes all
+/// its rounds (`REVIEW_ROUND_LIMIT`, two reviewers, a quick fix and a fix
+/// each) spends about 25; more than this in one state is a runaway.
+pub const STAY_SESSIONS: u32 = 40;
+/// The default [`Budget::max_run_sessions`]: four stays' worth. A whole
+/// lifecycle, review rounds and pull request included, takes about 60.
+pub const RUN_SESSIONS: u32 = 4 * STAY_SESSIONS;
+
 impl Default for Budget {
     fn default() -> Self {
         Self {
-            max_sessions: 60,
+            max_sessions: STAY_SESSIONS,
+            max_run_sessions: RUN_SESSIONS,
             max_duration: Duration::from_secs(16 * 60 * 60),
         }
     }
@@ -215,8 +233,41 @@ pub enum BudgetLimit {
     /// Both counts are kept: the one that was not the limit is shown too, as
     /// what was used, not as its maximum (`elapsed_secs` / `used` of an older
     /// saved state read as 0).
-    Sessions { used: u32, #[serde(default)] elapsed_secs: u64 },
+    Sessions {
+        used: u32,
+        #[serde(default)]
+        elapsed_secs: u64,
+        /// The lifecycle state whose stay spent its budget
+        /// ([`Budget::max_sessions`]); `None` when the run's ceiling
+        /// ([`Budget::max_run_sessions`]) was reached (and in a stop saved
+        /// before stays were counted).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stay: Option<String>,
+        /// What the sessions were, most first: by protocol in a stay, by
+        /// state over the run.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        breakdown: Vec<(String, u32)>,
+    },
     Time { elapsed_secs: u64, #[serde(default)] used: u32 },
+}
+
+impl BudgetLimit {
+    /// What the spent sessions were, in short: " in pr_draft (review 3,
+    /// quick_fix 2)" or " over the run (review 20, pr_draft 14)"; empty for
+    /// a time limit or a stop saved before the sessions were counted by
+    /// where they were spent.
+    pub fn sessions_detail(&self) -> String {
+        let Self::Sessions { stay, breakdown, .. } = self else {
+            return String::new();
+        };
+        let parts = breakdown.iter().map(|(what, n)| format!("{what} {n}")).collect::<Vec<_>>().join(", ");
+        let parts = if parts.is_empty() { String::new() } else { format!(" ({parts})") };
+        match stay {
+            Some(state) => format!(" in {state}{parts}"),
+            None if breakdown.is_empty() => String::new(),
+            None => format!(" over the run{parts}"),
+        }
+    }
 }
 
 /// What the user is needed for.
@@ -655,6 +706,7 @@ impl Autopilot {
         self.state.active_ms = 0;
         self.state.active_since_ms = None;
         self.state.sessions = 0;
+        self.state.session_counts = Default::default();
         self.state.acp_quota_retries = Default::default();
         // Rounds on the pull request count from here (they are in `loops`):
         // the user has seen why it stopped and wants it to go on. This also
@@ -691,6 +743,9 @@ impl Autopilot {
             }
             return Ok(());
         }
+        // A fresh set of rounds is sessions in this stay: they count from
+        // here too (the run's ceiling still holds).
+        self.state.session_counts.clear_stay();
         let loops = &mut self.state.loops;
         loops.review_rounds = 0;
         loops.check_rounds = 0;
@@ -715,6 +770,20 @@ impl Autopilot {
         let quiet_for = chrono::Utc::now().timestamp_millis() - loops.pr_housekeeping_at_ms;
         if loops.pr_housekeeping_rounds != 0 && quiet_for >= 4 * self.housekeeping_gap.as_millis() as i64 {
             self.state.loops.pr_housekeeping_rounds = 0;
+            self.save()?;
+        }
+        Ok(())
+    }
+
+    /// The pull request has nothing left for tod: only a person (or a bot
+    /// asked as often as allowed) is waited for. The stay's sessions count
+    /// from here: a `pr_draft` or `pr_review` stay lasts as long as people
+    /// take, and each wave of their feedback is new work, not a runaway (the
+    /// run's ceiling still holds). A loop that never gets the pull request
+    /// to rest is still stopped by the stay's budget.
+    fn pr_at_rest(&mut self) -> Result<()> {
+        if !self.state.session_counts.stay.is_empty() {
+            self.state.session_counts.clear_stay();
             self.save()?;
         }
         Ok(())
@@ -746,13 +815,40 @@ impl Autopilot {
         Ok(outcome)
     }
 
-    pub(crate) fn over_budget(&self) -> Option<BudgetLimit> {
-        if self.state.sessions >= self.budget.max_sessions {
+    /// Whether the run has spent its budget, with the node in its current
+    /// lifecycle state: the sessions of this stay in it, the run's sessions
+    /// against its ceiling, or the time worked.
+    pub(crate) fn over_budget(&self, fleet: &FleetStore) -> Result<Option<BudgetLimit>> {
+        let lifecycle = lifecycle::current_state(fleet, self.node)?;
+        Ok(self.over_budget_in(&lifecycle))
+    }
+
+    /// [`Self::over_budget`] with the node in `lifecycle`.
+    pub(crate) fn over_budget_in(&self, lifecycle: &str) -> Option<BudgetLimit> {
+        let counts = &self.state.session_counts;
+        let in_stay = counts.in_stay(lifecycle);
+        if in_stay >= self.budget.max_sessions {
+            return Some(BudgetLimit::Sessions {
+                used: in_stay,
+                elapsed_secs: self.state.elapsed().as_secs(),
+                stay: Some(lifecycle.to_string()),
+                breakdown: counts.stay_breakdown(),
+            });
+        }
+        if self.state.sessions >= self.budget.max_run_sessions {
             return Some(BudgetLimit::Sessions {
                 used: self.state.sessions,
                 elapsed_secs: self.state.elapsed().as_secs(),
+                stay: None,
+                breakdown: counts.run_breakdown(),
             });
         }
+        self.over_time_budget()
+    }
+
+    /// Whether the run has worked as long as its budget allows (checked
+    /// while a turn runs, where the session it is in already counted).
+    fn over_time_budget(&self) -> Option<BudgetLimit> {
         let elapsed = self.state.elapsed();
         (elapsed >= self.budget.max_duration).then_some(BudgetLimit::Time {
             elapsed_secs: elapsed.as_secs(),
@@ -760,11 +856,20 @@ impl Autopilot {
         })
     }
 
-    pub(crate) fn record_workflow_launch(&mut self) -> Result<()> {
-        let before = self.state.sessions;
-        self.state.sessions = before.saturating_add(1);
+    /// One session of `kind` (`ProtocolKind::as_str`) starts with the node
+    /// in `lifecycle`: it counts toward the run and toward this stay.
+    fn note_session(&mut self, lifecycle: &str, kind: &str) {
+        self.state.sessions = self.state.sessions.saturating_add(1);
+        self.state.session_counts.note(lifecycle, kind);
+    }
+
+    pub(crate) fn record_workflow_launch(&mut self, fleet: &FleetStore) -> Result<()> {
+        let lifecycle = lifecycle::current_state(fleet, self.node)?;
+        let (sessions, counts) = (self.state.sessions, self.state.session_counts.clone());
+        self.note_session(&lifecycle, "workflow");
         if let Err(error) = self.save() {
-            self.state.sessions = before;
+            self.state.sessions = sessions;
+            self.state.session_counts = counts;
             return Err(error);
         }
         Ok(())
@@ -929,7 +1034,7 @@ impl Autopilot {
             if let Some(reason) = hook.at(fleet, Boundary::Step)? {
                 return Ok(Outcome::Stopped { reason });
             }
-            if let Some(limit) = self.over_budget() {
+            if let Some(limit) = self.over_budget(fleet)? {
                 return Ok(Outcome::BudgetExhausted { limit });
             }
             if let Some(outcome) = self.incident_step(fleet, agent, hook)? {
@@ -1833,7 +1938,7 @@ impl Autopilot {
                 hook.waiting(None, None);
                 return Ok(Some(Outcome::Stopped { reason }));
             }
-            if let Some(limit) = self.over_budget() {
+            if let Some(limit) = self.over_budget(fleet)? {
                 hook.waiting(None, None);
                 return Ok(Some(Outcome::BudgetExhausted { limit }));
             }
@@ -2090,6 +2195,7 @@ impl Autopilot {
                     } else {
                         github_wait::clear_read_failures(fleet, node)?;
                     }
+                    self.pr_at_rest()?;
                     self.reset_housekeeping()?;
                     return Ok(None);
                 }
@@ -2313,12 +2419,14 @@ impl Autopilot {
                                 OwnReview::Again => continue,
                                 OwnReview::Stop(outcome) => return Ok(Some(outcome)),
                                 OwnReview::Clear => {
+                                    self.pr_at_rest()?;
                                     self.reset_housekeeping()?;
                                     return Ok(None);
                                 }
                             }
                         }
                         github_wait::clear_read_failures(fleet, node)?;
+                        self.pr_at_rest()?;
                         self.reset_housekeeping()?;
                         // Hours or days: the run ends, and is woken at the
                         // time recorded (or by the review's webhook).
@@ -2490,6 +2598,7 @@ impl Autopilot {
                 &what,
             )?;
         }
+        self.pr_at_rest()?;
         self.reset_housekeeping()?;
         Ok(Some(Outcome::Waiting { what, due_at_ms }))
     }
@@ -3663,10 +3772,10 @@ impl Autopilot {
             }
             return self.converse_review(fleet, agent, hook, reopen);
         }
-        if let Some(limit) = self.over_budget() {
+        let lifecycle = lifecycle::current_state(fleet, self.node)?;
+        if let Some(limit) = self.over_budget_in(&lifecycle) {
             return Ok(Some(Outcome::BudgetExhausted { limit }));
         }
-        let lifecycle = lifecycle::current_state(fleet, self.node)?;
         let started = state::now_ms();
         // A head that reached the pull request since the last look, outside
         // any turn (`crate::pr_pushes`).
@@ -3706,7 +3815,7 @@ impl Autopilot {
         // against the run's budget; neither is a triage session, which reads
         // one request the work filed.
         if kind != ProtocolKind::Guidance && kind != ProtocolKind::Triage {
-            self.state.sessions += 1;
+            self.note_session(&lifecycle, protocol_name(kind));
         }
         if let Err(err) = driver.send(fleet, agent, &message) {
             self.state.current = None;
@@ -3799,7 +3908,7 @@ impl Autopilot {
                     answered = Some(request.title);
                 }
             }
-            if let Some(limit) = self.over_budget().filter(|l| matches!(l, BudgetLimit::Time { .. })) {
+            if let Some(limit) = self.over_time_budget() {
                 driver.cancel(fleet, agent)?;
                 return Ok(Some(Outcome::BudgetExhausted { limit }));
             }
@@ -3835,10 +3944,10 @@ impl Autopilot {
     ) -> Result<Option<Outcome>> {
         use tod_store::review::Reviewer;
         let kind = ProtocolKind::Review;
-        if let Some(limit) = self.over_budget() {
+        let lifecycle = lifecycle::current_state(fleet, self.node)?;
+        if let Some(limit) = self.over_budget_in(&lifecycle) {
             return Ok(Some(Outcome::BudgetExhausted { limit }));
         }
-        let lifecycle = lifecycle::current_state(fleet, self.node)?;
         let started = state::now_ms();
         if let Some(outcome) = self.check_pushes(fleet, &lifecycle, None)? {
             return Ok(Some(outcome));
@@ -3873,7 +3982,7 @@ impl Autopilot {
             self.save()?;
         }
         let mut lanes = vec![Lane::new(lead, step_label(kind, 0))];
-        if let Some(outcome) = self.start_lane(fleet, agent, &mut lanes[0], true, &lead_message)? {
+        if let Some(outcome) = self.start_lane(fleet, agent, &lifecycle, &mut lanes[0], true, &lead_message)? {
             return Ok(Some(outcome));
         }
         let lead_id = lanes[0]
@@ -3897,7 +4006,7 @@ impl Autopilot {
                 }
             };
             lanes.push(Lane::new(risk, format!("{} ({})", step_label(kind, 0), Reviewer::Risk.title())));
-            if let Some(outcome) = self.start_lane(fleet, agent, &mut lanes[1], false, &message)? {
+            if let Some(outcome) = self.start_lane(fleet, agent, &lifecycle, &mut lanes[1], false, &message)? {
                 // Kept as current: the next run reopens the lead and starts
                 // the risk reviewer again.
                 cancel_lanes(fleet, agent, &mut lanes)?;
@@ -3995,7 +4104,7 @@ impl Autopilot {
                     }
                 }
             }
-            if let Some(limit) = self.over_budget().filter(|l| matches!(l, BudgetLimit::Time { .. })) {
+            if let Some(limit) = self.over_time_budget() {
                 cancel_lanes(fleet, agent, &mut lanes)?;
                 return Ok(Some(Outcome::BudgetExhausted { limit }));
             }
@@ -4047,6 +4156,7 @@ impl Autopilot {
         &mut self,
         fleet: &FleetStore,
         agent: &mut A,
+        lifecycle: &str,
         lane: &mut Lane,
         lead: bool,
         message: &str,
@@ -4057,7 +4167,7 @@ impl Autopilot {
             lane.done = true;
             return Ok(None);
         }
-        self.state.sessions += 1;
+        self.note_session(lifecycle, protocol_name(ProtocolKind::Review));
         if let Err(err) = lane.driver.send(fleet, agent, message) {
             if lead {
                 self.state.current = None;

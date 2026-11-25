@@ -63,7 +63,7 @@ fn a_second_supervisor_exits_at_once_and_leaves_everything_alone() {
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("tod").join("media"),
         )
         .unwrap(),
-        budget: Budget { max_sessions: 1, max_duration: Duration::from_secs(60) },
+        budget: Budget { max_sessions: 1, max_run_sessions: 1, max_duration: Duration::from_secs(60) },
         guards: Default::default(),
         poll: Duration::from_millis(20),
         push_branch: false,

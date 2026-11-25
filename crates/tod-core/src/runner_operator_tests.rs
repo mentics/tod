@@ -142,7 +142,7 @@ fn the_menu_of_a_running_node_offers_pause_and_stop_now() {
 fn the_menu_after_a_spent_budget_offers_a_fresh_one_and_after_a_stop_resume() {
     let fx = fixture();
     active(&fx);
-    let budget = Outcome::BudgetExhausted { limit: BudgetLimit::Sessions { used: 3, elapsed_secs: 10 } };
+    let budget = Outcome::BudgetExhausted { limit: BudgetLimit::Sessions { used: 3, elapsed_secs: 10, stay: None, breakdown: Vec::new() } };
     let report = menu(&fx, &FakeDaemon::with(fx.node, false, false, Some(budget)));
     assert_eq!(report.default.as_ref().map(|e| e.verb), Some("resume-fresh-budget"), "{report:?}");
     assert!(verbs(&report.entries).contains(&"run-fresh"));
@@ -199,7 +199,7 @@ fn start_goes_to_the_daemon_and_is_noted_as_the_operator() {
 fn a_shepherd_is_named_on_the_note_and_the_budget_verb_renews() {
     let fx = fixture();
     active(&fx);
-    let budget = Outcome::BudgetExhausted { limit: BudgetLimit::Sessions { used: 3, elapsed_secs: 10 } };
+    let budget = Outcome::BudgetExhausted { limit: BudgetLimit::Sessions { used: 3, elapsed_secs: 10, stay: None, breakdown: Vec::new() } };
     let daemon = FakeDaemon::with(fx.node, false, false, Some(budget));
     go(&fx, &daemon, Verb::ResumeFreshBudget, &Options::default(), &Who::Shepherd("s1".into())).unwrap();
     assert_eq!(daemon.calls(), [format!("start {} renew=true", fx.node)]);
@@ -221,7 +221,7 @@ fn preparing_a_phase_rerun_clears_local_run_state_but_not_for_a_supervisor() {
     let fx = fixture();
     active(&fx);
     let mut state = crate::autopilot::AutopilotState::fresh();
-    state.outcome = Some(Outcome::BudgetExhausted { limit: BudgetLimit::Sessions { used: 3, elapsed_secs: 10 } });
+    state.outcome = Some(Outcome::BudgetExhausted { limit: BudgetLimit::Sessions { used: 3, elapsed_secs: 10, stay: None, breakdown: Vec::new() } });
     state.save(&fx.root, fx.node).unwrap();
 
     prepare_fresh_run(&fx.fleet, &fx.root, fx.node, true, FreshRun::Phase).unwrap();
