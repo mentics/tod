@@ -253,6 +253,11 @@ pub const MAX_INLINE_RATE_WAIT_SECS: i64 = 90;
 #[derive(Default)]
 struct Usage {
     calls: std::collections::BTreeMap<String, u64>,
+    /// Requests GitHub answered 304 Not Modified (an ETag matched): they cost no
+    /// quota, so they are counted apart from `calls`.
+    not_modified: std::collections::BTreeMap<String, u64>,
+    /// When the rate was last logged, and the call total then.
+    window: Option<(std::time::Instant, u64, u64)>,
     refused: u64,
     /// By resource (`core`, `graphql`, `search`): limit, remaining, reset (epoch secs).
     quota: std::collections::BTreeMap<String, (i64, i64, i64)>,
@@ -316,8 +321,9 @@ fn usage_summary_of(u: &Usage) -> String {
     calls.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
     let top: Vec<String> = calls.iter().take(8).map(|(k, n)| format!("{k} x{n}")).collect();
     let total: u64 = u.calls.values().sum();
+    let cached: u64 = u.not_modified.values().sum();
     format!(
-        "quota {}; this process made {total} calls, {} refused{}",
+        "quota {}; this process made {total} calls ({cached} more answered 304 Not Modified, free), {} refused{}",
         if quota.is_empty() { "not seen yet".to_string() } else { quota.join(", ") },
         u.refused,
         if top.is_empty() { String::new() } else { format!(": {}", top.join(", ")) }
@@ -339,7 +345,46 @@ fn note_response(class: &str, headers: &ureq::http::HeaderMap) {
         if let Some((res, q)) = quota {
             u.quota.insert(res, q);
         }
+        log_rate(u);
     });
+}
+
+/// Like [`note_response`] for a 304: not a spent call, still a request.
+fn note_not_modified(class: &str, headers: &ureq::http::HeaderMap) {
+    note_response(class, headers);
+    with_usage(|u| {
+        // note_response counted it as a call; move it to the free count.
+        if let Some(n) = u.calls.get_mut(class) {
+            *n = n.saturating_sub(1);
+        }
+        *u.not_modified.entry(class.to_string()).or_insert(0) += 1;
+    });
+}
+
+/// How often the call rate is logged.
+const RATE_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// At most every [`RATE_LOG_EVERY`], logs how many calls this process made in
+/// the interval, per minute, and the most-called endpoints, so a runaway
+/// poller shows long before the quota is gone.
+fn log_rate(u: &mut Usage) {
+    let total: u64 = u.calls.values().sum();
+    let cached: u64 = u.not_modified.values().sum();
+    let now = std::time::Instant::now();
+    let (since, was, was_cached) = *u.window.get_or_insert((now, total, cached));
+    let elapsed = now.duration_since(since);
+    if elapsed >= RATE_LOG_EVERY {
+        let made = total.saturating_sub(was);
+        let minutes = elapsed.as_secs_f64() / 60.0;
+        tracing::info!(
+            target: "tod::github",
+            "GitHub calls in the last {minutes:.1} min: {made} spent ({:.1}/min), {} not modified; {}",
+            made as f64 / minutes,
+            cached.saturating_sub(was_cached),
+            usage_summary_of(u)
+        );
+        u.window = Some((now, total, cached));
+    }
 }
 
 /// The error for a call GitHub refused for its quota, logging the quota and
@@ -802,14 +847,54 @@ impl Github {
         }
     }
 
-    /// `GET <api><path>`, as JSON.
+    /// `GET <api><path>`, as JSON. A reply that carries an ETag is kept, and the
+    /// next read of the same path asks `If-None-Match`: GitHub answers 304 for
+    /// free (a 304 spends no quota) while nothing changed, which is what makes
+    /// polling a quiet pull request cheap.
     fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T, GithubError> {
         if self.proxy_missing {
             return Err(GithubError::ProxyMissing);
         }
         self.check_quota_gate("GET", path, None)?;
-        let response = self.authorize(self.agent.get(&format!("{}{path}", self.api)), path, None).call();
-        match self.read("GET", path, None, response) {
+        let key = format!("{}|{path}", self.quota_key(path, None));
+        let cached = etag_get(&key);
+        let mut req = self.authorize(self.agent.get(&format!("{}{path}", self.api)), path, None);
+        if let Some((etag, _)) = &cached {
+            req = req.header("If-None-Match", etag);
+        }
+        let response = req.call();
+        let class = endpoint_class("GET", path);
+        if let (Ok(r), Some((_, body))) = (&response, &cached)
+            && r.status().as_u16() == 304
+        {
+            note_not_modified(&class, r.headers());
+            return serde_json::from_str(body)
+                .map_err(|err| GithubError::Http(format!("GET {path}: the kept reply no longer parses: {err}")));
+        }
+        let fresh_etag = match &response {
+            Ok(r) if r.status().as_u16() == 200 => {
+                r.headers().get("etag").and_then(|v| v.to_str().ok()).map(str::to_string)
+            }
+            _ => None,
+        };
+        let result = match (fresh_etag, response) {
+            (Some(etag), Ok(mut r)) => {
+                note_response(&class, r.headers());
+                match r.body_mut().read_to_string() {
+                    Ok(body) => {
+                        let parsed = serde_json::from_str(&body)
+                            .map_err(|err| GithubError::Http(format!("invalid JSON (HTTP 200): {err}")));
+                        if parsed.is_ok() {
+                            etag_put(key, etag, body);
+                        }
+                        parsed
+                    }
+                    Err(err) => Err(GithubError::Http(format!("GET {path}: could not read the body: {err}"))),
+                }
+            }
+            (_, response) => self.read("GET", path, None, response),
+        };
+        match result {
             Err(GithubError::NotFound) => Err(self.explain_pull_not_found(path)),
             other => other,
         }
@@ -1655,15 +1740,19 @@ impl Github {
     /// Reply in a review thread (by the thread's GraphQL id).
     pub fn reply_to_thread(&self, thread_id: &str, body: &str) -> Result<(), GithubError> {
         const MUTATION: &str = "mutation($thread: ID!, $body: String!) { addPullRequestReviewThreadReply(input: {pullRequestReviewThreadId: $thread, body: $body}) { comment { id } } }";
-        self.graphql::<serde_json::Value>(MUTATION, serde_json::json!({ "thread": thread_id, "body": body }), None)?;
-        Ok(())
+        forget_threads();
+        let result = self.graphql::<serde_json::Value>(MUTATION, serde_json::json!({ "thread": thread_id, "body": body }), None);
+        forget_threads();
+        result.map(|_| ())
     }
 
     /// Mark a review thread resolved.
     pub fn resolve_thread(&self, thread_id: &str) -> Result<(), GithubError> {
         const MUTATION: &str = "mutation($thread: ID!) { resolveReviewThread(input: {threadId: $thread}) { thread { id } } }";
-        self.graphql::<serde_json::Value>(MUTATION, serde_json::json!({ "thread": thread_id }), None)?;
-        Ok(())
+        forget_threads();
+        let result = self.graphql::<serde_json::Value>(MUTATION, serde_json::json!({ "thread": thread_id }), None);
+        forget_threads();
+        result.map(|_| ())
     }
 
     /// The files the pull request changes, each with its patch (GitHub omits
@@ -2036,6 +2125,7 @@ impl Github {
     }
 
     pub fn get_pr_snapshot(&self, owner: &str, repo: &str, number: i64) -> Result<PrSnapshot, GithubError> {
+        let pull_path = format!("/repos/{owner}/{repo}/pulls/{number}");
         let mut status = self.get_pr_status(owner, repo, number)?;
         let look = self.base_failures(owner, repo, &status)?;
         status.base_failures = look.failures;
@@ -2043,7 +2133,34 @@ impl Github {
         if let Some(sha) = status.head_sha.clone() {
             status.head_committed_at = self.commit_date(owner, repo, &sha).ok().flatten();
         }
-        let threads = self.list_review_threads(owner, repo, number)?;
+        // Review threads cost a GraphQL call GitHub's ETags cannot spare. A pull
+        // request's ETag changes with its `updated_at`, which new review
+        // activity moves, so while it is the one the threads were read under
+        // (and they are younger than THREADS_REUSED) they are reused. tod's
+        // own replies and resolves drop every kept list; a read that failed
+        // is never kept.
+        let pull_etag = etag_get(&format!("{}|{pull_path}", self.quota_key(&pull_path, None))).map(|(e, _)| e);
+        let threads_key = format!("{}|{owner}/{repo}#{number}", self.api);
+        let kept = pull_etag.as_ref().and_then(|etag| {
+            let cache = threads_cache().lock().unwrap_or_else(|e| e.into_inner());
+            cache
+                .get(&threads_key)
+                .filter(|(e, at, _)| e == etag && at.elapsed() < THREADS_REUSED)
+                .map(|(_, _, t)| t.clone())
+        });
+        let threads = match kept {
+            Some(threads) => threads,
+            None => {
+                let threads = self.list_review_threads(owner, repo, number)?;
+                if let Some(etag) = pull_etag {
+                    threads_cache()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(threads_key, (etag, std::time::Instant::now(), threads.clone()));
+                }
+                threads
+            }
+        };
         let comments = self.list_issue_comments(owner, repo, number)?;
         let reviews = self.list_reviews(owner, repo, number)?;
         Ok(PrSnapshot { status, threads, comments, reviews })
@@ -3141,6 +3258,48 @@ struct BaseHead {
 
 type BaseHeadCache = std::collections::HashMap<String, (BaseHead, std::time::Instant)>;
 
+/// How long review threads are reused under an unchanged pull request ETag.
+const THREADS_REUSED: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+type ThreadsCache = std::collections::HashMap<String, (String, std::time::Instant, Vec<ReviewThread>)>;
+
+fn threads_cache() -> &'static std::sync::Mutex<ThreadsCache> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<ThreadsCache>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+fn forget_threads() {
+    threads_cache().lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
+/// Replies kept with their ETag, by credential and path; see [`Github::get_json`].
+type EtagCache = std::collections::HashMap<String, (String, String, u64)>;
+
+const ETAG_CACHE_MAX: usize = 1500;
+
+fn etag_cache() -> &'static std::sync::Mutex<EtagCache> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<EtagCache>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+fn etag_get(key: &str) -> Option<(String, String)> {
+    etag_cache().lock().unwrap_or_else(|e| e.into_inner()).get(key).map(|(e, b, _)| (e.clone(), b.clone()))
+}
+
+fn etag_put(key: String, etag: String, body: String) {
+    let mut cache = etag_cache().lock().unwrap_or_else(|e| e.into_inner());
+    // Bounded: a long-lived daemon reads many paths (every sha is its own).
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if cache.len() >= ETAG_CACHE_MAX && !cache.contains_key(&key) {
+        // The oldest-written goes, never the whole cache.
+        if let Some(oldest) = cache.iter().min_by_key(|(_, (_, _, n))| *n).map(|(k, _)| k.clone()) {
+            cache.remove(&oldest);
+        }
+    }
+    cache.insert(key, (etag, body, seq));
+}
+
 /// Base heads by API, repository and branch, with when each was read; see
 /// [`Github::base_head`].
 fn base_head_cache() -> &'static std::sync::Mutex<BaseHeadCache> {
@@ -3979,6 +4138,98 @@ mod tests {
         assert!(matches!(err, GithubError::Api(_)) && !err.is_transient(), "{err}");
         assert!(err.to_string().contains("lacks access") && !err.to_string().contains("rate limit"), "{err}");
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn an_unchanged_reply_is_a_free_304_answered_from_the_kept_body() {
+        let (url, handle) = serve_canned(vec![
+            (with_headers("200 OK", "etag: \"abc\""), r#"{"login":"me"}"#),
+            ("304 Not Modified", ""),
+            ("304 Not Modified", ""),
+        ]);
+        let gh = client(&url, &[]);
+        let before = with_usage(|u| u.not_modified.values().sum::<u64>());
+        for _ in 0..3 {
+            assert_eq!(gh.user_login().unwrap(), "me");
+        }
+        let after = with_usage(|u| u.not_modified.values().sum::<u64>());
+        assert!(after - before >= 2, "the two 304s are counted as free, not spent");
+        assert_eq!(handle.join().unwrap(), 3);
+    }
+
+    #[test]
+    fn a_changed_resource_with_a_new_etag_replaces_the_kept_body() {
+        let (url, handle) = serve_canned(vec![
+            (with_headers("200 OK", "etag: \"e1\""), r#"{"v":1}"#),
+            (with_headers("200 OK", "etag: \"e2\""), r#"{"v":2}"#),
+            ("304 Not Modified", ""),
+        ]);
+        let gh = client(&url, &[]);
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            seen.push(gh.get_json::<serde_json::Value>("/thing").unwrap()["v"].as_i64().unwrap());
+        }
+        assert_eq!(seen, vec![1, 2, 2]);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn paths_and_tokens_do_not_share_a_cache_entry() {
+        let (url, handle) = serve_canned(vec![
+            (with_headers("200 OK", "etag: \"a\""), r#"{"v":1}"#),
+            // /b was never read: a 304 for it has nothing kept to answer from.
+            ("304 Not Modified", ""),
+            // Nor did the other token read /a.
+            ("304 Not Modified", ""),
+        ]);
+        let gh = client(&url, &[]);
+        gh.get_json::<serde_json::Value>("/a").unwrap();
+        assert!(gh.get_json::<serde_json::Value>("/b").is_err());
+        let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+        let other = Github::with_agent(GithubAuth::Token("other".into()), agent, &url).with_retry_delays(&[]);
+        assert!(other.get_json::<serde_json::Value>("/a").is_err());
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn a_full_etag_cache_drops_the_oldest_entry_only() {
+        for i in 0..ETAG_CACHE_MAX + 5 {
+            etag_put(format!("evict-test|{i}"), "e".into(), "{}".into());
+        }
+        assert!(etag_get(&format!("evict-test|{}", ETAG_CACHE_MAX + 4)).is_some(), "the newest is kept");
+        assert!(etag_cache().lock().unwrap().len() <= ETAG_CACHE_MAX);
+    }
+
+    #[test]
+    fn review_threads_are_read_again_only_when_the_pull_request_changed() {
+        let n = 7_000_000 + (now_secs() % 1000);
+        let pull = r#"{"state":"open","head":{"sha":"h"},"base":{"ref":"main"},"merged":false}"#;
+        let threads = r#"{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]}}}}}"#;
+        let (url, handle) = serve_canned(vec![
+            // First snapshot: pull (etag), status, check runs, compare, threads, comments, reviews.
+            (with_headers("200 OK", "etag: \"p1\""), pull),
+            ("200 OK", r#"{"state":"success","statuses":[]}"#),
+            ("200 OK", r#"{"check_runs":[]}"#),
+            ("200 OK", r#"{"behind_by":0}"#),
+            ("200 OK", r#"{"commit":{"committer":{"date":"2026-01-01T00:00:00Z"}}}"#),
+            ("200 OK", threads),
+            ("200 OK", "[]"),
+            ("200 OK", "[]"),
+            // Second: the pull is unchanged (304), so no threads read.
+            ("304 Not Modified", ""),
+            ("200 OK", r#"{"state":"success","statuses":[]}"#),
+            ("200 OK", r#"{"check_runs":[]}"#),
+            ("200 OK", r#"{"behind_by":0}"#),
+            ("200 OK", r#"{"commit":{"committer":{"date":"2026-01-01T00:00:00Z"}}}"#),
+            ("200 OK", "[]"),
+            ("200 OK", "[]"),
+        ]);
+        let gh = client(&url, &[]);
+        gh.get_pr_snapshot("o", "r", n).unwrap();
+        gh.get_pr_snapshot("o", "r", n).unwrap();
+        // Every canned reply was consumed in order: a threads read in the second
+        // snapshot would have taken the status reply's place and failed above.
+        assert_eq!(handle.join().unwrap(), 15);
     }
 
     #[test]
