@@ -6011,6 +6011,24 @@ fn a_job_the_infrastructure_lost_is_rerun_by_tod_and_a_pass_is_noted_as_a_flake(
     assert!(pending_requests(&fx).is_empty());
 }
 
+/// Gap 124: a failed LFS download in the "migration conflicts" job is the
+/// infrastructure's (`infra_kind`), so tod reruns it with no agent turn and no
+/// request to the user.
+#[test]
+fn a_failed_download_is_rerun_by_tod_with_no_agent_turn() {
+    let (fx, feed, mut agent, _) = failing_check_node(false);
+    *feed.infra.lock().unwrap() = Some(tod_store::github::InfraFailure {
+        check: "terraform".into(),
+        job_id: 999,
+        kind: "download failed".into(),
+    });
+    *feed.rerun_result.lock().unwrap() = Some(true);
+    run_babysitter(&fx, &mut agent);
+    assert_eq!(agent.turns, 0);
+    assert_eq!(*feed.reruns.lock().unwrap(), vec![999]);
+    assert!(pending_requests(&fx).is_empty());
+}
+
 /// Design 4.2.1: a cancelled job is rerun whatever else is failing, bounded by
 /// `max_infra_reruns`, and the other failure goes its usual way to the agent.
 #[test]

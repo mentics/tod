@@ -587,7 +587,35 @@ pub fn infra_kind(conclusion: &str, annotation_text: &str) -> Option<&'static st
         "received request to deprovision",
         "runner lost",
     ];
-    RUNNER_LOST.iter().any(|p| lower.contains(p)).then_some("runner lost")
+    if RUNNER_LOST.iter().any(|p| lower.contains(p)) {
+        return Some("runner lost");
+    }
+    // A fetch that failed on the network (gap 124: git-lfs could not download
+    // an object while the job fetched the base branch). A short, conservative
+    // list: only phrases a download tool writes for a transport failure, never
+    // a test or lint verdict.
+    const TRANSIENT_DOWNLOAD: &[&str] = &[
+        "error downloading object",
+        "smudge filter lfs failed",
+        "could not resolve host",
+        "connection reset by peer",
+        "rpc failed; curl",
+        "the remote end hung up unexpectedly",
+        "unexpected disconnect while reading sideband packet",
+    ];
+    if TRANSIENT_DOWNLOAD.iter().any(|p| lower.contains(p)) || has_http_5xx_fetch_error(&lower) {
+        return Some("download failed");
+    }
+    None
+}
+
+/// `the requested url returned error: 502` (git and curl's words for a 5xx).
+fn has_http_5xx_fetch_error(lower: &str) -> bool {
+    const P: &str = "the requested url returned error: 5";
+    lower.match_indices(P).any(|(i, _)| {
+        let rest = &lower[i + P.len()..];
+        rest.len() >= 2 && rest.as_bytes()[..2].iter().all(u8::is_ascii_digit)
+    })
 }
 
 /// A failing check of a pull request whose failure is also on the base
@@ -1378,7 +1406,7 @@ impl Github {
         // A refusal is remembered for a while (so a token with no Actions
         // access does not cost three requests a minute); only a signature is
         // kept for good.
-        let infra = if actions { infra_kind(conclusion, &annotation_text).map(str::to_string) } else { None };
+        let infra = if actions { infra_kind(conclusion, &format!("{annotation_text}\n{evidence}")).map(str::to_string) } else { None };
         let result = RunFailure { signature, lines, infra };
         if run.id != 0 {
             signature_cache_put(key, result.clone());
@@ -3982,6 +4010,35 @@ mod tests {
         );
         assert_eq!(infra_kind("failure", "error[E0308]: mismatched types"), None);
         assert_eq!(infra_kind("success", ""), None);
+    }
+
+    /// Gap 124: the failing step's log, as the job's log shows it.
+    const LFS_LOG: &str = "2026-11-24T22:20:01.0000000Z Error downloading object: .devcontainer/prod-org-scoped-sample.sql.gz (b732b1e): Smudge error: Error downloading .devcontainer/prod-org-scoped-sample.sql.gz\n2026-11-24T22:20:01.1Z error: external filter 'git-lfs filter-process' failed\n2026-11-24T22:20:01.2Z fatal: .devcontainer/prod-org-scoped-sample.sql.gz: smudge filter lfs failed\n2026-11-24T22:20:02Z tar: Unexpected EOF in archive\n2026-11-24T22:20:02Z ##[error]Process completed with exit code 2.\n";
+
+    fn step(name: &str) -> JobStepRaw {
+        JobStepRaw {
+            name: name.into(),
+            conclusion: Some("failure".into()),
+            started_at: Some("2026-11-24T22:20:00Z".into()),
+            completed_at: Some("2026-11-24T22:20:03Z".into()),
+        }
+    }
+
+    #[test]
+    fn a_failed_lfs_download_is_the_infrastructures() {
+        let evidence = failing_step_log(LFS_LOG, &step("Fetch the live tip of the base branch"));
+        assert_eq!(infra_kind("failure", &evidence), Some("download failed"), "{evidence}");
+        assert_eq!(infra_kind("failure", "curl: (6) Could not resolve host: github.com"), Some("download failed"));
+        assert_eq!(infra_kind("failure", "fatal: The requested URL returned error: 503"), Some("download failed"));
+        assert_eq!(infra_kind("failure", "The requested URL returned error: 404"), None);
+    }
+
+    #[test]
+    fn an_ordinary_test_or_lint_failure_is_still_work() {
+        let log = "2026-11-24T22:20:01Z FAIL src/a.test.ts > adds\n2026-11-24T22:20:01Z AssertionError: expected 2 to be 3\n2026-11-24T22:20:02Z ##[error]Process completed with exit code 1.\n";
+        let evidence = failing_step_log(log, &step("Run tests"));
+        assert_eq!(infra_kind("failure", &evidence), None, "{evidence}");
+        assert_eq!(infra_kind("failure", "ruff: E501 line too long"), None);
     }
 
     /// Serves one canned `(status line, body)` per request on loopback and

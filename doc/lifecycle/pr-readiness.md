@@ -700,7 +700,17 @@ tod handles them before any agent turn (`Autopilot::rerun_infra_failures`,
 
 - **Infrastructure** (`github::infra_kind`): a job that was cancelled, timed
   out, or lost its runner ("The runner has received a shutdown signal", "lost
-  communication with the server", "runner ... offline"). tod asks GitHub to
+  communication with the server", "runner ... offline"), or whose failing
+  step's log (or annotations) shows a transient download or network error
+  rather than a verdict (git-lfs "Error downloading object" / "smudge filter
+  lfs failed", "Could not resolve host", "Connection reset by peer", "RPC
+  failed; curl", "The requested URL returned error: 5xx"; kind `download
+  failed`, gap 124: "Fetch the live tip of the base branch" failed twice on
+  an LFS download and went to the user as `check_unrelated`). The one
+  classifier, `infra_kind`, is shared by the babysitter, the gate's
+  assessment and the incident classifier (`incident_class`: `ci_infra`). A log
+  that cannot be read leaves the check as work, and the reason is kept in the
+  signature notes. tod asks GitHub to
   run the job again (`PrFeed::rerun_job`, `POST /actions/jobs/{id}/rerun`; no
   agent turn), at most `max_infra_reruns` (default 2) per check and head, only
   while no check is running (GitHub reruns a finished run only), and notes
