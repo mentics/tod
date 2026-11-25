@@ -48,9 +48,9 @@ pub struct AutopilotState {
     /// held to the run's ceiling (`Budget::max_run_sessions`).
     pub sessions: u32,
     /// The same sessions by the stay in a lifecycle state they were spent
-    /// in, and by state over the run: the per-stay budget
-    /// (`Budget::max_sessions`) counts the stay, and a stop for either says
-    /// what the sessions were.
+    /// in, and by state over the run, and where the stay's time began: the
+    /// per-stay budget (`Budget::max_sessions`, `Budget::max_duration`)
+    /// counts the stay, and a stop for either says what the sessions were.
     #[serde(default)]
     pub session_counts: SessionCounts,
     /// The conversation in progress, reopened by a restart.
@@ -192,9 +192,10 @@ pub struct PrChange {
     pub held: bool,
 }
 
-/// The run's sessions by where they were spent
-/// ([`AutopilotState::session_counts`]). The run's total is
-/// [`AutopilotState::sessions`]; this says what it was made of.
+/// The run's sessions by where they were spent, and the current stay
+/// ([`AutopilotState::session_counts`]). The run's totals are
+/// [`AutopilotState::sessions`] and [`AutopilotState::elapsed`]; this says
+/// what they were made of, and how much of them is the stay's.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionCounts {
     /// The lifecycle state of the stay counted in `stay` (empty before the
@@ -208,17 +209,27 @@ pub struct SessionCounts {
     /// The run's sessions by the lifecycle state they were spent in.
     #[serde(default)]
     pub by_state: BTreeMap<String, u32>,
+    /// The run's time worked ([`AutopilotState::elapsed`], ms) when the
+    /// stay began: the stay's time is what the run worked since.
+    #[serde(default)]
+    pub stay_since_ms: u64,
 }
 
 impl SessionCounts {
-    /// One session of `kind` started in `state`. A state other than the
-    /// stay's begins a new stay: a move on or back (a send-back is one; its
-    /// own guard caps those loops) starts its count again.
-    pub fn note(&mut self, state: &str, kind: &str) {
+    /// The node is in `state`, the run having worked `worked_ms`. A state
+    /// other than the stay's begins a new stay: a move on or back (a
+    /// send-back is one; its own guard caps those loops) starts its counts
+    /// again.
+    pub fn enter(&mut self, state: &str, worked_ms: u64) {
         if self.stay_state != state {
             self.stay_state = state.to_string();
-            self.stay.clear();
+            self.clear_stay(worked_ms);
         }
+    }
+
+    /// One session of `kind` started in `state` ([`Self::enter`] first).
+    pub fn note(&mut self, state: &str, kind: &str, worked_ms: u64) {
+        self.enter(state, worked_ms);
         *self.stay.entry(kind.to_string()).or_insert(0) += 1;
         *self.by_state.entry(state.to_string()).or_insert(0) += 1;
     }
@@ -227,6 +238,12 @@ impl SessionCounts {
     /// no longer in the state the last ones were spent in.
     pub fn in_stay(&self, state: &str) -> u32 {
         if self.stay_state == state { self.stay.values().sum() } else { 0 }
+    }
+
+    /// The time the stay in `state` has worked so far, the run having worked
+    /// `worked_ms`: none when the node is no longer in that state.
+    pub fn stay_worked_ms(&self, state: &str, worked_ms: u64) -> u64 {
+        if self.stay_state == state { worked_ms.saturating_sub(self.stay_since_ms) } else { 0 }
     }
 
     /// The current stay's sessions by protocol, most first (ties by name).
@@ -239,9 +256,12 @@ impl SessionCounts {
         most_first(&self.by_state)
     }
 
-    /// The stay starts its count again (the user asked to redo the state).
-    pub fn clear_stay(&mut self) {
+    /// The stay starts its counts again, the run having worked `worked_ms`
+    /// (a new state, the user asked to redo it or go on, the pull request
+    /// rests with a person).
+    pub fn clear_stay(&mut self, worked_ms: u64) {
         self.stay.clear();
+        self.stay_since_ms = worked_ms;
     }
 }
 
@@ -456,9 +476,9 @@ impl AutopilotState {
         state.pending_groups = None;
         state.loops.clear();
         state.loops.review_floor_ms = now_ms();
-        // Redone from the top: the stay's sessions count from here (the
-        // run's ceiling still holds).
-        state.session_counts.clear_stay();
+        // Redone from the top: the stay's sessions and time count from here
+        // (the run's ceiling still holds).
+        state.restart_stay();
         state.outcome = None;
         state.quota_after_push = None;
         state.acp_quota_retries = AcpQuotaRetries::default();
@@ -474,6 +494,18 @@ impl AutopilotState {
             .with_context(|| format!("write {}", tmp.display()))?;
         std::fs::rename(&tmp, &path).with_context(|| format!("replace {}", path.display()))?;
         Ok(())
+    }
+
+    /// The stay's sessions and time count from here
+    /// ([`SessionCounts::clear_stay`]).
+    pub fn restart_stay(&mut self) {
+        let worked = self.worked_ms();
+        self.session_counts.clear_stay(worked);
+    }
+
+    /// [`Self::elapsed`] in ms.
+    pub fn worked_ms(&self) -> u64 {
+        self.elapsed().as_millis() as u64
     }
 
     /// Time spent working: every finished stretch plus the one running.

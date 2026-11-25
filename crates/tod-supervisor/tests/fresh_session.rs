@@ -98,7 +98,7 @@ fn config(orchestrator: &Orchestrator, node: Uuid, base: &Path) -> Config {
         holder: Arc::new(NoHold),
         transcripts: None,
         media: media(),
-        budget: Budget { max_sessions: 1, max_run_sessions: 1, max_duration: Duration::from_secs(600) },
+        budget: Budget { max_sessions: 1, max_run_sessions: 1, max_duration: Duration::from_secs(600), max_run_duration: Duration::from_secs(600) },
         guards: Default::default(),
         poll: Duration::from_millis(20),
         push_branch: false,
@@ -142,7 +142,7 @@ fn a_requested_new_session_is_taken_when_the_supervisor_wakes() {
     // The app's request arrives while it sleeps.
     std::fs::write(&request, b"").unwrap();
     let mut second = config(&orchestrator, node, &base);
-    second.budget = Budget { max_sessions: 10, max_run_sessions: 10, max_duration: Duration::from_secs(600) };
+    second.budget = Budget { max_sessions: 10, max_run_sessions: 10, max_duration: Duration::from_secs(600), max_run_duration: Duration::from_secs(600) };
     let woke = wake(second).unwrap();
     assert!(matches!(woke, Woke::Ran(_)), "{woke:?}");
     assert!(!request.exists(), "the request was taken");
@@ -203,7 +203,7 @@ fn a_requested_new_session_runs_despite_a_pending_wait() {
 
     std::fs::write(state_dir.join(tod_core::autopilot::FRESH_SESSION_REQUEST_FILE), b"").unwrap();
     let mut second = config(&orchestrator, node, &base);
-    second.budget = Budget { max_sessions: 10, max_run_sessions: 10, max_duration: Duration::from_secs(600) };
+    second.budget = Budget { max_sessions: 10, max_run_sessions: 10, max_duration: Duration::from_secs(600), max_run_duration: Duration::from_secs(600) };
     let woke = wake(second).unwrap();
     match &woke {
         Woke::Ran(tod_core::autopilot::Outcome::Stopped { reason }) => {

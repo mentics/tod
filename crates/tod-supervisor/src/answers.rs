@@ -69,6 +69,7 @@ fn granted(budget: Budget, grants: u32) -> Budget {
         max_sessions: budget.max_sessions.saturating_mul(times),
         max_run_sessions: budget.max_run_sessions.saturating_mul(times),
         max_duration: budget.max_duration.checked_mul(times).unwrap_or(Duration::MAX),
+        max_run_duration: budget.max_run_duration.checked_mul(times).unwrap_or(Duration::MAX),
     }
 }
 

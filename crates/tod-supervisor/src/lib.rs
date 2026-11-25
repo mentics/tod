@@ -254,7 +254,12 @@ fn left_by_the_user(
     let reason = std::fs::read_to_string(state_dir.join(USER_STOPPED_FILE)).ok()?;
     stop_reason(
         &Outcome::Stopped { reason: reason.trim().to_string() },
-        &Budget { max_sessions: 1, max_run_sessions: 1, max_duration: Duration::from_secs(1) },
+        &Budget {
+            max_sessions: 1,
+            max_run_sessions: 1,
+            max_duration: Duration::from_secs(1),
+            max_run_duration: Duration::from_secs(1),
+        },
     )
 }
 
@@ -460,36 +465,45 @@ fn hours(d: Duration) -> String {
     fmt_hours(d.as_secs_f64() / 3600.0)
 }
 
-/// What the node spent of `budget` when `limit` stopped it: the sessions,
-/// against the limit they count toward (the stay's, when a stay spent its
-/// budget; else the run's), and the hours worked.
-fn budget_spent(limit: &BudgetLimit, budget: &Budget) -> (String, f64) {
-    let (used, elapsed_secs, of) = match limit {
-        BudgetLimit::Sessions { used, elapsed_secs, stay: Some(_), .. } => (*used, *elapsed_secs, budget.max_sessions),
-        BudgetLimit::Sessions { used, elapsed_secs, stay: None, .. } => (*used, *elapsed_secs, budget.max_run_sessions),
-        BudgetLimit::Time { elapsed_secs, used } => (*used, *elapsed_secs, budget.max_run_sessions),
-    };
-    (format!("{used} of {of} sessions{}", limit.sessions_detail()), elapsed_secs as f64 / 3600.0)
+/// The limits `limit` counts against: a stay's (sessions and time in one
+/// lifecycle state) when a stay spent its budget, else the run's.
+fn budget_limits(limit: &BudgetLimit, budget: &Budget) -> (u32, Duration) {
+    match limit.stay() {
+        Some(_) => (budget.max_sessions, budget.max_duration),
+        None => (budget.max_run_sessions, budget.max_run_duration),
+    }
 }
 
-/// The sessions another budget gives: a stay's more in that state, or the
-/// run's more.
-fn sessions_granted(limit: &BudgetLimit, budget: &Budget) -> String {
-    match limit {
-        BudgetLimit::Sessions { stay: Some(state), .. } => format!("{} more sessions in {state}", budget.max_sessions),
-        _ => format!("{} more sessions", budget.max_run_sessions),
-    }
+/// What the node spent of `budget` when `limit` stopped it: the sessions and
+/// the hours worked (the stay's, when a stay spent its budget; else the
+/// run's), against the limits they count toward.
+fn budget_spent(limit: &BudgetLimit, budget: &Budget) -> (String, String) {
+    let (used, elapsed_secs) = match limit {
+        BudgetLimit::Sessions { used, elapsed_secs, .. } | BudgetLimit::Time { used, elapsed_secs, .. } => {
+            (*used, *elapsed_secs)
+        }
+    };
+    let (sessions, duration) = budget_limits(limit, budget);
+    (
+        format!("{used} of {sessions} sessions{}", limit.scope_detail()),
+        format!("{} of {} hours", fmt_hours(elapsed_secs as f64 / 3600.0), hours(duration)),
+    )
+}
+
+/// What another budget gives: a stay's more sessions and hours in that
+/// state, or the run's more.
+fn budget_granted(limit: &BudgetLimit, budget: &Budget) -> String {
+    let (sessions, duration) = budget_limits(limit, budget);
+    let scope = limit.stay().map(|state| format!(" in {state}")).unwrap_or_default();
+    format!("{sessions} more sessions{scope} and {} more hours", hours(duration))
 }
 
 fn budget_question(limit: &BudgetLimit, budget: &Budget) -> String {
     let (sessions, spent_hours) = budget_spent(limit, budget);
-    let spent_hours = fmt_hours(spent_hours);
     format!(
-        "Used {sessions} ({spent_hours} of {} hours). Keep going gives it {} \
-         and {} more hours. Leave it stopped keeps it stopped until you change this answer.",
-        hours(budget.max_duration),
-        sessions_granted(limit, budget),
-        hours(budget.max_duration),
+        "Used {sessions} ({spent_hours}). Keep going gives it {}. \
+         Leave it stopped keeps it stopped until you change this answer.",
+        budget_granted(limit, budget),
     )
 }
 
@@ -497,10 +511,8 @@ fn budget_question(limit: &BudgetLimit, budget: &Budget) -> String {
 fn budget_reason(limit: &BudgetLimit, budget: &Budget) -> String {
     let (sessions, spent_hours) = budget_spent(limit, budget);
     format!(
-        "its budget is spent ({sessions}, {} of {} hours). \
+        "its budget is spent ({sessions}, {spent_hours}). \
          Answer the budget question \"{}\" to give it more.",
-        fmt_hours(spent_hours),
-        hours(budget.max_duration),
         tod_core::stop_questions::KEEP_GOING,
     )
 }
@@ -1105,7 +1117,12 @@ mod tests {
     }
 
     fn budget() -> Budget {
-        Budget { max_sessions: 40, max_run_sessions: 160, max_duration: Duration::from_secs(16 * 3600) }
+        Budget {
+            max_sessions: 40,
+            max_run_sessions: 160,
+            max_duration: Duration::from_secs(16 * 3600),
+            max_run_duration: Duration::from_secs(64 * 3600),
+        }
     }
 
     #[test]
@@ -1129,7 +1146,7 @@ mod tests {
             Some("you stopped it; run it again to carry on")
         );
         let spent = reason(Outcome::BudgetExhausted { limit: BudgetLimit::Sessions { used: 60, elapsed_secs: 5 * 60, stay: None, breakdown: Vec::new() } }).unwrap();
-        assert!(spent.contains("60 of 160 sessions") && spent.contains("0.1 of 16 hours") && spent.contains("Keep going"), "{spent}");
+        assert!(spent.contains("60 of 160 sessions") && spent.contains("0.1 of 64 hours") && spent.contains("Keep going"), "{spent}");
         let stay = reason(Outcome::BudgetExhausted {
             limit: BudgetLimit::Sessions {
                 used: 40,
@@ -1140,8 +1157,14 @@ mod tests {
         })
         .unwrap();
         assert!(stay.contains("40 of 40 sessions in pr_draft (review 30, quick_fix 10)"), "{stay}");
-        let timed = reason(Outcome::BudgetExhausted { limit: BudgetLimit::Time { elapsed_secs: 16 * 3600, used: 7 } }).unwrap();
-        assert!(timed.contains("7 of 160 sessions") && timed.contains("16 of 16 hours"), "{timed}");
+        let timed = reason(Outcome::BudgetExhausted {
+            limit: BudgetLimit::Time { elapsed_secs: 16 * 3600, used: 3, stay: Some("review".into()) },
+        })
+        .unwrap();
+        assert!(timed.contains("3 of 40 sessions in review, 16 of 16 hours"), "{timed}");
+        let timed = reason(Outcome::BudgetExhausted { limit: BudgetLimit::Time { elapsed_secs: 64 * 3600, used: 70, stay: None } })
+            .unwrap();
+        assert!(timed.contains("70 of 160 sessions over the run, 64 of 64 hours"), "{timed}");
         // Requests are shown from the request itself, and stale once answered.
         for needs in [
             NeedsHuman::Decision { pending: 1 },
@@ -1184,7 +1207,8 @@ mod tests {
             Outcome::Stopped { reason: usage_limit_reason(&usage_limit::UsageLimit { reset_at_ms: 5, parsed: true }) },
             Outcome::Stopped { reason: "a new session was requested".into() },
             Outcome::BudgetExhausted { limit: BudgetLimit::Sessions { used: 60, elapsed_secs: 5 * 60, stay: None, breakdown: Vec::new() } },
-            Outcome::BudgetExhausted { limit: BudgetLimit::Time { elapsed_secs: 16 * 3600, used: 7 } },
+            Outcome::BudgetExhausted { limit: BudgetLimit::Time { elapsed_secs: 64 * 3600, used: 70, stay: None } },
+            Outcome::BudgetExhausted { limit: BudgetLimit::Time { elapsed_secs: 16 * 3600, used: 7, stay: Some("pr_draft".into()) } },
         ];
         for needs in [
             NeedsHuman::Decision { pending: 1 },
@@ -1232,7 +1256,7 @@ mod tests {
         let q = budget_question(&BudgetLimit::Sessions { used: 60, elapsed_secs: 5 * 60, stay: None, breakdown: Vec::new() }, &budget());
         assert_eq!(
             q,
-            "Used 60 of 160 sessions (0.1 of 16 hours). Keep going gives it 160 more sessions and 16 more hours. \
+            "Used 60 of 160 sessions (0.1 of 64 hours). Keep going gives it 160 more sessions and 64 more hours. \
              Leave it stopped keeps it stopped until you change this answer."
         );
         let q = budget_question(
@@ -1249,12 +1273,21 @@ mod tests {
             "Used 40 of 40 sessions in review (review 25, fix 15) (0.1 of 16 hours). Keep going gives it 40 more \
              sessions in review and 16 more hours. Leave it stopped keeps it stopped until you change this answer."
         );
-        let q = budget_question(&BudgetLimit::Time { elapsed_secs: 16 * 3600 + 600, used: 7 }, &budget());
-        assert!(q.starts_with("Used 7 of 160 sessions (16.2 of 16 hours)."), "{q}");
+        let q = budget_question(
+            &BudgetLimit::Time { elapsed_secs: 16 * 3600 + 600, used: 7, stay: Some("pr_draft".into()) },
+            &budget(),
+        );
+        assert!(
+            q.starts_with(
+                "Used 7 of 40 sessions in pr_draft (16.2 of 16 hours). Keep going gives it 40 more sessions in \
+                 pr_draft and 16 more hours."
+            ),
+            "{q}"
+        );
     }
 
     #[test]
-    fn the_default_budget_is_forty_sessions_a_stay_a_hundred_and_sixty_a_run_and_sixteen_hours() {
+    fn the_default_budget_is_forty_sessions_and_sixteen_hours_a_stay_and_four_times_that_a_run() {
         assert_eq!(Budget::default(), budget());
     }
 }

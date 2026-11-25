@@ -125,9 +125,11 @@ impl Words<'static> {
 pub fn budget_text(limit: &BudgetLimit) -> String {
     match limit {
         BudgetLimit::Sessions { used, .. } => format!("budget spent: {used} sessions{}", limit.sessions_detail()),
-        BudgetLimit::Time { elapsed_secs, .. } => {
-            format!("budget spent: {} of work", crate::runner_status::format_elapsed(*elapsed_secs as i64 * 1000))
-        }
+        BudgetLimit::Time { elapsed_secs, .. } => format!(
+            "budget spent: {} of work{}",
+            crate::runner_status::format_elapsed(*elapsed_secs as i64 * 1000),
+            limit.scope_detail()
+        ),
     }
 }
 

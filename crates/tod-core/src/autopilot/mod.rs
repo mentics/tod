@@ -11,8 +11,8 @@
 //! it stops when the node is `done`, when a human is needed (a pending
 //! decision, a `blocked` plan step, a failing criterion no agent can fix, an
 //! evaluator that rejected the same work twice, a step that changed nothing),
-//! or when its budget (sessions started in one stay in a state, or over the
-//! whole run against a larger ceiling; time spent working) runs out.
+//! or when its budget (sessions started and time spent working, in one stay
+//! in a state, or over the whole run against larger ceilings) runs out.
 //! Spec: `doc/lifecycle/phase-agents.md`.
 //!
 //! It has no GPUI and blocks while it drives the agent, so it can run in a
@@ -68,9 +68,9 @@ pub const RESUME_MESSAGE: &str = "Continue where you left off.";
 
 /// How much one run may spend before it stops for the user. The budget
 /// catches a runaway, not a node that has simply lived long: the sessions
-/// are counted per stay in a lifecycle state, and the run as a whole only
-/// against a ceiling several stays wide, for a cycle across states that no
-/// other guard catches.
+/// and the time worked are counted per stay in a lifecycle state, and the
+/// run as a whole only against a ceiling several stays wide, for a cycle
+/// across states that no other guard catches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Budget {
     /// Conversations started (or reopened after a restart) in one stay in a
@@ -79,8 +79,11 @@ pub struct Budget {
     pub max_sessions: u32,
     /// Conversations started over the whole run, every state.
     pub max_run_sessions: u32,
-    /// Time spent working, summed over the run's wakes (not time asleep).
+    /// Time spent working (summed over the wakes, not time asleep) in one
+    /// stay in a lifecycle state; it restarts where the sessions do.
     pub max_duration: Duration,
+    /// Time spent working over the whole run, every state.
+    pub max_run_duration: Duration,
 }
 
 /// The default [`Budget::max_sessions`]. A stay in `review` that goes all
@@ -90,13 +93,19 @@ pub const STAY_SESSIONS: u32 = 40;
 /// The default [`Budget::max_run_sessions`]: four stays' worth. A whole
 /// lifecycle, review rounds and pull request included, takes about 60.
 pub const RUN_SESSIONS: u32 = 4 * STAY_SESSIONS;
+/// The default [`Budget::max_duration`]: no state's work takes this long.
+pub const STAY_DURATION: Duration = Duration::from_secs(16 * 60 * 60);
+/// The default [`Budget::max_run_duration`]: four stays' worth, as for the
+/// sessions.
+pub const RUN_DURATION: Duration = Duration::from_secs(4 * 16 * 60 * 60);
 
 impl Default for Budget {
     fn default() -> Self {
         Self {
             max_sessions: STAY_SESSIONS,
             max_run_sessions: RUN_SESSIONS,
-            max_duration: Duration::from_secs(16 * 60 * 60),
+            max_duration: STAY_DURATION,
+            max_run_duration: RUN_DURATION,
         }
     }
 }
@@ -248,7 +257,18 @@ pub enum BudgetLimit {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         breakdown: Vec<(String, u32)>,
     },
-    Time { elapsed_secs: u64, #[serde(default)] used: u32 },
+    Time {
+        elapsed_secs: u64,
+        #[serde(default)]
+        used: u32,
+        /// The lifecycle state whose stay worked its time
+        /// ([`Budget::max_duration`]): `elapsed_secs` and `used` are the
+        /// stay's. `None` when the run's ceiling
+        /// ([`Budget::max_run_duration`]) was reached (and in a stop saved
+        /// before stays were timed): they are the run's.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stay: Option<String>,
+    },
 }
 
 impl BudgetLimit {
@@ -266,6 +286,25 @@ impl BudgetLimit {
             Some(state) => format!(" in {state}{parts}"),
             None if breakdown.is_empty() => String::new(),
             None => format!(" over the run{parts}"),
+        }
+    }
+
+    /// Where the budget was spent, for either limit: [`Self::sessions_detail`]
+    /// for sessions, " in review" or " over the run" for time (a time stop
+    /// saved before stays were timed was the run's too).
+    pub fn scope_detail(&self) -> String {
+        match self {
+            Self::Sessions { .. } => self.sessions_detail(),
+            Self::Time { stay: Some(state), .. } => format!(" in {state}"),
+            Self::Time { stay: None, .. } => " over the run".to_string(),
+        }
+    }
+
+    /// The stay in a lifecycle state that spent its budget, when it was a
+    /// stay's and not the run's.
+    pub fn stay(&self) -> Option<&str> {
+        match self {
+            Self::Sessions { stay, .. } | Self::Time { stay, .. } => stay.as_deref(),
         }
     }
 }
@@ -743,9 +782,9 @@ impl Autopilot {
             }
             return Ok(());
         }
-        // A fresh set of rounds is sessions in this stay: they count from
-        // here too (the run's ceiling still holds).
-        self.state.session_counts.clear_stay();
+        // A fresh set of rounds is sessions and time in this stay: they
+        // count from here too (the run's ceiling still holds).
+        self.state.restart_stay();
         let loops = &mut self.state.loops;
         loops.review_rounds = 0;
         loops.check_rounds = 0;
@@ -776,17 +815,14 @@ impl Autopilot {
     }
 
     /// The pull request has nothing left for tod: only a person (or a bot
-    /// asked as often as allowed) is waited for. The stay's sessions count
-    /// from here: a `pr_draft` or `pr_review` stay lasts as long as people
-    /// take, and each wave of their feedback is new work, not a runaway (the
-    /// run's ceiling still holds). A loop that never gets the pull request
-    /// to rest is still stopped by the stay's budget.
+    /// asked as often as allowed) is waited for. The stay's sessions and
+    /// time count from here: a `pr_draft` or `pr_review` stay lasts as long
+    /// as people take, and each wave of their feedback is new work, not a
+    /// runaway (the run's ceiling still holds). A loop that never gets the
+    /// pull request to rest is still stopped by the stay's budget.
     fn pr_at_rest(&mut self) -> Result<()> {
-        if !self.state.session_counts.stay.is_empty() {
-            self.state.session_counts.clear_stay();
-            self.save()?;
-        }
-        Ok(())
+        self.state.restart_stay();
+        self.save()
     }
 
     fn reset_pr_rounds(&mut self) -> Result<()> {
@@ -816,21 +852,25 @@ impl Autopilot {
     }
 
     /// Whether the run has spent its budget, with the node in its current
-    /// lifecycle state: the sessions of this stay in it, the run's sessions
-    /// against its ceiling, or the time worked.
-    pub(crate) fn over_budget(&self, fleet: &FleetStore) -> Result<Option<BudgetLimit>> {
+    /// lifecycle state: the sessions or time of this stay in it, or the
+    /// run's against their ceilings.
+    pub(crate) fn over_budget(&mut self, fleet: &FleetStore) -> Result<Option<BudgetLimit>> {
         let lifecycle = lifecycle::current_state(fleet, self.node)?;
         Ok(self.over_budget_in(&lifecycle))
     }
 
-    /// [`Self::over_budget`] with the node in `lifecycle`.
-    pub(crate) fn over_budget_in(&self, lifecycle: &str) -> Option<BudgetLimit> {
+    /// [`Self::over_budget`] with the node in `lifecycle`. A state other
+    /// than the stay's begins a new stay here, so its time counts from when
+    /// the run first looked at it in that state.
+    pub(crate) fn over_budget_in(&mut self, lifecycle: &str) -> Option<BudgetLimit> {
+        let worked = self.state.worked_ms();
+        self.state.session_counts.enter(lifecycle, worked);
         let counts = &self.state.session_counts;
         let in_stay = counts.in_stay(lifecycle);
         if in_stay >= self.budget.max_sessions {
             return Some(BudgetLimit::Sessions {
                 used: in_stay,
-                elapsed_secs: self.state.elapsed().as_secs(),
+                elapsed_secs: counts.stay_worked_ms(lifecycle, worked) / 1000,
                 stay: Some(lifecycle.to_string()),
                 breakdown: counts.stay_breakdown(),
             });
@@ -838,7 +878,7 @@ impl Autopilot {
         if self.state.sessions >= self.budget.max_run_sessions {
             return Some(BudgetLimit::Sessions {
                 used: self.state.sessions,
-                elapsed_secs: self.state.elapsed().as_secs(),
+                elapsed_secs: worked / 1000,
                 stay: None,
                 breakdown: counts.run_breakdown(),
             });
@@ -846,13 +886,24 @@ impl Autopilot {
         self.over_time_budget()
     }
 
-    /// Whether the run has worked as long as its budget allows (checked
-    /// while a turn runs, where the session it is in already counted).
+    /// Whether the stay the node is in, or the run, has worked as long as
+    /// its budget allows (also checked while a turn runs, where the session
+    /// it is in already counted).
     fn over_time_budget(&self) -> Option<BudgetLimit> {
-        let elapsed = self.state.elapsed();
-        (elapsed >= self.budget.max_duration).then_some(BudgetLimit::Time {
-            elapsed_secs: elapsed.as_secs(),
+        let worked = self.state.worked_ms();
+        let counts = &self.state.session_counts;
+        let stay_ms = worked.saturating_sub(counts.stay_since_ms);
+        if !counts.stay_state.is_empty() && Duration::from_millis(stay_ms) >= self.budget.max_duration {
+            return Some(BudgetLimit::Time {
+                elapsed_secs: stay_ms / 1000,
+                used: counts.in_stay(&counts.stay_state),
+                stay: Some(counts.stay_state.clone()),
+            });
+        }
+        (Duration::from_millis(worked) >= self.budget.max_run_duration).then(|| BudgetLimit::Time {
+            elapsed_secs: worked / 1000,
             used: self.state.sessions,
+            stay: None,
         })
     }
 
@@ -860,7 +911,8 @@ impl Autopilot {
     /// in `lifecycle`: it counts toward the run and toward this stay.
     fn note_session(&mut self, lifecycle: &str, kind: &str) {
         self.state.sessions = self.state.sessions.saturating_add(1);
-        self.state.session_counts.note(lifecycle, kind);
+        let worked = self.state.worked_ms();
+        self.state.session_counts.note(lifecycle, kind, worked);
     }
 
     pub(crate) fn record_workflow_launch(&mut self, fleet: &FleetStore) -> Result<()> {

@@ -533,16 +533,18 @@ reply reached the app's store while its turn ran and was gone after it.
 - **A hung agent** (no output or tool activity for N minutes): the supervisor
   ends the session and retries. After K failures it asks the user.
 - **A runaway loop**: each node has a budget (sessions, awake hours).
-  Reaching it asks the user; it never just keeps going. The sessions are
-  counted per stay in a lifecycle state (`Budget::max_sessions`, 40 by
-  default), starting again on every move on or back, on a user's go-on
-  after a round limit, and when the pull request rests with a person; a
-  ceiling for the whole run (`Budget::max_run_sessions`, 160) catches a
-  cycle across states that no other guard does. So a node that simply
-  lives for days is never stopped for its age. The stop says what the
-  sessions were: "budget spent: 40 sessions in pr_draft (review 30,
-  quick_fix 10)", or "... over the run (review 90, verifying 40, ...)" for
-  the ceiling (`AutopilotState::session_counts`).
+  Reaching it asks the user; it never just keeps going. Both are counted
+  per stay in a lifecycle state (`Budget::max_sessions`, 40 by default, and
+  `Budget::max_duration`, 16 hours of work, not time asleep), starting
+  again on every move on or back, on a user's go-on after a round limit, on
+  a rerun of the phase, and when the pull request rests with a person;
+  ceilings for the whole run (`Budget::max_run_sessions`, 160, and
+  `Budget::max_run_duration`, 64 hours) catch a cycle across states that no
+  other guard does. So a node that simply lives for days is never stopped
+  for its age. The stop names the stay and says what the sessions were:
+  "budget spent: 40 sessions in pr_draft (review 30, quick_fix 10)",
+  "budget spent: 16h of work in review", or "... over the run (review 90,
+  verifying 40, ...)" for a ceiling (`AutopilotState::session_counts`).
 - **The user's answer takes effect.** These questions, and the watchdog's
   flag, are decisions marked as stop questions (`tod_core::stop_questions`);
   an answer syncs to the orchestrator, which pokes the node (so does the

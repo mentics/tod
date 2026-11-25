@@ -60,7 +60,7 @@ pub(crate) fn resume_agent<A: AgentAccess + ?Sized, H: StepHook + ?Sized>(
 
 trait Driver {
     fn stop_requested(&mut self) -> Result<Option<String>>;
-    fn budget_limit(&self) -> Result<Option<BudgetLimit>> {
+    fn budget_limit(&mut self) -> Result<Option<BudgetLimit>> {
         Ok(None)
     }
     fn external_wait(
@@ -118,7 +118,7 @@ impl<A: AgentAccess + ?Sized, H: StepHook + ?Sized> Driver for WithAgent<'_, A, 
         self.hook.at(self.fleet, Boundary::Step)
     }
 
-    fn budget_limit(&self) -> Result<Option<BudgetLimit>> {
+    fn budget_limit(&mut self) -> Result<Option<BudgetLimit>> {
         self.autopilot.over_budget(self.fleet)
     }
 

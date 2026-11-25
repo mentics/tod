@@ -166,7 +166,7 @@ fn wake_once(s: &Setup, relay: String, max_sessions: u32) -> Woke {
         holder: Arc::new(RelayHolder::new(relay)),
         transcripts: None,
         media: media(),
-        budget: Budget { max_sessions, max_run_sessions: max_sessions, max_duration: Duration::from_secs(600) },
+        budget: Budget { max_sessions, max_run_sessions: max_sessions, max_duration: Duration::from_secs(600), max_run_duration: Duration::from_secs(600) },
         guards: Default::default(),
         poll: Duration::from_millis(20),
         push_branch: false,
@@ -452,7 +452,7 @@ fn before_wake_requested_grants_a_fresh_budget_request_once() {
     std::fs::create_dir_all(&tmp.0).unwrap();
     let fleet = FleetStore::open(&tmp.0).unwrap();
     let state = tmp.0.join("state");
-    let budget = Budget { max_sessions: 10, max_run_sessions: 10, max_duration: Duration::from_secs(100) };
+    let budget = Budget { max_sessions: 10, max_run_sessions: 10, max_duration: Duration::from_secs(100), max_run_duration: Duration::from_secs(100) };
     let node = Uuid::new_v4();
     let request = Uuid::new_v4();
     let go = |ids: &[Uuid]| match tod_supervisor::answers::before_wake_requested(&fleet, node, &state, budget, false, ids).unwrap() {
