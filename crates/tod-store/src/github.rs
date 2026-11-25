@@ -2109,7 +2109,20 @@ impl Github {
                     base_url: run.url,
                     proof,
                 }),
-                Ok(None) => {}
+                Ok(None) => {
+                    // Never an unexplained "no proof": when the base fails the
+                    // same check but not the same way, say how the lines differ.
+                    if let Some(run) = base_runs.iter().find(|r| r.name.eq_ignore_ascii_case(check)) {
+                        let only_here: Vec<&String> = lines.iter().filter(|l| !run.lines.contains(l)).take(2).collect();
+                        let only_base: Vec<&String> = run.lines.iter().filter(|l| !lines.contains(l)).take(2).collect();
+                        look.notes.push((
+                            check.clone(),
+                            format!(
+                                "it fails on {base} too, but not the same way (the failing step or its error lines differ). Only here: {only_here:?}. Only on {base}: {only_base:?}"
+                            ),
+                        ));
+                    }
+                }
                 Err(err) if err.is_transient() => return Err(err),
                 Err(err) => {
                     // No proof (the conservative answer), but never silently.
@@ -3164,6 +3177,13 @@ fn failing_step_log(log: &str, step: &JobStepRaw) -> String {
     ];
     let content = |l: &str| -> Option<String> {
         let l = l.trim();
+        // A test runner's line for a test that passed (`✓ draws a box 3ms`)
+        // is not how the step failed, though its words (`fails`, `expected`)
+        // match a keyword, and its duration changes on every run: kept, no two
+        // runs of one failure would ever have the same lines.
+        if l.starts_with(['✓', '✔', '√']) {
+            return None;
+        }
         if l.starts_with("##[") && !l.starts_with("##[error]") && !l.starts_with("##[warning]") {
             return None;
         }
@@ -3382,6 +3402,16 @@ fn is_iso_timestamp(s: &str) -> bool {
         && (s.len() == 10 || (matches!(b[10], b'T' | b't') && s[11..].chars().all(|c| c.is_ascii_digit() || matches!(c, ':' | '.' | 'Z' | 'z' | '+' | '-'))))
 }
 
+/// `257ms`, `1.2s`, `40µs`: how long a test or step took, which differs on every run.
+fn is_duration(s: &str) -> bool {
+    let n = s.trim_end_matches(|c: char| c.is_ascii_alphabetic() || c == 'µ');
+    let unit = &s[n.len()..];
+    !n.is_empty()
+        && n.chars().all(|c| c.is_ascii_digit() || c == '.')
+        && n.chars().any(|c| c.is_ascii_digit())
+        && matches!(unit, "ms" | "s" | "us" | "µs" | "ns")
+}
+
 /// `20:14:45`, `20:14:45.123Z`, `20:14`.
 fn is_clock_time(s: &str) -> bool {
     let b = s.as_bytes();
@@ -3393,7 +3423,7 @@ fn is_clock_time(s: &str) -> bool {
 }
 
 /// One whitespace-separated word of a failure text without its volatile
-/// parts, or `None` when it is only volatile: a timestamp, a UUID, a hash (a
+/// parts, or `None` when it is only volatile: a timestamp, a duration (`257ms`), a UUID, a hash (a
 /// hex run of 12 or more, or a lock file's `h1:`/`zh:` digest), a
 /// `/tmp`, `_temp` or `/var/folders` directory (only that segment), a GitHub
 /// run, job or check id in a URL, and the line and column after a file name.
@@ -3405,7 +3435,7 @@ fn scrub_word(word: &str) -> Option<String> {
         return Some(word.to_string());
     }
     let low = core_t.to_ascii_lowercase();
-    if is_iso_timestamp(core_t) || is_clock_time(core_t) || is_uuid(core_t) || is_hex_run(core_t) || low.starts_with("h1:") || low.starts_with("zh:") {
+    if is_duration(core_t) || is_iso_timestamp(core_t) || is_clock_time(core_t) || is_uuid(core_t) || is_hex_run(core_t) || low.starts_with("h1:") || low.starts_with("zh:") {
         return None;
     }
     // `file.tf:12:5` is `file.tf`.
@@ -4763,6 +4793,72 @@ mod tests {
         let found = client(&url, &[]).base_failures("o", &unique_repo(), status).unwrap().failures;
         assert_eq!(handle.join().unwrap(), expected);
         found
+    }
+
+    /// A vitest job log as the failing "Run tests" step wrote it: every passing
+    /// test echoed with its duration (some with words that match a failure
+    /// keyword), two real failures, the file line with its own duration.
+    fn vitest_log(clock: &str, ms: [u32; 3]) -> String {
+        let t = |s: u32| format!("2026-11-25T{clock}:{s:02}.123Z");
+        let mut out = String::new();
+        out.push_str(&format!("{} ##[group]Run pnpm test\n", t(31)));
+        out.push_str(&format!("{} ✓ keeps planned ship endpoints when arrivals are expected {}ms\n", t(32), ms[0]));
+        out.push_str(&format!("{} ✓ disables the broker option when the profiles request fails {}ms\n", t(32), ms[1]));
+        out.push_str(&format!("{} ❯ src/views/KitScheduler/utils.test.ts (237 tests | 2 failed) {}ms\n", t(33), ms[2]));
+        out.push_str(&format!(
+            "{} FAIL  src/views/KitScheduler/utils.test.ts > draws a today ship box on a worked scope due tomorrow (partial false)\n",
+            t(34)
+        ));
+        out.push_str(&format!(
+            "{} AssertionError: expected 91.93548387096774 to be close to 91.66666666666666, received difference is 0.2688172043010866, but expected 0.005\n",
+            t(34)
+        ));
+        out.push_str(&format!("{} ##[error]Process completed with exit code 1.\n", t(35)));
+        out
+    }
+
+    fn run_tests_step(start: &str, end: &str) -> JobStepRaw {
+        JobStepRaw {
+            name: "Run tests".into(),
+            conclusion: Some("failure".into()),
+            started_at: Some(format!("2026-11-25T{start}:30Z")),
+            completed_at: Some(format!("2026-11-25T{end}:36Z")),
+        }
+    }
+
+    /// Gap 115: the pull request's "Test (2/2)" and main's latest run of the
+    /// same job fail the same two date-dependent tests, but the step's log also
+    /// echoes every passing test with a duration that differs on each run, so
+    /// no two runs had the same signature and the base was never proof.
+    #[test]
+    fn the_same_test_failures_in_two_runs_with_other_durations_are_the_same_failure() {
+        let pr_log = vitest_log("06:53", [2, 948, 205]);
+        let base_log = vitest_log("03:27", [3, 864, 257]);
+        let pr_step = run_tests_step("06:53", "06:53");
+        let base_step = run_tests_step("03:27", "03:27");
+        let pr_evidence = failing_step_log(&pr_log, &pr_step);
+        let base_evidence = failing_step_log(&base_log, &base_step);
+        assert!(pr_evidence.contains("AssertionError"), "{pr_evidence}");
+        assert!(!pr_evidence.contains("✓"), "{pr_evidence}");
+        let pr_sig = failure_signature("failure", "Run tests", &pr_evidence);
+        assert!(!pr_sig.is_empty());
+        assert_eq!(pr_sig, failure_signature("failure", "Run tests", &base_evidence));
+
+        // The comparison: main's failing job of the same name and failure is proof.
+        let runs = vec![BaseRun {
+            name: "Test (2/2)".into(),
+            url: Some("https://github.com/o/r/actions/runs/1/job/2".into()),
+            signature: failure_signature("failure", "Run tests", &base_evidence),
+            lines: normalized_failure_lines(&base_evidence),
+        }];
+        let lines = normalized_failure_lines(&pr_evidence);
+        let found = base_proof("Test (2/2)", &pr_sig, &lines, &runs, &mut || panic!("no diff needed")).unwrap();
+        assert!(matches!(found, Some((_, BaseProof::SameCheck))));
+
+        // A different assertion in the same step is still a different failure.
+        let other = base_log.replace("0.005", "0.5");
+        let other_sig = failure_signature("failure", "Run tests", &failing_step_log(&other, &base_step));
+        assert_ne!(pr_sig, other_sig);
     }
 
     fn unique_repo() -> String {
