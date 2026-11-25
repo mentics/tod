@@ -42,3 +42,8 @@ a dispute sent to it is open.
 
 `lifecycle set <NODE> <STATE> --reason <TEXT>` is the operator's own move
 and is refused in an agent session.
+
+`lifecycle workflow <COMMAND>` (list, publish, assign, status, resume,
+cancel and the rest; `lifecycle workflow help` lists them) authors, assigns
+and runs saved lifecycle workflows. It is the operator's own and is refused
+in an agent session, so never run it.
