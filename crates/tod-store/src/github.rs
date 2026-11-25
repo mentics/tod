@@ -521,6 +521,11 @@ pub struct PrStatus {
     /// runner lost): tod reruns the job ([`Github::rerun_job`]) instead of
     /// sending an agent. Empty from a look that could not read them.
     pub infra_failures: Vec<InfraFailure>,
+    /// For each of [`Self::failing_checks`] that is a finished GitHub Actions
+    /// job, its job id: what tod reruns to find out whether an ordinary
+    /// failure is a flake (`Autopilot::probe_flakes`). Empty from a look that
+    /// could not read them; a check that is a commit status has none.
+    pub failed_jobs: Vec<FailedJob>,
     /// Some check is still running (a status `pending`, a run not completed),
     /// whatever else failed: `checks` says `failure` first.
     pub checks_running: bool,
@@ -554,6 +559,15 @@ impl PrStatus {
             .map(|(_, sig)| sig.clone())
             .unwrap_or_default()
     }
+}
+
+/// A failed GitHub Actions job of a failing check, whatever the reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailedJob {
+    /// The failing check's name.
+    pub check: String,
+    /// The Actions job's id (what [`Github::rerun_job`] takes).
+    pub job_id: i64,
 }
 
 /// A failing GitHub Actions job whose failure is the infrastructure's
@@ -1441,6 +1455,7 @@ impl Github {
         let mut signature_notes = Vec::new();
         let mut failing_evidence = Vec::new();
         let mut infra_failures = Vec::new();
+        let mut failed_jobs = Vec::new();
         let mut checks_running = false;
         let checks = match &raw.head {
             Some(head) => {
@@ -1459,6 +1474,7 @@ impl Github {
                 for hidden in hidden_cancelled_jobs(&runs, &infra_failures) {
                     infra_failures.push(hidden);
                 }
+                failed_jobs = failed_actions_jobs(&runs, &failing_checks);
                 combine_checks(Some(&statuses), Some(&runs))
             }
             None => None,
@@ -1486,6 +1502,7 @@ impl Github {
             base_failures: Vec::new(),
             base_notes: Vec::new(),
             infra_failures,
+            failed_jobs,
             checks_running,
             head_sha: raw.head.as_ref().map(|h| h.sha.clone()),
             head_committed_at: None,
@@ -3745,6 +3762,25 @@ fn hidden_cancelled_jobs(runs: &CheckRunsRaw, known: &[InfraFailure]) -> Vec<Inf
             continue;
         }
         out.push(InfraFailure { check: name.clone(), job_id: run.id, kind: "cancelled".to_string() });
+    }
+    out
+}
+
+/// The finished GitHub Actions job of each failing check in `names` that did
+/// not succeed: the job a rerun would run again.
+fn failed_actions_jobs(runs: &CheckRunsRaw, names: &[String]) -> Vec<FailedJob> {
+    let mut out: Vec<FailedJob> = Vec::new();
+    for run in &runs.check_runs {
+        let Some(name) = run.name.as_ref().filter(|n| names.contains(n)) else { continue };
+        let conclusion = run.conclusion.as_deref().unwrap_or_default();
+        let is_actions = run.app.as_ref().and_then(|a| a.slug.as_deref()) == Some("github-actions") && run.id != 0;
+        if !is_actions || run.status != "completed" || matches!(conclusion, "success" | "neutral" | "skipped") {
+            continue;
+        }
+        if out.iter().any(|j| &j.check == name) {
+            continue;
+        }
+        out.push(FailedJob { check: name.clone(), job_id: run.id });
     }
     out
 }

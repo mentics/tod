@@ -129,6 +129,18 @@ request's CI checks (`doc/lifecycle/pr-readiness.md`). In order:
    defaults for common formatters.
 4. Otherwise it is `work`, and goes to a quick fix (section 5).
 
+**The flake probe** (gap 126). A failure that is none of the above, a failing
+test with no base run to compare against, may still be a flake. Before tod asks
+the user whether such a check is the change's (the agent's `pr checks
+unrelated` claim, or tod's own question after two turns that changed nothing),
+tod reruns the check's failed GitHub Actions job once, itself, with no agent
+turn (`api_work::probe_flakes`; once per check and head, in the same ledger as
+rung 1, off with `max_infra_reruns: 0`). A pass is recorded as a flake
+(`Flake: ...`) and nobody is asked, or the pending question is withdrawn; a
+failure the same way is asked about as before. It is not done before the
+agent's turns: a rerun costs a full CI run and a real failure would only be
+re-run for nothing, so the signal is that the agent could change nothing.
+
 **What a mechanical or quick fix does not trigger.** Today a check failure
 goes to the Fix protocol, and the node then goes round Review again. That is
 wrong for a formatting fix:

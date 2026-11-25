@@ -2286,6 +2286,7 @@ mod tests {
             base_failures: Vec::new(),
             base_notes: Vec::new(),
             infra_failures: infra,
+            failed_jobs: Vec::new(),
             checks_running: false,
             head_sha: Some("abc1234".into()),
             head_committed_at: None,

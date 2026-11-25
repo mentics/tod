@@ -40,6 +40,21 @@ use uuid::Uuid;
 /// taken to be the old one.
 pub(super) const INFRA_RERUN_SETTLE_MS: i64 = 120_000;
 
+/// Tests that exercise a probe's wait set this to 0 (one process per test).
+#[cfg(test)]
+pub(super) static PROBE_SETTLE_TEST_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(INFRA_RERUN_SETTLE_MS);
+
+fn probe_settle_ms() -> i64 {
+    #[cfg(test)]
+    {
+        PROBE_SETTLE_TEST_MS.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    #[cfg(not(test))]
+    {
+        INFRA_RERUN_SETTLE_MS
+    }
+}
+
 /// How long a look that only polls (checks running, a bot's review, GitHub
 /// computing) waits before looking again, with no sandbox awake meanwhile.
 pub const POLL_MS: i64 = 3 * 60 * 1000;
@@ -139,7 +154,7 @@ enum Rerun {
 }
 
 fn rerun_standing(c: &Ctx<'_>, label: &str, head: &str, check: &str) -> Rerun {
-    let asked = c.infra_reruns.iter().find(|r| r.pr == label && r.head == head && r.check == check);
+    let asked = c.infra_reruns.iter().find(|r| !r.probe && r.pr == label && r.head == head && r.check == check);
     let (count, at) = asked.map_or((0, 0), |r| (r.count, r.at_ms));
     if count > 0 && c.now_ms - at < INFRA_RERUN_SETTLE_MS {
         Rerun::Settling
@@ -505,7 +520,7 @@ pub(super) fn rerun_infra_failures(
         }
         let label = pr_readiness::pr_label(&p.pr);
         // A check that failed for infrastructure, was rerun, and now passes.
-        let mut flaked = Vec::new();
+        let mut flaked: Vec<(String, u32, bool)> = Vec::new();
         for r in ledger.iter_mut().filter(|r| r.pr == label && r.head == head && !r.flaked && r.count > 0) {
             let failing = a.failing_checks.iter().any(|c| c.eq_ignore_ascii_case(&r.check))
                 || a.infra_failures.iter().any(|f| f.check.eq_ignore_ascii_case(&r.check));
@@ -513,12 +528,13 @@ pub(super) fn rerun_infra_failures(
                 continue;
             }
             r.flaked = true;
-            flaked.push((r.check.clone(), r.count));
+            flaked.push((r.check.clone(), r.count, r.probe));
         }
-        for (check, count) in flaked {
+        for (check, count, probe) in flaked {
             let title = format!("Flake: \"{check}\" on {label} passed on rerun");
+            let why = if probe { "failed at" } else { "failed for the infrastructure's reasons at" };
             let detail = format!(
-                "The check \"{check}\" failed for the infrastructure's reasons at {} and passed when tod ran it again ({count} rerun{}). Recorded as a flake of that check.",
+                "The check \"{check}\" {why} {} and passed when tod ran it again ({count} rerun{}). Recorded as a flake of that check, and nobody was asked about it.",
                 head.chars().take(7).collect::<String>(),
                 if count == 1 { "" } else { "s" },
             );
@@ -538,7 +554,7 @@ pub(super) fn rerun_infra_failures(
             .any(|c| !a.infra_failures.iter().any(|f| f.check.eq_ignore_ascii_case(c)));
         for found in &a.infra_failures {
             let now = state::now_ms();
-            let at = match ledger.iter().position(|r| r.pr == label && r.head == head && r.check == found.check) {
+            let at = match ledger.iter().position(|r| !r.probe && r.pr == label && r.head == head && r.check == found.check) {
                 Some(at) => at,
                 None => {
                     ledger.push(InfraRerun {
@@ -548,6 +564,7 @@ pub(super) fn rerun_infra_failures(
                         count: 0,
                         at_ms: 0,
                         flaked: false,
+                        probe: false,
                     });
                     let over = ledger.len().saturating_sub(state::MECHANICAL_KEPT);
                     ledger.drain(..over);
@@ -594,6 +611,99 @@ pub(super) fn rerun_infra_failures(
         }
     }
     Ok(acted)
+}
+
+/// The flake probe (`doc/lifecycle/pr-readiness.md`, "Mechanical failures"):
+/// before anyone is asked whether a failing check is the change's, tod runs
+/// that check's failed job once more itself, no agent turn. The candidates are
+/// the failing checks nobody has ruled on (no standing, or a question still
+/// pending, which is how an agent's "not my change" arrives) that the base
+/// branch is not known to fail, and whose failure is a GitHub Actions job;
+/// once per check and head, kept in the same ledger as the infrastructure
+/// reruns (entries with `probe` set), and bounded by the same switch:
+/// `max_infra_reruns` of 0 turns reruns, probes included, off.
+///
+/// A pass is noted as a flake by [`rerun_infra_failures`] (which reads the
+/// ledger every look) and, for a question already pending, withdrawn by
+/// [`crate::check_unrelated::reconcile`], so nobody is asked. Returns whether
+/// a probe is in flight (just started, not yet shown by GitHub, or running):
+/// the caller waits and reads again instead of asking. A rerun GitHub refuses
+/// is noted, never hidden, and the check goes on to be asked about.
+pub(super) fn probe_flakes(
+    fleet: &FleetStore,
+    node: Uuid,
+    feed: &dyn PrFeed,
+    live: &[LivePr],
+    settings: &tod_store::PrReadinessSettings,
+    phase: &str,
+    ledger: &mut Vec<InfraRerun>,
+    save: &mut dyn FnMut(&[InfraRerun]) -> Result<()>,
+) -> Result<bool> {
+    use tod_store::settings::UnrelatedStanding;
+    use tod_store::node_timeline::{KIND_NOTE, TimelineEntry};
+    if settings.max_infra_reruns == 0 {
+        return Ok(false);
+    }
+    let mut waiting = false;
+    for p in live {
+        let a = &p.assessment;
+        let Some(head) = a.head_sha.clone() else { continue };
+        if a.merged || head.is_empty() {
+            continue;
+        }
+        let label = pr_readiness::pr_label(&p.pr);
+        for check in &a.failing_checks {
+            let ruled = !matches!(a.check_standing(check), None | Some(UnrelatedStanding::Pending));
+            if ruled || a.base_failure(check).is_some() || a.infra_failures.iter().any(|f| f.check.eq_ignore_ascii_case(check)) {
+                continue;
+            }
+            let Some(job) = a.failed_jobs.iter().find(|j| j.check.eq_ignore_ascii_case(check)) else { continue };
+            let asked = ledger.iter().find(|r| r.probe && r.pr == label && r.head == head && r.check == *check).cloned();
+            let now = state::now_ms();
+            if let Some(r) = asked {
+                // Asked already: wait for GitHub to show it and for it to end;
+                // a failure that is still there after that is the answer.
+                if r.count > 0 && (now - r.at_ms < probe_settle_ms() || a.checks_running) && r.at_ms > 0 {
+                    waiting = true;
+                }
+                continue;
+            }
+            if a.checks_running {
+                // GitHub refuses a rerun while a run goes on.
+                waiting = true;
+                continue;
+            }
+            ledger.push(InfraRerun { pr: label.clone(), head: head.clone(), check: check.clone(), count: 1, at_ms: now, flaked: false, probe: true });
+            let over = ledger.len().saturating_sub(state::MECHANICAL_KEPT);
+            ledger.drain(..over);
+            let at = ledger.len() - 1;
+            let what = format!("\"{check}\" on {label}");
+            match feed.rerun_job(&p.pr, job.job_id) {
+                Ok(()) => {
+                    save(ledger)?;
+                    let title = format!("Reran {what}: a flake probe before anyone is asked whether it is the change's");
+                    let detail = format!(
+                        "The check failed at {} and tod asked GitHub to run the job once more, with no agent turn. If it passes it is recorded as a flake and nobody is asked; if it fails the same way, the question is asked as usual.",
+                        head.chars().take(7).collect::<String>()
+                    );
+                    fleet.enqueue(tod_store::fleet::FleetMutation::RecordTimeline(Box::new(TimelineEntry::new(node, KIND_NOTE, phase, title, false, detail))))?;
+                    fleet.writer().flush()?;
+                    pr_readiness::forget_snapshot(&p.pr);
+                    waiting = true;
+                }
+                Err(err) => {
+                    // Counted, so a refusal never repeats; the check is asked about.
+                    ledger[at].at_ms = 0;
+                    save(ledger)?;
+                    let title = format!("Could not rerun {what} as a flake probe");
+                    let entry = TimelineEntry::new(node, KIND_NOTE, phase, title, true, format!("GitHub refused the rerun: {err}"));
+                    fleet.enqueue(tod_store::fleet::FleetMutation::RecordTimeline(Box::new(entry)))?;
+                    fleet.writer().flush()?;
+                }
+            }
+        }
+    }
+    Ok(waiting)
 }
 
 /// What waiting for a review bot owes (`doc/lifecycle/pr-readiness.md`,
@@ -864,7 +974,7 @@ mod tests {
         a.checks = Some("failure".into());
         a.failing_checks = vec!["test".into()];
         a.infra_failures = vec![cancelled("test")];
-        let spent = [InfraRerun { pr: "acme/app#7".into(), head: "abc1234".into(), check: "test".into(), count: 2, at_ms: 0, flaked: false }];
+        let spent = [InfraRerun { pr: "acme/app#7".into(), head: "abc1234".into(), check: "test".into(), count: 2, at_ms: 0, flaked: false, probe: false }];
         let c = classify_with(a, &spent, true, false);
         assert!(c.needs_agent(), "{c:?}");
     }
@@ -875,7 +985,7 @@ mod tests {
         a.checks = Some("failure".into());
         a.failing_checks = vec!["test".into()];
         a.infra_failures = vec![cancelled("test")];
-        let asked = [InfraRerun { pr: "acme/app#7".into(), head: "abc1234".into(), check: "test".into(), count: 1, at_ms: 10_000_000 - 1_000, flaked: false }];
+        let asked = [InfraRerun { pr: "acme/app#7".into(), head: "abc1234".into(), check: "test".into(), count: 1, at_ms: 10_000_000 - 1_000, flaked: false, probe: false }];
         let c = classify_with(a, &asked, true, false);
         // Nothing to rerun again, nothing for the agent; the check is still red.
         assert!(!c.needs_agent(), "{c:?}");

@@ -718,6 +718,23 @@ tod handles them before any agent turn (`Autopilot::rerun_infra_failures`,
   **flake** of that check (`Flake: ...`). Reruns spent, or refused by GitHub
   (noted, counted), leave the failure to the agent as any other. Kept in the
   run state (`AutopilotState::infra_reruns`).
+- **The flake probe** (gap 126: one test of 12,255 failed in a workflow that
+  never runs on the base branch, so there was nothing to compare, and a plain
+  rerun passed). When the agent's turns have changed nothing twice (or the
+  agent has claimed a failing check is not the change's), and before anyone is
+  asked, tod reruns that check's failed Actions job once (`PrStatus::failed_jobs`,
+  `Autopilot::probe_flakes`, `api_work::probe_flakes`), no agent turn, for each
+  failing check nobody has ruled on and the base branch is not known to fail.
+  It is once per check and head, shares the infrastructure reruns' ledger
+  (`InfraRerun::probe`), settle wait and `max_infra_reruns` switch (0 turns
+  reruns off), and the loop reads again instead of taking another turn while
+  it is in flight. A pass is a **flake** (`Flake: ...`) and the pending
+  question, if any, is withdrawn; a failure the same way is asked about as
+  before (the check-unrelated request, `Raised::QuietTurns`). A refused
+  rerun is noted and the check asked about. A check that is a commit status
+  has no job to rerun and is asked about at once. The supervisor in a sandbox
+  runs the same code; the sandbox-free GitHub look files no request (it only
+  wakes the agent), so it needs no probe of its own.
 - **A configured fix** (`pr_readiness.check_fixes`, `check` and `fix`): on a
   failing check with an entry, tod runs the fix in the node's checkout
   (`tod_core::fixer`), commits the result as its own mechanical commit,

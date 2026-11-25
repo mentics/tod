@@ -710,6 +710,16 @@ const AT_ONCE_TRIES: u32 = 3;
 const BRANCH_UPDATE_WAIT: Duration = Duration::from_secs(120);
 const BRANCH_UPDATE_POLL: Duration = Duration::from_secs(5);
 
+/// What `Autopilot::settle_quiet_checks` did.
+enum Quiet {
+    /// The user was asked about a failing check.
+    Asked,
+    /// A flake probe is in flight: read again, no agent turn.
+    Probing,
+    /// Nothing for either.
+    Nothing,
+}
+
 /// What `Autopilot::update_branches` did.
 enum BranchUpdate {
     /// Nothing was due.
@@ -2245,6 +2255,16 @@ impl Autopilot {
             // Nothing for the agent is left but a check the user is asked
             // about: only now does the run wait on that answer.
             if held_unrelated > 0 && !matches!(overall, PrNext::Work(_) | PrNext::Merged) {
+                // The agent (or two quiet turns) called a failing check not the
+                // change's: it is rerun once, by tod, before the user is
+                // asked to judge it. A pass withdraws the question.
+                if self.probe_flakes(fleet, feed.as_ref(), &live, &settings, phase_key)? {
+                    if let Some(reason) = self.sleep_watching(fleet, hook, self.pr_poll.min(Duration::from_secs(20)))? {
+                        hook.waiting(None, None);
+                        return Ok(Some(Outcome::Stopped { reason }));
+                    }
+                    continue;
+                }
                 github_wait::clear_read_failures(fleet, node)?;
                 hook.waiting(None, None);
                 return Ok(Some(Outcome::NeedsHuman {
@@ -2287,6 +2307,27 @@ impl Autopilot {
                     waited_since = None;
                     self.clear_poll_waits(fleet)?;
                     hook.waiting(None, None);
+                    // Two quiet turns already, and a flake probe was started
+                    // for the failing check: what it showed is judged now,
+                    // before a third turn that would change nothing again.
+                    if self.state.loops.pr_unchanged >= 2 {
+                        match self.settle_quiet_checks(fleet, feed.as_ref(), &live, &settings, phase_key)? {
+                            Quiet::Asked => {
+                                self.state.loops.pr_unchanged = 0;
+                                self.state.loops.pr_rounds = 0;
+                                self.save()?;
+                                continue;
+                            }
+                            Quiet::Probing => {
+                                if let Some(reason) = self.sleep_watching(fleet, hook, self.pr_poll.min(Duration::from_secs(20)))? {
+                                    hook.waiting(None, None);
+                                    return Ok(Some(Outcome::Stopped { reason }));
+                                }
+                                continue;
+                            }
+                            Quiet::Nothing => {}
+                        }
+                    }
                     // With the review steps on (`pr_draft` and `pr_review`), the
                     // agent takes two turns a round: the change, then the push.
                     let reviewed = fleet.read(|conn| crate::pr_draft_review::enabled(conn, node))?;
@@ -2436,15 +2477,28 @@ impl Autopilot {
                             // A failing check is the user's to decide, as a
                             // request, not a stop that says "open the log".
                             let seen = if pr_readiness::outstanding(&now).is_empty() { &live } else { &now };
-                            if self.ask_about_quiet_checks(fleet, seen, phase_key)? {
-                                self.state.loops.pr_unchanged = 0;
-                                // The rounds spent on the check before the
-                                // question was asked are not the user's
-                                // answer's to inherit: "fix it here" starts
-                                // a fresh budget.
-                                self.state.loops.pr_rounds = 0;
-                                self.save()?;
-                                continue;
+                            match self.settle_quiet_checks(fleet, feed.as_ref(), seen, &settings, phase_key)? {
+                                Quiet::Asked => {
+                                    self.state.loops.pr_unchanged = 0;
+                                    // The rounds spent on the check before the
+                                    // question was asked are not the user's
+                                    // answer's to inherit: "fix it here" starts
+                                    // a fresh budget.
+                                    self.state.loops.pr_rounds = 0;
+                                    self.save()?;
+                                    continue;
+                                }
+                                Quiet::Probing => {
+                                    // A flake probe is running: the count of
+                                    // quiet turns stays, so what it shows is
+                                    // judged without another agent turn.
+                                    if let Some(reason) = self.sleep_watching(fleet, hook, self.pr_poll.min(Duration::from_secs(20)))? {
+                                        hook.waiting(None, None);
+                                        return Ok(Some(Outcome::Stopped { reason }));
+                                    }
+                                    continue;
+                                }
+                                Quiet::Nothing => {}
                             }
                             // Name what is still outstanding, on which pull
                             // request, and what the user can decide: the
@@ -2824,6 +2878,44 @@ impl Autopilot {
         });
         self.state.infra_reruns = ledger;
         result
+    }
+
+    /// The flake probe ([`api_work::probe_flakes`]), with the reruns counted in
+    /// this run's state like [`Self::rerun_infra_failures`]'s.
+    fn probe_flakes(
+        &mut self,
+        fleet: &FleetStore,
+        feed: &dyn crate::pr_readiness::PrFeed,
+        live: &[crate::pr_readiness::LivePr],
+        settings: &tod_store::PrReadinessSettings,
+        phase: &str,
+    ) -> Result<bool> {
+        let node = self.node;
+        let mut ledger = std::mem::take(&mut self.state.infra_reruns);
+        let result = api_work::probe_flakes(fleet, node, feed, live, settings, phase, &mut ledger, &mut |l| {
+            self.state.infra_reruns = l.to_vec();
+            self.save()
+        });
+        self.state.infra_reruns = ledger;
+        result
+    }
+
+    /// What to do about failing checks after two quiet turns: first the flake
+    /// probe (rerun once, no agent turn; [`api_work::probe_flakes`]), and only
+    /// when nothing is in flight the user is asked
+    /// ([`Self::ask_about_quiet_checks`]).
+    fn settle_quiet_checks(
+        &mut self,
+        fleet: &FleetStore,
+        feed: &dyn crate::pr_readiness::PrFeed,
+        live: &[crate::pr_readiness::LivePr],
+        settings: &tod_store::PrReadinessSettings,
+        phase: &str,
+    ) -> Result<Quiet> {
+        if self.probe_flakes(fleet, feed, live, settings, phase)? {
+            return Ok(Quiet::Probing);
+        }
+        Ok(if self.ask_about_quiet_checks(fleet, live, phase)? { Quiet::Asked } else { Quiet::Nothing })
     }
 
     /// A failing CI check with a configured fixer (`pr_readiness.check_fixes`)

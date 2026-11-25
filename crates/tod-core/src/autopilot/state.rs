@@ -149,6 +149,11 @@ pub struct InfraRerun {
     /// Whether the check's passing after a rerun is already recorded as a flake.
     #[serde(default)]
     pub flaked: bool,
+    /// A flake probe ([`super::api_work::probe_flakes`]): the check failed an
+    /// ordinary way and tod reran it once before asking anyone. Kept apart
+    /// from the infrastructure reruns of the same check and head.
+    #[serde(default)]
+    pub probe: bool,
 }
 
 /// How often the configured fixer ran for one CI check of one pull request.

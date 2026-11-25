@@ -319,6 +319,9 @@ pub struct Assessment {
     /// ([`PrStatus::infra_failures`]): tod reruns them, no agent turn
     /// (`Autopilot::rerun_infra_failures`).
     pub infra_failures: Vec<tod_store::github::InfraFailure>,
+    /// The failing checks' Actions jobs ([`PrStatus::failed_jobs`]): what the
+    /// flake probe reruns before the user is asked about a failing check.
+    pub failed_jobs: Vec<tod_store::github::FailedJob>,
     /// A check is still running, whatever else failed.
     pub checks_running: bool,
     /// The head commit this was read at; a standing for a failing check
@@ -585,6 +588,7 @@ impl Assessment {
             base_failures: snapshot.status.base_failures.clone(),
             base_notes: snapshot.status.base_notes.clone(),
             infra_failures: snapshot.status.infra_failures.clone(),
+            failed_jobs: snapshot.status.failed_jobs.clone(),
             checks_running: snapshot.status.checks_running,
             head_sha: snapshot.status.head_sha.clone(),
             check_standings: Vec::new(),

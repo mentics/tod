@@ -290,6 +290,7 @@ fn hook_snapshot(checks: &str, failing: &[&str], infra: Vec<tod_store::github::I
             checks: Some(checks.into()),
             failing_checks: failing.iter().map(|c| c.to_string()).collect(),
             infra_failures: infra,
+            failed_jobs: Vec::new(),
             checks_running: running,
             head_sha: Some("abc".into()),
             open: true,

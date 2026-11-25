@@ -2714,6 +2714,7 @@ fn a_pr_draft_wake_leaves_running_checks_to_the_babysitter() {
         base_failures: Vec::new(),
         base_notes: Vec::new(),
         infra_failures: Vec::new(),
+        failed_jobs: Vec::new(),
         checks_running: false,
         head_sha: None,
         head_committed_at: None,
@@ -2766,6 +2767,7 @@ fn check_now_in_pr_draft_waits_for_the_draft_to_be_ready_and_reviewed() {
         base_failures: Vec::new(),
         base_notes: Vec::new(),
         infra_failures: Vec::new(),
+        failed_jobs: Vec::new(),
         checks_running: false,
         head_sha: None,
         head_committed_at: None,
@@ -2900,6 +2902,7 @@ fn check_now_in_pr_draft_sends_new_changes_requested_to_the_agent_even_on_a_draf
         base_failures: Vec::new(),
         base_notes: Vec::new(),
         infra_failures: Vec::new(),
+        failed_jobs: Vec::new(),
         checks_running: false,
         head_sha: None,
         head_committed_at: Some("2026-01-01T09:00:00Z".into()),
@@ -2955,6 +2958,7 @@ fn check_now_in_pr_draft_clears_a_leftover_review_wait_and_ignores_a_bot_reviewe
         base_failures: Vec::new(),
         base_notes: Vec::new(),
         infra_failures: Vec::new(),
+        failed_jobs: Vec::new(),
         checks_running: false,
         head_sha: None,
         head_committed_at: None,
@@ -5598,6 +5602,8 @@ struct FailingCheckFeed {
     own_failing: std::sync::Mutex<Vec<String>>,
     /// `terraform` failed for the infrastructure's reasons (`PrStatus::infra_failures`).
     infra: std::sync::Mutex<Option<tod_store::github::InfraFailure>>,
+    /// `terraform`'s failed Actions job, an ordinary failure (`PrStatus::failed_jobs`).
+    failed_job: std::sync::Mutex<Option<tod_store::github::FailedJob>>,
     /// What rerunning a job does: `Some(true)` passes the check, `Some(false)`
     /// leaves it failing, `None` is refused by GitHub.
     rerun_result: std::sync::Mutex<Option<bool>>,
@@ -5654,6 +5660,7 @@ impl crate::pr_readiness::PrFeed for FailingCheckFeed {
                 base_failures: if fixed { Vec::new() } else { self.base_failure.lock().unwrap().iter().cloned().collect() },
                 base_notes: if fixed { Vec::new() } else { self.base_note.lock().unwrap().iter().map(|w| ("terraform".to_string(), w.clone())).collect() },
                 infra_failures: if fixed { Vec::new() } else { self.infra.lock().unwrap().iter().cloned().collect() },
+                failed_jobs: if fixed { Vec::new() } else { self.failed_job.lock().unwrap().iter().cloned().collect() },
                 ..Default::default()
             },
             threads: Vec::new(),
@@ -5707,6 +5714,7 @@ fn failing_check_on(fx: &Fixture, says_unrelated: bool) -> (Arc<FailingCheckFeed
         base_note: std::sync::Mutex::new(None),
         own_failing: std::sync::Mutex::new(Vec::new()),
         infra: std::sync::Mutex::new(None),
+        failed_job: std::sync::Mutex::new(None),
         rerun_result: std::sync::Mutex::new(None),
         reruns: std::sync::Mutex::new(Vec::new()),
     });
@@ -5917,6 +5925,58 @@ fn two_quiet_turns_on_a_failing_check_become_one_request_not_a_stop() {
         Outcome::NeedsHuman { reason: NeedsHuman::PrStuck { why } } => assert!(why.contains("terraform"), "{why}"),
         other => panic!("{other:?}"),
     }
+}
+
+fn ordinary_failure() -> tod_store::github::FailedJob {
+    tod_store::github::FailedJob { check: "terraform".into(), job_id: 555 }
+}
+
+/// Gap 126: a test that failed once and passed on `gh run rerun --failed` cost
+/// the user two requests. After two quiet turns tod reruns the failed job
+/// itself, once, before asking: a pass is a flake and nobody is asked.
+#[test]
+fn a_failing_check_is_rerun_before_the_user_is_asked_and_a_pass_is_a_flake() {
+    let (fx, feed, mut agent, _) = failing_check_node(false);
+    *feed.failed_job.lock().unwrap() = Some(ordinary_failure());
+    *feed.rerun_result.lock().unwrap() = Some(true);
+    for _ in 0..3 {
+        run_babysitter(&fx, &mut agent);
+    }
+    assert_eq!(agent.turns, 2, "the probe comes after the two quiet turns, not before and not another");
+    assert_eq!(*feed.reruns.lock().unwrap(), vec![555], "rerun once");
+    assert!(unrelated_decisions(&fx).is_empty(), "nobody is asked about a flake");
+    let notes = fx.fleet.read(|conn| Ok(tod_store::node_timeline::TimelineRepo::new(conn).list(fx.node)?)).unwrap();
+    assert!(notes.iter().any(|e| e.title.contains("flake probe")), "{notes:?}");
+    assert!(notes.iter().any(|e| e.title.starts_with("Flake: \"terraform\"")), "{notes:?}");
+}
+
+/// The same failure on the rerun is still asked about, once, and not rerun again.
+#[test]
+fn a_failing_check_that_fails_again_on_the_probe_is_asked_about() {
+    let (fx, feed, mut agent, _) = failing_check_node(false);
+    *feed.failed_job.lock().unwrap() = Some(ordinary_failure());
+    *feed.rerun_result.lock().unwrap() = Some(false);
+    super::api_work::PROBE_SETTLE_TEST_MS.store(0, std::sync::atomic::Ordering::SeqCst);
+    let mut asked = false;
+    for _ in 0..4 {
+        let outcome = run_babysitter(&fx, &mut agent);
+        asked |= matches!(&outcome, Outcome::NeedsHuman { reason: NeedsHuman::Decision { .. } });
+    }
+    assert!(asked);
+    assert_eq!(unrelated_decisions(&fx).len(), 1);
+    assert_eq!(*feed.reruns.lock().unwrap(), vec![555], "one probe per check and head");
+    assert_eq!(agent.turns, 2);
+}
+
+/// A rerun GitHub refuses is noted and the check is asked about as before.
+#[test]
+fn a_refused_probe_is_noted_and_the_check_is_asked_about() {
+    let (fx, feed, mut agent, _) = failing_check_node(false);
+    *feed.failed_job.lock().unwrap() = Some(ordinary_failure());
+    let outcome = run_babysitter(&fx, &mut agent);
+    assert!(matches!(&outcome, Outcome::NeedsHuman { reason: NeedsHuman::Decision { pending: 1 } }), "{outcome:?}");
+    let notes = fx.fleet.read(|conn| Ok(tod_store::node_timeline::TimelineRepo::new(conn).list(fx.node)?)).unwrap();
+    assert!(notes.iter().any(|e| e.title.contains("as a flake probe") && e.title.starts_with("Could not rerun")), "{notes:?}");
 }
 
 /// A check the base could not be compared with: the quiet-turn request says why.
